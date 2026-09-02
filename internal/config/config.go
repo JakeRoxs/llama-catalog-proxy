@@ -15,6 +15,7 @@ import (
 
 const (
 	defaultListen         = "0.0.0.0:8080"
+	defaultHealthPath     = "/health"
 	defaultModelsCacheTTL = 15 * time.Second
 	defaultRequestTimeout = 10 * time.Second
 	defaultLogLevel       = "INFO"
@@ -33,10 +34,12 @@ type Config struct {
 }
 
 type Backend struct {
-	URL     string            `yaml:"url"`
-	Prefix  string            `yaml:"prefix"`
-	APIKey  string            `yaml:"api_key,omitempty"`
-	Headers map[string]string `yaml:"headers,omitempty"`
+	URL                  string            `yaml:"url"`
+	Prefix               string            `yaml:"prefix"`
+	HealthPath           string            `yaml:"health_path"`
+	OllamaShowEnrichment bool              `yaml:"ollama_show_enrichment"`
+	APIKey               string            `yaml:"api_key,omitempty"`
+	Headers              map[string]string `yaml:"headers,omitempty"`
 }
 
 type fileConfig struct {
@@ -77,6 +80,12 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Backends == nil {
 		cfg.Backends = make(map[string]Backend)
+	}
+	for id, backend := range cfg.Backends {
+		if backend.HealthPath == "" {
+			backend.HealthPath = defaultHealthPath
+		}
+		cfg.Backends[id] = backend
 	}
 
 	if raw.ModelsCacheTTL != "" {
@@ -131,6 +140,11 @@ func (c Config) Validate() error {
 		}
 		if err := validateHTTPURL("backend "+backendID, backend.URL); err != nil {
 			return err
+		}
+		if backend.HealthPath != "" {
+			if err := validateHealthPath("backend "+backendID, backend.HealthPath); err != nil {
+				return err
+			}
 		}
 		if strings.TrimSpace(backend.Prefix) != backend.Prefix {
 			return fmt.Errorf("backend %q prefix must not have surrounding whitespace", backendID)
@@ -229,6 +243,14 @@ func validateHTTPURL(name, value string) error {
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
 		return fmt.Errorf("%s URL must not contain a query or fragment", name)
+	}
+	return nil
+}
+
+func validateHealthPath(name, value string) error {
+	if !strings.HasPrefix(value, "/") || strings.TrimSpace(value) != value ||
+		strings.ContainsAny(value, " \t\r\n?#") || path.Clean(value) != value {
+		return fmt.Errorf("%s health_path %q must be a canonical absolute path without a query or fragment", name, value)
 	}
 	return nil
 }

@@ -1,20 +1,19 @@
 # llama-catalog-proxy
 
-`llama-catalog-proxy` is a small model-aware OpenAI-compatible router for independent
-[llama-swap](https://github.com/mostlygeek/llama-swap) backends. It aggregates each backend's model
-catalog, gives each backend an optional configurable public prefix, and routes inference requests by
-that prefix.
+`llama-catalog-proxy` is a small model-aware router for independent OpenAI-compatible inference
+backends. It aggregates each backend's model catalog, gives each backend an optional configurable
+public prefix, and routes inference requests by that prefix.
 
-Each llama-swap instance manages only its local models. The backends do not need llama-swap peer
-configuration, and the proxy does not implement scheduling, model lifecycle management, load
-balancing, or inference logic.
+Each backend manages its own models and inference lifecycle. The proxy does not implement
+scheduling, model lifecycle management, load balancing, or inference logic. It is tested with
+[llama-swap](https://github.com/mostlygeek/llama-swap), but llama-swap is not required.
 
 ## Architecture
 
 ```text
-                          +-> default llama-swap (local model IDs)
+                          +-> default OpenAI-compatible backend
 Client -> router :9292 --|
-                          +-> GPU llama-swap (public prefix: gpu/)
+                          +-> GPU OpenAI-compatible backend (prefix: gpu/)
 ```
 
 `GET /v1/models` is handled locally by aggregating cached backend catalogs. All other requests are
@@ -27,6 +26,83 @@ inspected for a top-level JSON `model` string:
 
 Routing depends only on configuration, not on whether a model is present in the catalog cache.
 
+## Backend Compatibility
+
+A backend is compatible with catalog aggregation when `GET /v1/models` returns an OpenAI-style
+object containing a `data` array whose model objects have string `id` fields. Unknown catalog fields
+are preserved. Routed APIs may use any path as long as JSON requests identify the model with a
+top-level `model` string; non-model and non-JSON requests pass through to the default backend.
+
+Response status, headers, bodies, streaming, and WebSocket upgrades are proxied without
+backend-specific translation. Backend-specific differences in supported OpenAI request fields remain
+the backend's responsibility.
+
+Readiness checks each backend's configured `health_path` via `GET`, defaulting to `/health`.
+Backends whose health path is unavailable can still serve routed traffic, but a default backend
+with an unreachable health path makes `/ready` return 503.
+
+## Ollama
+
+[Ollama](https://ollama.com) exposes OpenAI-compatible endpoints and works as a backend without
+translation. Point its health path at the liveness endpoint:
+
+```yaml
+default_backend: ollama
+backends:
+  ollama:
+    url: http://ollama-host:11434
+    health_path: /api/version
+    prefix: ""
+```
+
+With a prefix such as `ollama/`, models appear as `ollama/qwen3:8b` in the aggregated catalog.
+Both OpenAI-compatible requests and native `POST /api/chat`, `/api/generate`, and `/api/embed`
+requests route by their top-level `model` and have the prefix stripped before reaching Ollama.
+The client may send any API key, including the placeholder `ollama`; credentials are forwarded as
+given and local Ollama ignores them.
+
+### Ollama catalog enrichment
+
+Set `ollama_show_enrichment: true` to fetch each model's native details via `POST /api/show`
+during catalog refresh and merge them under an `ollama` key on the model object:
+
+```yaml
+backends:
+  ollama:
+    url: http://ollama-host:11434
+    health_path: /api/version
+    prefix: ollama/
+    ollama_show_enrichment: true
+```
+
+```json
+{
+  "id": "ollama/qwen3:8b",
+  "object": "model",
+  "owned_by": "library",
+  "ollama": {
+    "context_length": 40960,
+    "max_completion_tokens": 8192,
+    "parameter_size": "8.3B",
+    "quantization_level": "Q4_K_M",
+    "family": "qwen3",
+    "format": "safetensors",
+    "capabilities": ["completion", "toolcalling"]
+  }
+}
+```
+
+Fields are included only when Ollama reports them. `context_length` is taken from
+`details.context_length`, falling back to `model_info[<architecture>.context_length]`. Requests
+run with bounded concurrency (8 parallel), so a 10-model Ollama with 50ms per `/api/show` adds
+about 100ms to a catalog refresh instead of 500ms sequential. A failing `/api/show` for one model
+omits its metadata without failing the catalog. Enrichment is off by default.
+
+Ollama implements a subset of OpenAI request fields. Unsupported fields are passed through
+unchanged and rejected or ignored by Ollama, including `tool_choice`, `logit_bias`, `user`, `n`,
+`best_of`, `echo`, logprobs, remote image URLs (base64 images only), and stateful
+`/v1/responses` fields.
+
 ## Configuration
 
 The default configuration path is `/config/config.yaml`. Override it with `--config`.
@@ -38,13 +114,14 @@ log_level: INFO
 default_backend: default
 backends:
   default:
-    url: http://llama-swap-default:8080
+    url: http://openai-backend-default:8080
     prefix: ""
     # api_key: replace-with-default-api-key
   gpu:
-    url: http://llama-swap-gpu:8080
+    url: http://openai-backend-gpu:8080
     prefix: gpu/
     # api_key: replace-with-gpu-api-key
+    # health_path: /api/version
     # headers:
     #   X-Custom-Backend-Header: value
 
@@ -60,8 +137,11 @@ The named default backend must exist and may use an empty or configured public p
 routing prefixes must be unique. Model IDs without a matching prefix still route to the default
 backend. Backend URLs must be absolute HTTP or HTTPS URLs. Optional `api_key` values inject
 `Authorization` and `X-Api-Key` only when the client did not provide credentials. Optional backend
-headers are also applied only when the request does not already contain that header. Header values,
-API keys, and request bodies are not logged.
+headers are also applied only when the request does not already contain that header. Optional
+`health_path` values must be canonical absolute paths without a query or fragment; they default to
+`/health` and control the readiness probe target only. Optional `ollama_show_enrichment` enables
+Ollama `POST /api/show` catalog enrichment (see the Ollama section). Header values, API keys, and
+request bodies are not logged.
 
 `max_json_request_body_bytes` limits uncompressed JSON bodies that must be buffered for model-aware
 routing. Oversized JSON requests return `413 Request Entity Too Large`. Explicitly non-JSON,
@@ -86,17 +166,17 @@ slash-delimited descendants; overlapping routes use the longest match. Local `GE
 `/health`, and `/ready` handlers take precedence. Path-route changes participate in configuration
 hot reload.
 
-The `/comfyui` example forwards the path unchanged to the GPU llama-swap, including query strings,
-encoded path segments, backend credentials, and WebSocket upgrades. The GPU llama-swap config
-must define the reserved local model ID `comfyui_auto`. llama-swap then owns the `/comfyui` redirect,
-cold-start restrictions, path stripping, and ComfyUI compatibility settings.
+When the GPU backend is llama-swap, the `/comfyui` example forwards the path unchanged, including
+query strings, encoded path segments, backend credentials, and WebSocket upgrades. That optional
+llama-swap configuration can define the reserved local model ID `comfyui_auto`; llama-swap then owns
+the redirect, cold-start restrictions, path stripping, and ComfyUI compatibility settings.
 
 ## Configuration Hot Reload
 
 The proxy hashes the config file every 2 seconds and applies content changes without a container
 restart, including same-size edits whose modification timestamp did not change.
 
-- Backend URLs, prefixes, API keys, and headers take effect on the next request.
+- Backend URLs, prefixes, API keys, headers, and health paths take effect on the next request.
 - `log_level` changes take effect immediately.
 - If a new config fails to validate, the running configuration is kept and an error is logged; a
   corrected file is picked up automatically on the next poll.
@@ -165,9 +245,9 @@ Streaming and SSE response bodies are never buffered and are flushed immediately
 curl -i http://localhost:9292/health
 ```
 
-`GET /ready` checks every backend's `/health` endpoint and reports their statuses. Only default
-backend failure makes readiness return `503`; optional backend failures are reported but do not make
-the router unready.
+`GET /ready` checks every backend's configured health path (default `/health`) and reports their
+statuses. Only default backend failure makes readiness return `503`; optional backend failures are
+reported but do not make the router unready.
 
 ```console
 curl -s http://localhost:9292/ready | jq

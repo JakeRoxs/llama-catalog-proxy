@@ -56,8 +56,9 @@ func New(cfg config.Config, logger *slog.Logger) (http.Handler, error) {
 			headers.Set(name, value)
 		}
 		catalogBackend := catalog.Backend{
-			ID: id, URL: target, Prefix: backend.Prefix, APIKey: backend.APIKey,
-			Headers: headers, Default: id == cfg.DefaultBackend,
+			ID: id, URL: target, Prefix: backend.Prefix, HealthPath: backend.HealthPath,
+			ShowEnrichment: backend.OllamaShowEnrichment,
+			APIKey:         backend.APIKey, Headers: headers, Default: id == cfg.DefaultBackend,
 		}
 		backends = append(backends, catalogBackend)
 		if backend.Prefix != "" {

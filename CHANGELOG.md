@@ -15,6 +15,8 @@ configuration changes.
 - Bounded JSON request-body inspection.
 - Configuration validation and build version CLI modes.
 - CI and multi-architecture GHCR image publishing.
+- Configurable per-backend health paths (`health_path`, default `/health`) to support Ollama and other non-standard liveness endpoints.
+- Optional Ollama catalog enrichment (`ollama_show_enrichment`) that fetches `POST /api/show` per model with bounded concurrency and merges context length, capabilities, and model metadata under an `ollama` key.
 
 ### Security
 

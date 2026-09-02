@@ -128,6 +128,65 @@ func TestLoadRejectsInvalidPathRoutes(t *testing.T) {
 	}
 }
 
+func TestLoadAppliesDefaultHealthPath(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default: {url: http://default-host:9292}
+  remote: {url: http://remote-host:9292, prefix: remote/}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backends["default"].HealthPath != "/health" || cfg.Backends["remote"].HealthPath != "/health" {
+		t.Fatalf("health paths = %#v", cfg.Backends)
+	}
+}
+
+func TestLoadSupportsConfiguredHealthPath(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292, health_path: /api/version}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backends["default"].HealthPath != "/api/version" {
+		t.Fatalf("health path = %q", cfg.Backends["default"].HealthPath)
+	}
+}
+
+func TestLoadRejectsInvalidHealthPaths(t *testing.T) {
+	tests := []struct {
+		name       string
+		healthPath string
+	}{
+		{name: "relative", healthPath: "api/version"},
+		{name: "trailing slash", healthPath: "/api/version/"},
+		{name: "unclean", healthPath: "/api/../version"},
+		{name: "query", healthPath: "/api/version?x=1"},
+		{name: "fragment", healthPath: "/api/version#one"},
+		{name: "surrounding whitespace", healthPath: " /api/version"},
+		{name: "embedded space", healthPath: "/api/ver sion"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			contents := "default_backend: default\nbackends: {default: {url: http://default-host:9292, health_path: \"" + test.healthPath + "\"}}\n"
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || !strings.Contains(err.Error(), "health_path") {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadSupportsOllamaShowEnrichment(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292, ollama_show_enrichment: true}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Backends["default"].OllamaShowEnrichment {
+		t.Fatal("ollama_show_enrichment was not loaded")
+	}
+}
+
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	_, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\nunknown: true\n"))
 	if err == nil {

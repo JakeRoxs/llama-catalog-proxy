@@ -4,13 +4,15 @@ log_level: INFO
 default_backend: default
 backends:
   default:
-    url: http://llama-swap-default:8080
+    url: http://openai-backend-default:8080
     prefix: ""
     # api_key: replace-with-default-api-key
   gpu:
-    url: http://llama-swap-gpu:8080
+    url: http://openai-backend-gpu:8080
     prefix: gpu/
     # api_key: replace-with-gpu-api-key
+    # health_path: /api/version
+    # ollama_show_enrichment: true
     # headers:
     #   X-Custom-Backend-Header: value
 

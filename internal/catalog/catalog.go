@@ -18,6 +18,8 @@ import (
 
 const maxCatalogBytes = 64 << 20
 
+const showEnrichmentConcurrency = 8
+
 type Response struct {
 	StatusCode int
 	Header     http.Header
@@ -25,12 +27,14 @@ type Response struct {
 }
 
 type Backend struct {
-	ID      string
-	URL     *url.URL
-	Prefix  string
-	APIKey  string
-	Headers http.Header
-	Default bool
+	ID             string
+	URL            *url.URL
+	Prefix         string
+	HealthPath     string
+	ShowEnrichment bool
+	APIKey         string
+	Headers        http.Header
+	Default        bool
 }
 
 type Service struct {
@@ -220,12 +224,19 @@ func (s *Service) backendCatalog(ctx context.Context, backend *backendState, req
 	backend.fetchedAt = time.Now()
 	backend.lastTry = backend.fetchedAt
 	backend.lastErr = nil
+	if backend.ShowEnrichment {
+		s.enrichWithShow(ctx, backend, models)
+	}
 	s.logger.Info("backend model catalog refreshed", "backend_id", backend.ID, "models", len(models))
 	return backend.root, backend.models, backend.header, nil
 }
 
 func (s *Service) backendReady(ctx context.Context, backend *backendState) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(backend.URL, "/health").String(), nil)
+	healthPath := backend.HealthPath
+	if healthPath == "" {
+		healthPath = "/health"
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(backend.URL, healthPath).String(), nil)
 	if err != nil {
 		return err
 	}
@@ -239,6 +250,110 @@ func (s *Service) backendReady(ctx context.Context, backend *backendState) error
 		return fmt.Errorf("backend %q health endpoint returned HTTP %d", backend.ID, response.StatusCode)
 	}
 	return nil
+}
+
+func (s *Service) enrichWithShow(ctx context.Context, backend *backendState, models []map[string]any) {
+	semaphore := make(chan struct{}, showEnrichmentConcurrency)
+	var wg sync.WaitGroup
+	for index := range models {
+		index := index
+		wg.Add(1)
+		semaphore <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+			localID := stringValue(models[index]["id"])
+			metadata, err := s.showMetadata(ctx, backend, localID)
+			if err != nil {
+				s.logger.Warn("ollama model metadata refresh failed", "backend_id", backend.ID, "model_id", localID, "error", err)
+				return
+			}
+			if len(metadata) > 0 {
+				models[index]["ollama"] = metadata
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func (s *Service) showMetadata(ctx context.Context, backend *backendState, modelID string) (map[string]any, error) {
+	body, err := json.Marshal(map[string]string{"model": modelID})
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL(backend.URL, "/api/show").String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	applyBackendHeaders(request.Header, backend)
+	response, err := s.client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("backend returned HTTP %d", response.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxCatalogBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxCatalogBytes {
+		return nil, errors.New("model details exceed 64 MiB limit")
+	}
+	var shown map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&shown); err != nil {
+		return nil, err
+	}
+	return normalizeShowMetadata(shown), nil
+}
+
+func normalizeShowMetadata(shown map[string]any) map[string]any {
+	metadata := make(map[string]any)
+	details := nestedObject(shown, "details")
+	for _, field := range []string{"context_length", "max_completion_tokens", "parameter_size", "quantization_level", "family", "format"} {
+		if value, ok := details[field]; ok {
+			metadata[field] = value
+		}
+	}
+	if capabilities, ok := shown["capabilities"].([]any); ok {
+		values := make([]any, 0, len(capabilities))
+		for _, capability := range capabilities {
+			if text, ok := capability.(string); ok {
+				values = append(values, text)
+			}
+		}
+		if len(values) > 0 {
+			metadata["capabilities"] = values
+		}
+	}
+	if _, exists := metadata["context_length"]; !exists {
+		if architecture, ok := nestedValue(shown, "model_info", "general.architecture"); ok {
+			if text, ok := architecture.(string); ok && text != "" {
+				if contextLength, ok := nestedValue(shown, "model_info", text+".context_length"); ok {
+					metadata["context_length"] = contextLength
+				}
+			}
+		}
+	}
+	return metadata
+}
+
+func nestedObject(source map[string]any, key string) map[string]any {
+	object, _ := source[key].(map[string]any)
+	return object
+}
+
+func nestedValue(source map[string]any, key, field string) (any, bool) {
+	if object := nestedObject(source, key); object != nil {
+		if value, ok := object[field]; ok {
+			return value, true
+		}
+	}
+	return nil, false
 }
 
 func (s *Service) fetch(ctx context.Context, target *url.URL, requestHeader http.Header, backend *backendState) (Response, error) {

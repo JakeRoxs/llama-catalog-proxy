@@ -26,7 +26,7 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 LABEL org.opencontainers.image.title="llama-catalog-proxy" \
-      org.opencontainers.image.description="Model-aware OpenAI-compatible router for independent llama-swap backends" \
+      org.opencontainers.image.description="Model-aware router for independent OpenAI-compatible inference backends" \
       org.opencontainers.image.source="https://github.com/JakeRoxs/llama-catalog-proxy" \
       org.opencontainers.image.version=$VERSION \
       org.opencontainers.image.revision=$COMMIT \
