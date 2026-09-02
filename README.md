@@ -149,14 +149,14 @@ compressed, and path-routed request bodies remain streaming passthroughs.
 
 Environment overrides:
 
-| Variable | Meaning |
-| --- | --- |
-| `LLAMA_CATALOG_LISTEN` | HTTP listen address |
-| `LLAMA_CATALOG_DEFAULT_BACKEND_URL` | URL of the named default backend |
+| Variable                                | Meaning                              |
+| --------------------------------------- | ------------------------------------ |
+| `LLAMA_CATALOG_LISTEN`                  | HTTP listen address                  |
+| `LLAMA_CATALOG_DEFAULT_BACKEND_URL`     | URL of the named default backend     |
 | `LLAMA_CATALOG_DEFAULT_BACKEND_API_KEY` | API key of the named default backend |
-| `LLAMA_CATALOG_MODELS_CACHE_TTL` | Per-backend catalog cache duration |
-| `LLAMA_CATALOG_REQUEST_TIMEOUT` | Backend request timeout |
-| `LLAMA_CATALOG_LOG_LEVEL` | `debug`, `info`, `warn`, or `error` |
+| `LLAMA_CATALOG_MODELS_CACHE_TTL`        | Per-backend catalog cache duration   |
+| `LLAMA_CATALOG_REQUEST_TIMEOUT`         | Backend request timeout              |
+| `LLAMA_CATALOG_LOG_LEVEL`               | `debug`, `info`, `warn`, or `error`  |
 
 Backend definitions remain in YAML so model namespaces and routing destinations stay explicit.
 
@@ -283,8 +283,7 @@ Display image build identity with `--version`.
 Pushing a semantic-version tag such as `v0.1.0` publishes signed, multi-architecture `linux/amd64`
 and `linux/arm64` images to `ghcr.io/jakeroxs/llama-catalog-proxy`. The release workflow publishes
 semantic-version, `latest`, and commit-SHA tags with an SBOM, provenance, and a registry
-attestation. After the first workflow run, the GHCR package visibility must be set to public in its
-package settings.
+attestation.
 
 ## Development
 
