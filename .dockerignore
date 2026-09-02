@@ -1,0 +1,12 @@
+.git
+.github
+.idea
+.vscode
+docs
+config.yaml
+README.md
+AGENTS.md
+CHANGELOG.md
+SECURITY.md
+compose*.yaml
+Dockerfile*

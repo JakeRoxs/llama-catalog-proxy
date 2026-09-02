@@ -1,0 +1,7 @@
+{
+  "root": "docs/todos",
+  "gitignored": true,
+  "backlogFolder": "backlog",
+  "cancelledFolder": "cancelled",
+  "completeFolder": "complete"
+}

@@ -1,0 +1,22 @@
+services:
+  llama-catalog-proxy:
+    image: ghcr.io/jakeroxs/llama-catalog-proxy:${LLAMA_CATALOG_PROXY_TAG:-latest}
+    restart: unless-stopped
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${LLAMA_CATALOG_PROXY_PORT:-9292}:8080"
+    volumes:
+      - ./config/:/config:ro
+    command:
+      - --config
+      - /config/config.yaml
+    healthcheck:
+      test: ["CMD", "/llama-catalog-proxy", "--healthcheck", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

@@ -1,0 +1,10 @@
+# Local runtime configuration (may contain API keys and internal URLs)
+config.yaml
+config/
+
+# Personal deployment instructions (contains host-specific details)
+.github/instructions/docker-homelab.instructions.md
+
+# Editor and IDE
+.vscode/
+.idea/

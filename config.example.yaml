@@ -1,0 +1,22 @@
+listen: 0.0.0.0:8080
+log_level: INFO
+
+default_backend: default
+backends:
+  default:
+    url: http://llama-swap-default:8080
+    prefix: ""
+    # api_key: replace-with-default-api-key
+  gpu:
+    url: http://llama-swap-gpu:8080
+    prefix: gpu/
+    # api_key: replace-with-gpu-api-key
+    # headers:
+    #   X-Custom-Backend-Header: value
+
+path_routes:
+  /comfyui: gpu
+
+models_cache_ttl: 15s
+request_timeout: 10s
+max_json_request_body_bytes: 67108864

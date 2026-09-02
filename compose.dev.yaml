@@ -1,0 +1,7 @@
+services:
+  llama-catalog-proxy:
+    image: llama-catalog-proxy:local
+    build:
+      context: .
+      args:
+        VERSION: dev

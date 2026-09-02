@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Documented placeholder API keys"
+regexTarget = "secret"
+regexes = ['''replace-with-[a-z0-9-]+-api-key''']
