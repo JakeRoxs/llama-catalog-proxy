@@ -21,4 +21,6 @@ path_routes:
 
 models_cache_ttl: 15s
 request_timeout: 10s
+# health_timeout: 2s   # inherits request_timeout when omitted
+# catalog_timeout: 20s # inherits request_timeout when omitted
 max_json_request_body_bytes: 67108864

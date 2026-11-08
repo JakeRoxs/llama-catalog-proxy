@@ -130,6 +130,8 @@ path_routes:
 
 models_cache_ttl: 15s
 request_timeout: 10s
+# health_timeout: 2s   # inherits request_timeout when omitted
+# catalog_timeout: 20s # inherits request_timeout when omitted
 max_json_request_body_bytes: 67108864
 ```
 
@@ -155,10 +157,19 @@ Environment overrides:
 | `LLAMA_CATALOG_DEFAULT_BACKEND_URL`     | URL of the named default backend     |
 | `LLAMA_CATALOG_DEFAULT_BACKEND_API_KEY` | API key of the named default backend |
 | `LLAMA_CATALOG_MODELS_CACHE_TTL`        | Per-backend catalog cache duration   |
-| `LLAMA_CATALOG_REQUEST_TIMEOUT`         | Backend request timeout              |
+| `LLAMA_CATALOG_REQUEST_TIMEOUT`         | Fallback for health/catalog budgets; also sets HTTP `ReadHeaderTimeout` |
+| `LLAMA_CATALOG_HEALTH_TIMEOUT`          | Readiness health-check budget        |
+| `LLAMA_CATALOG_CATALOG_TIMEOUT`         | Backend catalog refresh budget       |
 | `LLAMA_CATALOG_LOG_LEVEL`               | `debug`, `info`, `warn`, or `error`  |
 
 Backend definitions remain in YAML so model namespaces and routing destinations stay explicit.
+
+`request_timeout` is the compatibility fallback for health/catalog operation budgets and also
+sets the HTTP server's `ReadHeaderTimeout`. It is not an inference wall-clock deadline: proxied
+generation, SSE flushing, and WebSocket lifetimes are not bounded by it. When `health_timeout` or
+`catalog_timeout` are omitted, they inherit `request_timeout`, preserving existing configurations.
+Set `health_timeout` short so an offline homelab backend does not delay readiness, and set
+`catalog_timeout` long enough for catalog discovery plus optional Ollama `/api/show` enrichment.
 
 `path_routes` sends requests to a backend by URL path before request-body model routing. Paths must
 be canonical absolute paths without a trailing slash. A route matches its exact path and
@@ -278,12 +289,16 @@ docker run --rm \
 
 Display image build identity with `--version`.
 
-## Releases
+## Container image publishing
 
-Pushing a semantic-version tag such as `v0.1.0` publishes signed, multi-architecture `linux/amd64`
-and `linux/arm64` images to `ghcr.io/jakeroxs/llama-catalog-proxy`. The release workflow publishes
-semantic-version, `latest`, and commit-SHA tags with an SBOM, provenance, and a registry
-attestation.
+Pushing a semantic-version tag such as `v0.1.0` publishes multi-architecture `linux/amd64` and
+`linux/arm64` container images to `ghcr.io/jakeroxs/llama-catalog-proxy`. This workflow publishes
+the container package only; it does not create a GitHub Release or attach source archives. It
+publishes version, major.minor, commit-SHA, and (for non-prerelease tags) `latest` image tags with
+an SBOM, provenance, and a registry attestation.
+
+The workflow can also be run manually by selecting an existing semantic-version tag in its `tag`
+input. It checks out and publishes that tag, rather than the branch selected to start the workflow.
 
 ## Development
 
@@ -299,8 +314,11 @@ docker compose -f compose.yaml -f compose.dev.yaml up --build
 ```
 
 Catalog responses are limited to 64 MiB. The cache is intentionally in-memory and cold after a
-restart. Structured logs include request method, path, status, duration, and response size, while
-configured URL credentials are redacted.
+restart. Structured request logs include a proxy-generated request ID, method, path, route kind,
+selected backend ID, status, duration, and response size. The request ID is echoed back to the
+client and forwarded upstream so request and error events correlate. Incoming request IDs are never
+trusted or logged verbatim. Log fields omit query strings, model IDs, request bodies, and configured
+credentials/secrets.
 
 ## License
 

@@ -393,7 +393,11 @@ func TestStreamingResponseIsFlushedBeforeCompletion(t *testing.T) {
 		writer.(http.Flusher).Flush()
 	}))
 	defer defaultServer.Close()
-	proxyServer := httptest.NewServer(testHandler(t, defaultServer.URL, nil))
+	cfg := baseConfig(defaultServer.URL)
+	cfg.RequestTimeout = 10 * time.Millisecond
+	cfg.HealthTimeout = 20 * time.Millisecond
+	cfg.CatalogTimeout = 30 * time.Millisecond
+	proxyServer := httptest.NewServer(newHandler(t, cfg))
 	defer proxyServer.Close()
 	response, err := (&http.Client{Timeout: 3 * time.Second}).Get(proxyServer.URL + "/v1/chat/completions")
 	if err != nil {
@@ -401,6 +405,7 @@ func TestStreamingResponseIsFlushedBeforeCompletion(t *testing.T) {
 	}
 	defer response.Body.Close()
 	<-firstSent
+	time.Sleep(50 * time.Millisecond)
 	chunk := make(chan string, 1)
 	go func() {
 		line, _ := bufio.NewReader(response.Body).ReadString('\n')
@@ -457,6 +462,95 @@ func TestReadyRequiresOnlyDefaultBackend(t *testing.T) {
 	}
 }
 
+func TestReadyBoundsDefaultHealthCheck(t *testing.T) {
+	slowServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer slowServer.Close()
+	handler := testHandler(t, slowServer.URL, nil)
+	deadline := time.Now().Add(5 * time.Second)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if time.Now().After(deadline) {
+		t.Fatal("readiness did not return within the health budget")
+	}
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for slow default health", recorder.Code)
+	}
+}
+
+func TestReadyOptionalSlowHealthDoesNotBlock(t *testing.T) {
+	defaultServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
+	defer defaultServer.Close()
+	optionalServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer optionalServer.Close()
+	handler := testHandler(t, defaultServer.URL, map[string]config.Backend{"optional": {URL: optionalServer.URL, Prefix: "optional/"}})
+	deadline := time.Now().Add(5 * time.Second)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if time.Now().After(deadline) {
+		t.Fatal("readiness did not return within the health budget")
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 when only optional backend is slow", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), `"optional":"unavailable"`) {
+		t.Fatalf("body = %s", recorder.Body.String())
+	}
+}
+
+func TestModelsBoundsDefaultCatalogRefresh(t *testing.T) {
+	slowServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		<-request.Context().Done()
+		writeTestJSON(writer, http.StatusOK, `{"data":[]}`)
+	}))
+	defer slowServer.Close()
+	handler := testHandler(t, slowServer.URL, nil)
+	deadline := time.Now().Add(5 * time.Second)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if time.Now().After(deadline) {
+		t.Fatal("models did not return within the catalog budget")
+	}
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for slow default catalog", recorder.Code)
+	}
+}
+
+func TestControlPlaneBudgetsCanExceedRequestTimeout(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		time.Sleep(40 * time.Millisecond)
+		if request.URL.Path == "/health" {
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		writeTestJSON(writer, http.StatusOK, `{"data":[]}`)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.RequestTimeout = 10 * time.Millisecond
+	cfg.HealthTimeout = 200 * time.Millisecond
+	cfg.CatalogTimeout = 200 * time.Millisecond
+	handler := newHandler(t, cfg)
+
+	ready := httptest.NewRecorder()
+	handler.ServeHTTP(ready, httptest.NewRequest(http.MethodGet, "/ready", nil))
+	if ready.Code != http.StatusOK {
+		t.Fatalf("readiness status = %d, want 200 despite shorter request_timeout", ready.Code)
+	}
+
+	models := httptest.NewRecorder()
+	handler.ServeHTTP(models, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if models.Code != http.StatusOK {
+		t.Fatalf("models status = %d, want 200 despite shorter request_timeout", models.Code)
+	}
+}
+
 func TestRequestServedIsLogged(t *testing.T) {
 	defaultServer := noContentServer()
 	defer defaultServer.Close()
@@ -484,7 +578,7 @@ func baseConfig(defaultURL string) config.Config {
 	return config.Config{
 		Listen: "127.0.0.1:0", LogLevel: "INFO", DefaultBackend: "default",
 		Backends:       map[string]config.Backend{"default": {URL: defaultURL}},
-		ModelsCacheTTL: time.Minute, RequestTimeout: time.Second, MaxJSONBody: 64 << 20,
+		ModelsCacheTTL: time.Minute, RequestTimeout: time.Second, HealthTimeout: time.Second, CatalogTimeout: time.Second, MaxJSONBody: 64 << 20,
 	}
 }
 
@@ -514,4 +608,10 @@ func bodyCaptureServer(received chan<- string) *httptest.Server {
 		received <- string(body)
 		writer.WriteHeader(http.StatusNoContent)
 	}))
+}
+
+func writeTestJSON(writer http.ResponseWriter, status int, body string) {
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_, _ = io.WriteString(writer, body)
 }

@@ -231,6 +231,84 @@ backends:
 	}
 }
 
+func TestLoadSupportsHealthAndCatalogTimeouts(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default: {url: http://default-host:9292}
+health_timeout: 2s
+catalog_timeout: 20s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HealthTimeout != 2*time.Second {
+		t.Fatalf("health_timeout = %v", cfg.HealthTimeout)
+	}
+	if cfg.CatalogTimeout != 20*time.Second {
+		t.Fatalf("catalog_timeout = %v", cfg.CatalogTimeout)
+	}
+}
+
+func TestLoadInheritsHealthAndCatalogTimeoutsFromRequestTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default: {url: http://default-host:9292}
+request_timeout: 7s
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HealthTimeout != 7*time.Second {
+		t.Fatalf("health_timeout inherited from request_timeout = %v", cfg.HealthTimeout)
+	}
+	if cfg.CatalogTimeout != 7*time.Second {
+		t.Fatalf("catalog_timeout inherited from request_timeout = %v", cfg.CatalogTimeout)
+	}
+}
+
+func TestLoadRejectsNonPositiveHealthTimeout(t *testing.T) {
+	_, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\nhealth_timeout: 0\n"))
+	if err == nil || !strings.Contains(err.Error(), "health_timeout") {
+		t.Fatalf("error = %v", err)
+	}
+	_, err = Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\nhealth_timeout: -1s\n"))
+	if err == nil || !strings.Contains(err.Error(), "health_timeout") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsNonPositiveCatalogTimeout(t *testing.T) {
+	_, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ncatalog_timeout: 0\n"))
+	if err == nil || !strings.Contains(err.Error(), "catalog_timeout") {
+		t.Fatalf("error = %v", err)
+	}
+	_, err = Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ncatalog_timeout: -1s\n"))
+	if err == nil || !strings.Contains(err.Error(), "catalog_timeout") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadAppliesHealthAndCatalogTimeoutEnvironmentOverrides(t *testing.T) {
+	t.Setenv(envHealthTimeout, "3s")
+	t.Setenv(envCatalogTimeout, "30s")
+	defer func() {
+		t.Setenv(envHealthTimeout, "")
+		t.Setenv(envCatalogTimeout, "")
+	}()
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HealthTimeout != 3*time.Second {
+		t.Fatalf("health_timeout env override = %v", cfg.HealthTimeout)
+	}
+	if cfg.CatalogTimeout != 30*time.Second {
+		t.Fatalf("catalog_timeout env override = %v", cfg.CatalogTimeout)
+	}
+}
+
 func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	_, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\nlog_level: noisy\n"))
 	if err == nil {
@@ -238,8 +316,8 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	}
 }
 
-func TestRedactedURLHidesPassword(t *testing.T) {
-	if got := RedactedURL("http://alice:supersecret@example.test:9292/base"); got != "http://alice:xxxxx@example.test:9292/base" {
+func TestRedactedURLHidesUserinfo(t *testing.T) {
+	if got := RedactedURL("http://alice:supersecret@example.test:9292/base"); got != "http://xxxxx@example.test:9292/base" {
 		t.Fatalf("RedactedURL() = %q", got)
 	}
 }

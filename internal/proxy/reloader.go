@@ -20,6 +20,10 @@ type Reloader struct {
 	onReload func(config.Config)
 	handler  atomic.Pointer[http.Handler]
 	lastHash [sha256.Size]byte
+	// lastReloadError is the last reload failure that was logged. Identical
+	// failures are suppressed so a broken config does not flood the logs;
+	// retries continue on every watch tick.
+	lastReloadError error
 }
 
 func NewReloader(path string, logger *slog.Logger, onReload func(config.Config)) (*Reloader, config.Config, error) {
@@ -74,9 +78,14 @@ func (r *Reloader) watch() {
 			continue
 		}
 		if err := r.reload(); err != nil {
-			r.logger.Error("config reload failed; keeping previous configuration", "error", err)
+			if r.lastReloadError == nil || err.Error() != r.lastReloadError.Error() {
+				r.logger.Error("config reload failed; keeping previous configuration", "error", err)
+				r.lastReloadError = err
+			}
+			// Identical failures are suppressed; the next tick retries anyway.
 			continue
 		}
+		r.lastReloadError = nil
 		last = digest
 	}
 }

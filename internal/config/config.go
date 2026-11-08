@@ -22,6 +22,11 @@ const (
 	defaultMaxJSONBody    = 64 << 20
 )
 
+const (
+	envHealthTimeout  = "LLAMA_CATALOG_HEALTH_TIMEOUT"
+	envCatalogTimeout = "LLAMA_CATALOG_CATALOG_TIMEOUT"
+)
+
 type Config struct {
 	Listen         string
 	LogLevel       string
@@ -30,6 +35,8 @@ type Config struct {
 	PathRoutes     map[string]string
 	ModelsCacheTTL time.Duration
 	RequestTimeout time.Duration
+	HealthTimeout  time.Duration
+	CatalogTimeout time.Duration
 	MaxJSONBody    int64
 }
 
@@ -50,6 +57,8 @@ type fileConfig struct {
 	PathRoutes     map[string]string  `yaml:"path_routes"`
 	ModelsCacheTTL string             `yaml:"models_cache_ttl"`
 	RequestTimeout string             `yaml:"request_timeout"`
+	HealthTimeout  string             `yaml:"health_timeout"`
+	CatalogTimeout string             `yaml:"catalog_timeout"`
 	MaxJSONBody    *int64             `yaml:"max_json_request_body_bytes"`
 }
 
@@ -100,6 +109,21 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("parse request_timeout: %w", err)
 		}
 	}
+	// Optional timeouts inherit request_timeout when not explicitly configured.
+	cfg.HealthTimeout = cfg.RequestTimeout
+	cfg.CatalogTimeout = cfg.RequestTimeout
+	if raw.HealthTimeout != "" {
+		cfg.HealthTimeout, err = time.ParseDuration(raw.HealthTimeout)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse health_timeout: %w", err)
+		}
+	}
+	if raw.CatalogTimeout != "" {
+		cfg.CatalogTimeout, err = time.ParseDuration(raw.CatalogTimeout)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse catalog_timeout: %w", err)
+		}
+	}
 	if raw.MaxJSONBody != nil {
 		cfg.MaxJSONBody = *raw.MaxJSONBody
 	}
@@ -119,6 +143,12 @@ func (c Config) Validate() error {
 	}
 	if c.RequestTimeout <= 0 {
 		return errors.New("request_timeout must be greater than zero")
+	}
+	if c.HealthTimeout <= 0 {
+		return errors.New("health_timeout must be greater than zero")
+	}
+	if c.CatalogTimeout <= 0 {
+		return errors.New("catalog_timeout must be greater than zero")
 	}
 	if c.MaxJSONBody <= 0 {
 		return errors.New("max_json_request_body_bytes must be greater than zero")
@@ -206,7 +236,10 @@ func RedactedURL(value string) string {
 	if err != nil {
 		return "<invalid-url>"
 	}
-	return parsed.Redacted()
+	if parsed.User != nil {
+		parsed.User = url.User("xxxxx")
+	}
+	return parsed.String()
 }
 
 func applyEnvironment(raw *fileConfig) {
@@ -227,6 +260,12 @@ func applyEnvironment(raw *fileConfig) {
 	}
 	if value := os.Getenv("LLAMA_CATALOG_REQUEST_TIMEOUT"); value != "" {
 		raw.RequestTimeout = value
+	}
+	if value := os.Getenv(envHealthTimeout); value != "" {
+		raw.HealthTimeout = value
+	}
+	if value := os.Getenv(envCatalogTimeout); value != "" {
+		raw.CatalogTimeout = value
 	}
 	if value := os.Getenv("LLAMA_CATALOG_LOG_LEVEL"); value != "" {
 		raw.LogLevel = value

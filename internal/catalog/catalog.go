@@ -38,11 +38,13 @@ type Backend struct {
 }
 
 type Service struct {
-	client    *http.Client
-	ttl       time.Duration
-	logger    *slog.Logger
-	backends  []*backendState
-	defaultID string
+	client         *http.Client
+	ttl            time.Duration
+	healthTimeout  time.Duration
+	catalogTimeout time.Duration
+	logger         *slog.Logger
+	backends       []*backendState
+	defaultID      string
 }
 
 type backendState struct {
@@ -65,7 +67,7 @@ type catalogResult struct {
 	err     error
 }
 
-func New(backends []Backend, client *http.Client, ttl time.Duration, logger *slog.Logger) *Service {
+func New(backends []Backend, client *http.Client, ttl time.Duration, healthTimeout, catalogTimeout time.Duration, logger *slog.Logger) *Service {
 	states := make([]*backendState, 0, len(backends))
 	defaultID := ""
 	for _, backend := range backends {
@@ -80,7 +82,7 @@ func New(backends []Backend, client *http.Client, ttl time.Duration, logger *slo
 		}
 		return states[i].ID < states[j].ID
 	})
-	return &Service{client: client, ttl: ttl, logger: logger, backends: states, defaultID: defaultID}
+	return &Service{client: client, ttl: ttl, healthTimeout: healthTimeout, catalogTimeout: catalogTimeout, logger: logger, backends: states, defaultID: defaultID}
 }
 
 func (s *Service) Models(ctx context.Context, requestHeader http.Header) (Response, error) {
@@ -194,8 +196,12 @@ func (s *Service) backendCatalog(ctx context.Context, backend *backendState, req
 		return nil, nil, nil, backend.lastErr
 	}
 
-	s.logger.Info("refreshing backend model catalog", "backend_id", backend.ID, "backend_url", backend.URL.Redacted())
-	response, err := s.fetch(ctx, endpointURL(backend.URL, "/v1/models"), requestHeader, backend)
+	operationCtx, cancel := context.WithTimeout(ctx, s.catalogTimeout)
+	defer cancel()
+	refreshStart := time.Now()
+
+	s.logger.Info("refreshing backend model catalog", "backend_id", backend.ID, "backend_url", safeBackendURL(backend.URL))
+	response, err := s.fetch(operationCtx, endpointURL(backend.URL, "/v1/models"), requestHeader, backend)
 	if err == nil && (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) {
 		err = fmt.Errorf("backend returned HTTP %d", response.StatusCode)
 	}
@@ -211,7 +217,19 @@ func (s *Service) backendCatalog(ctx context.Context, backend *backendState, req
 	if err != nil {
 		backend.lastTry = time.Now()
 		backend.lastErr = err
-		s.logger.Warn("backend model catalog refresh failed", "backend_id", backend.ID, "backend_url", backend.URL.Redacted(), "error", err, "using_stale", backend.root != nil)
+		refreshDuration := time.Since(refreshStart)
+		staleAge := time.Duration(0)
+		if backend.root != nil && !backend.fetchedAt.IsZero() {
+			staleAge = time.Since(backend.fetchedAt)
+		}
+		s.logger.Warn("backend model catalog refresh failed",
+			"backend_id", backend.ID,
+			"backend_url", safeBackendURL(backend.URL),
+			"error", safeErrorDetail(err),
+			"using_stale", backend.root != nil,
+			"refresh_duration_ms", refreshDuration.Seconds()*1000,
+			"stale_cache_age_ms", staleAge.Seconds()*1000,
+		)
 		if backend.root != nil {
 			return backend.root, backend.models, backend.header, nil
 		}
@@ -225,10 +243,31 @@ func (s *Service) backendCatalog(ctx context.Context, backend *backendState, req
 	backend.lastTry = backend.fetchedAt
 	backend.lastErr = nil
 	if backend.ShowEnrichment {
-		s.enrichWithShow(ctx, backend, models)
+		s.enrichWithShow(operationCtx, backend, models)
 	}
-	s.logger.Info("backend model catalog refreshed", "backend_id", backend.ID, "models", len(models))
+	refreshDuration := time.Since(refreshStart)
+	s.logger.Info("backend model catalog refreshed",
+		"backend_id", backend.ID,
+		"models", len(models),
+		"refresh_duration_ms", refreshDuration.Seconds()*1000,
+	)
 	return backend.root, backend.models, backend.header, nil
+}
+
+func safeErrorDetail(err error) string {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		return urlErr.Err.Error()
+	}
+	return err.Error()
+}
+
+func safeBackendURL(target *url.URL) string {
+	redacted := *target
+	if redacted.User != nil {
+		redacted.User = url.User("xxxxx")
+	}
+	return redacted.String()
 }
 
 func (s *Service) backendReady(ctx context.Context, backend *backendState) error {
@@ -236,7 +275,9 @@ func (s *Service) backendReady(ctx context.Context, backend *backendState) error
 	if healthPath == "" {
 		healthPath = "/health"
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL(backend.URL, healthPath).String(), nil)
+	readyCtx, cancel := context.WithTimeout(ctx, s.healthTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(readyCtx, http.MethodGet, endpointURL(backend.URL, healthPath).String(), nil)
 	if err != nil {
 		return err
 	}
