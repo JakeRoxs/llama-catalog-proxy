@@ -297,8 +297,9 @@ the container package only; it does not create a GitHub Release or attach source
 publishes version, major.minor, commit-SHA, and (for non-prerelease tags) `latest` image tags with
 an SBOM, provenance, and a registry attestation.
 
-The workflow can also be run manually by selecting an existing semantic-version tag in its `tag`
-input. It checks out and publishes that tag, rather than the branch selected to start the workflow.
+For a manual publish, choose the source branch/ref in the Actions UI and enter the image version
+(for example, `0.3.0` or `v0.3.0`). The workflow builds that selected source and does not require or
+create a Git tag. It still publishes the container package only; it does not create a GitHub Release.
 
 ## Development
 
