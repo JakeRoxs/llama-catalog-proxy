@@ -325,14 +325,25 @@ func recognize(name string, object map[string]json.RawMessage) (State, *Build) {
 	var valid bool
 	switch name {
 	case "version":
-		var raw struct{ Version, Commit string; BuildDate string `json:"build_date"` }
+		var raw struct {
+			Version, Commit string
+			BuildDate       string `json:"build_date"`
+		}
 		encoded, _ := json.Marshal(object)
 		valid = json.Unmarshal(encoded, &raw) == nil && raw.Version != ""
 		build := &Build{}
-		if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 { build.Version = raw.Version }
-		if commitPattern.MatchString(raw.Commit) { build.Commit = raw.Commit }
-		if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil { build.Date = date.Format(time.RFC3339) }
-		if valid { return Supported, build }
+		if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 {
+			build.Version = raw.Version
+		}
+		if commitPattern.MatchString(raw.Commit) {
+			build.Commit = raw.Commit
+		}
+		if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil {
+			build.Date = date.Format(time.RFC3339)
+		}
+		if valid {
+			return Supported, build
+		}
 	case "models":
 		valid = isArray(object["data"])
 	case "activity":
@@ -342,13 +353,17 @@ func recognize(name string, object map[string]json.RawMessage) (State, *Build) {
 	case "performance":
 		var enabled *bool
 		if value, exists := object["enabled"]; exists && json.Unmarshal(value, &enabled) == nil && enabled != nil {
-			if !*enabled { return Disabled, nil }
+			if !*enabled {
+				return Disabled, nil
+			}
 			valid = isArray(object["sys_stats"]) && isArray(object["gpu_stats"])
 		}
 	case "hardware":
 		valid = isCount(object["schema_version"]) && isArray(object["accelerators"])
 	}
-	if valid { return Supported, nil }
+	if valid {
+		return Supported, nil
+	}
 	return Unknown, nil
 }
 

@@ -106,11 +106,11 @@ type lifecycleBackendResult struct {
 // attribution fields are always serialized so the collection contract is
 // self-documenting.
 type LifecycleReport struct {
-	BackendStates map[string]LifecycleBackendState `json:"backend_states"`
-	Models        []LifecycleModel                 `json:"models"`
-	SnapshotScope string                          `json:"snapshot_scope"`
-	AbsenceState  string                          `json:"absence_state"`
-	TransitionTime string                         `json:"transition_time"`
+	BackendStates  map[string]LifecycleBackendState `json:"backend_states"`
+	Models         []LifecycleModel                 `json:"models"`
+	SnapshotScope  string                           `json:"snapshot_scope"`
+	AbsenceState   string                           `json:"absence_state"`
+	TransitionTime string                           `json:"transition_time"`
 	// Attribution limits: structural constraints of the collection method.
 	UpstreamGenerationUnknown           string `json:"upstream_generation,omitempty"`
 	AliasResolutionUnsupported          string `json:"alias_resolution,omitempty"`
