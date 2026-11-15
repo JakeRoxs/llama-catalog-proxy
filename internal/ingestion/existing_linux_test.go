@@ -28,7 +28,8 @@ func TestAdoptExistingArtifactPersistsLocalEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := StageOptions{Directory: dir, Source: source, MaxBytes: int64(len(data)), FileMode: 0o600,
+	options := StageOptions{Directory: dir, Source: source, MaxBytes: int64(len(data)),
+		MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600,
 		AdoptExisting: true, AllowAdoption: true}
 	job, err := manager.Start(options, time.Minute)
 	if err != nil {
@@ -97,7 +98,8 @@ func TestAdoptRejectsUnsafeOrInvalidFiles(t *testing.T) {
 				}
 			}
 			source, _ := LocalSource("model.gguf")
-			options := StageOptions{Directory: dir, Source: source, MaxBytes: 1024, FileMode: 0o600, AdoptExisting: true, AllowAdoption: true}
+			options := StageOptions{Directory: dir, Source: source, MaxBytes: 1024,
+				MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AdoptExisting: true, AllowAdoption: true}
 			if kind == "too_large" {
 				options.MaxBytes = int64(len(data) - 1)
 			}

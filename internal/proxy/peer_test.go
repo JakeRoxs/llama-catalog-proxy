@@ -25,6 +25,151 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
+func TestAuthenticatedPeerBindsIdentityToScopedCredential(t *testing.T) {
+	catalogToken, inferenceToken, managementToken := strings.Repeat("a", 32), strings.Repeat("b", 32), strings.Repeat("c", 32)
+	state := &reloaderState{peer: &config.PeerConfig{Peers: map[string]config.PeerGrant{
+		"node-b": {Token: catalogToken, CatalogRead: true},
+		"node-c": {Token: inferenceToken, Inference: true},
+		"node-d": {Token: managementToken, ManageSettings: true},
+	}}}
+	request := httptest.NewRequest(http.MethodGet, "https://peer.example/peer/v1/report", nil)
+	request.Header.Set("Authorization", "Bearer "+catalogToken)
+	if id, ok := authenticatedPeer(request, state, peerCatalog); !ok || id != "node-b" {
+		t.Fatalf("catalog identity = %q, %v", id, ok)
+	}
+	if id, ok := authenticatedPeer(request, state, peerInference); ok || id != "" {
+		t.Fatalf("catalog credential granted inference: %q, %v", id, ok)
+	}
+	if id, ok := authenticatedPeer(request, state, peerManageSettings); ok || id != "" {
+		t.Fatalf("catalog credential granted settings management: %q, %v", id, ok)
+	}
+	request.Header.Set("Authorization", "Bearer "+inferenceToken)
+	if id, ok := authenticatedPeer(request, state, peerInference); !ok || id != "node-c" {
+		t.Fatalf("inference identity = %q, %v", id, ok)
+	}
+	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
+		t.Fatalf("inference credential granted catalog: %q, %v", id, ok)
+	}
+	request.Header.Set("Authorization", "Bearer "+managementToken)
+	if id, ok := authenticatedPeer(request, state, peerManageSettings); !ok || id != "node-d" {
+		t.Fatalf("settings management identity = %q, %v", id, ok)
+	}
+	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
+		t.Fatalf("settings management granted catalog: %q, %v", id, ok)
+	}
+	state.peer.Peers["node-d"] = config.PeerGrant{Token: managementToken}
+	if id, ok := authenticatedPeer(request, state, peerManageSettings); ok || id != "" {
+		t.Fatalf("revoked settings management accepted: %q, %v", id, ok)
+	}
+	request.Header.Set("Authorization", "Bearer "+inferenceToken)
+	state.peer.Peers["node-c"] = config.PeerGrant{Token: inferenceToken}
+	if id, ok := authenticatedPeer(request, state, peerInference); ok || id != "" {
+		t.Fatalf("revoked grant accepted: %q, %v", id, ok)
+	}
+	state.peer.Peers["node-c"] = config.PeerGrant{Token: catalogToken, CatalogRead: true}
+	request.Header.Set("Authorization", "Bearer "+catalogToken)
+	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
+		t.Fatalf("ambiguous credential accepted: %q, %v", id, ok)
+	}
+	request.Header.Add("Authorization", "Bearer "+inferenceToken)
+	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
+		t.Fatalf("duplicate authorization accepted: %q, %v", id, ok)
+	}
+}
+
+func TestPeerManagementBindingDoesNotEnableRemoteActions(t *testing.T) {
+	original := &config.PeerConfig{
+		ManagementTargets: map[string]string{"local": "swap"},
+		Peers:             map[string]config.PeerGrant{"peer": {Token: strings.Repeat("x", 32), ManageSettings: true}},
+	}
+	snapshot := copyPeerConfig(original)
+	original.ManagementTargets["local"] = "changed"
+	if snapshot.ManagementTargets["local"] != "swap" {
+		t.Fatal("peer configuration snapshot shares management bindings")
+	}
+	r := &Reloader{}
+	r.state.Store(&reloaderState{peer: snapshot})
+	request := httptest.NewRequest(http.MethodPost, "https://peer.example/peer/v1/management", nil)
+	request.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
+	response := httptest.NewRecorder()
+	r.PeerHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("remote management unexpectedly available: %d", response.Code)
+	}
+}
+
+func TestDelegatedCallerCredentialIsolationAndRevocation(t *testing.T) {
+	delegation, rotated := strings.Repeat("l", 32), strings.Repeat("r", 32)
+	preview, proposal, backup, write := strings.Repeat("m", 32), strings.Repeat("p", 32), strings.Repeat("b", 32), strings.Repeat("w", 32)
+	ingestion, peer := strings.Repeat("i", 32), strings.Repeat("x", 32)
+	state := &reloaderState{
+		management: &config.ManagementConfig{
+			PreviewToken: preview, DelegationToken: delegation, WriteToken: write,
+			ProposalStore: &config.ProposalStoreConfig{Token: proposal},
+			BackupStore:   &config.BackupStoreConfig{Token: backup},
+			Ingestion:     &config.IngestionConfig{Token: ingestion},
+		},
+		peer: &config.PeerConfig{Peers: map[string]config.PeerGrant{
+			"owner": {Token: peer, ManageSettings: true},
+		}},
+	}
+	r := &Reloader{}
+	r.state.Store(state)
+	request := httptest.NewRequest(http.MethodPost, "https://proxy.example/management/v1/delegation", nil)
+	request.Header.Set("Authorization", "Bearer "+delegation)
+	if !r.delegatedCallerAuthorized(request, state) {
+		t.Fatal("configured delegated caller rejected")
+	}
+	if _, ok := authenticatedPeer(request, state, peerManageSettings); ok {
+		t.Fatal("local delegation credential authorized as peer")
+	}
+	for _, invalid := range []string{"", preview, proposal, backup, write, ingestion, peer, rotated} {
+		request.Header.Set("Authorization", "Bearer "+invalid)
+		if r.delegatedCallerAuthorized(request, state) {
+			t.Fatal("wrong credential authorized for delegation")
+		}
+	}
+	request.Header.Set("Authorization", "Bearer "+delegation)
+	request.Header.Add("Authorization", "Bearer "+delegation)
+	if r.delegatedCallerAuthorized(request, state) {
+		t.Fatal("duplicate authorization headers accepted")
+	}
+	request.Header.Del("Authorization")
+	request.Header.Set("Authorization", "Bearer "+delegation)
+	request.TLS = nil
+	if r.delegatedCallerAuthorized(request, state) {
+		t.Fatal("plaintext caller authorized")
+	}
+	request = httptest.NewRequest(http.MethodPost, "https://proxy.example/management/v1/delegation", nil)
+	request.Header.Set("Authorization", "Bearer "+delegation)
+	for _, path := range []string{
+		"/management/v1/preview", "/management/v1/proposals", "/management/v1/backups",
+		"/management/v1/proposals/id/apply", "/management/v1/ingestion", "/management/v1/delegation",
+	} {
+		request.URL.Path = path
+		response := httptest.NewRecorder()
+		r.ManagementHandler().ServeHTTP(response, request)
+		if response.Code != http.StatusUnauthorized {
+			t.Fatalf("delegation credential unexpectedly accessed %s: %d", path, response.Code)
+		}
+	}
+	next := *state
+	next.management = copyManagementConfig(state.management)
+	next.management.DelegationToken = rotated
+	r.state.Store(&next)
+	if r.delegatedCallerAuthorized(request, state) || r.delegatedCallerAuthorized(request, &next) {
+		t.Fatal("revoked credential or stale state authorized")
+	}
+	request.Header.Set("Authorization", "Bearer "+rotated)
+	if !r.delegatedCallerAuthorized(request, &next) {
+		t.Fatal("rotated credential rejected")
+	}
+	next.management.DelegationToken = ""
+	if r.delegatedCallerAuthorized(request, &next) {
+		t.Fatal("disabled credential authorized")
+	}
+}
+
 func TestPeerHTTPSReportAndReload(t *testing.T) {
 	var backendRequests atomic.Int32
 	var unhealthy atomic.Bool
@@ -45,6 +190,8 @@ func TestPeerHTTPSReportAndReload(t *testing.T) {
 	token := strings.Repeat("a", 32)
 	revoked := strings.Repeat("b", 32)
 	diagnosticToken := strings.Repeat("e", 32)
+	previewToken := strings.Repeat("m", 32)
+	targetDir := t.TempDir()
 	path := configPath(t)
 	allowDiagnostics := true
 	write := func(active, nodeID, certificate string) {
@@ -59,11 +206,20 @@ peer:
   tls_cert_file: %q
   tls_key_file: %q
   local_backends: [local]
+  management_targets: {local: swap}
   peers:
     node-b: {token: %q, catalog_read: true}
     node-c: {token: %q, catalog_read: false}
     node-d: {token: %q, catalog_read: true, diagnostics_read: %t}
-`, local.URL, remote.URL, nodeID, certificate, keyPath, active, revoked, diagnosticToken, allowDiagnostics)
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: %q
+  tls_key_file: %q
+  preview_token: %q
+  targets:
+    swap: {directory: %q, filename: config.yaml}
+`, local.URL, remote.URL, nodeID, certificate, keyPath, active, revoked, diagnosticToken, allowDiagnostics,
+			certPath, keyPath, previewToken, targetDir)
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -76,6 +232,10 @@ peer:
 	mutatedToken := strings.Repeat("d", 32)
 	returnedConfig.Peer.Peers["node-b"] = config.PeerGrant{Token: mutatedToken, CatalogRead: true}
 	returnedConfig.Peer.LocalBackends = append(returnedConfig.Peer.LocalBackends, "remote")
+	returnedConfig.Peer.ManagementTargets["local"] = "changed"
+	if r.state.Load().peer.ManagementTargets["local"] != "swap" {
+		t.Fatal("returned config changed active management binding")
+	}
 	warm := httptest.NewRecorder()
 	r.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 	if warm.Code != http.StatusOK {
@@ -146,7 +306,8 @@ peer:
 		receipt.Report.Observations[0].Identity.LocalID != "local-model" {
 		t.Fatalf("report = %#v, status %d", receipt.Report, response.StatusCode)
 	}
-	if receipt.Report.Capabilities["diagnostics_read"] != "enabled" || receipt.Report.BackendReadiness != nil {
+	if receipt.Report.Capabilities["diagnostics_read"] != "enabled" || receipt.Report.Capabilities["config_write"] != "disabled" ||
+		receipt.Report.BackendReadiness != nil {
 		t.Fatal("catalog-only peer received readiness or feature not advertised")
 	}
 	getDiagnostics := func() nodecontract.Report {

@@ -47,6 +47,7 @@ func TestManagementHTTPSPreviewAndReload(t *testing.T) {
 	certPath, keyPath, roots := peerTestCertificate(t)
 	token, newToken := strings.Repeat("m", 32), strings.Repeat("n", 32)
 	proposalToken, newProposalToken := strings.Repeat("p", 32), strings.Repeat("q", 32)
+	delegationToken, newDelegationToken := strings.Repeat("l", 32), strings.Repeat("r", 32)
 	storeDir := t.TempDir()
 	if err := os.Chmod(storeDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -61,11 +62,12 @@ func TestManagementHTTPSPreviewAndReload(t *testing.T) {
   tls_cert_file: %q
   tls_key_file: %q
   preview_token: %q
+  delegation_token: %q
   proposal_store: {directory: %q, token: %q}
   targets:
     local: {directory: %q, filename: config.yaml}
     link: {directory: %q, filename: link.yaml}
-`, listen, certificate, keyPath, credential, storeDir, proposalToken, dir, dir)
+`, listen, certificate, keyPath, credential, delegationToken, storeDir, proposalToken, dir, dir)
 		}
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -78,8 +80,15 @@ func TestManagementHTTPSPreviewAndReload(t *testing.T) {
 	}
 	defer r.Stop()
 	cfg.Management.PreviewToken = newToken
+	cfg.Management.DelegationToken = newDelegationToken
 	cfg.Management.ProposalStore.Token = newProposalToken
 	cfg.Management.Targets["local"] = cfg.Management.Targets["link"]
+	delegationRequest := httptest.NewRequest(http.MethodPost, "https://proxy.example/management/v1/delegation", nil)
+	delegationRequest.Header.Set("Authorization", "Bearer "+delegationToken)
+	oldState := r.state.Load()
+	if !r.delegatedCallerAuthorized(delegationRequest, oldState) {
+		t.Fatal("configured delegated caller not retained in snapshot")
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -286,9 +295,17 @@ func TestManagementHTTPSPreviewAndReload(t *testing.T) {
 		t.Fatalf("client listener status = %d", public.Code)
 	}
 	proposalToken = newProposalToken
+	delegationToken = newDelegationToken
 	writeConfig(newToken, "127.0.0.1:9294", certPath, true)
 	if err := r.reload(); err != nil {
 		t.Fatal(err)
+	}
+	if r.delegatedCallerAuthorized(delegationRequest, oldState) || r.delegatedCallerAuthorized(delegationRequest, r.state.Load()) {
+		t.Fatal("reload did not revoke delegated caller")
+	}
+	delegationRequest.Header.Set("Authorization", "Bearer "+newDelegationToken)
+	if !r.delegatedCallerAuthorized(delegationRequest, r.state.Load()) {
+		t.Fatal("reloaded delegated caller rejected")
 	}
 	if status, _ := request(token, valid); status != http.StatusUnauthorized {
 		t.Fatalf("revoked credential status = %d", status)

@@ -66,7 +66,7 @@ func artifactDirectoryUnchanged(directory *os.File, path string) error {
 
 func adoptArtifact(ctx context.Context, options StageOptions, duration time.Duration) (StageResult, error) {
 	result := StageResult{Publication: PublicationNotPublished, Durability: "not_applicable"}
-	if ctx == nil || duration <= 0 || options.MaxBytes < 1 || options.MaxDirectoryBytes < 0 || options.MinFreeBytes < 0 ||
+	if ctx == nil || duration <= 0 || options.MaxBytes < 1 || options.MaxDirectoryBytes < 1 || options.MinFreeBytes < 1 ||
 		!options.AdoptExisting || !options.AllowAdoption ||
 		options.AllowDownload || options.ReplaceExisting || options.AllowReplacement || options.AcknowledgeExclusiveWindow ||
 		!filepath.IsAbs(options.Directory) || filepath.Clean(options.Directory) != options.Directory ||

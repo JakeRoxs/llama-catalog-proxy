@@ -67,15 +67,22 @@ type BenchmarkConfig struct {
 
 // ManagementConfig enables a separate HTTPS endpoint for local config previews.
 type ManagementConfig struct {
-	Listen        string                      `yaml:"listen"`
-	TLSCertFile   string                      `yaml:"tls_cert_file"`
-	TLSKeyFile    string                      `yaml:"tls_key_file"`
-	PreviewToken  string                      `yaml:"preview_token"`
-	ProposalStore *ProposalStoreConfig        `yaml:"proposal_store,omitempty"`
-	BackupStore   *BackupStoreConfig          `yaml:"backup_store,omitempty"`
-	WriteToken    string                      `yaml:"write_token,omitempty"`
-	Ingestion     *IngestionConfig            `yaml:"ingestion,omitempty"`
-	Targets       map[string]ManagementTarget `yaml:"targets"`
+	Listen          string                      `yaml:"listen"`
+	TLSCertFile     string                      `yaml:"tls_cert_file"`
+	TLSKeyFile      string                      `yaml:"tls_key_file"`
+	PreviewToken    string                      `yaml:"preview_token"`
+	DelegationToken string                      `yaml:"delegation_token,omitempty"`
+	DelegatedStore  *DelegatedStoreConfig       `yaml:"delegated_store,omitempty"`
+	ProposalStore   *ProposalStoreConfig        `yaml:"proposal_store,omitempty"`
+	BackupStore     *BackupStoreConfig          `yaml:"backup_store,omitempty"`
+	WriteToken      string                      `yaml:"write_token,omitempty"`
+	Ingestion       *IngestionConfig            `yaml:"ingestion,omitempty"`
+	Targets         map[string]ManagementTarget `yaml:"targets"`
+}
+
+type DelegatedStoreConfig struct {
+	ProposalDirectory  string `yaml:"proposal_directory"`
+	OperationDirectory string `yaml:"operation_directory"`
 }
 
 type IngestionConfig struct {
@@ -85,8 +92,8 @@ type IngestionConfig struct {
 	Token             string `yaml:"token"`
 	HuggingFaceToken  string `yaml:"huggingface_token,omitempty"`
 	MaxBytes          int64  `yaml:"max_bytes"`
-	MaxDirectoryBytes int64  `yaml:"max_directory_bytes,omitempty"`
-	MinFreeBytes      int64  `yaml:"min_free_bytes,omitempty"`
+	MaxDirectoryBytes int64  `yaml:"max_directory_bytes"`
+	MinFreeBytes      int64  `yaml:"min_free_bytes"`
 	Timeout           string `yaml:"timeout"`
 	FileMode          string `yaml:"file_mode"`
 }
@@ -109,12 +116,13 @@ type ManagementTarget struct {
 
 // PeerConfig describes the opt-in HTTPS listener and explicitly configured peers.
 type PeerConfig struct {
-	NodeID        string               `yaml:"node_id"`
-	Listen        string               `yaml:"listen"`
-	TLSCertFile   string               `yaml:"tls_cert_file"`
-	TLSKeyFile    string               `yaml:"tls_key_file"`
-	LocalBackends []string             `yaml:"local_backends"`
-	Peers         map[string]PeerGrant `yaml:"peers"`
+	NodeID            string               `yaml:"node_id"`
+	Listen            string               `yaml:"listen"`
+	TLSCertFile       string               `yaml:"tls_cert_file"`
+	TLSKeyFile        string               `yaml:"tls_key_file"`
+	LocalBackends     []string             `yaml:"local_backends"`
+	ManagementTargets map[string]string    `yaml:"management_targets,omitempty"`
+	Peers             map[string]PeerGrant `yaml:"peers"`
 }
 
 type PeerGrant struct {
@@ -122,10 +130,12 @@ type PeerGrant struct {
 	CatalogRead     bool   `yaml:"catalog_read"`
 	DiagnosticsRead bool   `yaml:"diagnostics_read"`
 	Inference       bool   `yaml:"inference"`
+	ManageSettings  bool   `yaml:"manage_settings"`
 	URL             string `yaml:"url"`
 	OutboundToken   string `yaml:"outbound_token"`
 	CAFile          string `yaml:"ca_file"`
 	RouteInference  bool   `yaml:"route_inference"`
+	RouteManagement bool   `yaml:"route_management"`
 }
 
 type Backend struct {
@@ -411,8 +421,12 @@ func validateManagement(c Config) error {
 	if strings.TrimSpace(m.TLSCertFile) == "" || strings.TrimSpace(m.TLSKeyFile) == "" {
 		return errors.New("management TLS certificate and key files are required")
 	}
-	if err := validateManagementToken(c, m.PreviewToken); err != nil {
-		return err
+	delegationOnly := m.DelegationToken != "" && m.PreviewToken == "" && len(m.Targets) == 0 &&
+		m.DelegatedStore == nil && m.ProposalStore == nil && m.BackupStore == nil && m.WriteToken == "" && m.Ingestion == nil
+	if !delegationOnly {
+		if err := validateManagementToken(c, m.PreviewToken); err != nil {
+			return err
+		}
 	}
 	if m.ProposalStore != nil {
 		if !filepath.IsAbs(m.ProposalStore.Directory) || filepath.Clean(m.ProposalStore.Directory) != m.ProposalStore.Directory {
@@ -455,6 +469,29 @@ func validateManagement(c Config) error {
 			return err
 		}
 	}
+	if m.DelegationToken != "" {
+		if err := validateManagementToken(c, m.DelegationToken); err != nil {
+			return fmt.Errorf("delegation credential invalid: %w", err)
+		}
+		credentials := []string{m.PreviewToken, m.WriteToken}
+		if m.ProposalStore != nil {
+			credentials = append(credentials, m.ProposalStore.Token)
+		}
+		if m.BackupStore != nil {
+			credentials = append(credentials, m.BackupStore.Token)
+		}
+		if m.Ingestion != nil {
+			credentials = append(credentials, m.Ingestion.Token, m.Ingestion.HuggingFaceToken)
+		}
+		if c.Benchmark != nil {
+			credentials = append(credentials, c.Benchmark.Token)
+		}
+		for _, credential := range credentials {
+			if m.DelegationToken == credential {
+				return errors.New("delegation credential must be distinct from other service credentials")
+			}
+		}
+	}
 	if m.Ingestion != nil {
 		i := m.Ingestion
 		if !filepath.IsAbs(i.Directory) || filepath.Clean(i.Directory) != i.Directory {
@@ -468,8 +505,8 @@ func validateManagement(c Config) error {
 		if i.MaxBytes < 1 || err != nil || timeout <= 0 || (i.FileMode != "0600" && i.FileMode != "0640") {
 			return errors.New("ingestion requires a positive byte limit and timeout and file mode 0600 or 0640")
 		}
-		if i.MaxDirectoryBytes < 0 || i.MinFreeBytes < 0 {
-			return errors.New("ingestion disk limits cannot be negative")
+		if i.MaxDirectoryBytes < 1 || i.MinFreeBytes < 1 {
+			return errors.New("ingestion requires positive max_directory_bytes and min_free_bytes")
 		}
 		if err := validateManagementToken(c, i.Token); err != nil {
 			return fmt.Errorf("ingestion credential invalid: %w", err)
@@ -522,7 +559,7 @@ func validateManagement(c Config) error {
 			}
 		}
 	}
-	if len(m.Targets) == 0 || len(m.Targets) > 32 {
+	if len(m.Targets) > 32 || len(m.Targets) == 0 && !delegationOnly {
 		return errors.New("management requires 1 to 32 targets")
 	}
 	for id, target := range m.Targets {
@@ -539,6 +576,40 @@ func validateManagement(c Config) error {
 		if m.BackupStore != nil && (containsPath(m.BackupStore.Directory, target.Directory) ||
 			containsPath(target.Directory, m.BackupStore.Directory)) {
 			return errors.New("backup store must be separate from target directories")
+		}
+	}
+	if m.DelegatedStore != nil {
+		stores := m.DelegatedStore
+		if m.BackupStore == nil {
+			return errors.New("delegated stores require a backup store for owner review")
+		}
+		for _, directory := range []string{stores.ProposalDirectory, stores.OperationDirectory} {
+			if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+				return errors.New("delegated store directories must be absolute clean paths")
+			}
+		}
+		dirs := []string{m.BackupStore.Directory}
+		if m.ProposalStore != nil {
+			dirs = append(dirs, m.ProposalStore.Directory)
+		}
+		if m.Ingestion != nil {
+			dirs = append(dirs, m.Ingestion.Directory, m.Ingestion.RecordDirectory)
+		}
+		if c.Benchmark != nil {
+			dirs = append(dirs, c.Benchmark.ReportDirectory)
+		}
+		for _, target := range m.Targets {
+			dirs = append(dirs, target.Directory)
+		}
+		if containsPath(stores.ProposalDirectory, stores.OperationDirectory) ||
+			containsPath(stores.OperationDirectory, stores.ProposalDirectory) {
+			return errors.New("delegated proposal and operation stores must be separate")
+		}
+		for _, directory := range dirs {
+			if containsPath(stores.ProposalDirectory, directory) || containsPath(directory, stores.ProposalDirectory) ||
+				containsPath(stores.OperationDirectory, directory) || containsPath(directory, stores.OperationDirectory) {
+				return errors.New("delegated stores must be separate from other stores and targets")
+			}
 		}
 	}
 	return nil
@@ -614,6 +685,17 @@ func validatePeer(c Config) error {
 		}
 		local[id] = true
 	}
+	if len(p.ManagementTargets) > len(local) || len(p.ManagementTargets) > 256 {
+		return errors.New("peer management targets must refer to owned backends")
+	}
+	for backend, target := range p.ManagementTargets {
+		if !local[backend] || c.Management == nil {
+			return errors.New("peer management target requires an owned backend and management configuration")
+		}
+		if _, ok := c.Management.Targets[target]; !ok {
+			return errors.New("peer management target references an undefined management target")
+		}
+	}
 	tokens := make(map[string]bool, len(p.Peers))
 	for id, grant := range p.Peers {
 		if !identity.ValidNodeID(id) || id == p.NodeID {
@@ -622,11 +704,14 @@ func validatePeer(c Config) error {
 		if grant.DiagnosticsRead && !grant.CatalogRead {
 			return errors.New("peer diagnostics_read requires catalog_read")
 		}
-		if grant.Token == "" && (grant.CatalogRead || grant.DiagnosticsRead || grant.Inference || grant.URL == "") {
+		if grant.ManageSettings && (c.Management == nil || len(p.ManagementTargets) == 0) {
+			return errors.New("peer manage_settings requires owner management targets")
+		}
+		if grant.Token == "" && (grant.CatalogRead || grant.DiagnosticsRead || grant.Inference || grant.ManageSettings || grant.URL == "") {
 			return errors.New("peer grant requires an incoming token or outbound URL")
 		}
 		if grant.URL == "" {
-			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference {
+			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference || grant.RouteManagement {
 				return errors.New("peer outbound token and CA require a URL")
 			}
 		} else {

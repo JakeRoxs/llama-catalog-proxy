@@ -35,6 +35,7 @@ type peerClient struct {
 	token              string
 	client             *http.Client
 	routeInference     bool
+	routeManagement    bool
 	inferenceTransport *http.Transport
 }
 
@@ -95,6 +96,7 @@ func newPeerClients(peer *config.PeerConfig) (map[string]*peerClient, *peerCache
 		clients[id] = &peerClient{
 			id: id, endpoint: strings.TrimSuffix(grant.URL, "/") + "/peer/v1/report", token: grant.OutboundToken,
 			origin: strings.TrimSuffix(grant.URL, "/"), routeInference: grant.RouteInference,
+			routeManagement:    grant.RouteManagement,
 			inferenceTransport: transport.Clone(),
 			client: &http.Client{Transport: transport, Timeout: peerReportTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse

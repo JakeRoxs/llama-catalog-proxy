@@ -22,6 +22,7 @@ const (
 	peerCatalog peerScope = iota
 	peerDiagnostics
 	peerInference
+	peerManageSettings
 )
 
 // PeerTLSConfig serves the currently installed peer certificate. Removing peer
@@ -135,24 +136,40 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 }
 
 func peerAuthorized(req *http.Request, state *reloaderState, scope peerScope) bool {
+	_, authorized := authenticatedPeer(req, state, scope)
+	return authorized
+}
+
+func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope) (string, bool) {
+	if state == nil || state.peer == nil {
+		return "", false
+	}
 	values := req.Header.Values("Authorization")
 	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
-		return false
+		return "", false
 	}
 	token := strings.TrimPrefix(values[0], "Bearer ")
 	if len(token) < 32 || len(token) > 256 {
-		return false
+		return "", false
 	}
 	hash := sha256.Sum256([]byte(token))
-	authorized := 0
-	for _, peer := range state.peer.Peers {
+	var nodeID string
+	matches := 0
+	authorized := false
+	for id, peer := range state.peer.Peers {
 		expected := sha256.Sum256([]byte(peer.Token))
 		match := subtle.ConstantTimeCompare(hash[:], expected[:])
-		if (scope == peerCatalog && peer.CatalogRead) ||
-			(scope == peerDiagnostics && peer.DiagnosticsRead) ||
-			(scope == peerInference && peer.Inference) {
-			authorized |= match
+		if match == 1 {
+			matches++
+			nodeID = id
+			authorized = (scope == peerCatalog && peer.CatalogRead) ||
+				(scope == peerDiagnostics && peer.DiagnosticsRead) ||
+				(scope == peerInference && peer.Inference) ||
+				(scope == peerManageSettings && peer.ManageSettings)
 		}
 	}
-	return authorized == 1
+	if matches != 1 || !authorized {
+		return "", false
+	}
+	return nodeID, true
 }

@@ -25,7 +25,7 @@ func StageNewArtifact(ctx context.Context, options StageOptions, input io.Reader
 	if ctx == nil || input == nil || !options.AllowDownload || options.AdoptExisting || options.AllowAdoption ||
 		(options.ReplaceExisting && (!options.AllowReplacement || !options.AcknowledgeExclusiveWindow)) ||
 		(!options.ReplaceExisting && (options.AllowReplacement || options.AcknowledgeExclusiveWindow)) ||
-		options.MaxBytes < 1 || options.MaxDirectoryBytes < 0 || options.MinFreeBytes < 0 ||
+		options.MaxBytes < 1 || options.MaxDirectoryBytes < 1 || options.MinFreeBytes < 1 ||
 		(options.FileMode != 0o600 && options.FileMode != 0o640) ||
 		!filepath.IsAbs(options.Directory) || filepath.Clean(options.Directory) != options.Directory {
 		return result, ErrStageInvalid
@@ -64,12 +64,9 @@ func StageNewArtifact(ctx context.Context, options StageOptions, input io.Reader
 			return result, ErrStageDirectory
 		}
 	}
-	var directoryBytes int64
-	if options.MaxDirectoryBytes > 0 {
-		directoryBytes, err = artifactDirectoryBytes(ctx, directory, options.MaxDirectoryBytes)
-		if err != nil {
-			return result, err
-		}
+	directoryBytes, err := artifactDirectoryBytes(ctx, directory, options.MaxDirectoryBytes)
+	if err != nil {
+		return result, err
 	}
 	if err := checkFreeSpace(directory, options.MinFreeBytes, 0); err != nil {
 		return result, err
@@ -114,7 +111,7 @@ func StageNewArtifact(ctx context.Context, options StageOptions, input io.Reader
 			return result, ErrStageTooLarge
 		}
 		if n > 0 {
-			if options.MaxDirectoryBytes > 0 && int64(n) > options.MaxDirectoryBytes-directoryBytes-written {
+			if int64(n) > options.MaxDirectoryBytes-directoryBytes-written {
 				return result, ErrStageQuota
 			}
 			if err := checkFreeSpace(directory, options.MinFreeBytes, int64(n)); err != nil {

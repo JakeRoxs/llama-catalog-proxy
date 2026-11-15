@@ -42,6 +42,60 @@ benchmark:
 	}
 }
 
+func TestDelegatedStoreConfiguration(t *testing.T) {
+	target, local, backups, proposals, operations := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	backupLine := fmt.Sprintf("  backup_store: {directory: %q, token: %q, max_backups: 2}\n", backups, strings.Repeat("b", 32))
+	proposalLine := fmt.Sprintf("    proposal_directory: %q\n", proposals)
+	operationLine := fmt.Sprintf("    operation_directory: %q\n", operations)
+	base := fmt.Sprintf(`default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: %q
+  proposal_store: {directory: %q, token: %q}
+%s  delegated_store:
+%s%s  targets:
+    swap: {directory: %q, filename: config.yaml}
+`, strings.Repeat("m", 32), local, strings.Repeat("p", 32), backupLine, proposalLine, operationLine, target)
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil || cfg.Management.DelegatedStore.ProposalDirectory != proposals ||
+		cfg.Management.DelegatedStore.OperationDirectory != operations {
+		t.Fatalf("valid store configuration rejected: %v", err)
+	}
+	for name, contents := range map[string]string{
+		"missing backup":   strings.Replace(base, backupLine, "", 1),
+		"missing proposal": strings.Replace(base, proposalLine, "", 1),
+		"relative path":    strings.Replace(base, operationLine, "    operation_directory: relative\n", 1),
+		"unclean path":     strings.Replace(base, operationLine, fmt.Sprintf("    operation_directory: %q\n", operations+"/../other"), 1),
+		"same stores":      strings.Replace(base, operationLine, fmt.Sprintf("    operation_directory: %q\n", proposals), 1),
+		"nested stores":    strings.Replace(base, operationLine, fmt.Sprintf("    operation_directory: %q\n", filepath.Join(proposals, "nested")), 1),
+		"target overlap":   strings.Replace(base, operationLine, fmt.Sprintf("    operation_directory: %q\n", target), 1),
+		"backup overlap":   strings.Replace(base, proposalLine, fmt.Sprintf("    proposal_directory: %q\n", backups), 1),
+		"local overlap":    strings.Replace(base, operationLine, fmt.Sprintf("    operation_directory: %q\n", local), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("invalid delegated store configuration accepted")
+			}
+		})
+	}
+	cfg.Benchmark = &BenchmarkConfig{ReportDirectory: operations}
+	if err := validateManagement(cfg); err == nil {
+		t.Fatal("delegated operation store overlaps benchmark reports")
+	}
+	cfg.Benchmark = nil
+	cfg.Management.Ingestion = &IngestionConfig{
+		Directory: t.TempDir(), RecordDirectory: proposals, MaxRecords: 1,
+		Token: strings.Repeat("i", 32), MaxBytes: 1, MaxDirectoryBytes: 1,
+		MinFreeBytes: 1, Timeout: "1s", FileMode: "0600",
+	}
+	if err := validateManagement(cfg); err == nil {
+		t.Fatal("delegated proposal store overlaps ingestion records")
+	}
+}
+
 func TestPeerConfigurationValidation(t *testing.T) {
 	token := strings.Repeat("a", 32)
 	base := `
@@ -61,15 +115,16 @@ peer:
 		t.Fatal(err)
 	}
 	cases := map[string]string{
-		"self peer":                   strings.Replace(base, "node-b:", "node-a:", 1),
-		"missing backend":             strings.Replace(base, "[local]", "[missing]", 1),
-		"duplicate local":             strings.Replace(base, "[local]", "[local, local]", 1),
-		"short token":                 strings.Replace(base, token, "short", 1),
-		"bad listen":                  strings.Replace(base, "127.0.0.1:9293", "bad", 1),
-		"missing cert":                strings.Replace(base, "tls_cert_file: cert.pem", "tls_cert_file: ''", 1),
-		"duplicate token":             base + "    node-c: {token: " + token + ", catalog_read: true}\n",
-		"diagnostics key":             base + "diagnostics_api_key: " + token + "\n",
-		"diagnostics without catalog": strings.Replace(base, "catalog_read: true", "catalog_read: false, diagnostics_read: true", 1),
+		"self peer":                    strings.Replace(base, "node-b:", "node-a:", 1),
+		"missing backend":              strings.Replace(base, "[local]", "[missing]", 1),
+		"duplicate local":              strings.Replace(base, "[local]", "[local, local]", 1),
+		"short token":                  strings.Replace(base, token, "short", 1),
+		"bad listen":                   strings.Replace(base, "127.0.0.1:9293", "bad", 1),
+		"missing cert":                 strings.Replace(base, "tls_cert_file: cert.pem", "tls_cert_file: ''", 1),
+		"duplicate token":              base + "    node-c: {token: " + token + ", catalog_read: true}\n",
+		"diagnostics key":              base + "diagnostics_api_key: " + token + "\n",
+		"diagnostics without catalog":  strings.Replace(base, "catalog_read: true", "catalog_read: false, diagnostics_read: true", 1),
+		"management route without URL": strings.Replace(base, "catalog_read: true", "catalog_read: true, route_management: true", 1),
 	}
 	for name, contents := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -98,6 +153,11 @@ peer:
 	if _, err := Load(writeConfig(t, base)); err != nil {
 		t.Fatal(err)
 	}
+	managed := strings.Replace(base, "outbound_token: "+outbound, "outbound_token: "+outbound+", route_management: true", 1)
+	cfg, err := Load(writeConfig(t, managed))
+	if err != nil || !cfg.Peer.Peers["node-b"].RouteManagement || cfg.Peer.Peers["node-b"].RouteInference {
+		t.Fatalf("independent outbound management scope rejected: %v", err)
+	}
 	cases := map[string]string{
 		"plaintext":   strings.Replace(base, "https://peer.example:9293", "http://peer.example:9293", 1),
 		"userinfo":    strings.Replace(base, "https://peer.example:9293", "https://user:pass@peer.example:9293", 1),
@@ -111,6 +171,58 @@ peer:
 			_, err := Load(writeConfig(t, contents))
 			if err == nil || strings.Contains(err.Error(), inbound) || strings.Contains(err.Error(), outbound) {
 				t.Fatalf("invalid peer accepted or token leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestPeerManagementTargetBindings(t *testing.T) {
+	peerToken, previewToken := strings.Repeat("p", 32), strings.Repeat("m", 32)
+	management := `
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: ` + previewToken + `
+  targets:
+    swap: {directory: /config/llama-swap, filename: config.yaml}
+`
+	base := `
+default_backend: local
+backends:
+  local: {url: http://localhost:9292}
+  remote: {url: http://localhost:9295}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  local_backends: [local]
+  management_targets: {local: swap}
+  peers:
+    node-b: {token: ` + peerToken + `, catalog_read: true}
+` + management
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil || cfg.Peer.ManagementTargets["local"] != "swap" {
+		t.Fatalf("valid management binding rejected: %v", err)
+	}
+	managed := strings.Replace(base, "catalog_read: true", "manage_settings: true", 1)
+	cfg, err = Load(writeConfig(t, managed))
+	if err != nil || !cfg.Peer.Peers["node-b"].ManageSettings || cfg.Peer.Peers["node-b"].CatalogRead {
+		t.Fatalf("independent settings grant rejected: %v", err)
+	}
+	for name, contents := range map[string]string{
+		"missing management": strings.TrimSuffix(base, management),
+		"unowned backend":    strings.Replace(base, "{local: swap}", "{remote: swap}", 1),
+		"missing backend":    strings.Replace(base, "{local: swap}", "{missing: swap}", 1),
+		"missing target":     strings.Replace(base, "{local: swap}", "{local: missing}", 1),
+		"empty target":       strings.Replace(base, "{local: swap}", `{local: ""}`, 1),
+		"grant no binding":   strings.Replace(managed, "  management_targets: {local: swap}\n", "", 1),
+		"grant no token":     strings.Replace(managed, "{token: "+peerToken+", manage_settings: true}", `{manage_settings: true, url: "https://peer.example", outbound_token: `+strings.Repeat("o", 32)+`}`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("invalid management binding accepted")
 			}
 		})
 	}
@@ -146,6 +258,107 @@ management:
 			_, err := Load(writeConfig(t, contents))
 			if err == nil || strings.Contains(err.Error(), token) {
 				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestDelegationCredentialValidation(t *testing.T) {
+	preview, delegation := strings.Repeat("m", 32), strings.Repeat("l", 32)
+	proposal, backup, write := strings.Repeat("p", 32), strings.Repeat("b", 32), strings.Repeat("w", 32)
+	ingestion, hub, benchmark := strings.Repeat("i", 32), strings.Repeat("h", 32), strings.Repeat("q", 32)
+	diagnostic, backend, header := strings.Repeat("d", 32), strings.Repeat("a", 32), strings.Repeat("z", 32)
+	inbound, outbound := strings.Repeat("n", 32), strings.Repeat("o", 32)
+	base := fmt.Sprintf(`
+default_backend: local
+backends:
+  local:
+    url: http://localhost:9292
+    api_key: %s
+    headers: {X-Custom-Auth: %s}
+diagnostics_api_key: %s
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  peers:
+    node-b: {token: %s, catalog_read: true, url: "https://peer.example", outbound_token: %s}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: %s
+  delegation_token: %s
+  proposal_store: {directory: /state/proposals, token: %s}
+  backup_store: {directory: /state/backups, token: %s, max_backups: 8}
+  write_token: %s
+  ingestion:
+    directory: /models
+    record_directory: /state/ingestion
+    max_records: 100
+    token: %s
+    huggingface_token: %s
+    max_bytes: 4096
+    max_directory_bytes: 8192
+    min_free_bytes: 1024
+    timeout: 1h
+    file_mode: "0640"
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+benchmark:
+  token: %s
+  proxy_origin: http://127.0.0.1:8080
+  report_directory: /reports
+`, backend, header, diagnostic, inbound, outbound, preview, delegation, proposal, backup, write, ingestion, hub, benchmark)
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil || cfg.Management.DelegationToken != delegation {
+		t.Fatalf("valid delegation credential rejected: %v", err)
+	}
+	for name, credential := range map[string]string{
+		"preview": preview, "proposal": proposal, "backup": backup, "write": write,
+		"ingestion": ingestion, "hub": hub, "benchmark": benchmark, "diagnostics": diagnostic,
+		"backend": backend, "backend header": header, "inbound peer": inbound, "outbound peer": outbound,
+		"too short": "short", "too long": strings.Repeat("x", 257), "invalid character": strings.Repeat("x", 31) + ",",
+	} {
+		t.Run(name, func(t *testing.T) {
+			current, err := Load(writeConfig(t, base))
+			if err != nil {
+				t.Fatal(err)
+			}
+			current.Management.DelegationToken = credential
+			err = current.Validate()
+			if err == nil || strings.Contains(err.Error(), credential) {
+				t.Fatalf("invalid or reused credential accepted or disclosed: %v", err)
+			}
+		})
+	}
+}
+
+func TestDelegationOnlyManagementConfiguration(t *testing.T) {
+	token := strings.Repeat("l", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  delegation_token: ` + token + `
+`
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil || cfg.Management.DelegationToken != token || cfg.Management.PreviewToken != "" || len(cfg.Management.Targets) != 0 {
+		t.Fatalf("receiving-only configuration rejected: %v", err)
+	}
+	for name, contents := range map[string]string{
+		"no credential":          strings.Replace(base, "  delegation_token: "+token+"\n", "", 1),
+		"preview without target": base + "  preview_token: " + strings.Repeat("m", 32) + "\n",
+		"target without preview": base + "  targets: {local: {directory: /config, filename: config.yaml}}\n",
+		"store without preview":  base + "  proposal_store: {directory: /proposals, token: " + strings.Repeat("p", 32) + "}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("invalid receiving-only configuration accepted")
 			}
 		})
 	}
@@ -188,6 +401,10 @@ management:
 		"missing size":           strings.Replace(base, "max_bytes: 4096", "max_bytes: 0", 1),
 		"negative quota":         strings.Replace(base, "max_directory_bytes: 8192", "max_directory_bytes: -1", 1),
 		"negative reserve":       strings.Replace(base, "min_free_bytes: 1024", "min_free_bytes: -1", 1),
+		"zero quota":             strings.Replace(base, "max_directory_bytes: 8192", "max_directory_bytes: 0", 1),
+		"zero reserve":           strings.Replace(base, "min_free_bytes: 1024", "min_free_bytes: 0", 1),
+		"missing quota":          strings.Replace(base, "    max_directory_bytes: 8192\n", "", 1),
+		"missing reserve":        strings.Replace(base, "    min_free_bytes: 1024\n", "", 1),
 		"missing deadline":       strings.Replace(base, "timeout: 1h", "timeout: 0s", 1),
 		"invalid deadline":       strings.Replace(base, "timeout: 1h", "timeout: forever", 1),
 		"unsafe permissions":     strings.Replace(base, `"0640"`, `"0666"`, 1),

@@ -19,7 +19,7 @@ import (
 func stageOptions(directory string) StageOptions {
 	return StageOptions{
 		Directory: directory, Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"},
-		MaxBytes: 1024, FileMode: 0o600, AllowDownload: true,
+		MaxBytes: 1024, MaxDirectoryBytes: 1 << 30, MinFreeBytes: 1, FileMode: 0o600, AllowDownload: true,
 	}
 }
 
@@ -188,6 +188,14 @@ func TestStageNewArtifactRejectsUnsafeOrIncompleteInput(t *testing.T) {
 		}, ErrStageInvalid},
 		{"unsafe permissions", func(_ *testing.T, o *StageOptions) (context.Context, io.Reader) {
 			o.FileMode = 0o666
+			return context.Background(), bytes.NewReader(data)
+		}, ErrStageInvalid},
+		{"missing quota", func(_ *testing.T, o *StageOptions) (context.Context, io.Reader) {
+			o.MaxDirectoryBytes = 0
+			return context.Background(), bytes.NewReader(data)
+		}, ErrStageInvalid},
+		{"missing reserve", func(_ *testing.T, o *StageOptions) (context.Context, io.Reader) {
+			o.MinFreeBytes = 0
 			return context.Background(), bytes.NewReader(data)
 		}, ErrStageInvalid},
 		{"directory permissions", func(t *testing.T, o *StageOptions) (context.Context, io.Reader) {

@@ -108,6 +108,42 @@ With `diagnostics_api_key` configured, `GET /diagnostics/v1/peers` lists peer re
 existing diagnostics bearer token, not a peer token. Reloading configuration clears peer snapshots,
 then starts new refreshes; removed peers disappear immediately.
 
+For future delegated management, an owner may associate an explicitly owned backend with an
+existing local management target using `peer.management_targets`, for example
+`management_targets: {local: llama-swap}`. This operator-declared binding is not evidence that the
+backend actually uses that target. It does not grant authorization or enable remote management;
+delegated management actions are not yet available.
+An owner may also configure `manage_settings: true` on an incoming peer grant as a separate,
+default-off scope. It requires an incoming peer token and at least one management target binding.
+This grant is currently inactive: it does not expose a route, advertise an action, or authorize a
+local caller. Do not rely on it until delegated management is available.
+The separate outgoing peer setting `route_management: true` reserves permission to contact that
+configured peer for future management requests. It requires the peer URL and outbound token, is
+independent of inference routing, and currently enables no management endpoints.
+On the receiving node, optional `management.delegation_token` reserves a separate shared caller
+credential for that future workflow. It must differ from all other configured service credentials
+and does not identify an individual. It currently enables no endpoints. A receiving-only management
+configuration may omit `preview_token` and local targets; its HTTPS listener, certificate, and key
+are still required. Existing local management operations remain disabled in that configuration.
+
+For the future owner-side workflow, optional `management.delegated_store` reserves two separate
+private directories:
+
+```yaml
+management:
+  delegated_store:
+    proposal_directory: /state/delegated-proposals
+    operation_directory: /state/delegated-operations
+```
+
+An existing `backup_store` is required. The directories must already exist, be owned by the proxy
+user with no group or world permissions, and be separate from each other, management targets,
+other stores, ingestion data, and benchmark reports. Enabling or changing their paths requires a
+restart; disabling them can be reloaded. Preserve both directories and the operation-store clock
+marker across restarts. Deleting, replacing, or rolling back this protected state can lose audit
+and replay protection; the proxy cannot detect all external state rollback. This configuration
+does not enable or advertise delegated actions or expose audit endpoints.
+
 Adding the listener, changing its address or node ID requires a restart. Credential grants, owned
 backends, and TLS file paths reload with the configuration; removing `peer` disables peer access.
 Certificate contents are reloaded when the configuration file changes. Invalid reloads retain the
@@ -409,16 +445,16 @@ Mount an existing, proxy-user-owned model directory read-write. It must not be a
 group/world writable, and must be separate from management targets/stores and benchmark reports,
 including resolved symlink aliases. Exclude uncooperative writers while ingestion runs. The backend
 needs directory traversal and file read access; choose `"0600"` or `"0640"` and configure ownership
-and group access accordingly. `max_bytes` limits each artifact. Optional positive
+and group access accordingly. `max_bytes` limits each artifact. The required positive
 `max_directory_bytes` limits the sum of logical regular-file sizes in the model directory and its
 subdirectories, including hidden files and the staged download. Hard links are counted once per
 directory entry; symlinks are not followed. Nested filesystems, unreadable entries, excessive depth
 (over 64), or more than 100,000 entries cause the job to fail closed. Replacement must fit the old
 and staged files simultaneously. This is not a filesystem quota: metadata, allocated blocks,
-external hard links and outside writers are not controlled. Optional positive `min_free_bytes`
+external hard links and outside writers are not controlled. The required positive `min_free_bytes`
 reserves filesystem space available to the proxy user, checked before and during staging and
-after synchronization. Both settings default to zero (disabled) for existing configurations;
-configure both for these protections. Other processes can consume space between checks, and
+after synchronization. Existing ingestion configurations must add both settings before restart.
+Other processes can consume space between checks, and
 neither setting deletes files or replaces filesystem quotas and monitoring. Adoption is read-only
 and does not enforce these download limits. Credentials belong in protected runtime configuration,
 must be distinct from other configured credentials, and must never be placed in URLs or request

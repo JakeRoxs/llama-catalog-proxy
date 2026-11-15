@@ -97,9 +97,6 @@ func artifactDirectoryBytes(ctx context.Context, directory *os.File, limit int64
 }
 
 func checkFreeSpace(directory *os.File, reserve, additional int64) error {
-	if reserve == 0 {
-		return nil
-	}
 	var stat unix.Statfs_t
 	if err := unix.Fstatfs(int(directory.Fd()), &stat); err != nil || stat.Bsize <= 0 {
 		return ErrStageDiskCheck

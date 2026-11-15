@@ -20,6 +20,10 @@ func withProposalStore(directory string, fn func(*os.Root, *os.File) error) erro
 }
 
 func proposalNames(dir *os.File) ([]string, error) {
+	return privateProposalNames(dir, "proposal-")
+}
+
+func privateProposalNames(dir *os.File, prefix string) ([]string, error) {
 	entries, err := dir.ReadDir(MaxProposals + 1)
 	if err != nil && err != io.EOF {
 		return nil, ErrProposalStore
@@ -30,10 +34,10 @@ func proposalNames(dir *os.File) ([]string, error) {
 	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "proposal-") || !strings.HasSuffix(name, ".json") {
+		if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".json") {
 			return nil, ErrProposalStore
 		}
-		id := strings.TrimSuffix(strings.TrimPrefix(name, "proposal-"), ".json")
+		id := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".json")
 		if !validProposalID(id) || entry.IsDir() {
 			return nil, ErrProposalStore
 		}
@@ -149,7 +153,11 @@ func readProposalFile(root *os.Root, id string) ([]byte, error) {
 	if !validProposalID(id) {
 		return nil, ErrProposalNotFound
 	}
-	file, err := root.OpenFile(proposalFilename(id), os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	return readPrivateProposalFile(root, proposalFilename(id))
+}
+
+func readPrivateProposalFile(root *os.Root, name string) ([]byte, error) {
+	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrProposalNotFound
 	}

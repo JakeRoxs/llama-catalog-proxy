@@ -19,7 +19,8 @@ func TestJobManagerBoundsJobsAndReportsCancellation(t *testing.T) {
 		<-ctx.Done()
 		return StageResult{Publication: PublicationNotPublished}, errors.Join(ctx.Err(), ErrStageCleanup)
 	}
-	options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"}, MaxBytes: 1024, FileMode: 0o600, AllowDownload: true}
+	options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"},
+		MaxBytes: 1024, MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AllowDownload: true}
 	job, err := manager.Start(options, time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +79,8 @@ func TestJobManagerPreservesPublicationWhenCancellationRaces(t *testing.T) {
 				name := "fixture"
 				return StageResult{Publication: tt.publication, Metadata: &GGUFMetadata{Name: &name}}, tt.err
 			}
-			options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"}, MaxBytes: 1024, FileMode: 0o600, AllowDownload: true}
+			options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"},
+				MaxBytes: 1024, MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AllowDownload: true}
 			job, err := manager.Start(options, time.Minute)
 			if err != nil {
 				t.Fatal(err)
@@ -109,11 +111,20 @@ func TestJobManagerValidatesAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer manager.Stop()
-	options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"}, MaxBytes: 1024, FileMode: 0o600}
+	options := StageOptions{Directory: t.TempDir(), Source: Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"},
+		MaxBytes: 1024, MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600}
 	if _, err := manager.Start(options, time.Minute); !errors.Is(err, ErrStageInvalid) {
 		t.Fatalf("unauthorized start = %v", err)
 	}
 	options.AllowDownload = true
+	for _, invalid := range []StageOptions{
+		{Directory: options.Directory, Source: options.Source, MaxBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AllowDownload: true},
+		{Directory: options.Directory, Source: options.Source, MaxBytes: 1024, MaxDirectoryBytes: 1024, FileMode: 0o600, AllowDownload: true},
+	} {
+		if _, err := manager.Start(invalid, time.Minute); !errors.Is(err, ErrStageInvalid) {
+			t.Fatalf("missing disk limit accepted: %v", err)
+		}
+	}
 	if _, err := manager.Start(options, 0); !errors.Is(err, ErrStageInvalid) {
 		t.Fatalf("unbounded start = %v", err)
 	}

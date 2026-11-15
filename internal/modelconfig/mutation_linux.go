@@ -28,6 +28,59 @@ func ApplyStoredProposal(proposalDirectory, proposalID, directory, filename, tar
 	return result, err
 }
 
+// ApplyStoredDelegatedProposal holds both private-store locks through execution
+// and outcome persistence. The caller must enforce current authorization,
+// directory separation, and an exclusive edit window under its lifecycle lock.
+// A false reservation is a replay and never invokes the mutation.
+// If outcome persistence fails, the returned reservation remains unknown and
+// the error must be surfaced; callers must not retry the mutation.
+func ApplyStoredDelegatedProposal(proposalDirectory, operationDirectory, proposalID, operationID, directory, filename, backupDirectory string, limit int, binding DelegatedApplyBinding) (DelegatedOperation, bool, error) {
+	if !validProposalID(proposalID) || !validProposalID(operationID) {
+		return DelegatedOperation{}, false, ErrProposalInvalid
+	}
+	var result DelegatedOperation
+	var reserved bool
+	err := withProposalStore(proposalDirectory, func(proposals *os.Root, _ *os.File) error {
+		proposal, err := readDelegatedProposal(proposals, proposalID)
+		if err != nil {
+			return err
+		}
+		if proposal.ReviewRevision != binding.ReviewRevision {
+			return ErrDelegatedProposalBinding
+		}
+		return withProposalStore(operationDirectory, func(operations *os.Root, dir *os.File) error {
+			now := time.Now()
+			if err := ValidateDelegatedProposal(proposal, binding.Owner, binding.RequesterNode, binding.BackendID, binding.TargetID, now); err != nil {
+				return err
+			}
+			result, reserved, err = reserveDelegatedOperation(operations, dir, proposal, operationID, now)
+			if err != nil || !reserved {
+				return err
+			}
+			check := func() error {
+				now := time.Now()
+				if now.Before(result.AcceptedAt) {
+					return ErrDelegatedClockRollback
+				}
+				return ValidateDelegatedProposal(proposal, binding.Owner, binding.RequesterNode, binding.BackendID, binding.TargetID, now)
+			}
+			mutation, mutationErr := applyReviewedProposalChecked(directory, filename, binding.TargetID, backupDirectory, limit, proposal.Proposal, check)
+			outcome, outcomeErr := delegatedMutationOutcome(mutation, mutationErr)
+			if outcomeErr != nil {
+				return errors.Join(mutationErr, outcomeErr)
+			}
+			finished, finishErr := updateDelegatedOperationLocked(operations, dir, proposalID,
+				finishDelegatedOperation(operationID, binding.Owner.ProxyInstanceID, outcome, time.Now()))
+			if finishErr != nil {
+				return errors.Join(mutationErr, finishErr)
+			}
+			result = finished
+			return mutationErr
+		})
+	})
+	return result, reserved, err
+}
+
 // ApplyStoredCreationProposal holds the proposal and target locks through
 // replacement. The caller must enforce authorization, directory separation,
 // an exclusive edit window, and the artifact binding's lifetime.
@@ -77,8 +130,17 @@ func RollbackStoredBackup(directory, filename, targetID, backupDirectory, backup
 // These internal operations require an authorized caller to enforce an exclusive
 // edit window; the directory lock cannot prevent uncooperative writers.
 func applyReviewedProposal(directory, filename, targetID, backupDirectory string, limit int, proposal Proposal) (mutationResult, error) {
+	return applyReviewedProposalChecked(directory, filename, targetID, backupDirectory, limit, proposal, nil)
+}
+
+func applyReviewedProposalChecked(directory, filename, targetID, backupDirectory string, limit int, proposal Proposal, check func() error) (mutationResult, error) {
 	var result mutationResult
 	err := withTargetWrite(directory, filename, func(target *targetWrite) error {
+		if check != nil {
+			if err := check(); err != nil {
+				return err
+			}
+		}
 		record, err := prepareBackup(directory, filename, targetID, proposal, target.source)
 		if err != nil {
 			return err
@@ -92,7 +154,14 @@ func applyReviewedProposal(directory, filename, targetID, backupDirectory string
 		}
 		result, err = commitWithBackup(backupDirectory, limit, func(*os.Root) (backupRecord, []byte, error) {
 			return record, preview.candidate, nil
-		}, target.replace)
+		}, func(candidate []byte) (bool, error) {
+			if check != nil {
+				if err := check(); err != nil {
+					return false, err
+				}
+			}
+			return target.replace(candidate)
+		})
 		return err
 	})
 	return result, err

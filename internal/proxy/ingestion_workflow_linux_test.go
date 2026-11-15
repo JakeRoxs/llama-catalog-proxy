@@ -79,7 +79,8 @@ func TestAdoptedArtifactReviewedCreationWorkflow(t *testing.T) {
 		catalogTimeout: time.Second, logger: discardLogger(),
 	}
 	ingestionToken, previewToken, proposalToken, writeToken := strings.Repeat("i", 32), strings.Repeat("v", 32), strings.Repeat("p", 32), strings.Repeat("w", 32)
-	ingestionConfig := config.IngestionConfig{Directory: models, RecordDirectory: records, Token: ingestionToken, MaxBytes: 1024}
+	ingestionConfig := config.IngestionConfig{Directory: models, RecordDirectory: records, Token: ingestionToken,
+		MaxBytes: 1024, MaxDirectoryBytes: 1024, MinFreeBytes: 1}
 	state := &reloaderState{handler: handler, management: &config.ManagementConfig{
 		PreviewToken: previewToken, WriteToken: writeToken, Ingestion: &ingestionConfig,
 		ProposalStore: &config.ProposalStoreConfig{Directory: proposals, Token: proposalToken},

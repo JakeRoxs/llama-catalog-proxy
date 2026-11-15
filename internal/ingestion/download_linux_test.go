@@ -3,9 +3,13 @@
 package ingestion
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
 func fixtureClient(t *testing.T, handler http.HandlerFunc) *http.Client {
@@ -204,7 +210,8 @@ func TestDownloadJobWithLocalTLSFixture(t *testing.T) {
 		w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 		_, _ = w.Write(data)
 	})
-	manager, err := NewJobManager(context.Background(), "")
+	records := privateRecordDirectory(t)
+	manager, err := NewPersistentJobManager(context.Background(), "", records, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +228,72 @@ func TestDownloadJobWithLocalTLSFixture(t *testing.T) {
 	status, err := manager.Status(job.ID)
 	if err != nil || status.State != "succeeded" || status.Result.Publication != PublicationPublished {
 		t.Fatalf("status = %+v, error = %v", status, err)
+	}
+	if err := manager.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := NewPersistentJobManager(context.Background(), "", records, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Stop()
+	record, err := restarted.Record(job.ID)
+	sum := sha256.Sum256(data)
+	if err != nil || record.Job.State != "succeeded" || record.Job.Source != options.Source ||
+		record.Job.Result.Durability != "confirmed" || record.Job.Result.SHA256 != hex.EncodeToString(sum[:]) ||
+		record.Job.Result.Metadata == nil {
+		t.Fatalf("persisted record = %+v, error = %v", record, err)
+	}
+	path := filepath.Join(options.Directory, record.Job.Source.Filename)
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("downloaded artifact = %x, error = %v", got, err)
+	}
+	evidence, err := restarted.CheckRecordedArtifact(options.Directory, job.ID)
+	if err != nil || evidence.RecordID != job.ID || evidence.RecordMatch != "unknown" ||
+		evidence.Integrity != "not_verified" || evidence.BackendAccess != "unknown" {
+		t.Fatalf("artifact evidence = %+v, error = %v", evidence, err)
+	}
+	preview, err := modelconfig.PreviewCreationDocument("local", "new", "",
+		[]byte("models:\n  old: {cmd: 'llama-server --port ${PORT} -m /models/old.gguf'}\n"),
+		modelconfig.CreationCommandInput{ModelPath: path, Executable: "llama-server"})
+	if err != nil || preview.ModelID != "new" || preview.Artifact != "not_checked" {
+		t.Fatalf("creation preview = %+v, error = %v", preview, err)
+	}
+}
+
+func TestDownloadJobPersistsFreeSpaceFailureWithoutRequest(t *testing.T) {
+	client := fixtureClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("download request sent despite insufficient free space")
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	manager, err := NewPersistentJobManager(context.Background(), "", privateRecordDirectory(t), 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop()
+	manager.run = func(ctx context.Context, options StageOptions, duration time.Duration, token string) (StageResult, error) {
+		return downloadArtifact(ctx, options, duration, token, client)
+	}
+	options := stageOptions(t.TempDir())
+	options.MinFreeBytes = math.MaxInt64
+	job, err := manager.Start(options, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.wg.Wait()
+	status, err := manager.Status(job.ID)
+	if err != nil || status.State != "failed" || status.Result.Publication != PublicationNotPublished ||
+		len(status.ErrorCodes) != 1 || status.ErrorCodes[0] != "free_space_reserve" {
+		t.Fatalf("status = %+v, error = %v", status, err)
+	}
+	record, err := manager.Record(job.ID)
+	if err != nil || record.Job.State != "failed" || len(record.Job.ErrorCodes) != 1 ||
+		record.Job.ErrorCodes[0] != "free_space_reserve" || record.ReviewRequired {
+		t.Fatalf("record = %+v, error = %v", record, err)
+	}
+	if _, err := os.Lstat(filepath.Join(options.Directory, options.Source.Filename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("artifact published despite reserve: %v", err)
 	}
 }
 

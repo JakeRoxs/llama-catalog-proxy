@@ -35,6 +35,7 @@ type Reloader struct {
 	peerNodeID         string
 	managementListen   string
 	managementSlots    chan struct{}
+	delegatedStores    *config.DelegatedStoreConfig
 	benchmark          *benchmarkRuntime
 	ingestion          *ingestionRuntime
 	instanceID         string
@@ -107,6 +108,10 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 	var managementCertificate *tls.Certificate
 	if cfg.Management != nil {
 		r.managementListen = cfg.Management.Listen
+		if cfg.Management.DelegatedStore != nil {
+			stores := *cfg.Management.DelegatedStore
+			r.delegatedStores = &stores
+		}
 		managementCertificate, err = loadManagementCertificate(cfg.Management)
 		if err != nil {
 			return nil, config.Config{}, err
@@ -229,6 +234,10 @@ func (r *Reloader) reload() error {
 	var ingestionConfig *config.IngestionConfig
 	if cfg.Management != nil {
 		ingestionConfig = cfg.Management.Ingestion
+		if stores := cfg.Management.DelegatedStore; stores != nil &&
+			(r.delegatedStores == nil || *stores != *r.delegatedStores) {
+			return errors.New("enabling or changing delegated store directories requires a restart")
+		}
 	}
 	if (ingestionConfig == nil) != (r.ingestion == nil) ||
 		ingestionConfig != nil && *ingestionConfig != r.ingestion.config {
@@ -342,6 +351,10 @@ func copyManagementConfig(management *config.ManagementConfig) *config.Managemen
 		return nil
 	}
 	copy := *management
+	if management.DelegatedStore != nil {
+		stores := *management.DelegatedStore
+		copy.DelegatedStore = &stores
+	}
 	if management.ProposalStore != nil {
 		store := *management.ProposalStore
 		copy.ProposalStore = &store
@@ -375,6 +388,10 @@ func copyPeerConfig(peer *config.PeerConfig) *config.PeerConfig {
 	}
 	copy := *peer
 	copy.LocalBackends = append([]string(nil), peer.LocalBackends...)
+	copy.ManagementTargets = make(map[string]string, len(peer.ManagementTargets))
+	for backend, target := range peer.ManagementTargets {
+		copy.ManagementTargets[backend] = target
+	}
 	copy.Peers = make(map[string]config.PeerGrant, len(peer.Peers))
 	for id, grant := range peer.Peers {
 		copy.Peers[id] = grant

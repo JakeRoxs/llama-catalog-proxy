@@ -78,6 +78,19 @@ Conflicting or duplicate identities are ambiguous; this validator rejects a repo
 model keys rather than choosing a winner. Checking that a peer actually owns a backend is an export
 policy responsibility; matching a source ID to an authenticated peer does not prove ownership.
 
+An optional owner-configured `peer.management_targets` mapping can associate explicitly owned
+backend IDs with existing local management target IDs. This is an operator assertion, not verified
+backend/configuration identity, and it neither grants permissions nor enables remote actions.
+The optional peer `manage_settings` scope is independent of catalog, diagnostics, and inference
+grants, but is currently inactive and does not expose or advertise any remote management action.
+The independently configured outgoing `route_management` permission is also inactive and requires
+the peer's configured HTTPS origin and outbound credential.
+The optional receiving-node `management.delegation_token` is a distinct shared credential; it is
+not an individual identity, currently enables no endpoints, and does not grant peer authorization.
+Optional `management.delegated_store` directories reserve separate private owner-side proposal and
+operation storage. They do not enable actions; replay and audit history require the protected
+operation store and its clock marker to be preserved rather than deleted, replaced, or rolled back.
+
 ## Report Envelope and Evidence
 
 Each report includes the following logical envelope:

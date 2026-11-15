@@ -47,7 +47,6 @@ func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 	isIngestion := req.URL.Path == "/management/v1/ingestion" || strings.HasPrefix(req.URL.Path, "/management/v1/ingestion/")
 	isWrite := strings.HasPrefix(req.URL.Path, "/management/v1/proposals/") && strings.HasSuffix(req.URL.Path, "/apply") ||
 		strings.HasPrefix(req.URL.Path, "/management/v1/backups/") && strings.HasSuffix(req.URL.Path, "/rollback")
-	auth := req.Header.Values("Authorization")
 	token := ""
 	if management != nil {
 		if isWrite {
@@ -62,8 +61,7 @@ func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 			token = management.PreviewToken
 		}
 	}
-	if management == nil || len(auth) != 1 || !strings.HasPrefix(auth[0], "Bearer ") ||
-		token == "" || subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth[0], "Bearer ")), []byte(token)) != 1 {
+	if management == nil || !managementBearerAuthorized(req, token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -176,6 +174,15 @@ func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeJSON(r.logger, w, http.StatusOK, result)
+}
+
+func managementBearerAuthorized(req *http.Request, token string) bool {
+	if req == nil || token == "" {
+		return false
+	}
+	auth := req.Header.Values("Authorization")
+	return len(auth) == 1 && strings.HasPrefix(auth[0], "Bearer ") &&
+		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth[0], "Bearer ")), []byte(token)) == 1
 }
 
 func validateManagementJSON(data []byte) error {

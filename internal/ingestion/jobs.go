@@ -66,7 +66,7 @@ func NewJobManager(parent context.Context, token string) (*JobManager, error) {
 }
 
 func (m *JobManager) Start(options StageOptions, duration time.Duration) (JobStatus, error) {
-	if options.MaxBytes < 1 || options.MaxDirectoryBytes < 0 || options.MinFreeBytes < 0 || duration <= 0 ||
+	if options.MaxBytes < 1 || options.MaxDirectoryBytes < 1 || options.MinFreeBytes < 1 || duration <= 0 ||
 		(options.FileMode != 0o600 && options.FileMode != 0o640) ||
 		!filepath.IsAbs(options.Directory) || filepath.Clean(options.Directory) != options.Directory {
 		return JobStatus{}, ErrStageInvalid
