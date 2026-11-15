@@ -23,6 +23,8 @@ import (
 //go:embed benchmark_ui/index.html benchmark_ui/style.css benchmark_ui/app.js
 var benchmarkAssets embed.FS
 
+const maxBenchmarkJSONBytes = 8192
+
 type benchmarkRuntime struct {
 	config         config.BenchmarkConfig
 	diagnosticsKey string
@@ -171,8 +173,8 @@ func decodeBenchmarkJSON(req *http.Request, dst any) error {
 	if err != nil || contentType != "application/json" || req.Header.Get("Content-Encoding") != "" || req.Body == nil {
 		return errors.New("JSON request required")
 	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, 8193))
-	if err != nil || len(data) > 8192 {
+	data, err := io.ReadAll(io.LimitReader(req.Body, maxBenchmarkJSONBytes+1))
+	if err != nil || len(data) > maxBenchmarkJSONBytes {
 		return errors.New("request is unavailable or too large")
 	}
 	if err := validateManagementJSON(data); err != nil {

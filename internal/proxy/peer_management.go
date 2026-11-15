@@ -18,21 +18,21 @@ var (
 )
 
 type delegatedSettingsRequest struct {
-	Owner    modelconfig.DelegatedOwner
-	Backend  string
-	Model    string
-	Revision string
-	Settings modelconfig.CommandSettings
+	Owner    modelconfig.DelegatedOwner  `json:"owner"`
+	Backend  string                      `json:"backend_id"`
+	Model    string                      `json:"model_id"`
+	Revision string                      `json:"revision"`
+	Settings modelconfig.CommandSettings `json:"settings"`
 }
 
 type delegatedSettingsApply struct {
-	Backend                    string
-	ProposalID                 string
-	OperationID                string
-	ReviewRevision             string
-	AcknowledgeReview          bool
-	AcknowledgeDisruption      bool
-	AcknowledgeExclusiveWindow bool
+	Backend                    string `json:"backend_id"`
+	ProposalID                 string `json:"proposal_id"`
+	OperationID                string `json:"operation_id"`
+	ReviewRevision             string `json:"review_revision"`
+	AcknowledgeReview          bool   `json:"acknowledge_review"`
+	AcknowledgeDisruption      bool   `json:"acknowledge_disruption"`
+	AcknowledgeExclusiveWindow bool   `json:"acknowledge_exclusive_window"`
 }
 
 // A future forwarding operation must recheck the state under the lifecycle
@@ -91,6 +91,9 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	defer r.lifecycleMu.Unlock()
 	if r.stopped || r.state.Load() != state {
 		return modelconfig.DelegatedProposal{}, errDelegationChanged
+	}
+	if err := req.Context().Err(); err != nil {
+		return modelconfig.DelegatedProposal{}, err
 	}
 	if !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
 		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalStore

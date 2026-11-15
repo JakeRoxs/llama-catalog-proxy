@@ -4,16 +4,21 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
 const (
-	peerOperationPath     = "/peer/v1/management/operations/"
-	receivedOperationPath = "/management/v1/delegation/operations/"
-	ownerOperationPath    = "/management/v1/delegation/owner/operations/"
+	peerOperationPath        = "/peer/v1/management/operations/"
+	receivedOperationPath    = "/management/v1/delegation/operations/"
+	ownerOperationPath       = "/management/v1/delegation/owner/operations/"
+	peerSettingsApplyPath    = "/peer/v1/management/settings/apply"
+	peerSettingsProposalPath = "/peer/v1/management/settings/proposals"
 )
+
+const delegatedProposalLifetime = 15 * time.Minute
 
 func delegatedOperationPath(req *http.Request, prefix string, withOwner bool) (string, string, string, bool) {
 	if req.URL.RawQuery != "" || req.URL.ForceQuery || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path {
@@ -104,6 +109,79 @@ func (r *Reloader) serveReceivingDelegatedOperation(w http.ResponseWriter, req *
 	writeJSON(r.logger, w, http.StatusOK, record)
 }
 
+func (r *Reloader) preparePeerDelegatedSettings(w http.ResponseWriter, req *http.Request, path string) (*reloaderState, bool) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if req.TLS == nil {
+		http.Error(w, "TLS required", http.StatusForbidden)
+		return nil, false
+	}
+	if req.URL.Path != path || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path ||
+		req.URL.RawQuery != "" || req.URL.ForceQuery {
+		http.NotFound(w, req)
+		return nil, false
+	}
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return nil, false
+	}
+	select {
+	case r.peerSlots <- struct{}{}:
+	default:
+		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
+		return nil, false
+	}
+	state := r.state.Load()
+	if !peerAuthorized(req, state, peerManageSettings) {
+		<-r.peerSlots
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, false
+	}
+	return state, true
+}
+
+// This internal handler is not registered on the peer listener.
+func (r *Reloader) servePeerDelegatedSettingsProposal(w http.ResponseWriter, req *http.Request) {
+	state, ok := r.preparePeerDelegatedSettings(w, req, peerSettingsProposalPath)
+	if !ok {
+		return
+	}
+	defer func() { <-r.peerSlots }()
+	var input delegatedSettingsRequest
+	if err := decodeBenchmarkJSON(req, &input); err != nil {
+		http.Error(w, "invalid proposal request", http.StatusBadRequest)
+		return
+	}
+	proposal, err := r.createDelegatedSettingsProposal(req, state, input, delegatedProposalLifetime)
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	writeJSON(r.logger, w, http.StatusOK, proposal)
+}
+
+// This internal handler is not registered on the peer listener.
+func (r *Reloader) servePeerDelegatedSettingsApply(w http.ResponseWriter, req *http.Request) {
+	state, ok := r.preparePeerDelegatedSettings(w, req, peerSettingsApplyPath)
+	if !ok {
+		return
+	}
+	defer func() { <-r.peerSlots }()
+	var input delegatedSettingsApply
+	if err := decodeBenchmarkJSON(req, &input); err != nil {
+		http.Error(w, "invalid apply request", http.StatusBadRequest)
+		return
+	}
+	record, _, err := r.applyDelegatedSettings(req, state, input)
+	if err != nil {
+		// Once dispatch begins, an error alone cannot prove that no write occurred.
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	writeJSON(r.logger, w, http.StatusOK, record)
+}
+
 // Owner review acknowledges an unknown outcome without resolving it or permitting retry.
 // This handler is intentionally not registered on the management listener.
 func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http.Request) {
@@ -182,7 +260,7 @@ func writeDelegatedOperationError(w http.ResponseWriter, err error) {
 	case errors.Is(err, modelconfig.ErrProposalNotFound):
 		http.Error(w, "not found", http.StatusNotFound)
 	case errors.Is(err, modelconfig.ErrDelegatedOperationConflict):
-		http.Error(w, "operation cannot be reviewed", http.StatusConflict)
+		http.Error(w, "delegated operation conflict", http.StatusConflict)
 	default:
 		http.Error(w, "delegated operation unavailable", http.StatusServiceUnavailable)
 	}
