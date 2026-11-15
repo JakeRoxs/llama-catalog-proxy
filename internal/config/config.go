@@ -28,16 +28,26 @@ const (
 )
 
 type Config struct {
-	Listen         string
-	LogLevel       string
-	DefaultBackend string
-	Backends       map[string]Backend
-	PathRoutes     map[string]string
-	ModelsCacheTTL time.Duration
-	RequestTimeout time.Duration
-	HealthTimeout  time.Duration
-	CatalogTimeout time.Duration
-	MaxJSONBody    int64
+	Listen             string
+	LogLevel           string
+	DefaultBackend     string
+	Backends           map[string]Backend
+	PathRoutes         map[string]string
+	ModelsCacheTTL     time.Duration
+	RequestTimeout     time.Duration
+	HealthTimeout      time.Duration
+	CatalogTimeout     time.Duration
+	ComfyUIWaitTimeout time.Duration
+	MaxJSONBody        int64
+	RequestHistory     bool
+	// RequestObservation enables per-request inference timing observation for
+	// POST generation paths. It defaults to false and is opt-in.
+	RequestObservation bool
+	// DiagnosticsAPIKey is the dedicated token that protects the internal
+	// diagnostics API. Empty disables the API; when set it authenticates
+	// /diagnostics and /diagnostics/v1 requests. It is never echoed in
+	// errors, logs, or JSON responses.
+	DiagnosticsAPIKey string
 }
 
 type Backend struct {
@@ -45,21 +55,26 @@ type Backend struct {
 	Prefix               string            `yaml:"prefix"`
 	HealthPath           string            `yaml:"health_path"`
 	OllamaShowEnrichment bool              `yaml:"ollama_show_enrichment"`
+	Diagnostics          string            `yaml:"diagnostics,omitempty"`
 	APIKey               string            `yaml:"api_key,omitempty"`
 	Headers              map[string]string `yaml:"headers,omitempty"`
 }
 
 type fileConfig struct {
-	Listen         string             `yaml:"listen"`
-	LogLevel       string             `yaml:"log_level"`
-	DefaultBackend string             `yaml:"default_backend"`
-	Backends       map[string]Backend `yaml:"backends"`
-	PathRoutes     map[string]string  `yaml:"path_routes"`
-	ModelsCacheTTL string             `yaml:"models_cache_ttl"`
-	RequestTimeout string             `yaml:"request_timeout"`
-	HealthTimeout  string             `yaml:"health_timeout"`
-	CatalogTimeout string             `yaml:"catalog_timeout"`
-	MaxJSONBody    *int64             `yaml:"max_json_request_body_bytes"`
+	Listen             string             `yaml:"listen"`
+	LogLevel           string             `yaml:"log_level"`
+	DefaultBackend     string             `yaml:"default_backend"`
+	Backends           map[string]Backend `yaml:"backends"`
+	PathRoutes         map[string]string  `yaml:"path_routes"`
+	ModelsCacheTTL     string             `yaml:"models_cache_ttl"`
+	RequestTimeout     string             `yaml:"request_timeout"`
+	HealthTimeout      string             `yaml:"health_timeout"`
+	CatalogTimeout     string             `yaml:"catalog_timeout"`
+	ComfyUIWaitTimeout string             `yaml:"comfyui_wait_timeout"`
+	MaxJSONBody        *int64             `yaml:"max_json_request_body_bytes"`
+	RequestHistory     *bool              `yaml:"request_history,omitempty"`
+	RequestObservation *bool              `yaml:"request_observation,omitempty"`
+	DiagnosticsAPIKey  *string            `yaml:"diagnostics_api_key,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -124,8 +139,23 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("parse catalog_timeout: %w", err)
 		}
 	}
+	if raw.ComfyUIWaitTimeout != "" {
+		cfg.ComfyUIWaitTimeout, err = time.ParseDuration(raw.ComfyUIWaitTimeout)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse comfyui_wait_timeout: %w", err)
+		}
+	}
 	if raw.MaxJSONBody != nil {
 		cfg.MaxJSONBody = *raw.MaxJSONBody
+	}
+	if raw.RequestHistory != nil {
+		cfg.RequestHistory = *raw.RequestHistory
+	}
+	if raw.RequestObservation != nil {
+		cfg.RequestObservation = *raw.RequestObservation
+	}
+	if raw.DiagnosticsAPIKey != nil {
+		cfg.DiagnosticsAPIKey = *raw.DiagnosticsAPIKey
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -150,6 +180,9 @@ func (c Config) Validate() error {
 	if c.CatalogTimeout <= 0 {
 		return errors.New("catalog_timeout must be greater than zero")
 	}
+	if c.ComfyUIWaitTimeout < 0 {
+		return errors.New("comfyui_wait_timeout must not be negative")
+	}
 	if c.MaxJSONBody <= 0 {
 		return errors.New("max_json_request_body_bytes must be greater than zero")
 	}
@@ -163,6 +196,9 @@ func (c Config) Validate() error {
 	if !exists {
 		return fmt.Errorf("default_backend %q is not defined in backends", c.DefaultBackend)
 	}
+	if err := validateDiagnosticsAPIKey(c.DiagnosticsAPIKey); err != nil {
+		return err
+	}
 	prefixOwners := make(map[string]string)
 	for backendID, backend := range c.Backends {
 		if strings.TrimSpace(backendID) == "" {
@@ -170,6 +206,9 @@ func (c Config) Validate() error {
 		}
 		if err := validateHTTPURL("backend "+backendID, backend.URL); err != nil {
 			return err
+		}
+		if backend.Diagnostics != "" && backend.Diagnostics != "llama_swap" {
+			return fmt.Errorf("backend %q diagnostics must be empty or llama_swap", backendID)
 		}
 		if backend.HealthPath != "" {
 			if err := validateHealthPath("backend "+backendID, backend.HealthPath); err != nil {
@@ -207,6 +246,11 @@ func (c Config) Validate() error {
 		}
 		if _, exists := c.Backends[backendID]; !exists {
 			return fmt.Errorf("path route %q references undefined backend %q", routePath, backendID)
+		}
+	}
+	if c.ComfyUIWaitTimeout > 0 {
+		if _, exists := c.PathRoutes["/comfyui"]; !exists {
+			return errors.New("comfyui_wait_timeout requires path_routes /comfyui")
 		}
 	}
 	return nil
@@ -308,4 +352,22 @@ func validLogLevel(level string) bool {
 	default:
 		return false
 	}
+}
+
+// validateDiagnosticsAPIKey rejects an empty key is allowed (disabled); a
+// nonempty key must be at most 4096 bytes and contain no control characters
+// (which covers CR and LF). The key value is never included in the error.
+func validateDiagnosticsAPIKey(key string) error {
+	if key == "" {
+		return nil
+	}
+	if len(key) > 4096 {
+		return errors.New("diagnostics_api_key must not exceed 4096 bytes")
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] == 0x7F {
+			return errors.New("diagnostics_api_key must not contain control characters")
+		}
+	}
+	return nil
 }

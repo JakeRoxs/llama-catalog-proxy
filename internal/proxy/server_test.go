@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -555,7 +556,7 @@ func TestRequestServedIsLogged(t *testing.T) {
 	defaultServer := noContentServer()
 	defer defaultServer.Close()
 	var logs bytes.Buffer
-	handler, err := New(baseConfig(defaultServer.URL), slog.New(slog.NewJSONHandler(&logs, nil)))
+	handler, err := New(baseConfig(defaultServer.URL), slog.New(slog.NewJSONHandler(&logs, nil)), nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,6 +564,351 @@ func TestRequestServedIsLogged(t *testing.T) {
 	if !strings.Contains(logs.String(), `"msg":"request served"`) || !strings.Contains(logs.String(), `"status":204`) {
 		t.Fatalf("logs = %s", logs.String())
 	}
+}
+
+func TestHistoryDisabledByDefault(t *testing.T) {
+	defaultServer := noContentServer()
+	defer defaultServer.Close()
+	handler, err := New(baseConfig(defaultServer.URL), slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handler.(*Handler).history != nil {
+		t.Fatal("history should be nil when request_history is disabled")
+	}
+}
+
+func TestHistoryEnabledStoresRequest(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+	if h.history == nil {
+		t.Fatal("history should be non-nil when request_history is enabled")
+	}
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/custom", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+
+	requestID := recorder.Header().Get("X-Request-ID")
+	if requestID == "" {
+		t.Fatal("no request ID in response")
+	}
+
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for request")
+	}
+	if record.RequestID != requestID {
+		t.Fatalf("record request ID = %q, want %q", record.RequestID, requestID)
+	}
+	if record.BackendID != "default" {
+		t.Fatalf("record backend ID = %q, want default", record.BackendID)
+	}
+	if record.Status != statusHTTPSuccess {
+		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPSuccess)
+	}
+	// Duration is retained in metadata as duration_ms; verify it is set.
+	if _, ok := record.Metadata["duration_ms"]; !ok {
+		t.Fatal("record duration_ms not present in metadata")
+	}
+}
+
+func TestHistoryEnabledStoresBackendAndStatus(t *testing.T) {
+	remote := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer remote.Close()
+
+	cfg := baseConfig(remote.URL)
+	cfg.Backends["remote"] = config.Backend{URL: remote.URL, Prefix: "remote/"}
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"remote/qwen"}`)))
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+
+	requestID := recorder.Header().Get("X-Request-ID")
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for request")
+	}
+	if record.BackendID != "remote" {
+		t.Fatalf("record backend ID = %q, want remote", record.BackendID)
+	}
+	if record.Status != statusHTTPServerError {
+		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPServerError)
+	}
+}
+
+func TestHistoryDoesNotRetainSecrets(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?token=super-secret&key=query-key", strings.NewReader(`{"model":"qwen","password":"sensitive-pw"}`))
+	request.Header.Set("Authorization", "Bearer client-secret-token")
+	request.Header.Set("X-Api-Key", "client-api-key")
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	requestID := recorder.Header().Get("X-Request-ID")
+	record, ok := handler.(*Handler).history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record")
+	}
+	if record.RequestID != requestID {
+		t.Fatalf("record request ID = %q, want %q", record.RequestID, requestID)
+	}
+	if record.BackendID != "default" {
+		t.Fatalf("record backend ID = %q, want default", record.BackendID)
+	}
+	// CorrelationRecord retains only RequestID, BackendID, ModelID, ActivityID,
+	// ActivityTime, RequestTime, Duration, Phase, Status, Metadata. No URL,
+	// path, query, body, headers, or errors are retained by construction.
+}
+
+func TestHistoryConcurrentAndSSE(t *testing.T) {
+	sseBackend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		flusher := writer.(http.Flusher)
+		_, _ = io.WriteString(writer, "data: hello\n\n")
+		flusher.Flush()
+		_, _ = io.WriteString(writer, "data: world\n\n")
+		flusher.Flush()
+	}))
+	defer sseBackend.Close()
+
+	cfg := baseConfig(sseBackend.URL)
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+
+	// Concurrent normal traffic.
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/custom", nil))
+			if recorder.Code != http.StatusOK {
+				t.Errorf("concurrent request %d status = %d", i, recorder.Code)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	stats := h.history.Stats()
+	if stats["record_count"] != 10 {
+		t.Fatalf("history record count = %v, want 10", stats["record_count"])
+	}
+
+	// SSE through proxy must remain byte-exact.
+	proxyServer := httptest.NewServer(h)
+	defer proxyServer.Close()
+	resp, err := http.DefaultClient.Get(proxyServer.URL + "/v1/chat/completions")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("SSE content type = %q", resp.Header.Get("Content-Type"))
+	}
+	var lines []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) < 2 {
+		t.Fatalf("expected SSE chunks, got %d", len(lines))
+	}
+	var events []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		events = append(events, line)
+	}
+	if len(events) < 2 {
+		t.Fatalf("expected SSE events, got %d", len(events))
+	}
+	for _, line := range events {
+		if line != "data: hello" && line != "data: world" {
+			t.Fatalf("unexpected SSE line = %q", line)
+		}
+	}
+
+	requestID := resp.Header.Get("X-Request-ID")
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for SSE request")
+	}
+	if record.Status != statusHTTPSuccess {
+		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPSuccess)
+	}
+}
+
+func TestHistoryClientCanceled(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, req *http.Request) {
+		<-req.Context().Done()
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/custom", nil).WithContext(ctx)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, req)
+
+	requestID := recorder.Header().Get("X-Request-ID")
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for canceled request")
+	}
+	if record.Status != statusClientCanceled {
+		t.Fatalf("record status = %q, want %q", record.Status, statusClientCanceled)
+	}
+}
+
+func TestHistoryBackendPanicRecovered(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		panic("boom")
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.RequestHistory = true
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := handler.(*Handler)
+
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/custom", nil))
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 for backend panic", recorder.Code)
+	}
+
+	requestID := recorder.Header().Get("X-Request-ID")
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for backend panic request")
+	}
+	if record.Status != statusHTTPServerError {
+		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPServerError)
+	}
+}
+
+func TestHistoryAbortPreservesPanicAndOutcome(t *testing.T) {
+	cfg := baseConfig("http://backend.invalid")
+	cfg.RequestHistory = true
+	h := newHandler(t, cfg).(*Handler)
+	h.proxies["default"].Transport = panicHistoryTransport{}
+	w := httptest.NewRecorder()
+	var caught any
+	func() {
+		defer func() { caught = recover() }()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/stream", nil))
+	}()
+	if caught != http.ErrAbortHandler {
+		t.Fatalf("panic = %v, want original ErrAbortHandler", caught)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("partial response status = %d, want 200 before abort", w.Code)
+	}
+	record, ok := h.history.GetByRequestID(w.Header().Get("X-Request-ID"))
+	if !ok || record.Status != statusAborted || record.ActivityID != "" {
+		t.Fatalf("aborted proxy-only record = %#v, found=%v", record, ok)
+	}
+}
+
+type panicHistoryTransport struct{}
+
+func (panicHistoryTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: panicHistoryBody{}, ContentLength: -1}, nil
+}
+
+type panicHistoryBody struct{}
+
+func (panicHistoryBody) Read([]byte) (int, error) {
+	panic(http.ErrAbortHandler)
+}
+
+func (panicHistoryBody) Close() error { return nil }
+
+func TestResponseWriterRecordsFinalStatusAfterEarlyHints(t *testing.T) {
+	w := &headerSequenceWriter{ResponseRecorder: httptest.NewRecorder()}
+	observed := &responseWriter{ResponseWriter: w}
+	observed.WriteHeader(http.StatusEarlyHints)
+	if observed.status != 0 {
+		t.Fatalf("informational response recorded as final status: %d", observed.status)
+	}
+	observed.WriteHeader(http.StatusOK)
+	if observed.status != http.StatusOK {
+		t.Fatalf("final status = %d, want 200", observed.status)
+	}
+	if len(w.statuses) != 2 || w.statuses[0] != http.StatusEarlyHints || w.statuses[1] != http.StatusOK {
+		t.Fatalf("forwarded statuses = %v", w.statuses)
+	}
+	upgraded := &responseWriter{ResponseWriter: httptest.NewRecorder()}
+	upgraded.WriteHeader(http.StatusSwitchingProtocols)
+	if upgraded.status != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade status = %d, want 101", upgraded.status)
+	}
+}
+
+type headerSequenceWriter struct {
+	*httptest.ResponseRecorder
+	statuses []int
+}
+
+func (w *headerSequenceWriter) WriteHeader(status int) {
+	w.statuses = append(w.statuses, status)
+	w.ResponseRecorder.WriteHeader(status)
 }
 
 func testHandler(t *testing.T, defaultURL string, optional map[string]config.Backend) http.Handler {
@@ -584,11 +930,68 @@ func baseConfig(defaultURL string) config.Config {
 
 func newHandler(t *testing.T, cfg config.Config) http.Handler {
 	t.Helper()
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return handler
+}
+
+func TestDiagnosticsAPIDisabledReturns404AndDoesNotHitBackend(t *testing.T) {
+	var backendCalled atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		backendCalled.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	// diagnostics_api_key is empty: API is disabled.
+	cfg := baseConfig(backend.URL)
+	handler := newHandler(t, cfg)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/diagnostics", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 when diagnostics API disabled", recorder.Code)
+	}
+	if backendCalled.Load() != 0 {
+		t.Fatal("backend was hit when diagnostics API disabled")
+	}
+
+	// Unknown diagnostics subpath is reserved and not proxied.
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/diagnostics/v1/unknown", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown diagnostics subpath", recorder.Code)
+	}
+	if backendCalled.Load() != 0 {
+		t.Fatal("backend was hit for unknown diagnostics subpath")
+	}
+}
+
+func TestDiagnosticsAPIReservedBeforePathRouting(t *testing.T) {
+	var backendCalled atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		backendCalled.Add(1)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	// Path route would normally proxy /comfyui to the backend, but
+	// /diagnostics is reserved before path routing.
+	cfg := baseConfig(backend.URL)
+	cfg.Backends["comfyui"] = config.Backend{URL: backend.URL, Prefix: "comfyui/"}
+	cfg.PathRoutes = map[string]string{"/comfyui": "comfyui"}
+	handler := newHandler(t, cfg)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/diagnostics", nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 when diagnostics API disabled", recorder.Code)
+	}
+	if backendCalled.Load() != 0 {
+		t.Fatal("backend was hit for /diagnostics despite path route")
+	}
 }
 
 func noContentServer() *httptest.Server {

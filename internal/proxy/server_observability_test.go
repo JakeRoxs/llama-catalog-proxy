@@ -52,7 +52,7 @@ func capturingHandler(t *testing.T, defaultURL string, optional map[string]confi
 	for id, backend := range optional {
 		cfg.Backends[id] = backend
 	}
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(backend.server.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestRequestIDForwardedUpstream(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(backend.server.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +141,7 @@ func TestIncomingRequestIDIsReplacedNotTrusted(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(backend.server.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestRouteKindAndBackendLogged(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(defaultServer.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestRouteKindAndBackendLogged(t *testing.T) {
 	logs.Reset()
 	cfg2 := baseConfig(defaultServer.URL)
 	cfg2.Backends["remote"] = config.Backend{URL: remote.URL, Prefix: "remote/"}
-	handler2, err := New(cfg2, logger)
+	handler2, err := New(cfg2, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +213,7 @@ func TestRouteKindAndBackendLogged(t *testing.T) {
 	cfg3 := baseConfig(defaultServer.URL)
 	cfg3.Backends["remote"] = config.Backend{URL: remote.URL}
 	cfg3.PathRoutes = map[string]string{"/comfyui": "remote"}
-	handler3, err := New(cfg3, logger)
+	handler3, err := New(cfg3, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestHTTP5xxPassthroughAndSummaryStatus(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(errorBackend.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +256,7 @@ func TestCatalogFailureLogCorrelatesWithRequestSummary(t *testing.T) {
 	defer backend.Close()
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	handler, err := New(baseConfig(backend.URL), logger)
+	handler, err := New(baseConfig(backend.URL), logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestAbortedStreamStillLogsRequestSummary(t *testing.T) {
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	handler, err := New(baseConfig(streamBackend.URL), logger)
+	handler, err := New(baseConfig(streamBackend.URL), logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,6 +382,7 @@ func TestWebSocketUpgradePreserved(t *testing.T) {
 	}))
 	defer wsBackend.Close()
 	cfg := baseConfig(wsBackend.URL)
+	cfg.RequestObservation = true
 	cfg.PathRoutes = map[string]string{"/ws": "default"}
 	handler := newHandler(t, cfg)
 	proxyServer := httptest.NewServer(handler)
@@ -422,7 +423,7 @@ func TestRedactionOmitsQueryBodyAndSecret(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(secretBackend.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -451,7 +452,7 @@ func TestProxyTransportErrorRedactsURLCredentials(t *testing.T) {
 
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	handler, err := New(baseConfig(parsed.String()), logger)
+	handler, err := New(baseConfig(parsed.String()), logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -486,7 +487,7 @@ func TestTransportErrorLogsRequestID(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&logs, nil))
 	cfg := baseConfig(transportBackend.URL)
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

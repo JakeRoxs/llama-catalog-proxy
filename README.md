@@ -128,6 +128,10 @@ backends:
 path_routes:
   /comfyui: gpu
 
+# Wait for active ComfyUI queue jobs before forwarding inference requests to
+# other backends. Requires path_routes /comfyui. Timeout returns HTTP 504.
+# comfyui_wait_timeout: 45m
+
 models_cache_ttl: 15s
 request_timeout: 10s
 # health_timeout: 2s   # inherits request_timeout when omitted
@@ -144,6 +148,84 @@ headers are also applied only when the request does not already contain that hea
 `/health` and control the readiness probe target only. Optional `ollama_show_enrichment` enables
 Ollama `POST /api/show` catalog enrichment (see the Ollama section). Header values, API keys, and
 request bodies are not logged.
+
+`request_observation: true` independently opts in to bounded metadata observation for POST
+`/v1/chat/completions` and `/v1/completions`; it is **off by default** and does not enable history.
+It adds a `request_observation` summary log keyed by generated request ID and configured backend,
+not raw model labels, request/response text, headers, or error strings. No usage options or client
+generation settings are added. Configuration reload can toggle observation.
+
+Summaries distinguish real upstream-header latency, the first successful body write, first
+recognized streamed output (including reasoning/tools), first answer text, and total handler time.
+These are proxy observations, not engine token timestamps or proof of delivery over the client
+socket. Non-streamed JSON does not establish streaming output times. Reported usage/cache/reasoning
+counts retain missing-versus-zero values; supported llama-server timing fields are separate from
+proxy wall times. No token counts or throughput are invented.
+
+Inspection supports uncompressed OpenAI-style chat/completion SSE and JSON. Upgrades, compressed
+responses, status errors, and unknown content types remain uninspected. Framing/JSON buffers are
+limited to 64 KiB; malformed/oversized metadata is ignored without changing forwarded bytes and
+marks inspection partial. SSE completion requires `[DONE]` and clean transport; a choice-level
+finish reason alone is not whole-stream completion. Length limits, incomplete streams, cancellation,
+transport failure, and aborts remain distinct. Summaries release transient body buffers at finish
+and never close the underlying response writer. Observation has CPU/allocation cost even though
+forwarding stays streaming; keep it disabled when that metadata is not needed.
+
+`request_history: true` opts in to bounded, in-memory proxy request history; it is disabled
+by default. Retention defaults are 1,000 records, 24 hours, and 10 MiB of estimated retained
+record size, with the oldest records evicted first. Records contain proxy-generated request IDs,
+configured backend IDs, HTTP/transport outcomes, and wall-clock timing, not request bodies,
+response text, URL paths or queries, credentials, or arbitrary client model labels. A successful
+HTTP response does not establish that an inference generation completed. History is local to the
+current configuration handler:
+configuration reloads and proxy restarts start a new, empty history. This setting does not
+enable the protected API by itself or start background polling of backend activity logs. The
+protected query surface also requires the dedicated `diagnostics_api_key` below.
+The inspected llama-swap activity API does not retain `X-Request-ID`, so forwarding that header
+alone cannot establish an exact upstream activity match.
+
+When **both** `request_history` and `request_observation` are enabled, eligible request records
+also retain a sanitized `proxy_observation` projection. Observation alone produces its summary
+log without a history store; history alone retains the existing HTTP/transport record without
+response inspection. The projection separates proxy wall phases from upstream-reported usage
+and engine timing, preserves unknown versus zero, and cannot create an upstream activity or model
+identity. It follows the same retention limits, reload lifetime, and frozen-page copy rules as
+the enclosing proxy record, with a separate fixed 4 KiB per-projection budget. Invalid or unfinished
+summaries are rejected; uninspected bodies cannot supply usage or output-phase evidence. A timing
+attachment is not an upstream request-ID or lifecycle join.
+
+The internal `QueryPage` API freezes filtered history for mutation-stable pagination. Cursors are
+authenticated and bound to their store, filter, and page size. Snapshot storage has a separate
+budget of 100 snapshots and 10 MiB estimated size, at most 1,000 records per snapshot, and a
+five-minute lifetime. Expired or capacity-evicted cursors return an error rather than silently
+switching to live history. The legacy offset-based `Query` API does not offer this guarantee.
+
+### Protected diagnostics query API
+
+The HTTP query API is disabled when `diagnostics_api_key` is empty. Configure a dedicated random
+bearer secret in the protected runtime config file; it is separate from all backend inference keys.
+Do not place credentials in query strings. Both the legacy `/diagnostics` route and `/diagnostics/v1/`
+namespace require `Authorization: Bearer <key>`; unauthenticated/disabled access returns 401/404.
+Responses set `Cache-Control: no-store`.
+
+Read-only GET routes include:
+
+- `/diagnostics` or `/diagnostics/v1/backends` — backend capability snapshots.
+- `/diagnostics/v1/models?backend=&model=&status=&limit=&cursor=` — typed per-model snapshots with
+  authenticated stable cursors bound to filters/page size and short-lived frozen pages.
+- `/diagnostics/v1/requests?since=&until=&backend=&status=&requestid=&limit=&cursor=` and
+  `/diagnostics/v1/requests/{request_id}` — proxy-local request history when `request_history: true`.
+  Request model filtering returns explicit `model_attribution_unsupported`; no join is inferred from
+  overlapping model names or timestamps.
+- `/diagnostics/v1/summary?since=&until=&backend=&status=` — bounded transport/generation outcome
+  counts and duration statistics with explicit sample denominators.
+
+Time queries are limited to 24 hours. Pagination is bounded; expired/evicted cursors fail explicitly
+rather than falling back to live data. Diagnostics collection runs only in response to an authorized
+query, with bounded worker concurrency, request rate, per-source timeouts, rows and body sizes. No
+inference, model-load, swap, restart, reconfigure, logs, or arbitrary upstream paths are exposed.
+Unknown, unavailable, stale, ambiguous and unsupported data is not silently reported as a successful
+empty result.
 
 `max_json_request_body_bytes` limits uncompressed JSON bodies that must be buffered for model-aware
 routing. Oversized JSON requests return `413 Request Entity Too Large`. Explicitly non-JSON,
@@ -181,6 +263,15 @@ When the GPU backend is llama-swap, the `/comfyui` example forwards the path unc
 query strings, encoded path segments, backend credentials, and WebSocket upgrades. That optional
 llama-swap configuration can define the reserved local model ID `comfyui_auto`; llama-swap then owns
 the redirect, cold-start restrictions, path stripping, and ComfyUI compatibility settings.
+
+`comfyui_wait_timeout` optionally prevents other recognized inference requests from reaching
+their backend while ComfyUI has queued or running jobs. It polls the configured `/comfyui` backend's
+`GET /comfyui/queue` and returns HTTP 504 rather than forwarding when the timeout expires. A queue
+query failure returns HTTP 502 (fail-closed). The option requires `path_routes: /comfyui` and is
+disabled when omitted or set to `0`. It does not delay ComfyUI requests or non-inference requests,
+and only coordinates submissions that pass through this proxy; direct ComfyUI submissions are
+visible while present in its queue but cannot be tracked during the brief submission/queue update
+race. Clients must retry a 504 after the render completes.
 
 ## Configuration Hot Reload
 
@@ -288,6 +379,79 @@ docker run --rm \
 ```
 
 Display image build identity with `--version`.
+
+### On-demand diagnostics
+
+Run `llama-catalog-proxy --config config/config.yaml --diagnostics` for a one-shot JSON
+report. Only backends configured with `diagnostics: llama_swap` receive metadata probes.
+With `request_history: true`, the report also includes normalized backend activity references
+and backend-host GPU samples from bounded reads of the activity and performance APIs.
+The extra fields include `backend_activity`, `backend_gpu`, `activity_gpu_associations`,
+`backend_aliases`, `activity_model_identity`, `backend_lifecycle`, and `activity_lifecycle`.
+`backend_lifecycle_events` describes adapter support; `activity_lifecycle_events` reports
+unavailable associations when that source cannot provide transition evidence.
+This does not query the running proxy's
+in-memory request history. The CLI command is separate from the protected HTTP diagnostics API
+documented above.
+
+Each invocation has a new collector-local epoch. That epoch is not a verified backend process
+generation, and activity IDs are scoped to their configured backend and local epoch. The
+inspected llama-swap API does not retain the forwarded proxy request ID, so no exact request
+join is claimed. Raw model labels, arbitrary metadata, upstream error text, and conversation
+content are omitted. No background subscription, model load, or lifecycle operation is started.
+
+Collection uses at most four concurrent metadata requests, a two-second per-request timeout,
+and a 1 MiB response limit. It reads the latest activity page (100 rows per backend by default),
+reports incomplete/truncated coverage, and retains at most 1,000 references and 10 MiB estimated
+size, with a 24-hour horizon based on source timestamps. Backend clock skew can therefore affect
+that horizon; it is not evidence of request timing or a process restart. Token metrics are not
+copied into these references. A successful HTTP status is labeled `http_success`, not completed
+generation. Explicit local epoch resets clear references and discard in-flight old-epoch results.
+
+GPU reports expose percent utilization and memory in the source API's MB units. Explicit zero
+readings remain distinct from absent or invalid measurements. Device identifiers are opaque;
+raw names, UUIDs, driver identifiers, and system statistics are not returned. Up to eight distinct
+devices per backend and 4,096 samples globally are retained, with incomplete/truncated coverage
+reported explicitly. Unavailable or unauthorized data is not reported as complete coverage.
+
+Activity/GPU associations are **approximate timestamp adjacency**, using a declared two-second
+window before and after the activity timestamp. This is not a reconstructed request span.
+Observed minimum/maximum sample spacing is reported only when at least two distinct matching
+timestamps exist; it is not the configured sampling interval or an inferred generation rate.
+Associations never cross a configured backend or collector-local epoch. Even a single matching
+activity cannot establish device ownership: the GPU is a shared backend-host resource and may
+not be the device executing the workload, especially for peer/remote routes. Clock alignment,
+upstream process generation, and model lifecycle remain unverified/unknown. No exact proxy
+request match, queue-time decomposition, or cold-start attribution is claimed.
+
+Alias identity uses only explicit `/v1/models` catalog metadata, including alias lists on canonical
+rows when separate alias entries are disabled. `catalog_resolved` means declared catalog identity,
+not verified loaded weights or an exact proxy-request match. Ambiguous mappings, alias chains,
+missing canonical targets, and incomplete catalogs do not produce a resolved identity. Returned
+model/alias references are backend-scoped opaque hashes, not raw labels or configuration text.
+
+The read-only `/running` snapshot contributes current states of non-stopped local processes.
+It does not expose transition times or a backend boot identifier. Omitted models remain unknown,
+never inferred stopped/unloaded. A uniquely resolved catalog identity may link to a current
+observation, but `activity_lifecycle` always reports `kind: current_metadata_only` and
+`state_at_activity: unknown`; it cannot establish a historical transition, restart, execution,
+queue time, or cold start. Commands, process proxy URLs, names/descriptions, and TTL values are
+excluded from the typed report.
+
+The inspected `/api/events` endpoint re-sends `modelStatus` snapshots when internal process
+events occur. It does **not** expose the internal old/new transition payload, an event timestamp,
+or a replay identifier. The adapter therefore does not subscribe to that endpoint or its log
+stream. `backend_lifecycle_events` reports `source: adapter_capability`,
+`transition_payload_not_exposed`, and `collection_performed: false`; `observed_transitions: null`
+means unavailable—not a measured zero or proof of inactivity. This describes the inspected
+adapter contract, not a live probe of a customized deployed backend.
+
+The pure lifecycle association API accepts supplied transition evidence for supported future
+sources. It matches unique catalog identities by backend, epoch, activity ID, and canonical model
+reference—not array position or time coincidence. Receipt time never replaces a missing source
+timestamp; replay IDs stay private, exact replays do not inflate counts, conflicting replays cannot
+produce approximate matches, and observed versus in-window event counts remain distinct. The
+current adapter supplies no such events and never claims historical state or an exact request join.
 
 ## Container image publishing
 

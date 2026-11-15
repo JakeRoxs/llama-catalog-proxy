@@ -436,6 +436,44 @@ func TestReadinessOnlyDefaultFailureMakesUnready(t *testing.T) {
 	}
 }
 
+func TestBackendModelsPropagatesAuthenticFetchedAt(t *testing.T) {
+	fetched := time.Date(2026, 11, 11, 12, 0, 0, 0, time.UTC)
+	bs := &backendState{
+		Backend:   Backend{ID: "default", Prefix: ""},
+		root:      map[string]any{"data": []any{}},
+		models:    []map[string]any{{"id": "model", "context_length": 8192}},
+		fetchedAt: fetched,
+	}
+	service := &Service{backends: []*backendState{bs}}
+	models := service.BackendModels()
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	if !models[0].FetchedAt.Equal(fetched) {
+		t.Fatalf("FetchedAt = %v, want %v", models[0].FetchedAt, fetched)
+	}
+	// Returned models are clones: mutating them must not alias cached data.
+	models[0].Models[0]["id"] = "mutated"
+	if bs.models[0]["id"] != "model" {
+		t.Fatal("BackendModels aliased cached catalog data")
+	}
+}
+
+func TestBackendModelsZeroFetchedAtWhenUnfetched(t *testing.T) {
+	bs := &backendState{
+		Backend: Backend{ID: "default", Prefix: ""},
+		models:  []map[string]any{{"id": "model"}},
+	}
+	service := &Service{backends: []*backendState{bs}}
+	models := service.BackendModels()
+	if len(models) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(models))
+	}
+	if !models[0].FetchedAt.IsZero() {
+		t.Fatalf("FetchedAt = %v, want zero for unfetched backend", models[0].FetchedAt)
+	}
+}
+
 func mustParseURL(t *testing.T, urlString string) *url.URL {
 	t.Helper()
 	parsed, err := url.Parse(urlString)

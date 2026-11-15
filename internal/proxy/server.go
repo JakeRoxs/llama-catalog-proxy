@@ -17,21 +17,27 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/catalog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/correlation"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/provenance"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/timing"
 )
 
 // requestIDKey is the context key type for the proxy-generated request ID.
 type requestIDKey struct{}
 
-// routeKind describes how a request was routed.
+// routeInfoKind describes how a request was routed.
 const (
-	routeKindDefault = "default"
-	routeKindModel   = "model_prefix"
-	routeKindPath    = "path"
-	routeKindLocal   = "local"
+	routeInfoKindDefault = "default"
+	routeInfoKindModel   = "model_prefix"
+	routeInfoKindPath    = "path"
+	routeInfoKindLocal   = "local"
 )
 
 // routeInfo captures how a request was routed for logging and correlation.
@@ -59,16 +65,73 @@ func requestIDFromContext(ctx context.Context) string {
 	return requestID
 }
 
+// observationKey is the context key type for the per-request timing observer.
+type observationKey struct{}
+
+// observerFromContext returns the per-request timing observer stored in the
+// request context, or nil when observation is not enabled for this request.
+func observerFromContext(ctx context.Context) *timing.Observer {
+	if o, _ := ctx.Value(observationKey{}).(*timing.Observer); o != nil {
+		return o
+	}
+	return nil
+}
+
+// isGenerationPath reports whether the request is a POST to a known inference
+// generation path that is eligible for per-request observation.
+func isGenerationPath(request *http.Request) bool {
+	if request.Method != http.MethodPost {
+		return false
+	}
+	if request.Header.Get("Upgrade") != "" {
+		return false
+	}
+	for _, token := range strings.Split(request.Header.Get("Connection"), ",") {
+		if strings.EqualFold(strings.TrimSpace(token), "upgrade") {
+			return false
+		}
+	}
+	path := request.URL.Path
+	return path == "/v1/chat/completions" || path == "/v1/completions"
+}
+
 type Handler struct {
-	catalog        *catalog.Service
-	proxies        map[string]*httputil.ReverseProxy
-	defaultBackend string
-	modelRoutes    []route
-	pathRoutes     []route
-	logger         *slog.Logger
-	healthTimeout  time.Duration
-	catalogTimeout time.Duration
-	maxJSONBody    int64
+	catalog            *catalog.Service
+	proxies            map[string]*httputil.ReverseProxy
+	defaultBackend     string
+	modelRoutes        []route
+	pathRoutes         []route
+	logger             *slog.Logger
+	healthTimeout      time.Duration
+	catalogTimeout     time.Duration
+	comfyUIWaitTimeout time.Duration
+	comfyUIBackendID   string
+	comfyUIJobs        *comfyUIJobTracker
+	maxJSONBody        int64
+	diagnostics        *diagnostics.Service
+	modelDiagnostics   *modeldiagnostics.Service
+	provenance         *provenance.Service
+	history            *correlation.Correlator
+	// requestObservation enables per-request inference timing observation.
+	requestObservation bool
+	// Diagnostics API auth boundary. A nonempty diagnosticsAPIKey protects
+	// /diagnostics and /diagnostics/v1 requests. Collectors and the
+	// concurrency/rate limiter are constructed only when a key is configured;
+	// construction issues no requests.
+	diagnosticsAPIKey   string
+	diagnosticSlots     chan struct{}
+	diagnosticRateMu    sync.Mutex
+	lastDiagnosticQuery time.Time
+	activityCollector   *correlation.ActivityCollector
+	aliasCollector      *correlation.AliasCollector
+	gpuCollector        *correlation.GPUCollector
+	lifecycleCollector  *correlation.LifecycleCollector
+	// modelSnapshotPages is the bounded per-handler immutable snapshot pager
+	// for the /diagnostics/v1/models endpoint. It is constructed only when the
+	// diagnostics API key is configured.
+	modelSnapshotPages *modelSnapshotPageStore
+	// pagerMu guards the model snapshot pager.
+	pagerMu sync.Mutex
 }
 
 type route struct {
@@ -76,13 +139,19 @@ type route struct {
 	prefix    string
 }
 
-func New(cfg config.Config, logger *slog.Logger) (http.Handler, error) {
+func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate configuration: %w", err)
 	}
 	// Health and catalog operations apply their own context budgets below. A
 	// client-wide timeout would accidentally cap the longer of those budgets.
 	client := &http.Client{}
+	var comfyJobs *comfyUIJobTracker
+	if cfg.ComfyUIWaitTimeout > 0 {
+		if backendID, exists := cfg.PathRoutes["/comfyui"]; exists {
+			comfyJobs = newComfyUIJobTracker(cfg.Backends[backendID], client)
+		}
+	}
 	backends := make([]catalog.Backend, 0, len(cfg.Backends))
 	routes := make([]route, 0, len(cfg.Backends)-1)
 	pathRoutes := make([]route, 0, len(cfg.PathRoutes))
@@ -122,6 +191,15 @@ func New(cfg config.Config, logger *slog.Logger) (http.Handler, error) {
 					if requestID := requestIDFromContext(response.Request.Context()); requestID != "" {
 						response.Header.Set("X-Request-ID", requestID)
 					}
+					// Observe upstream headers at the actual received headers,
+					// never inferred from the response writer. Skip 101
+					// switching protocol upgrades.
+					if obs := observerFromContext(response.Request.Context()); obs != nil && response.StatusCode != http.StatusSwitchingProtocols {
+						obs.ObserveUpstream(response.StatusCode, response.Header)
+					}
+				}
+				if backendID == cfg.PathRoutes["/comfyui"] && comfyJobs != nil && isComfyPromptRequest(response.Request) {
+					comfyJobs.promptResponse(response.StatusCode)
 				}
 				return nil
 			},
@@ -145,17 +223,44 @@ func New(cfg config.Config, logger *slog.Logger) (http.Handler, error) {
 		return pathRoutes[i].prefix < pathRoutes[j].prefix
 	})
 	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
-	return &Handler{
-		catalog:        catalogService,
-		proxies:        proxies,
-		defaultBackend: cfg.DefaultBackend,
-		modelRoutes:    routes,
-		pathRoutes:     pathRoutes,
-		logger:         logger,
-		healthTimeout:  cfg.HealthTimeout,
-		catalogTimeout: cfg.CatalogTimeout,
-		maxJSONBody:    cfg.MaxJSONBody,
-	}, nil
+	h := &Handler{
+		catalog:            catalogService,
+		proxies:            proxies,
+		defaultBackend:     cfg.DefaultBackend,
+		modelRoutes:        routes,
+		pathRoutes:         pathRoutes,
+		logger:             logger,
+		healthTimeout:      cfg.HealthTimeout,
+		catalogTimeout:     cfg.CatalogTimeout,
+		comfyUIWaitTimeout: cfg.ComfyUIWaitTimeout,
+		comfyUIBackendID:   cfg.PathRoutes["/comfyui"],
+		comfyUIJobs:        comfyJobs,
+		maxJSONBody:        cfg.MaxJSONBody,
+		diagnostics:        diagnostics,
+		modelDiagnostics:   modelDiagnostics,
+		provenance:         provenance,
+		// The legacy timing prototype argument is accepted for signature
+		// compatibility but is ignored: per-request observers are created in
+		// ServeHTTP only when request_observation is enabled.
+		history:            historyStore(cfg),
+		requestObservation: cfg.RequestObservation,
+	}
+
+	// Diagnostics API auth boundary: collectors and the concurrency/rate
+	// limiter are constructed only when a dedicated API key is configured.
+	// Construction copies configuration and issues no requests.
+	if cfg.DiagnosticsAPIKey != "" {
+		h.diagnosticsAPIKey = cfg.DiagnosticsAPIKey
+		h.diagnosticSlots = make(chan struct{}, 2)
+		h.modelDiagnostics = modeldiagnostics.New()
+		h.modelSnapshotPages = newModelSnapshotPageStore()
+		h.activityCollector = correlation.NewActivityCollector(cfg.Backends)
+		h.aliasCollector = correlation.NewAliasCollector(cfg.Backends)
+		h.gpuCollector = correlation.NewGPUCollector(cfg.Backends)
+		h.lifecycleCollector = correlation.NewLifecycleCollector(cfg.Backends)
+	}
+
+	return h, nil
 }
 
 func safeErrorDetail(err error) string {
@@ -180,6 +285,13 @@ func proxyErrorHandler(logger *slog.Logger, backendID string) func(http.Response
 				"method", request.Method, "path", request.URL.Path, "error", errorDetail)
 		}
 		writeJSONError(logger, writer, http.StatusBadGateway, "backend unavailable")
+		// Mark transport failure with a fixed sentinel so the observation
+		// records the transport outcome without storing the raw error. This is
+		// done after the error response is written so the wrapped writer chain
+		// is not disturbed.
+		if obs := observerFromContext(request.Context()); obs != nil {
+			obs.Finish(errTransportFailure)
+		}
 	}
 }
 
@@ -205,10 +317,73 @@ func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestID := generateRequestID()
 	ctx := context.WithValue(request.Context(), requestIDKey{}, requestID)
 	request = request.WithContext(ctx)
-	w := &responseWriter{ResponseWriter: writer}
+
+	var wrapped http.ResponseWriter = writer
+	var obs *timing.Observer
+	// Per-request observation is created only for POST known generation paths
+	// when the request_observation config flag is enabled. Disabled requests
+	// do not allocate a parser, wrap the writer, or store context state.
+	if h.requestObservation && isGenerationPath(request) {
+		obs = timing.New(writer)
+		wrapped = obs
+		ctx = context.WithValue(ctx, observationKey{}, obs)
+		request = request.WithContext(ctx)
+	}
+	w := &responseWriter{ResponseWriter: wrapped}
 	w.Header().Set("X-Request-ID", requestID)
 	info := routeInfo{}
-	defer func() { h.logRequest(request, w, start, info) }()
+
+	// Record one transport outcome, including aborted streams, without swallowing
+	// the original panic or treating a partial HTTP response as a generation success.
+	defer func() {
+		panicValue := recover()
+		h.logRequest(request, w, start, info)
+		if h.history != nil && info.backendID != "" {
+			status := classifyOutcome(ctx, w.status)
+			if panicValue != nil {
+				status = statusAborted
+			}
+			h.history.RegisterRequest(requestID, info.backendID, "", start)
+			h.history.CompleteRequest(requestID, time.Since(start), status)
+		}
+		if obs != nil {
+			// Finish the observation. Any panic (including non-error values)
+			// must be reported as timing.ErrAborted; the original panic value
+			// is rethrown verbatim after Finish. Context cancellation takes
+			// precedence over a nil error; the ErrorHandler may have already
+			// finished the observation with a fixed transport-failure sentinel.
+			if panicValue != nil {
+				obs.Finish(timing.ErrAborted)
+			} else if ctx.Err() != nil {
+				obs.Finish(ctx.Err())
+			} else {
+				obs.Finish(nil)
+			}
+			if h.requestObservation {
+				summary := obs.Summary()
+				h.logger.Info("request_observation",
+					"request_id", requestID,
+					"backend_id", info.backendID,
+					"summary", summary,
+				)
+				// After final Finish + Summary, attach the observation to the
+				// correlation record. This is fail-open: if the record was
+				// evicted or never registered, the request completes normally
+				// without the observation being retained. The raw summary is
+				// never stored in the metadata map.
+				if h.history != nil && info.backendID != "" {
+					if !h.history.AttachObservation(requestID, summary) {
+						// fail-open: no new logs with raw data, no availability effect
+					}
+				}
+			}
+			obs.Close()
+		}
+		if panicValue != nil {
+			panic(panicValue)
+		}
+	}()
+
 	h.serve(w, request, &info)
 }
 
@@ -216,43 +391,119 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 	if request.Method == http.MethodGet {
 		switch request.URL.Path {
 		case "/v1/models":
-			*info = routeInfo{kind: routeKindLocal}
+			*info = routeInfo{kind: routeInfoKindLocal}
 			h.serveModels(writer, request)
 			return
 		case "/health":
-			*info = routeInfo{kind: routeKindLocal}
+			*info = routeInfo{kind: routeInfoKindLocal}
 			writeJSON(h.logger, writer, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		case "/ready":
-			*info = routeInfo{kind: routeKindLocal}
+			*info = routeInfo{kind: routeInfoKindLocal}
 			h.serveReady(writer, request)
 			return
 		}
 	}
+	// Reserve the diagnostics API boundary before path routing so no upstream
+	// path passthrough occurs for unknown diagnostics subpaths. All
+	// /diagnostics and /diagnostics/v1 requests are authenticated and handled
+	// by serveDiagnosticsAPI (owned by the diagnostics API worker).
+	if request.URL.Path == "/diagnostics" || strings.HasPrefix(request.URL.Path, "/diagnostics/v1") {
+		*info = routeInfo{kind: routeInfoKindLocal}
+		h.serveDiagnosticsAPI(writer, request, info)
+		return
+	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
-		*info = routeInfo{backendID: backendID, kind: routeKindPath}
+		*info = routeInfo{backendID: backendID, kind: routeInfoKindPath}
+		if backendID == h.comfyUIBackendID && isComfyPromptRequest(request) && h.comfyUIJobs != nil {
+			ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
+			err := h.comfyUIJobs.beginSubmission(ctx)
+			cancel()
+			if err != nil {
+				h.writeComfyUIWaitError(writer, request, err)
+				return
+			}
+			defer h.comfyUIJobs.endSubmission()
+		} else if isInferenceRequest(request) {
+			if err := h.waitForComfyUI(request); err != nil {
+				h.writeComfyUIWaitError(writer, request, err)
+				return
+			}
+		}
 		h.proxies[backendID].ServeHTTP(writer, request)
 		return
 	}
 	backendID, modelMatched, err := h.routeRequest(request)
 	if err != nil {
 		if errors.Is(err, errJSONBodyTooLarge) {
-			*info = routeInfo{backendID: h.defaultBackend, kind: routeKindDefault}
+			*info = routeInfo{backendID: h.defaultBackend, kind: routeInfoKindDefault}
 			h.logger.Warn("JSON request body rejected", "request_id", requestIDFromContext(request.Context()), "content_length", request.ContentLength, "limit", h.maxJSONBody)
 			writeJSONError(h.logger, writer, http.StatusRequestEntityTooLarge, "JSON request body exceeds the configured limit")
 			return
 		}
-		*info = routeInfo{backendID: h.defaultBackend, kind: routeKindDefault}
+		*info = routeInfo{backendID: h.defaultBackend, kind: routeInfoKindDefault}
 		h.logger.Warn("request body inspection failed", "request_id", requestIDFromContext(request.Context()), "error", err)
 		writeJSONError(h.logger, writer, http.StatusBadRequest, "request body could not be read")
 		return
 	}
-	kind := routeKindDefault
+	kind := routeInfoKindDefault
 	if modelMatched {
-		kind = routeKindModel
+		kind = routeInfoKindModel
 	}
 	*info = routeInfo{backendID: backendID, kind: kind}
+	reservedInference := false
+	if isInferenceRequest(request) {
+		if h.comfyUIWaitTimeout > 0 && h.comfyUIJobs != nil {
+			ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
+			err := h.comfyUIJobs.reserveInference(ctx)
+			cancel()
+			if err != nil {
+				h.writeComfyUIWaitError(writer, request, err)
+				return
+			}
+			reservedInference = true
+		}
+	}
+	if reservedInference {
+		defer h.comfyUIJobs.endInference()
+	}
 	h.proxies[backendID].ServeHTTP(writer, request)
+}
+
+func isInferenceRequest(request *http.Request) bool {
+	if request.Method != http.MethodPost {
+		return false
+	}
+	switch request.URL.Path {
+	case "/v1/chat/completions", "/v1/completions", "/v1/responses", "/v1/embeddings",
+		"/rerank", "/reranking", "/v1/rerank", "/v1/reranking",
+		"/v1/images/generations", "/v1/images/edits", "/sdapi/v1/txt2img", "/sdapi/v1/img2img",
+		"/v1/audio/speech", "/v1/audio/transcriptions":
+		return true
+	default:
+		return false
+	}
+}
+
+func (h *Handler) waitForComfyUI(request *http.Request) error {
+	if h.comfyUIWaitTimeout <= 0 || h.comfyUIJobs == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
+	defer cancel()
+	return h.comfyUIJobs.wait(ctx)
+}
+
+func (h *Handler) writeComfyUIWaitError(writer http.ResponseWriter, request *http.Request, err error) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		writeJSONError(h.logger, writer, http.StatusGatewayTimeout, "timed out waiting for ComfyUI jobs to finish")
+		return
+	}
+	if errors.Is(err, context.Canceled) {
+		return
+	}
+	h.logger.Warn("ComfyUI job wait failed", "request_id", requestIDFromContext(request.Context()), "error", err)
+	writeJSONError(h.logger, writer, http.StatusBadGateway, "could not confirm ComfyUI job completion")
 }
 
 func (h *Handler) routeRequest(request *http.Request) (string, bool, error) {
@@ -302,6 +553,10 @@ func (h *Handler) routeRequest(request *http.Request) (string, bool, error) {
 }
 
 var errJSONBodyTooLarge = errors.New("JSON request body exceeds configured limit")
+
+// errTransportFailure is a fixed sentinel used to mark transport failures in
+// observations without leaking raw error details into summaries or logs.
+var errTransportFailure = errors.New("proxy transport failure")
 
 func (h *Handler) routeModel(model string) (string, string) {
 	for _, candidate := range h.modelRoutes {
@@ -353,7 +608,7 @@ type responseWriter struct {
 }
 
 func (w *responseWriter) WriteHeader(status int) {
-	if w.status == 0 {
+	if w.status == 0 && (status >= 200 || status == http.StatusSwitchingProtocols) {
 		w.status = status
 	}
 	w.ResponseWriter.WriteHeader(status)
@@ -430,6 +685,48 @@ func copyResponseHeaders(destination, source http.Header) {
 
 func writeJSONError(logger *slog.Logger, writer http.ResponseWriter, status int, message string) {
 	writeJSON(logger, writer, status, map[string]any{"error": map[string]string{"message": message, "type": "proxy_error"}})
+}
+
+// Finite transport outcome statuses recorded by the proxy-only history store.
+const (
+	statusHTTPSuccess     = "http_success"
+	statusHTTPClientError = "http_client_error"
+	statusHTTPServerError = "http_server_error"
+	statusHTTPOther       = "http_other"
+	statusClientCanceled  = "client_canceled"
+	statusAborted         = "aborted"
+	statusTransportError  = "transport_error"
+)
+
+// historyStore returns a Correlator when request_history is enabled, or nil
+// when disabled. It is constructed per Handler and reset on config reload.
+func historyStore(cfg config.Config) *correlation.Correlator {
+	if !cfg.RequestHistory {
+		return nil
+	}
+	return correlation.New()
+}
+
+// classifyOutcome maps a response status to a finite transport outcome.
+// Client cancellation takes precedence, then unset status (transport error),
+// then HTTP status classes. Generation completion is never inferred.
+func classifyOutcome(ctx context.Context, status int) string {
+	if ctx.Err() != nil {
+		return statusClientCanceled
+	}
+	if status == 0 {
+		return statusTransportError
+	}
+	switch {
+	case status >= 200 && status < 300:
+		return statusHTTPSuccess
+	case status >= 400 && status < 500:
+		return statusHTTPClientError
+	case status >= 500:
+		return statusHTTPServerError
+	default:
+		return statusHTTPOther
+	}
 }
 
 func writeJSON(logger *slog.Logger, writer http.ResponseWriter, status int, value any) {

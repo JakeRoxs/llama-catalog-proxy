@@ -59,6 +59,17 @@ type backendState struct {
 	lastErr   error
 }
 
+// BackendModel describes the models served by one backend, using cached
+// catalog data only. The local model IDs have no prefix; the public ID is
+// prefix + local ID. FetchedAt is the time the backend catalog was last
+// successfully fetched; it is zero when no successful fetch has occurred.
+type BackendModel struct {
+	BackendID string
+	Prefix    string
+	Models    []map[string]any
+	FetchedAt time.Time
+}
+
 type catalogResult struct {
 	backend *backendState
 	root    map[string]any
@@ -134,6 +145,30 @@ func (s *Service) Models(ctx context.Context, requestHeader http.Header) (Respon
 	removeRepresentationHeaders(header)
 	header.Set("Content-Type", "application/json")
 	return Response{StatusCode: http.StatusOK, Header: header, Body: body}, nil
+}
+
+// BackendModels returns the cached catalog models for each backend. No
+// upstream requests are made; stale or unavailable backends return their last
+// known models or an empty list. The returned models are clones so callers
+// cannot alias cached data.
+func (s *Service) BackendModels() []BackendModel {
+	result := make([]BackendModel, 0, len(s.backends))
+	for _, bs := range s.backends {
+		bs.mu.Lock()
+		models := make([]map[string]any, 0, len(bs.models))
+		for _, m := range bs.models {
+			models = append(models, cloneObject(m))
+		}
+		fetchedAt := bs.fetchedAt
+		bs.mu.Unlock()
+		result = append(result, BackendModel{
+			BackendID: bs.ID,
+			Prefix:    bs.Prefix,
+			Models:    models,
+			FetchedAt: fetchedAt,
+		})
+	}
+	return result
 }
 
 func (s *Service) BackendStatuses(ctx context.Context) (map[string]string, error) {

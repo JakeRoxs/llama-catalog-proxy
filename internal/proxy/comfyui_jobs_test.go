@@ -1,0 +1,233 @@
+package proxy
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+)
+
+func TestComfyUIJobTrackerWaitsUntilQueueIsEmpty(t *testing.T) {
+	var busy atomic.Bool
+	busy.Store(true)
+	queue := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		if busy.Load() {
+			_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
+	}))
+	defer queue.Close()
+
+	tracker := &comfyUIJobTracker{url: queue.URL, client: queue.Client()}
+	tracker.promptResponse(http.StatusOK)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- tracker.wait(context.Background())
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("wait returned while ComfyUI was busy: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	busy.Store(false)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("wait returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not return after ComfyUI queue emptied")
+	}
+}
+
+func TestComfyUIJobTrackerHonorsContextDeadline(t *testing.T) {
+	queue := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))
+	}))
+	defer queue.Close()
+
+	tracker := &comfyUIJobTracker{url: queue.URL, client: queue.Client()}
+	tracker.promptResponse(http.StatusOK)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err := tracker.wait(ctx); err != context.DeadlineExceeded {
+		t.Fatalf("wait error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestCompetingInferenceTimesOutWithoutForwarding(t *testing.T) {
+	comfy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/comfyui/queue" {
+			t.Errorf("unexpected ComfyUI path %q", request.URL.Path)
+		}
+		_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))
+	}))
+	defer comfy.Close()
+
+	var inferenceCalled atomic.Bool
+	inference := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		inferenceCalled.Store(true)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer inference.Close()
+
+	cfg := baseConfig(inference.URL)
+	cfg.Backends["comfy"] = config.Backend{URL: comfy.URL}
+	cfg.PathRoutes = map[string]string{"/comfyui": "comfy"}
+	cfg.ComfyUIWaitTimeout = 30 * time.Millisecond
+	handler := newHandler(t, cfg)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %d, want 504; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if inferenceCalled.Load() {
+		t.Fatal("inference request reached backend after wait timeout")
+	}
+}
+
+func TestComfyUIPromptTrackingHoldsCompetingInference(t *testing.T) {
+	var busy atomic.Bool
+	var inferenceCalled atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/comfyui/queue":
+			if busy.Load() {
+				_, _ = writer.Write([]byte(`{"queue_running":[["job-1"]],"queue_pending":[]}`))
+			} else {
+				_, _ = writer.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
+			}
+		default:
+			if request.URL.Path == "/prompt" || request.URL.Path == "/comfyui/prompt" {
+				busy.Store(true)
+				writer.Header().Set("Content-Type", "application/json")
+				_, _ = writer.Write([]byte(`{"prompt_id":"job-1"}`))
+			} else {
+				inferenceCalled.Store(true)
+				writer.WriteHeader(http.StatusNoContent)
+			}
+		}
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.ComfyUIWaitTimeout = 3 * time.Second
+	handler := newHandler(t, cfg)
+	if tracker, ok := handler.(*Handler); ok {
+		tracker.comfyUIJobs = newComfyUIJobTracker(config.Backend{URL: backend.URL}, backend.Client())
+	}
+
+	promptResponse := httptest.NewRecorder()
+	handler.ServeHTTP(promptResponse, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(`{"prompt":{}}`)))
+	if promptResponse.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d", promptResponse.Code)
+	}
+	requestDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
+		requestDone <- recorder
+	}()
+	select {
+	case <-requestDone:
+		t.Fatal("competing inference did not wait for ComfyUI queue")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if inferenceCalled.Load() {
+		t.Fatal("competing inference reached backend while ComfyUI job was active")
+	}
+
+	busy.Store(false)
+	select {
+	case recorder := <-requestDone:
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("inference status = %d", recorder.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("competing inference did not proceed after ComfyUI completed")
+	}
+}
+
+func TestComfyUIPromptWaitsForActiveInference(t *testing.T) {
+	started := make(chan struct{})
+	finishInference := make(chan struct{})
+	var promptCalled atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/v1/chat/completions" {
+			close(started)
+			<-finishInference
+			writer.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.URL.Path == "/comfyui/prompt" {
+			promptCalled.Store(true)
+			writer.WriteHeader(http.StatusOK)
+			return
+		}
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.ComfyUIWaitTimeout = time.Second
+	handler := newHandler(t, cfg)
+	tracker := handler.(*Handler)
+	tracker.comfyUIJobs = newComfyUIJobTracker(config.Backend{URL: backend.URL}, backend.Client())
+
+	inferenceDone := make(chan struct{})
+	go func() {
+		defer close(inferenceDone)
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
+	}()
+	<-started
+
+	promptDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(`{}`)))
+		promptDone <- recorder
+	}()
+	select {
+	case <-promptDone:
+		t.Fatal("ComfyUI prompt did not wait for active inference")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if promptCalled.Load() {
+		t.Fatal("ComfyUI prompt reached backend during active inference")
+	}
+
+	close(finishInference)
+	<-inferenceDone
+	select {
+	case recorder := <-promptDone:
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("prompt status = %d", recorder.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ComfyUI prompt did not proceed after inference completed")
+	}
+}
+
+func TestComfyUIQueueFailureFailsClosedAfterTrackedPrompt(t *testing.T) {
+	tracker := &comfyUIJobTracker{
+		url:    "http://127.0.0.1:1/comfyui/queue",
+		client: &http.Client{Timeout: 20 * time.Millisecond},
+	}
+	tracker.promptResponse(http.StatusOK)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := tracker.wait(ctx); err == nil {
+		t.Fatal("wait succeeded without confirming completion of a tracked prompt")
+	}
+}

@@ -25,7 +25,7 @@ func TestReloaderAppliesNewConfigWithoutRestart(t *testing.T) {
 
 	path := configPath(t)
 	writeReloaderConfig(t, path, serverA.URL)
-	reloader, initial, err := NewReloader(path, discardLogger(), nil)
+	reloader, initial, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +51,7 @@ func TestReloaderKeepsPreviousConfigWhenNewConfigIsInvalid(t *testing.T) {
 
 	path := configPath(t)
 	writeReloaderConfig(t, path, serverA.URL)
-	reloader, _, err := NewReloader(path, discardLogger(), nil)
+	reloader, _, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestReloaderInvokesReloadCallbackWithNewConfig(t *testing.T) {
 	reloaded := make(chan config.Config, 1)
 	reloader, _, err := NewReloader(path, discardLogger(), func(cfg config.Config) {
 		reloaded <- cfg
-	})
+	}, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ func TestReloaderDetectsSameSizeChangeWithUnchangedModTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reloader, _, err := NewReloader(path, discardLogger(), nil)
+	reloader, _, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,6 +146,117 @@ func TestReloaderDetectsSameSizeChangeWithUnchangedModTime(t *testing.T) {
 	}
 	if err := waitForUpstream(t, reloader, "B"); err != nil {
 		t.Fatalf("same-metadata config change was not detected: %v", err)
+	}
+}
+
+func TestReloaderReloadResetsHistoryStore(t *testing.T) {
+	serverA := markerServer("A")
+	defer serverA.Close()
+	serverB := markerServer("B")
+	defer serverB.Close()
+
+	path := configPath(t)
+	writeReloaderConfig(t, path, serverA.URL)
+	reloader, _, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloader.SetWatchInterval(20 * time.Millisecond)
+	reloader.Start()
+
+	if got := probeUpstream(t, reloader); got != "A" {
+		t.Fatalf("initial upstream = %q, want A", got)
+	}
+
+	// Initial handler should have a nil history store (request_history disabled by default).
+	initialHandler := (*reloader.handler.Load()).(*Handler)
+	if initialHandler.history != nil {
+		t.Fatal("initial history store should be nil when request_history is disabled")
+	}
+
+	// Change config to enable request_history and point at B.
+	contents := "default_backend: default\nrequest_history: true\nbackends:\n  default:\n    url: " + serverB.URL + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForUpstream(t, reloader, "B"); err != nil {
+		t.Fatalf("config change was not applied: %v", err)
+	}
+
+	// Reloaded handler should have a non-nil, fresh history store (new pointer
+	// after reload). It may contain records from post-reload probe traffic.
+	reloadedHandler := (*reloader.handler.Load()).(*Handler)
+	if reloadedHandler.history == nil {
+		t.Fatal("reloaded history store should be non-nil when request_history is enabled")
+	}
+	if reloadedHandler.history == initialHandler.history {
+		t.Fatal("reloaded history store should be a new store after reload")
+	}
+}
+
+func TestReloaderReloadReconstructsDiagnosticsCollectors(t *testing.T) {
+	serverA := markerServer("A")
+	defer serverA.Close()
+	serverB := markerServer("B")
+	defer serverB.Close()
+
+	path := configPath(t)
+	// Start with diagnostics API disabled (no key).
+	writeReloaderConfig(t, path, serverA.URL)
+	reloader, _, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloader.SetWatchInterval(20 * time.Millisecond)
+	reloader.Start()
+
+	if got := probeUpstream(t, reloader); got != "A" {
+		t.Fatalf("initial upstream = %q, want A", got)
+	}
+
+	// Initial handler should have nil collectors (diagnostics API disabled).
+	initialHandler := (*reloader.handler.Load()).(*Handler)
+	if initialHandler.activityCollector != nil || initialHandler.aliasCollector != nil ||
+		initialHandler.gpuCollector != nil || initialHandler.lifecycleCollector != nil {
+		t.Fatal("collectors should be nil when diagnostics API is disabled")
+	}
+
+	// Enable diagnostics API with a dedicated key and point at B.
+	contents := "default_backend: default\ndiagnostics_api_key: test-key\nbackends:\n  default:\n    url: " + serverB.URL + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForUpstream(t, reloader, "B"); err != nil {
+		t.Fatalf("config change was not applied: %v", err)
+	}
+
+	// Reloaded handler should have non-nil, fresh collectors.
+	reloadedHandler := (*reloader.handler.Load()).(*Handler)
+	if reloadedHandler.activityCollector == nil || reloadedHandler.aliasCollector == nil ||
+		reloadedHandler.gpuCollector == nil || reloadedHandler.lifecycleCollector == nil {
+		t.Fatal("collectors should be non-nil when diagnostics API is enabled")
+	}
+	if reloadedHandler.activityCollector == initialHandler.activityCollector {
+		t.Fatal("activity collector should be a new store after reload")
+	}
+	if reloadedHandler.aliasCollector == initialHandler.aliasCollector {
+		t.Fatal("alias collector should be a new store after reload")
+	}
+
+	// Disable diagnostics API again and point back at A.
+	contents = "default_backend: default\nbackends:\n  default:\n    url: " + serverA.URL + "\n"
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := waitForUpstream(t, reloader, "A"); err != nil {
+		t.Fatalf("config change was not applied: %v", err)
+	}
+
+	// Collectors should be nil again after reload.
+	disabledHandler := (*reloader.handler.Load()).(*Handler)
+	if disabledHandler.activityCollector != nil || disabledHandler.aliasCollector != nil ||
+		disabledHandler.gpuCollector != nil || disabledHandler.lifecycleCollector != nil {
+		t.Fatal("collectors should be nil when diagnostics API is disabled after reload")
 	}
 }
 
@@ -221,7 +332,7 @@ func TestReloaderSuppressesIdenticalReloadFailures(t *testing.T) {
 	path := configPath(t)
 	writeReloaderConfig(t, path, serverA.URL)
 	logger, logs := captureLogger()
-	reloader, _, err := NewReloader(path, logger, nil)
+	reloader, _, err := NewReloader(path, logger, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +382,7 @@ func TestReloaderLogsRecoveryAndChangedFailure(t *testing.T) {
 	path := configPath(t)
 	writeReloaderConfig(t, path, serverA.URL)
 	logger, logs := captureLogger()
-	reloader, _, err := NewReloader(path, logger, nil)
+	reloader, _, err := NewReloader(path, logger, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +16,10 @@ import (
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/correlation"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/provenance"
 	proxyserver "github.com/JakeRoxs/llama-catalog-proxy/internal/proxy"
 )
 
@@ -68,6 +74,7 @@ func main() {
 	healthcheckURL := flag.String("healthcheck", "", "check an HTTP health endpoint and exit")
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")
 	showVersion := flag.Bool("version", false, "print version information and exit")
+	showDiagnostics := flag.Bool("diagnostics", false, "report opt-in backend diagnostics and, when request history is enabled, normalized backend activity as JSON and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("llama-catalog-proxy %s (commit %s, built %s)\n", version, commit, buildDate)
@@ -88,18 +95,42 @@ func main() {
 		fmt.Println("configuration valid")
 		return
 	}
+	if *showDiagnostics {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := runDiagnostics(ctx, *configPath, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "diagnostics failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	level := int32(slog.LevelInfo)
 	levelHandler := &dynamicLevelHandler{inner: slog.NewJSONHandler(os.Stdout, nil), level: &level}
 	logger := slog.New(levelHandler)
 
 	var initialListen string
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		logger.Error("configuration failed", "error", err)
+		os.Exit(1)
+	}
+	diagnosticsService, err := diagnostics.New(cfg.Backends)
+	if err != nil {
+		logger.Error("diagnostics service failed", "error", err)
+		os.Exit(1)
+	}
+	modelDiagnosticsService := modeldiagnostics.New()
+	provenanceService := provenance.New()
+	// The legacy timing prototype argument is accepted for signature
+	// compatibility but is ignored: per-request observers are created in
+	// ServeHTTP only when request_observation is enabled.
 	reloader, cfg, err := proxyserver.NewReloader(*configPath, logger, func(newCfg config.Config) {
 		levelHandler.setLevel(parseLogLevel(newCfg.LogLevel))
 		if newCfg.Listen != initialListen {
 			logger.Warn("listen address change requires a restart", "requested", newCfg.Listen, "current", initialListen)
 		}
-	})
+	}, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
 	if err != nil {
 		logger.Error("configuration failed", "error", err)
 		os.Exit(1)
@@ -172,4 +203,127 @@ func runHealthcheck(target string) error {
 		return fmt.Errorf("healthcheck returned HTTP %d", response.StatusCode)
 	}
 	return nil
+}
+
+func runDiagnostics(ctx context.Context, path string, writer io.Writer) error {
+	cfg, err := config.Load(path)
+	if err != nil {
+		return err
+	}
+	service, err := diagnostics.New(cfg.Backends)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	snapshots, err := service.All(ctx)
+	if err != nil {
+		return err
+	}
+	report := map[string]any{"backends": snapshots}
+	if cfg.RequestHistory {
+		// The collector gates collection itself: only backends with
+		// Diagnostics == "llama_swap" are collected; all others make no
+		// requests and are reported as disabled. No server is constructed
+		// and no background collection is started here.
+		collector := correlation.NewActivityCollector(cfg.Backends)
+		if _, err := collector.Refresh(ctx); err != nil {
+			return err
+		}
+		report["backend_activity"] = collector.Stats()
+
+		// The same collector epoch scopes alias and lifecycle collection
+		// so that activity, alias, and lifecycle observations share one
+		// collection scope. Only GET /v1/models (source cache) and GET
+		// /running (proven finite read-only) are requested; no public
+		// route, background collection, SSE, or lifecycle action is
+		// invoked.
+		epoch := collector.Epoch()
+
+		// Describe lifecycle event support: pure, no HTTP, no goroutines.
+		// Reports what the adapter contract exposes (or does not expose)
+		// rather than probing a deployed backend. The unsupported adapter
+		// contract explains the absence of transition events; we do not
+		// pretend 0 events were collected.
+		support, err := correlation.DescribeLifecycleEventSupport(cfg.Backends, epoch)
+		if err != nil {
+			return err
+		}
+		report["backend_lifecycle_events"] = support
+
+		// Alias collection: GET /v1/models only, source-cache read-only.
+		aliasCollector := correlation.NewAliasCollector(cfg.Backends)
+		aliasReport, err := aliasCollector.Collect(ctx, epoch)
+		if err != nil {
+			return err
+		}
+		report["backend_aliases"] = aliasReport
+
+		// Resolve activity identities against the alias catalog.
+		identities, err := correlation.ResolveActivityAliases(collector.Snapshot(), aliasReport)
+		if err != nil {
+			return err
+		}
+		report["activity_model_identity"] = identities
+
+		// Associate activity records with lifecycle transition events.
+		// The source adapter (llama-swap) does not expose transition events,
+		// so the event list is empty and associations correctly report
+		// no_matching_event (for resolved identities) or identity_unresolved
+		// (for unresolved identities). This is expected: the unsupported
+		// adapter contract explains the absence; we do not pretend 0 events
+		// were collected.
+		activityLifecycleEvents, err := correlation.AssociateLifecycleEvents(collector.Snapshot(), identities, nil, correlation.DefaultAssociationWindow())
+		if err != nil {
+			return err
+		}
+		report["activity_lifecycle_events"] = activityLifecycleEvents
+
+		// Lifecycle collection: GET /running only, proven finite
+		// read-only.
+		lifecycleCollector := correlation.NewLifecycleCollector(cfg.Backends)
+		lifecycleReport, err := lifecycleCollector.Collect(ctx, epoch)
+		if err != nil {
+			return err
+		}
+		report["backend_lifecycle"] = lifecycleReport
+
+		// Link the current lifecycle snapshot to the resolved activity
+		// identities.
+		observations, err := correlation.LinkCurrentLifecycle(identities, lifecycleReport)
+		if err != nil {
+			return err
+		}
+		report["activity_lifecycle"] = observations
+
+		// GPU collection runs after activity collection and shares the
+		// same collector epoch so activity and GPU samples can be
+		// associated within a single collection scope. No public endpoint,
+		// background collection, inference, or model request is made here.
+		gpuCollector := correlation.NewGPUCollector(cfg.Backends)
+		gpuReport, err := gpuCollector.Collect(ctx, epoch)
+		if err != nil {
+			return err
+		}
+		report["backend_gpu"] = gpuReport
+
+		// Associate activity records with GPU device samples within the
+		// default time window. Samples are converted to normalized
+		// timed device samples; raw upstream metadata is never copied.
+		timed := make([]correlation.TimedDeviceSample, 0, len(gpuReport.Samples))
+		for _, s := range gpuReport.Samples {
+			timed = append(timed, correlation.TimedDeviceSample{
+				BackendID: s.BackendID,
+				Epoch:     s.Epoch,
+				DeviceID:  s.DeviceID,
+				Timestamp: s.Timestamp,
+			})
+		}
+		associations, err := correlation.AssociateActivities(collector.Snapshot(), timed, correlation.DefaultAssociationWindow())
+		if err != nil {
+			return err
+		}
+		report["activity_gpu_associations"] = associations
+	}
+	return json.NewEncoder(writer).Encode(report)
 }

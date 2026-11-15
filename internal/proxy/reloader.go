@@ -9,6 +9,10 @@ import (
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/provenance"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/timing"
 )
 
 const defaultWatchInterval = 2 * time.Second
@@ -26,12 +30,12 @@ type Reloader struct {
 	lastReloadError error
 }
 
-func NewReloader(path string, logger *slog.Logger, onReload func(config.Config)) (*Reloader, config.Config, error) {
+func NewReloader(path string, logger *slog.Logger, onReload func(config.Config), diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (*Reloader, config.Config, error) {
 	cfg, err := config.Load(path)
 	if err != nil {
 		return nil, config.Config{}, err
 	}
-	handler, err := New(cfg, logger)
+	handler, err := New(cfg, logger, diagnostics, modelDiagnostics, provenance, timing)
 	if err != nil {
 		return nil, config.Config{}, err
 	}
@@ -95,7 +99,16 @@ func (r *Reloader) reload() error {
 	if err != nil {
 		return err
 	}
-	handler, err := New(cfg, r.logger)
+	diagnosticsService, err := diagnostics.New(cfg.Backends)
+	if err != nil {
+		return err
+	}
+	modelDiagnosticsService := modeldiagnostics.New()
+	provenanceService := provenance.New()
+	// The legacy timing prototype argument is accepted for signature
+	// compatibility but is ignored: per-request observers are created in
+	// ServeHTTP only when request_observation is enabled.
+	handler, err := New(cfg, r.logger, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
 	if err != nil {
 		return err
 	}

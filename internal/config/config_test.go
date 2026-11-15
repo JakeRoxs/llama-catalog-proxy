@@ -104,6 +104,49 @@ path_routes:
 	}
 }
 
+func TestLoadSupportsComfyUIWaitTimeout(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default: {url: http://default-host:9292}
+  gpu: {url: http://gpu-host:9292}
+path_routes:
+  /comfyui: gpu
+comfyui_wait_timeout: 45m
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ComfyUIWaitTimeout != 45*time.Minute {
+		t.Fatalf("comfyui_wait_timeout = %s", cfg.ComfyUIWaitTimeout)
+	}
+}
+
+func TestLoadRejectsComfyUIWaitTimeoutWithoutRoute(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+default_backend: default
+backends: {default: {url: http://default-host:9292}}
+comfyui_wait_timeout: 1m
+`))
+	if err == nil || !strings.Contains(err.Error(), "requires path_routes /comfyui") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestLoadRejectsNegativeComfyUIWaitTimeout(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default: {url: http://default-host:9292}
+  gpu: {url: http://gpu-host:9292}
+path_routes: {/comfyui: gpu}
+comfyui_wait_timeout: -1s
+`))
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestLoadRejectsInvalidPathRoutes(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -313,6 +356,122 @@ func TestLoadRejectsInvalidLogLevel(t *testing.T) {
 	_, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\nlog_level: noisy\n"))
 	if err == nil {
 		t.Fatal("Load() accepted an invalid log_level")
+	}
+}
+
+func TestLoadSupportsRequestHistory(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default:
+    url: http://default-host:9292
+request_history: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RequestHistory {
+		t.Fatal("request_history was not loaded")
+	}
+}
+
+func TestLoadRequestHistoryDefaultsToFalse(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default:
+    url: http://default-host:9292
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RequestHistory {
+		t.Fatal("request_history should default to false")
+	}
+}
+
+func TestLoadSupportsRequestObservation(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default:
+    url: http://default-host:9292
+request_observation: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.RequestObservation {
+		t.Fatal("request_observation was not loaded")
+	}
+}
+
+func TestLoadRequestObservationDefaultsToFalse(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+default_backend: default
+backends:
+  default:
+    url: http://default-host:9292
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RequestObservation {
+		t.Fatal("request_observation should default to false")
+	}
+}
+
+func TestLoadRejectsInvalidDiagnosticsAPIKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr string
+	}{
+		{name: "too long", key: strings.Repeat("a", 4097), wantErr: "diagnostics_api_key"},
+		{name: "tab", key: "key\t", wantErr: "diagnostics_api_key"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			contents := "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ndiagnostics_api_key: \"" + test.key + "\"\n"
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateDiagnosticsAPIKeyRejectsControlCharacters(t *testing.T) {
+	for _, key := range []string{"key\r", "key\n", "key\r\n", "key\x00", "key\x01", "key\x1f", "key\x7f"} {
+		if err := validateDiagnosticsAPIKey(key); err == nil {
+			t.Fatalf("validateDiagnosticsAPIKey(%q) accepted key with control character", key)
+		}
+	}
+	if err := validateDiagnosticsAPIKey("valid-key"); err != nil {
+		t.Fatalf("validateDiagnosticsAPIKey(%q) rejected valid key: %v", "valid-key", err)
+	}
+	if err := validateDiagnosticsAPIKey(""); err != nil {
+		t.Fatalf("validateDiagnosticsAPIKey(empty) rejected empty key: %v", err)
+	}
+}
+
+func TestLoadAcceptsValidDiagnosticsAPIKey(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ndiagnostics_api_key: valid-key-123\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DiagnosticsAPIKey != "valid-key-123" {
+		t.Fatalf("diagnostics_api_key = %q", cfg.DiagnosticsAPIKey)
+	}
+}
+
+func TestDiagnosticsAPIKeyDefaultsToEmpty(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DiagnosticsAPIKey != "" {
+		t.Fatalf("diagnostics_api_key should default to empty, got %q", cfg.DiagnosticsAPIKey)
 	}
 }
 
