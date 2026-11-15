@@ -142,8 +142,12 @@ func (t *comfyUIJobTracker) wait(ctx context.Context) error {
 		t.mu.Unlock()
 
 		t.mu.Lock()
-		wasActive := t.active
+		tracked := t.active
 		t.mu.Unlock()
+		if !tracked {
+			return nil
+		}
+		wasActive := tracked
 		busy, err := t.queueBusy(ctx)
 		if err != nil {
 			t.mu.Lock()

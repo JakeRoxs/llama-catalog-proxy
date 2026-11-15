@@ -48,6 +48,23 @@ func TestComfyUIJobTrackerWaitsUntilQueueIsEmpty(t *testing.T) {
 	}
 }
 
+func TestComfyUIJobTrackerDoesNotProbeWhenNoTrackedJob(t *testing.T) {
+	var probeCalled atomic.Bool
+	queue := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		probeCalled.Store(true)
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer queue.Close()
+
+	tracker := &comfyUIJobTracker{url: queue.URL, client: queue.Client()}
+	if err := tracker.wait(context.Background()); err != nil {
+		t.Fatalf("wait returned error without a tracked ComfyUI job: %v", err)
+	}
+	if probeCalled.Load() {
+		t.Fatal("queue was probed while no ComfyUI job was tracked")
+	}
+}
+
 func TestComfyUIJobTrackerHonorsContextDeadline(t *testing.T) {
 	queue := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))
@@ -84,6 +101,7 @@ func TestCompetingInferenceTimesOutWithoutForwarding(t *testing.T) {
 	cfg.PathRoutes = map[string]string{"/comfyui": "comfy"}
 	cfg.ComfyUIWaitTimeout = 30 * time.Millisecond
 	handler := newHandler(t, cfg)
+	handler.(*Handler).comfyUIJobs.promptResponse(http.StatusOK)
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
 	if recorder.Code != http.StatusGatewayTimeout {
@@ -124,6 +142,7 @@ func TestComfyUIPromptTrackingHoldsCompetingInference(t *testing.T) {
 	handler := newHandler(t, cfg)
 	if tracker, ok := handler.(*Handler); ok {
 		tracker.comfyUIJobs = newComfyUIJobTracker(config.Backend{URL: backend.URL}, backend.Client())
+		tracker.comfyUIJobs.promptResponse(http.StatusOK)
 	}
 
 	promptResponse := httptest.NewRecorder()
