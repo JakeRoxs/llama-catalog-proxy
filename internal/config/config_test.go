@@ -456,11 +456,11 @@ func TestValidateDiagnosticsAPIKeyRejectsControlCharacters(t *testing.T) {
 }
 
 func TestLoadAcceptsValidDiagnosticsAPIKey(t *testing.T) {
-	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ndiagnostics_api_key: valid-key-123\n"))
+	cfg, err := Load(writeConfig(t, "default_backend: default\nbackends: {default: {url: http://default-host:9292}}\ndiagnostics_api_key: test-diagnostics-api-key-placeholder\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DiagnosticsAPIKey != "valid-key-123" {
+	if cfg.DiagnosticsAPIKey != "test-diagnostics-api-key-placeholder" {
 		t.Fatalf("diagnostics_api_key = %q", cfg.DiagnosticsAPIKey)
 	}
 }
