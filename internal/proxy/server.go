@@ -38,6 +38,8 @@ const (
 	routeInfoKindModel   = "model_prefix"
 	routeInfoKindPath    = "path"
 	routeInfoKindLocal   = "local"
+	comfyUIPathPrefix    = "/comfyui"
+	requestIDHeader      = "X-Request-ID"
 )
 
 // routeInfo captures how a request was routed for logging and correlation.
@@ -106,6 +108,8 @@ type Handler struct {
 	catalogTimeout     time.Duration
 	comfyUIWaitTimeout time.Duration
 	comfyUIBackendID   string
+	comfyUIEndpoint    string
+	backendEndpoints   map[string]string
 	comfyUIJobs        *comfyUIJobTracker
 	maxJSONBody        int64
 	diagnostics        *diagnostics.Service
@@ -139,102 +143,145 @@ type route struct {
 	prefix    string
 }
 
+type handlerDependencies struct {
+	catalog          *catalog.Service
+	proxies          map[string]*httputil.ReverseProxy
+	modelRoutes      []route
+	pathRoutes       []route
+	backendEndpoints map[string]string
+	comfyUIJobs      *comfyUIJobTracker
+}
+
 func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (http.Handler, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate configuration: %w", err)
 	}
+	client := &http.Client{}
+	dependencies, err := buildHandlerDependencies(cfg, logger, client)
+	if err != nil {
+		return nil, err
+	}
+	h := assembleHandler(cfg, logger, diagnostics, modelDiagnostics, provenance, dependencies)
+	return h, nil
+}
+
+func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *http.Client) (handlerDependencies, error) {
 	// Health and catalog operations apply their own context budgets below. A
 	// client-wide timeout would accidentally cap the longer of those budgets.
-	client := &http.Client{}
 	var comfyJobs *comfyUIJobTracker
 	if cfg.ComfyUIWaitTimeout > 0 {
-		if backendID, exists := cfg.PathRoutes["/comfyui"]; exists {
+		if backendID, exists := cfg.PathRoutes[comfyUIPathPrefix]; exists {
 			comfyJobs = newComfyUIJobTracker(cfg.Backends[backendID], client)
 		}
 	}
+	backends, routes, proxies, backendEndpoints, err := buildBackendRoutes(cfg, logger, comfyJobs)
+	if err != nil {
+		return handlerDependencies{}, err
+	}
+	pathRoutes := buildPathRoutes(cfg.PathRoutes)
+	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
+	return handlerDependencies{
+		catalog: catalogService, proxies: proxies, modelRoutes: routes, pathRoutes: pathRoutes,
+		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs,
+	}, nil
+}
+
+func buildBackendRoutes(cfg config.Config, logger *slog.Logger, comfyJobs *comfyUIJobTracker) ([]catalog.Backend, []route, map[string]*httputil.ReverseProxy, map[string]string, error) {
 	backends := make([]catalog.Backend, 0, len(cfg.Backends))
 	routes := make([]route, 0, len(cfg.Backends)-1)
-	pathRoutes := make([]route, 0, len(cfg.PathRoutes))
 	proxies := make(map[string]*httputil.ReverseProxy, len(cfg.Backends))
+	backendEndpoints := make(map[string]string, len(cfg.Backends))
 	for id, backend := range cfg.Backends {
-		target, err := url.Parse(backend.URL)
+		backendInfo, prefixRoute, endpoint, reverseProxy, err := buildBackend(cfg, logger, id, backend, comfyJobs)
 		if err != nil {
-			return nil, fmt.Errorf("parse backend %q URL: %w", id, err)
+			return nil, nil, nil, nil, err
 		}
-		headers := make(http.Header, len(backend.Headers))
-		for name, value := range backend.Headers {
-			headers.Set(name, value)
+		backends = append(backends, backendInfo)
+		if prefixRoute != nil {
+			routes = append(routes, *prefixRoute)
 		}
-		catalogBackend := catalog.Backend{
-			ID: id, URL: target, Prefix: backend.Prefix, HealthPath: backend.HealthPath,
-			ShowEnrichment: backend.OllamaShowEnrichment,
-			APIKey:         backend.APIKey, Headers: headers, Default: id == cfg.DefaultBackend,
-		}
-		backends = append(backends, catalogBackend)
-		if backend.Prefix != "" {
-			routes = append(routes, route{backendID: id, prefix: backend.Prefix})
-		}
+		backendEndpoints[id] = endpoint
+		proxies[id] = reverseProxy
+	}
+	sortRoutes(routes)
+	return backends, routes, proxies, backendEndpoints, nil
+}
 
-		backendID := id
-		backendConfig := backend
-		proxies[id] = &httputil.ReverseProxy{
-			Rewrite: func(request *httputil.ProxyRequest) {
-				request.SetURL(target)
-				request.SetXForwarded()
-				applyBackendHeaders(request.Out.Header, backendConfig)
-				if requestID := requestIDFromContext(request.Out.Context()); requestID != "" {
-					request.Out.Header.Set("X-Request-ID", requestID)
-				}
-			},
-			ModifyResponse: func(response *http.Response) error {
-				if response.Request != nil {
-					if requestID := requestIDFromContext(response.Request.Context()); requestID != "" {
-						response.Header.Set("X-Request-ID", requestID)
-					}
-					// Observe upstream headers at the actual received headers,
-					// never inferred from the response writer. Skip 101
-					// switching protocol upgrades.
-					if obs := observerFromContext(response.Request.Context()); obs != nil && response.StatusCode != http.StatusSwitchingProtocols {
-						obs.ObserveUpstream(response.StatusCode, response.Header)
-					}
-				}
-				if backendID == cfg.PathRoutes["/comfyui"] && comfyJobs != nil && isComfyPromptRequest(response.Request) {
-					comfyJobs.promptResponse(response.StatusCode)
-				}
-				return nil
-			},
-			FlushInterval: -1,
-			ErrorHandler:  proxyErrorHandler(logger, backendID),
+func buildPathRoutes(configured map[string]string) []route {
+	routes := make([]route, 0, len(configured))
+	for prefix, backendID := range configured {
+		routes = append(routes, route{backendID: backendID, prefix: prefix})
+	}
+	sortPathRoutes(routes)
+	return routes
+}
+
+func buildBackend(cfg config.Config, logger *slog.Logger, id string, backend config.Backend, comfyJobs *comfyUIJobTracker) (catalog.Backend, *route, string, *httputil.ReverseProxy, error) {
+	target, err := url.Parse(backend.URL)
+	if err != nil {
+		return catalog.Backend{}, nil, "", nil, fmt.Errorf("parse backend %q URL: %w", id, err)
+	}
+	headers := make(http.Header, len(backend.Headers))
+	for name, value := range backend.Headers {
+		headers.Set(name, value)
+	}
+	catalogBackend := catalog.Backend{
+		ID: id, URL: target, Prefix: backend.Prefix, HealthPath: backend.HealthPath,
+		ShowEnrichment: backend.OllamaShowEnrichment,
+		APIKey:         backend.APIKey, Headers: headers, Default: id == cfg.DefaultBackend,
+	}
+	var prefixRoute *route
+	if backend.Prefix != "" {
+		prefixRoute = &route{backendID: id, prefix: backend.Prefix}
+	}
+	return catalogBackend, prefixRoute, backendEndpointKey(target), newReverseProxy(cfg, logger, id, backend, target, comfyJobs), nil
+}
+
+func newReverseProxy(cfg config.Config, logger *slog.Logger, backendID string, backend config.Backend, target *url.URL, comfyJobs *comfyUIJobTracker) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(request *httputil.ProxyRequest) {
+			request.SetURL(target)
+			request.SetXForwarded()
+			applyBackendHeaders(request.Out.Header, backend)
+			setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
+		},
+		ModifyResponse: func(response *http.Response) error {
+			modifyProxiedResponse(response, backendID, cfg.PathRoutes[comfyUIPathPrefix], comfyJobs)
+			return nil
+		},
+		FlushInterval: -1,
+		ErrorHandler:  proxyErrorHandler(logger, backendID),
+	}
+}
+
+func modifyProxiedResponse(response *http.Response, backendID, comfyBackendID string, comfyJobs *comfyUIJobTracker) {
+	if response.Request != nil {
+		setRequestIDHeader(response.Header, requestIDFromContext(response.Request.Context()))
+		observer := observerFromContext(response.Request.Context())
+		if observer != nil && response.StatusCode != http.StatusSwitchingProtocols {
+			observer.ObserveUpstream(response.StatusCode, response.Header)
 		}
 	}
-	for prefix, backendID := range cfg.PathRoutes {
-		pathRoutes = append(pathRoutes, route{backendID: backendID, prefix: prefix})
+	if backendID == comfyBackendID && comfyJobs != nil && isComfyPromptRequest(response.Request) {
+		comfyJobs.promptResponse(response.StatusCode)
 	}
-	sort.Slice(routes, func(i, j int) bool {
-		if len(routes[i].prefix) != len(routes[j].prefix) {
-			return len(routes[i].prefix) > len(routes[j].prefix)
-		}
-		return routes[i].backendID < routes[j].backendID
-	})
-	sort.Slice(pathRoutes, func(i, j int) bool {
-		if len(pathRoutes[i].prefix) != len(pathRoutes[j].prefix) {
-			return len(pathRoutes[i].prefix) > len(pathRoutes[j].prefix)
-		}
-		return pathRoutes[i].prefix < pathRoutes[j].prefix
-	})
-	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
+}
+
+func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, dependencies handlerDependencies) *Handler {
 	h := &Handler{
-		catalog:            catalogService,
-		proxies:            proxies,
+		catalog:            dependencies.catalog,
+		proxies:            dependencies.proxies,
 		defaultBackend:     cfg.DefaultBackend,
-		modelRoutes:        routes,
-		pathRoutes:         pathRoutes,
+		modelRoutes:        dependencies.modelRoutes,
+		pathRoutes:         dependencies.pathRoutes,
 		logger:             logger,
 		healthTimeout:      cfg.HealthTimeout,
 		catalogTimeout:     cfg.CatalogTimeout,
 		comfyUIWaitTimeout: cfg.ComfyUIWaitTimeout,
-		comfyUIBackendID:   cfg.PathRoutes["/comfyui"],
-		comfyUIJobs:        comfyJobs,
+		comfyUIBackendID:   cfg.PathRoutes[comfyUIPathPrefix],
+		comfyUIEndpoint:    dependencies.backendEndpoints[cfg.PathRoutes[comfyUIPathPrefix]],
+		backendEndpoints:   dependencies.backendEndpoints,
+		comfyUIJobs:        dependencies.comfyUIJobs,
 		maxJSONBody:        cfg.MaxJSONBody,
 		diagnostics:        diagnostics,
 		modelDiagnostics:   modelDiagnostics,
@@ -260,7 +307,31 @@ func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Servic
 		h.lifecycleCollector = correlation.NewLifecycleCollector(cfg.Backends)
 	}
 
-	return h, nil
+	return h
+}
+
+func sortRoutes(routes []route) {
+	sort.Slice(routes, func(i, j int) bool {
+		if len(routes[i].prefix) != len(routes[j].prefix) {
+			return len(routes[i].prefix) > len(routes[j].prefix)
+		}
+		return routes[i].backendID < routes[j].backendID
+	})
+}
+
+func sortPathRoutes(routes []route) {
+	sort.Slice(routes, func(i, j int) bool {
+		if len(routes[i].prefix) != len(routes[j].prefix) {
+			return len(routes[i].prefix) > len(routes[j].prefix)
+		}
+		return routes[i].prefix < routes[j].prefix
+	})
+}
+
+func setRequestIDHeader(header http.Header, requestID string) {
+	if requestID != "" {
+		header.Set(requestIDHeader, requestID)
+	}
 }
 
 func safeErrorDetail(err error) string {
@@ -312,138 +383,172 @@ func setAPIKeyIfMissing(header http.Header, apiKey string) {
 	header.Set("X-Api-Key", apiKey)
 }
 
+type requestExecution struct {
+	request   *http.Request
+	response  *responseWriter
+	start     time.Time
+	info      routeInfo
+	ctx       context.Context
+	observer  *timing.Observer
+	requestID string
+}
+
 func (h *Handler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	execution := h.prepareRequest(writer, request)
+	defer h.finishRequest(&execution)
+	h.serve(execution.response, execution.request, &execution.info)
+}
+
+func (h *Handler) prepareRequest(writer http.ResponseWriter, request *http.Request) requestExecution {
 	start := time.Now()
 	requestID := generateRequestID()
 	ctx := context.WithValue(request.Context(), requestIDKey{}, requestID)
 	request = request.WithContext(ctx)
 
 	var wrapped http.ResponseWriter = writer
-	var obs *timing.Observer
+	var observer *timing.Observer
 	// Per-request observation is created only for POST known generation paths
 	// when the request_observation config flag is enabled. Disabled requests
 	// do not allocate a parser, wrap the writer, or store context state.
 	if h.requestObservation && isGenerationPath(request) {
-		obs = timing.New(writer)
-		wrapped = obs
-		ctx = context.WithValue(ctx, observationKey{}, obs)
+		observer = timing.New(writer)
+		wrapped = observer
+		ctx = context.WithValue(ctx, observationKey{}, observer)
 		request = request.WithContext(ctx)
 	}
-	w := &responseWriter{ResponseWriter: wrapped}
-	w.Header().Set("X-Request-ID", requestID)
-	info := routeInfo{}
+	response := &responseWriter{ResponseWriter: wrapped}
+	response.Header().Set(requestIDHeader, requestID)
+	return requestExecution{
+		request: request, response: response, start: start, ctx: ctx,
+		observer: observer, requestID: requestID,
+	}
+}
 
+func (h *Handler) finishRequest(execution *requestExecution) {
 	// Record one transport outcome, including aborted streams, without swallowing
 	// the original panic or treating a partial HTTP response as a generation success.
-	defer func() {
-		panicValue := recover()
-		h.logRequest(request, w, start, info)
-		if h.history != nil && info.backendID != "" {
-			status := classifyOutcome(ctx, w.status)
-			if panicValue != nil {
-				status = statusAborted
-			}
-			h.history.RegisterRequest(requestID, info.backendID, "", start)
-			h.history.CompleteRequest(requestID, time.Since(start), status)
-		}
-		if obs != nil {
-			// Finish the observation. Any panic (including non-error values)
-			// must be reported as timing.ErrAborted; the original panic value
-			// is rethrown verbatim after Finish. Context cancellation takes
-			// precedence over a nil error; the ErrorHandler may have already
-			// finished the observation with a fixed transport-failure sentinel.
-			if panicValue != nil {
-				obs.Finish(timing.ErrAborted)
-			} else if ctx.Err() != nil {
-				obs.Finish(ctx.Err())
-			} else {
-				obs.Finish(nil)
-			}
-			if h.requestObservation {
-				summary := obs.Summary()
-				h.logger.Info("request_observation",
-					"request_id", requestID,
-					"backend_id", info.backendID,
-					"summary", summary,
-				)
-				// After final Finish + Summary, attach the observation to the
-				// correlation record. This is fail-open: if the record was
-				// evicted or never registered, the request completes normally
-				// without the observation being retained. The raw summary is
-				// never stored in the metadata map.
-				if h.history != nil && info.backendID != "" {
-					if !h.history.AttachObservation(requestID, summary) {
-						// fail-open: no new logs with raw data, no availability effect
-					}
-				}
-			}
-			obs.Close()
-		}
-		if panicValue != nil {
-			panic(panicValue)
-		}
-	}()
+	panicValue := recover()
+	h.logRequest(execution.request, execution.response, execution.start, execution.info)
+	h.finishRequestHistory(execution, panicValue)
+	h.finishRequestObservation(execution, panicValue)
+	if panicValue != nil {
+		panic(panicValue)
+	}
+}
 
-	h.serve(w, request, &info)
+func (h *Handler) finishRequestHistory(execution *requestExecution, panicValue any) {
+	if h.history == nil || execution.info.backendID == "" {
+		return
+	}
+	status := classifyOutcome(execution.ctx, execution.response.status)
+	if panicValue != nil {
+		status = statusAborted
+	}
+	h.history.RegisterRequest(execution.requestID, execution.info.backendID, "", execution.start)
+	h.history.CompleteRequest(execution.requestID, time.Since(execution.start), status)
+}
+
+func (h *Handler) finishRequestObservation(execution *requestExecution, panicValue any) {
+	observer := execution.observer
+	if observer == nil {
+		return
+	}
+	if panicValue != nil {
+		observer.Finish(timing.ErrAborted)
+	} else if execution.ctx.Err() != nil {
+		observer.Finish(execution.ctx.Err())
+	} else {
+		observer.Finish(nil)
+	}
+	if h.requestObservation {
+		summary := observer.Summary()
+		h.logger.Info("request_observation",
+			"request_id", execution.requestID,
+			"backend_id", execution.info.backendID,
+			"summary", summary,
+		)
+		if h.history != nil && execution.info.backendID != "" {
+			h.history.AttachObservation(execution.requestID, summary)
+		}
+	}
+	observer.Close()
 }
 
 func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info *routeInfo) {
-	if request.Method == http.MethodGet {
-		switch request.URL.Path {
-		case "/v1/models":
-			*info = routeInfo{kind: routeInfoKindLocal}
-			h.serveModels(writer, request)
-			return
-		case "/health":
-			*info = routeInfo{kind: routeInfoKindLocal}
-			writeJSON(h.logger, writer, http.StatusOK, map[string]string{"status": "ok"})
-			return
-		case "/ready":
-			*info = routeInfo{kind: routeInfoKindLocal}
-			h.serveReady(writer, request)
-			return
-		}
+	if h.serveLocalGET(writer, request, info) {
+		return
 	}
-	// Reserve the diagnostics API boundary before path routing so no upstream
-	// path passthrough occurs for unknown diagnostics subpaths. All
-	// /diagnostics and /diagnostics/v1 requests are authenticated and handled
-	// by serveDiagnosticsAPI (owned by the diagnostics API worker).
-	if request.URL.Path == "/diagnostics" || strings.HasPrefix(request.URL.Path, "/diagnostics/v1") {
+	if isDiagnosticsPath(request.URL.Path) {
 		*info = routeInfo{kind: routeInfoKindLocal}
 		h.serveDiagnosticsAPI(writer, request, info)
 		return
 	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
-		*info = routeInfo{backendID: backendID, kind: routeInfoKindPath}
-		if backendID == h.comfyUIBackendID && isComfyPromptRequest(request) && h.comfyUIJobs != nil {
-			ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
-			err := h.comfyUIJobs.beginSubmission(ctx)
-			cancel()
-			if err != nil {
-				h.writeComfyUIWaitError(writer, request, err)
-				return
-			}
-			defer h.comfyUIJobs.endSubmission()
-		} else if isInferenceRequest(request) {
-			if err := h.waitForComfyUI(request); err != nil {
-				h.writeComfyUIWaitError(writer, request, err)
-				return
-			}
-		}
-		h.proxies[backendID].ServeHTTP(writer, request)
+		h.servePathRoute(writer, request, info, backendID)
 		return
 	}
+	h.serveModelRoute(writer, request, info)
+}
+
+func (h *Handler) serveLocalGET(writer http.ResponseWriter, request *http.Request, info *routeInfo) bool {
+	if request.Method != http.MethodGet {
+		return false
+	}
+	switch request.URL.Path {
+	case "/v1/models":
+		*info = routeInfo{kind: routeInfoKindLocal}
+		h.serveModels(writer, request)
+	case "/health":
+		*info = routeInfo{kind: routeInfoKindLocal}
+		writeJSON(h.logger, writer, http.StatusOK, map[string]string{"status": "ok"})
+	case "/ready":
+		*info = routeInfo{kind: routeInfoKindLocal}
+		h.serveReady(writer, request)
+	default:
+		return false
+	}
+	return true
+}
+
+func isDiagnosticsPath(path string) bool {
+	return path == "/diagnostics" || strings.HasPrefix(path, "/diagnostics/v1")
+}
+
+func (h *Handler) servePathRoute(writer http.ResponseWriter, request *http.Request, info *routeInfo, backendID string) {
+	*info = routeInfo{backendID: backendID, kind: routeInfoKindPath}
+	cleanup, allowed := h.waitForPathRequest(writer, request, backendID)
+	if !allowed {
+		return
+	}
+	if cleanup != nil {
+		defer cleanup()
+	}
+	h.proxies[backendID].ServeHTTP(writer, request)
+}
+
+func (h *Handler) waitForPathRequest(writer http.ResponseWriter, request *http.Request, backendID string) (func(), bool) {
+	if backendID == h.comfyUIBackendID && isComfyPromptRequest(request) && h.comfyUIJobs != nil {
+		ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
+		err := h.comfyUIJobs.beginSubmission(ctx)
+		cancel()
+		if err != nil {
+			h.writeComfyUIWaitError(writer, request, err)
+			return nil, false
+		}
+		return h.comfyUIJobs.endSubmission, true
+	} else if isInferenceRequest(request) && h.sharesComfyUIBackend(backendID) {
+		if err := h.waitForComfyUI(request); err != nil {
+			h.writeComfyUIWaitError(writer, request, err)
+			return nil, false
+		}
+	}
+	return nil, true
+}
+
+func (h *Handler) serveModelRoute(writer http.ResponseWriter, request *http.Request, info *routeInfo) {
 	backendID, modelMatched, err := h.routeRequest(request)
 	if err != nil {
-		if errors.Is(err, errJSONBodyTooLarge) {
-			*info = routeInfo{backendID: h.defaultBackend, kind: routeInfoKindDefault}
-			h.logger.Warn("JSON request body rejected", "request_id", requestIDFromContext(request.Context()), "content_length", request.ContentLength, "limit", h.maxJSONBody)
-			writeJSONError(h.logger, writer, http.StatusRequestEntityTooLarge, "JSON request body exceeds the configured limit")
-			return
-		}
-		*info = routeInfo{backendID: h.defaultBackend, kind: routeInfoKindDefault}
-		h.logger.Warn("request body inspection failed", "request_id", requestIDFromContext(request.Context()), "error", err)
-		writeJSONError(h.logger, writer, http.StatusBadRequest, "request body could not be read")
+		h.writeRouteRequestError(writer, request, info, err)
 		return
 	}
 	kind := routeInfoKindDefault
@@ -451,23 +556,38 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 		kind = routeInfoKindModel
 	}
 	*info = routeInfo{backendID: backendID, kind: kind}
-	reservedInference := false
-	if isInferenceRequest(request) {
-		if h.comfyUIWaitTimeout > 0 && h.comfyUIJobs != nil {
-			ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
-			err := h.comfyUIJobs.reserveInference(ctx)
-			cancel()
-			if err != nil {
-				h.writeComfyUIWaitError(writer, request, err)
-				return
-			}
-			reservedInference = true
-		}
+	if !h.reserveModelRequest(writer, request, backendID) {
+		return
 	}
-	if reservedInference {
+	if isInferenceRequest(request) && h.comfyUIWaitTimeout > 0 && h.comfyUIJobs != nil && h.sharesComfyUIBackend(backendID) {
 		defer h.comfyUIJobs.endInference()
 	}
 	h.proxies[backendID].ServeHTTP(writer, request)
+}
+
+func (h *Handler) writeRouteRequestError(writer http.ResponseWriter, request *http.Request, info *routeInfo, err error) {
+	*info = routeInfo{backendID: h.defaultBackend, kind: routeInfoKindDefault}
+	if errors.Is(err, errJSONBodyTooLarge) {
+		h.logger.Warn("JSON request body rejected", "request_id", requestIDFromContext(request.Context()), "content_length", request.ContentLength, "limit", h.maxJSONBody)
+		writeJSONError(h.logger, writer, http.StatusRequestEntityTooLarge, "JSON request body exceeds the configured limit")
+		return
+	}
+	h.logger.Warn("request body inspection failed", "request_id", requestIDFromContext(request.Context()), "error", err)
+	writeJSONError(h.logger, writer, http.StatusBadRequest, "request body could not be read")
+}
+
+func (h *Handler) reserveModelRequest(writer http.ResponseWriter, request *http.Request, backendID string) bool {
+	if !isInferenceRequest(request) || h.comfyUIWaitTimeout <= 0 || h.comfyUIJobs == nil || !h.sharesComfyUIBackend(backendID) {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
+	err := h.comfyUIJobs.reserveInference(ctx)
+	cancel()
+	if err != nil {
+		h.writeComfyUIWaitError(writer, request, err)
+		return false
+	}
+	return true
 }
 
 func isInferenceRequest(request *http.Request) bool {
@@ -492,6 +612,20 @@ func (h *Handler) waitForComfyUI(request *http.Request) error {
 	ctx, cancel := context.WithTimeout(request.Context(), h.comfyUIWaitTimeout)
 	defer cancel()
 	return h.comfyUIJobs.wait(ctx)
+}
+
+func (h *Handler) sharesComfyUIBackend(backendID string) bool {
+	return h.comfyUIEndpoint != "" && h.backendEndpoints[backendID] == h.comfyUIEndpoint
+}
+
+func backendEndpointKey(target *url.URL) string {
+	endpoint := *target
+	endpoint.Scheme = strings.ToLower(endpoint.Scheme)
+	endpoint.Host = strings.ToLower(endpoint.Host)
+	endpoint.Path = strings.TrimSuffix(endpoint.Path, "/")
+	endpoint.RawPath = ""
+	endpoint.User = nil
+	return endpoint.String()
 }
 
 func (h *Handler) writeComfyUIWaitError(writer http.ResponseWriter, request *http.Request, err error) {

@@ -97,18 +97,101 @@ func TestCompetingInferenceTimesOutWithoutForwarding(t *testing.T) {
 	defer inference.Close()
 
 	cfg := baseConfig(inference.URL)
-	cfg.Backends["comfy"] = config.Backend{URL: comfy.URL}
+	cfg.Backends["default"] = config.Backend{URL: inference.URL, Prefix: "local/"}
+	cfg.Backends["comfy"] = config.Backend{URL: comfy.URL, Prefix: "comfy/"}
 	cfg.PathRoutes = map[string]string{"/comfyui": "comfy"}
+	cfg.DefaultBackend = "default"
 	cfg.ComfyUIWaitTimeout = 30 * time.Millisecond
 	handler := newHandler(t, cfg)
 	handler.(*Handler).comfyUIJobs.promptResponse(http.StatusOK)
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"comfy/model"}`)))
 	if recorder.Code != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504; body=%s", recorder.Code, recorder.Body.String())
 	}
 	if inferenceCalled.Load() {
 		t.Fatal("inference request reached backend after wait timeout")
+	}
+}
+
+func TestComfyUIBarrierDoesNotBlockDifferentBackend(t *testing.T) {
+	comfy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer comfy.Close()
+
+	var udmsCalled atomic.Bool
+	udms := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		udmsCalled.Store(true)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer udms.Close()
+
+	cfg := baseConfig(udms.URL)
+	cfg.Backends["default"] = config.Backend{URL: udms.URL}
+	cfg.Backends["bigboi"] = config.Backend{URL: comfy.URL, Prefix: "bigboi/"}
+	cfg.PathRoutes = map[string]string{"/comfyui": "bigboi"}
+	cfg.ComfyUIWaitTimeout = time.Second
+	handler := newHandler(t, cfg)
+	handler.(*Handler).comfyUIJobs.promptResponse(http.StatusOK)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"udms/model"}`)))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("UDMS request status = %d, want 204", recorder.Code)
+	}
+	if !udmsCalled.Load() {
+		t.Fatal("UDMS request was not forwarded while Bigboi ComfyUI was active")
+	}
+}
+
+func TestComfyUIBarrierBlocksInferenceOnSameBackend(t *testing.T) {
+	var busy atomic.Bool
+	var inferenceCalled atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/comfyui/queue" {
+			if busy.Load() {
+				_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))
+				return
+			}
+			_, _ = writer.Write([]byte(`{"queue_running":[],"queue_pending":[]}`))
+			return
+		}
+		inferenceCalled.Store(true)
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.Backends["same-host"] = config.Backend{URL: backend.URL, Prefix: "same/"}
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.ComfyUIWaitTimeout = time.Second
+	handler := newHandler(t, cfg)
+	handler.(*Handler).comfyUIJobs.promptResponse(http.StatusOK)
+
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"same/model"}`)))
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("same-backend inference did not wait for ComfyUI")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if inferenceCalled.Load() {
+		t.Fatal("same-backend inference reached backend while ComfyUI was active")
+	}
+
+	busy.Store(false)
+	select {
+	case <-done:
+		if recorder.Code != http.StatusNoContent {
+			t.Fatalf("same-backend inference status = %d", recorder.Code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("same-backend inference did not proceed after ComfyUI completed")
 	}
 }
 

@@ -129,7 +129,7 @@ path_routes:
   /comfyui: gpu
 
 # Wait for active ComfyUI queue jobs before forwarding inference requests to
-# other backends. Requires path_routes /comfyui. Timeout returns HTTP 504.
+# the same backend endpoint. Requires path_routes /comfyui. Timeout returns HTTP 504.
 # comfyui_wait_timeout: 45m
 
 models_cache_ttl: 15s
@@ -264,8 +264,9 @@ query strings, encoded path segments, backend credentials, and WebSocket upgrade
 llama-swap configuration can define the reserved local model ID `comfyui_auto`; llama-swap then owns
 the redirect, cold-start restrictions, path stripping, and ComfyUI compatibility settings.
 
-`comfyui_wait_timeout` optionally prevents other recognized inference requests from reaching
-their backend while ComfyUI has queued or running jobs. It polls the configured `/comfyui` backend's
+`comfyui_wait_timeout` optionally prevents recognized inference requests routed to the same backend
+endpoint as `/comfyui` from reaching that backend while ComfyUI has queued or running jobs. Requests
+routed to other backend endpoints are not delayed. It polls the configured `/comfyui` backend's
 `GET /comfyui/queue` and returns HTTP 504 rather than forwarding when the timeout expires. A queue
 query failure returns HTTP 502 (fail-closed). The option requires `path_routes: /comfyui` and is
 disabled when omitted or set to `0`. It does not delay ComfyUI requests or non-inference requests,

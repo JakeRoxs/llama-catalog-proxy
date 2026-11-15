@@ -21,7 +21,7 @@ path_routes:
   /comfyui: gpu
 
 # Wait for active ComfyUI queue jobs before forwarding inference requests to
-# other backends. Requires path_routes /comfyui. Timeout returns HTTP 504.
+# the same backend endpoint. Requires path_routes /comfyui. Timeout returns HTTP 504.
 # comfyui_wait_timeout: 45m
 
 models_cache_ttl: 15s
