@@ -82,6 +82,55 @@ func operationInventory(root *os.Root, dir *os.File) ([]string, time.Time, error
 	return ids, clock, nil
 }
 
+// delegatedOperationProposalIDsReadOnly validates and inventories the replay
+// ledger without recovering temporary files or otherwise changing it. Proposal
+// cleanup fails closed if an interrupted operation replacement is present.
+func delegatedOperationProposalIDsReadOnly(root *os.Root, dir *os.File) (map[string]bool, error) {
+	entries, err := dir.ReadDir(MaxProposals + 3)
+	if err != nil && err != io.EOF || len(entries) > MaxProposals+2 {
+		return nil, ErrProposalStore
+	}
+	ids := make(map[string]bool)
+	var clock time.Time
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case name == operationClockFilename:
+			data, err := readPrivateProposalFile(root, name)
+			if err != nil {
+				return nil, ErrProposalStore
+			}
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			decoder.DisallowUnknownFields()
+			var value operationClock
+			var extra any
+			if decoder.Decode(&value) != nil || value.Since.IsZero() || decoder.Decode(&extra) != io.EOF {
+				return nil, ErrProposalStore
+			}
+			clock = value.Since
+		case strings.HasPrefix(name, delegatedOperationPrefix) && strings.HasSuffix(name, ".json"):
+			id := strings.TrimSuffix(strings.TrimPrefix(name, delegatedOperationPrefix), ".json")
+			if !validProposalID(id) || entry.IsDir() {
+				return nil, ErrProposalStore
+			}
+			if _, err := readDelegatedOperation(root, id); err != nil {
+				return nil, err
+			}
+			ids[id] = true
+		case strings.HasPrefix(name, ".operation-") && strings.HasSuffix(name, ".tmp"):
+			// A temporary replacement may be evidence of an interrupted write.
+			// Do not let proposal cleanup trigger the operation store's recovery.
+			return nil, ErrProposalStore
+		default:
+			return nil, ErrProposalStore
+		}
+	}
+	if len(ids) > MaxProposals || len(ids) != 0 && clock.IsZero() {
+		return nil, ErrProposalStore
+	}
+	return ids, nil
+}
+
 func writeOperationClock(root *os.Root, dir *os.File, now time.Time) error {
 	data, err := json.Marshal(operationClock{Since: now.UTC()})
 	if err != nil {

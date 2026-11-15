@@ -276,12 +276,79 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	unregistered.Header.Set("Authorization", "Bearer "+peerToken)
 	recorder := httptest.NewRecorder()
 	owner.r.PeerHandler().ServeHTTP(recorder, unregistered)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("proposal route unexpectedly registered: %d", recorder.Code)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("proposal route did not reject an empty request: %d", recorder.Code)
 	}
 	server.Close()
 	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationProposalUnknown) {
 		t.Fatalf("owner outage was not unknown: %v", err)
+	}
+}
+
+func TestForwardDelegatedProposalRecoveryAcrossTLS(t *testing.T) {
+	owner := newDelegatedApplyFixture(t)
+	owner.r.peerSlots = make(chan struct{}, 1)
+	proposal, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := delegatedSettingsRequest{
+		Owner: proposal.Owner, Backend: proposal.BackendID, Model: proposal.Proposal.ModelID,
+		Revision: proposal.Proposal.Revision, Settings: proposal.Proposal.Settings,
+	}
+	peerToken, caller := strings.Repeat("p", 32), strings.Repeat("c", 32)
+	server := httptest.NewTLSServer(owner.r.PeerHandler())
+	defer server.Close()
+	caPath := filepath.Join(t.TempDir(), "peer-ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
+		"owner": {URL: server.URL, OutboundToken: peerToken, CAFile: caPath, RouteManagement: true},
+	}}
+	clients, _, err := newPeerClients(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closePeerClients(clients)
+	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
+	receiver := &Reloader{logger: discardLogger(), managementSlots: make(chan struct{}, 1)}
+	receiver.state.Store(state)
+	receiverServer := httptest.NewTLSServer(receiver.ManagementHandler())
+	defer receiverServer.Close()
+	body, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, receiverServer.URL+receivedSettingsRecoveryPath, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+caller)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", "must-not-forward")
+	response, err := receiverServer.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var recovered modelconfig.DelegatedProposal
+	if err := json.NewDecoder(response.Body).Decode(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || recovered.Proposal.ID != proposal.Proposal.ID || len(recovered.RecoveryAudit) != 1 {
+		t.Fatalf("TLS recovery status=%d proposal=%+v", response.StatusCode, recovered)
+	}
+	if event := recovered.RecoveryAudit[0]; event.RequesterNode != "requester" ||
+		event.CredentialScope != modelconfig.DelegatedSettingsCredentialScope || event.Outcome != "recovered" {
+		t.Fatalf("TLS recovery audit = %+v", event)
+	}
+	stored, err := modelconfig.LoadDelegatedProposal(owner.proposals, proposal.Proposal.ID)
+	if err != nil || len(stored.RecoveryAudit) != 1 {
+		t.Fatalf("owner did not durably record recovery: %+v, %v", stored.RecoveryAudit, err)
+	}
+	if _, err := modelconfig.LoadDelegatedOperation(owner.operations, proposal.Proposal.ID); !errors.Is(err, modelconfig.ErrProposalNotFound) {
+		t.Fatalf("read-only recovery changed operation ledger: %v", err)
 	}
 }
 

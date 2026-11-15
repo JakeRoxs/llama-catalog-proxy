@@ -162,6 +162,81 @@ func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *re
 	return proposal, nil
 }
 
+// Recovery is a read-only exact-match lookup; repeating it does not reserve an
+// operation or authorize a write. Each successful owner lookup appends a
+// bounded audit event, so transport failure is reported without auto-retry.
+func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		return modelconfig.DelegatedProposal{}, errDelegationBusy
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return modelconfig.DelegatedProposal{}, errDelegationChanged
+	}
+	if !r.delegatedCallerAuthorized(req, state) {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	}
+	if err := req.Context().Err(); err != nil {
+		return modelconfig.DelegatedProposal{}, err
+	}
+	if state.peer == nil || input.Owner.NodeID == state.peer.NodeID {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+	}
+	client := state.peerClients[input.Owner.NodeID]
+	if client == nil || !client.routeManagement || client.id != input.Owner.NodeID {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+	}
+	payload, err := json.Marshal(input)
+	if err != nil || len(payload) > maxBenchmarkJSONBytes {
+		return modelconfig.DelegatedProposal{}, modelconfig.ErrDelegatedProposalInvalid
+	}
+	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost,
+		client.origin+peerSettingsProposalRecoveryPath, bytes.NewReader(payload))
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+	}
+	remote.Header.Set("Authorization", "Bearer "+client.token)
+	remote.Header.Set("Content-Type", "application/json")
+	remote.Header.Set("Accept", "application/json")
+	response, err := client.client.Do(remote)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+	}
+	defer response.Body.Close()
+	switch response.StatusCode {
+	case http.StatusNotFound:
+		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalNotFound
+	case http.StatusConflict:
+		return modelconfig.DelegatedProposal{}, modelconfig.ErrDelegatedProposalAmbiguous
+	case http.StatusOK:
+	default:
+		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+	}
+	var proposal modelconfig.DelegatedProposal
+	if err := decodeDelegatedPeerJSON(response, &proposal); err != nil ||
+		modelconfig.ValidateDelegatedProposal(proposal, input.Owner, state.peer.NodeID, input.Backend,
+			proposal.Proposal.TargetID, proposal.Proposal.CreatedAt) != nil ||
+		proposal.Proposal.ModelID != input.Model || proposal.Proposal.Revision != input.Revision ||
+		!reflect.DeepEqual(proposal.Proposal.Settings, input.Settings) ||
+		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime ||
+		len(proposal.RecoveryAudit) == 0 {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerResponse
+	}
+	audit := proposal.RecoveryAudit[len(proposal.RecoveryAudit)-1]
+	if audit.RequesterNode != state.peer.NodeID || audit.CredentialScope != modelconfig.DelegatedSettingsCredentialScope ||
+		audit.OwnerNode != input.Owner.NodeID || audit.Outcome != "recovered" && audit.Outcome != "expired" {
+		return modelconfig.DelegatedProposal{}, errDelegationPeerResponse
+	}
+	return proposal, nil
+}
+
 // The supplied review is not authorization. The owner reloads its stored
 // proposal and rechecks every binding before any write.
 func (r *Reloader) forwardDelegatedSettingsApply(req *http.Request, state *reloaderState, review modelconfig.DelegatedProposal, operationID string, acknowledgeReview, acknowledgeDisruption, acknowledgeExclusiveWindow bool) (modelconfig.DelegatedOperation, error) {

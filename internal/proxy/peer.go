@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -56,6 +57,21 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	if req.URL.Path == "/peer/v1/inference" {
 		r.servePeerInference(w, req)
+		return
+	}
+	switch req.URL.Path {
+	case peerSettingsProposalPath:
+		r.servePeerDelegatedSettingsProposal(w, req)
+		return
+	case peerSettingsProposalRecoveryPath:
+		r.servePeerDelegatedSettingsProposalRecovery(w, req)
+		return
+	case peerSettingsApplyPath:
+		r.servePeerDelegatedSettingsApply(w, req)
+		return
+	}
+	if strings.HasPrefix(req.URL.Path, peerOperationPath) {
+		r.servePeerDelegatedOperation(w, req)
 		return
 	}
 	if req.URL.Path != "/peer/v1/report" {
@@ -107,6 +123,10 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	// This advertises the feature, not the requesting peer's authorization.
 	report.Capabilities["diagnostics_read"] = "enabled"
+	if delegatedSettingsEnabled(state) {
+		// The peer's manage_settings grant is still checked independently per request.
+		report.Capabilities["config_write"] = "enabled"
+	}
 	if peerAuthorized(req, state, peerDiagnostics) {
 		report, err = nodecontract.AddBackendReadiness(report, handler.catalog.CachedBackendReadiness(peer.LocalBackends), state.cacheTTL)
 		if err != nil {
@@ -133,6 +153,23 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer func() { _ = controller.SetWriteDeadline(time.Time{}) }()
 	_, _ = w.Write(data)
+}
+
+func delegatedSettingsEnabled(state *reloaderState) bool {
+	if state == nil || state.peer == nil || state.management == nil ||
+		len(state.peer.ManagementTargets) == 0 || state.management.WriteToken == "" ||
+		state.management.ProposalStore == nil || state.management.BackupStore == nil ||
+		state.management.DelegatedStore == nil {
+		return false
+	}
+	for backendID, targetID := range state.peer.ManagementTargets {
+		if slices.Contains(state.peer.LocalBackends, backendID) {
+			if _, ok := state.management.Targets[targetID]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func peerAuthorized(req *http.Request, state *reloaderState, scope peerScope) bool {

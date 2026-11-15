@@ -104,6 +104,51 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	return proposal, nil
 }
 
+// recoverDelegatedSettingsProposal returns a unique exact match for the
+// currently authenticated management peer. The shared peer credential proves
+// scope possession, not an individual or the original request's delivery state.
+func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return modelconfig.DelegatedProposal{}, errDelegationChanged
+	}
+	requester, ok := authenticatedPeer(req, state, peerManageSettings)
+	if !ok {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	}
+	if err := req.Context().Err(); err != nil {
+		return modelconfig.DelegatedProposal{}, err
+	}
+	owner := modelconfig.DelegatedOwner{NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation}
+	if input.Owner != owner {
+		return modelconfig.DelegatedProposal{}, errDelegationChanged
+	}
+	if state.management == nil || !slices.Contains(state.peer.LocalBackends, input.Backend) {
+		return modelconfig.DelegatedProposal{}, errDelegationTarget
+	}
+	targetID, ok := state.peer.ManagementTargets[input.Backend]
+	if !ok {
+		return modelconfig.DelegatedProposal{}, errDelegationTarget
+	}
+	if _, ok := state.management.Targets[targetID]; !ok {
+		return modelconfig.DelegatedProposal{}, errDelegationTarget
+	}
+	stores := state.management.DelegatedStore
+	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
+		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalStore
+	}
+	query := modelconfig.DelegatedProposalRecoveryQuery{
+		Owner: owner, RequesterNode: requester, BackendID: input.Backend, TargetID: targetID,
+		ModelID: input.Model, Revision: input.Revision, Settings: input.Settings,
+	}
+	return modelconfig.RecoverDelegatedProposal(stores.ProposalDirectory, query,
+		modelconfig.DelegatedSettingsCredentialScope, time.Now())
+}
+
 func (r *Reloader) separateDelegatedStore(store string, state *reloaderState) bool {
 	if state.management == nil || !separateProposalDirectory(store, state.management.Targets) {
 		return false
@@ -270,4 +315,38 @@ func (r *Reloader) ownerDelegatedOperation(req *http.Request, state *reloaderSta
 		return modelconfig.DelegatedOperation{}, modelconfig.ErrProposalNotFound
 	}
 	return record, nil
+}
+
+// The owner's backup credential permits inspection and explicit cleanup of
+// expired delegated reviews. Operation-associated proposals are never eligible;
+// cleanup is not operation review, resolution, or replay authorization.
+func (r *Reloader) ownerDelegatedProposals(req *http.Request, state *reloaderState, cleanupIDs []string, cleanup bool) ([]modelconfig.DelegatedProposalCleanupCandidate, []string, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return nil, nil, errDelegationUnauthorized
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return nil, nil, errDelegationChanged
+	}
+	if state.management == nil || state.management.BackupStore == nil ||
+		!managementBearerAuthorized(req, state.management.BackupStore.Token) {
+		return nil, nil, errDelegationUnauthorized
+	}
+	if err := req.Context().Err(); err != nil {
+		return nil, nil, err
+	}
+	if r.peerNodeID == "" || state.peer != nil && state.peer.NodeID != r.peerNodeID {
+		return nil, nil, errDelegationChanged
+	}
+	stores := state.management.DelegatedStore
+	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
+		return nil, nil, modelconfig.ErrProposalStore
+	}
+	if !cleanup {
+		candidates, err := modelconfig.ListExpiredOrphanedDelegatedProposals(stores.ProposalDirectory, stores.OperationDirectory, time.Now())
+		return candidates, nil, err
+	}
+	removed, err := modelconfig.CleanupExpiredOrphanedDelegatedProposals(stores.ProposalDirectory, stores.OperationDirectory, cleanupIDs, time.Now())
+	return nil, removed, err
 }

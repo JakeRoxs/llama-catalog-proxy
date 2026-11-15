@@ -41,6 +41,15 @@ func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	state := r.state.Load()
+	switch {
+	case strings.HasPrefix(req.URL.Path, receivedSettingsPathPrefix),
+		req.URL.Path == receivedOperationPath[:len(receivedOperationPath)-1],
+		strings.HasPrefix(req.URL.Path, receivedOperationPath),
+		req.URL.Path == ownerProposalsPath,
+		strings.HasPrefix(req.URL.Path, ownerOperationPath):
+		r.serveDelegatedManagement(w, req, state)
+		return
+	}
 	management := state.management
 	isProposal := req.URL.Path == "/management/v1/proposals" || strings.HasPrefix(req.URL.Path, "/management/v1/proposals/")
 	isBackup := req.URL.Path == "/management/v1/backups" || strings.HasPrefix(req.URL.Path, "/management/v1/backups/")

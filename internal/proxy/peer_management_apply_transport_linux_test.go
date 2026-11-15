@@ -268,8 +268,90 @@ func TestForwardDelegatedApplyLostResponseAndReplay(t *testing.T) {
 	unregistered.Header.Set("Authorization", "Bearer "+peerToken)
 	recorder := httptest.NewRecorder()
 	owner.r.PeerHandler().ServeHTTP(recorder, unregistered)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("apply route unexpectedly registered: %d", recorder.Code)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("apply route did not enforce the revoked peer grant: %d", recorder.Code)
+	}
+}
+
+func TestRegisteredDelegatedSettingsManagementRoundTrip(t *testing.T) {
+	owner := newDelegatedApplyFixture(t)
+	owner.r.peerSlots = make(chan struct{}, 1)
+	ownerServer := httptest.NewTLSServer(owner.r.PeerHandler())
+	defer ownerServer.Close()
+	caPath := filepath.Join(t.TempDir(), "owner-ca.pem")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ownerServer.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	peerToken, caller := strings.Repeat("p", 32), strings.Repeat("c", 32)
+	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
+		"owner": {URL: ownerServer.URL, OutboundToken: peerToken, CAFile: caPath, RouteManagement: true},
+	}}
+	clients, _, err := newPeerClients(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closePeerClients(clients)
+	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
+	receiver := &Reloader{logger: discardLogger(), managementSlots: make(chan struct{}, 1)}
+	receiver.state.Store(state)
+	receiverServer := httptest.NewTLSServer(receiver.ManagementHandler())
+	defer receiverServer.Close()
+	client := receiverServer.Client()
+
+	review, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyBody, err := json.Marshal(struct {
+		Review                     modelconfig.DelegatedProposal `json:"review"`
+		OperationID                string                        `json:"operation_id"`
+		AcknowledgeReview          bool                          `json:"acknowledge_review"`
+		AcknowledgeDisruption      bool                          `json:"acknowledge_disruption"`
+		AcknowledgeExclusiveWindow bool                          `json:"acknowledge_exclusive_window"`
+	}{review, owner.input.OperationID, true, true, true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, receiverServer.URL+receivedSettingsApplyPath, bytes.NewReader(applyBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer "+caller)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var operation modelconfig.DelegatedOperation
+	if err := json.NewDecoder(response.Body).Decode(&operation); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusOK || operation.Outcome != "written" || operation.OperationID != owner.input.OperationID {
+		t.Fatalf("registered apply status=%d operation=%+v", response.StatusCode, operation)
+	}
+
+	lookupURL := receiverServer.URL + receivedOperationPath + "owner/" + owner.input.ProposalID + "/" + owner.input.OperationID
+	lookup, err := http.NewRequest(http.MethodGet, lookupURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lookup.Header.Set("Authorization", "Bearer "+caller)
+	response, err = client.Do(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var recovered modelconfig.DelegatedOperation
+	if err := json.NewDecoder(response.Body).Decode(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || recovered.Outcome != "written" || recovered.RequesterNode != "requester" {
+		t.Fatalf("registered lookup status=%d operation=%+v", response.StatusCode, recovered)
+	}
+	if _, err := os.ReadFile(filepath.Join(owner.target, "config.yaml")); err != nil {
+		t.Fatal(err)
 	}
 }
 

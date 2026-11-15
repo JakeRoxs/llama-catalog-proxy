@@ -138,8 +138,8 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	unregistered.Header.Set("Authorization", "Bearer "+f.state.management.PreviewToken)
 	recorder := httptest.NewRecorder()
 	f.r.ManagementHandler().ServeHTTP(recorder, unregistered)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("recovery route unexpectedly registered: %d", recorder.Code)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("owner recovery route did not enforce backup credential scope: %d", recorder.Code)
 	}
 }
 

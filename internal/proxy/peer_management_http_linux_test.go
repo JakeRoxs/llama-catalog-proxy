@@ -24,7 +24,7 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 	reserveDelegatedFixture(t, owner)
 	owner.r.logger = discardLogger()
 	owner.r.peerSlots = make(chan struct{}, 2)
-	ownerServer := httptest.NewTLSServer(http.HandlerFunc(owner.r.servePeerDelegatedOperation))
+	ownerServer := httptest.NewTLSServer(owner.r.PeerHandler())
 	defer ownerServer.Close()
 	caPath := filepath.Join(t.TempDir(), "owner-ca.pem")
 	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ownerServer.Certificate().Raw}), 0o600); err != nil {
@@ -45,7 +45,7 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 	}
 	receiver := &Reloader{logger: discardLogger(), managementSlots: make(chan struct{}, 2)}
 	receiver.state.Store(state)
-	receiverServer := httptest.NewTLSServer(http.HandlerFunc(receiver.serveReceivingDelegatedOperation))
+	receiverServer := httptest.NewTLSServer(receiver.ManagementHandler())
 	defer receiverServer.Close()
 	path := receivedOperationPath + "owner/" + owner.input.ProposalID + "/" + owner.input.OperationID
 	get := func(token, origin string) (int, []byte, http.Header) {
@@ -111,15 +111,15 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 	ownerRequest.Header.Set("Authorization", "Bearer "+peerToken)
 	recorder := httptest.NewRecorder()
 	owner.r.PeerHandler().ServeHTTP(recorder, ownerRequest)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("owner lookup unexpectedly registered: %d", recorder.Code)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("owner lookup did not enforce the revoked peer grant: %d", recorder.Code)
 	}
 	receivingRequest := httptest.NewRequest(http.MethodGet, "https://receiver.example"+path, nil)
 	receivingRequest.Header.Set("Authorization", "Bearer "+caller)
 	recorder = httptest.NewRecorder()
 	receiver.ManagementHandler().ServeHTTP(recorder, receivingRequest)
-	if recorder.Code != http.StatusNotFound {
-		t.Fatalf("receiving lookup unexpectedly registered: %d", recorder.Code)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("receiving lookup did not report revoked owner grant: %d", recorder.Code)
 	}
 }
 

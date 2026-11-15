@@ -98,6 +98,53 @@ func TestPeerManagementBindingDoesNotEnableRemoteActions(t *testing.T) {
 	}
 }
 
+func TestDelegatedSettingsCapabilityRequiresLocalWriteOptIn(t *testing.T) {
+	state := &reloaderState{
+		peer: &config.PeerConfig{
+			LocalBackends:     []string{"local"},
+			ManagementTargets: map[string]string{"local": "swap"},
+			Peers:             map[string]config.PeerGrant{"reader": {Token: strings.Repeat("r", 32), CatalogRead: true}},
+		},
+		management: &config.ManagementConfig{
+			WriteToken: "write", ProposalStore: &config.ProposalStoreConfig{Token: "proposal"},
+			BackupStore:    &config.BackupStoreConfig{Token: "backup"},
+			DelegatedStore: &config.DelegatedStoreConfig{},
+			Targets:        map[string]config.ManagementTarget{"swap": {}},
+		},
+	}
+	if !delegatedSettingsEnabled(state) {
+		t.Fatal("complete owner-side configuration did not advertise settings management")
+	}
+	if grant := state.peer.Peers["reader"]; grant.ManageSettings {
+		t.Fatal("feature advertisement fixture unexpectedly grants the peer management scope")
+	}
+	for _, disable := range []func(){
+		func() { state.peer.ManagementTargets = nil },
+		func() { state.peer.ManagementTargets = map[string]string{"remote": "swap"} },
+		func() { state.peer.ManagementTargets = map[string]string{"local": "missing"} },
+		func() {
+			state.peer.ManagementTargets = map[string]string{"local": "swap"}
+			state.management.WriteToken = ""
+		},
+		func() { state.management.WriteToken = "write"; state.management.DelegatedStore = nil },
+		func() {
+			state.management.DelegatedStore = &config.DelegatedStoreConfig{}
+			state.management.BackupStore = nil
+		},
+	} {
+		// Start each case from the same fully enabled configuration.
+		state.peer.ManagementTargets = map[string]string{"local": "swap"}
+		state.management.WriteToken = "write"
+		state.management.ProposalStore = &config.ProposalStoreConfig{Token: "proposal"}
+		state.management.BackupStore = &config.BackupStoreConfig{Token: "backup"}
+		state.management.DelegatedStore = &config.DelegatedStoreConfig{}
+		disable()
+		if delegatedSettingsEnabled(state) {
+			t.Fatal("incomplete or unmapped owner configuration advertised settings management")
+		}
+	}
+}
+
 func TestDelegatedCallerCredentialIsolationAndRevocation(t *testing.T) {
 	delegation, rotated := strings.Repeat("l", 32), strings.Repeat("r", 32)
 	preview, proposal, backup, write := strings.Repeat("m", 32), strings.Repeat("p", 32), strings.Repeat("b", 32), strings.Repeat("w", 32)

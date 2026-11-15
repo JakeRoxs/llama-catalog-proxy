@@ -157,6 +157,10 @@ func readProposalFile(root *os.Root, id string) ([]byte, error) {
 }
 
 func readPrivateProposalFile(root *os.Root, name string) ([]byte, error) {
+	return readPrivateProposalFileLimit(root, name, maxProposalBytes)
+}
+
+func readPrivateProposalFileLimit(root *os.Root, name string, maxBytes int64) ([]byte, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, ErrProposalNotFound
@@ -166,15 +170,15 @@ func readPrivateProposalFile(root *os.Root, name string) ([]byte, error) {
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxProposalBytes {
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() > maxBytes {
 		return nil, ErrProposalStore
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
 		return nil, ErrProposalStore
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maxProposalBytes+1))
-	if err != nil || len(data) > maxProposalBytes {
+	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil || int64(len(data)) > maxBytes {
 		return nil, ErrProposalStore
 	}
 	return data, nil

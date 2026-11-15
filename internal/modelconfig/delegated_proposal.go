@@ -12,12 +12,17 @@ import (
 )
 
 const MaxDelegatedProposalLifetime = 24 * time.Hour
+const DelegatedSettingsCredentialScope = "manage_settings"
 
 var (
-	ErrDelegatedProposalInvalid = errors.New("invalid delegated proposal")
-	ErrDelegatedProposalBinding = errors.New("delegated proposal binding changed")
-	ErrDelegatedProposalExpired = errors.New("delegated proposal expired or is not yet valid")
+	ErrDelegatedProposalInvalid   = errors.New("invalid delegated proposal")
+	ErrDelegatedProposalBinding   = errors.New("delegated proposal binding changed")
+	ErrDelegatedProposalExpired   = errors.New("delegated proposal expired or is not yet valid")
+	ErrDelegatedProposalCleanup   = errors.New("delegated proposal is not eligible for cleanup")
+	ErrDelegatedProposalAmbiguous = errors.New("delegated proposal recovery is ambiguous")
 )
+
+const MaxDelegatedProposalRecoveryAudit = 8
 
 type DelegatedOwner struct {
 	NodeID           string `json:"node_id"`
@@ -28,12 +33,53 @@ type DelegatedOwner struct {
 // DelegatedProposal binds an owner-created settings proposal to the peer that
 // requested it. ReviewRevision is a digest, not a signature or authorization.
 type DelegatedProposal struct {
-	Owner          DelegatedOwner `json:"owner"`
-	RequesterNode  string         `json:"requester_node_id"`
-	BackendID      string         `json:"backend_id"`
-	Proposal       Proposal       `json:"proposal"`
-	ExpiresAt      time.Time      `json:"expires_at"`
-	ReviewRevision string         `json:"review_revision"`
+	Owner          DelegatedOwner                   `json:"owner"`
+	RequesterNode  string                           `json:"requester_node_id"`
+	BackendID      string                           `json:"backend_id"`
+	Proposal       Proposal                         `json:"proposal"`
+	ExpiresAt      time.Time                        `json:"expires_at"`
+	ReviewRevision string                           `json:"review_revision"`
+	RecoveryAudit  []DelegatedProposalRecoveryAudit `json:"recovery_audit,omitempty"`
+}
+
+// DelegatedProposalRecoveryAudit records requester-scoped recovery without
+// asserting that the request caused the stored proposal to be created.
+type DelegatedProposalRecoveryAudit struct {
+	At              time.Time `json:"at"`
+	ProposalID      string    `json:"proposal_id"`
+	RequesterNode   string    `json:"requester_node_id"`
+	CredentialScope string    `json:"credential_scope"`
+	OwnerNode       string    `json:"owner_node_id"`
+	TargetID        string    `json:"target_id"`
+	BackendID       string    `json:"backend_id"`
+	ModelID         string    `json:"model_id"`
+	SourceRevision  string    `json:"source_revision"`
+	ReviewRevision  string    `json:"review_revision"`
+	RequestDigest   string    `json:"request_digest"`
+	Outcome         string    `json:"outcome"`
+}
+
+// DelegatedProposalRecoveryQuery repeats the typed request fields because no
+// request ID or receiver-side creation timestamp is persisted.
+type DelegatedProposalRecoveryQuery struct {
+	Owner         DelegatedOwner
+	RequesterNode string
+	BackendID     string
+	TargetID      string
+	ModelID       string
+	Revision      string
+	Settings      CommandSettings
+}
+
+// DelegatedProposalCleanupCandidate contains only the stored metadata needed
+// for an owner to identify expired reviews with no operation record. It omits
+// reviewed settings and local target paths.
+type DelegatedProposalCleanupCandidate struct {
+	ProposalID    string    `json:"proposal_id"`
+	RequesterNode string    `json:"requester_node_id"`
+	BackendID     string    `json:"backend_id"`
+	ModelID       string    `json:"model_id"`
+	ExpiresAt     time.Time `json:"expires_at"`
 }
 
 // DelegatedApplyBinding is supplied by the owner after authenticating the peer
@@ -86,9 +132,20 @@ func ValidateDelegatedProposal(proposal DelegatedProposal, owner DelegatedOwner,
 func validDelegatedProposal(proposal DelegatedProposal) bool {
 	if !validDelegatedIdentity(proposal.Owner, proposal.RequesterNode, proposal.BackendID) ||
 		!validProposal(proposal.Proposal) || !validDigest(proposal.ReviewRevision) ||
+		len(proposal.RecoveryAudit) > MaxDelegatedProposalRecoveryAudit ||
 		!proposal.ExpiresAt.After(proposal.Proposal.CreatedAt) ||
 		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > MaxDelegatedProposalLifetime {
 		return false
+	}
+	for _, event := range proposal.RecoveryAudit {
+		if event.At.IsZero() || event.ProposalID != proposal.Proposal.ID || event.RequesterNode != proposal.RequesterNode ||
+			event.CredentialScope != DelegatedSettingsCredentialScope || event.OwnerNode != proposal.Owner.NodeID ||
+			event.TargetID != proposal.Proposal.TargetID || event.BackendID != proposal.BackendID ||
+			event.ModelID != proposal.Proposal.ModelID || event.SourceRevision != proposal.Proposal.Revision ||
+			event.ReviewRevision != proposal.ReviewRevision || !validDigest(event.RequestDigest) ||
+			(event.Outcome != "recovered" && event.Outcome != "expired" && event.Outcome != "ambiguous") {
+			return false
+		}
 	}
 	revision, err := delegatedReviewRevision(proposal)
 	return err == nil && revision == proposal.ReviewRevision
