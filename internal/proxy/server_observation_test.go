@@ -236,7 +236,7 @@ func TestObservationRouteGateAndReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if (*reload.handler.Load()).(*Handler).requestObservation {
+	if reload.state.Load().handler.(*Handler).requestObservation {
 		t.Fatal("enabled by default")
 	}
 	contents, err := os.ReadFile(path)
@@ -250,7 +250,7 @@ func TestObservationRouteGateAndReload(t *testing.T) {
 	if err = reload.reload(); err != nil {
 		t.Fatal(err)
 	}
-	if !(*reload.handler.Load()).(*Handler).requestObservation {
+	if !reload.state.Load().handler.(*Handler).requestObservation {
 		t.Fatal("reload did not enable observer")
 	}
 }
@@ -713,6 +713,7 @@ func TestObservationReloadResetsStore(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
@@ -727,7 +728,7 @@ func TestObservationReloadResetsStore(t *testing.T) {
 		t.Fatalf("config change was not applied: %v", err)
 	}
 
-	reloadedHandler := (*reloader.handler.Load()).(*Handler)
+	reloadedHandler := reloader.state.Load().handler.(*Handler)
 	if reloadedHandler.history == nil {
 		t.Fatal("history should be non-nil after reload")
 	}

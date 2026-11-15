@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -154,42 +155,110 @@ func main() {
 		"commit", commit,
 	)
 
-	reloader.Start()
-
 	server := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           reloader,
 		ReadHeaderTimeout: cfg.RequestTimeout,
 	}
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		logger.Error("client listener failed", "error", err)
+		os.Exit(1)
+	}
+	var peerServer *http.Server
+	var peerListener net.Listener
+	if cfg.Peer != nil {
+		peerListener, err = net.Listen("tcp", cfg.Peer.Listen)
+		if err != nil {
+			_ = listener.Close()
+			logger.Error("peer listener failed", "error", err)
+			os.Exit(1)
+		}
+		peerServer = &http.Server{
+			Handler: reloader.PeerHandler(), TLSConfig: reloader.PeerTLSConfig(),
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+			MaxHeaderBytes: 16 << 10,
+		}
+	}
+	var managementServer *http.Server
+	var managementListener net.Listener
+	if cfg.Management != nil {
+		managementListener, err = net.Listen("tcp", cfg.Management.Listen)
+		if err != nil {
+			_ = listener.Close()
+			if peerListener != nil {
+				_ = peerListener.Close()
+			}
+			logger.Error("management listener failed", "error", err)
+			os.Exit(1)
+		}
+		managementServer = &http.Server{
+			Handler: reloader.ManagementHandler(), TLSConfig: reloader.ManagementTLSConfig(),
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+			WriteTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10,
+		}
+	}
+	reloader.Start()
+	defer reloader.Stop()
 
 	signals, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serverErrors := make(chan error, 1)
+	serverErrors := make(chan error, 3)
 	go func() {
 		logger.Info("server listening", "address", cfg.Listen)
-		serverErrors <- server.ListenAndServe()
+		serverErrors <- server.Serve(listener)
 	}()
+	if peerServer != nil {
+		go func() {
+			logger.Info("peer server listening", "address", cfg.Peer.Listen)
+			serverErrors <- peerServer.ServeTLS(peerListener, "", "")
+		}()
+	}
+	if managementServer != nil {
+		go func() {
+			logger.Info("management server listening", "address", cfg.Management.Listen)
+			serverErrors <- managementServer.ServeTLS(managementListener, "", "")
+		}()
+	}
 
+	failed := false
 	select {
 	case <-signals.Done():
 		logger.Info("shutdown signal received")
 	case err := <-serverErrors:
 		if err != nil && err != http.ErrServerClosed {
 			logger.Error("server stopped unexpectedly", "error", err)
-			os.Exit(1)
+			failed = true
 		}
-		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+	reloader.Stop()
 	if err := server.Shutdown(ctx); err != nil {
 		logger.Error("graceful shutdown failed", "error", err)
 		_ = server.Close()
 		os.Exit(1)
 	}
+	if peerServer != nil {
+		if err := peerServer.Shutdown(ctx); err != nil {
+			logger.Error("peer graceful shutdown failed", "error", err)
+			_ = peerServer.Close()
+			failed = true
+		}
+	}
+	if managementServer != nil {
+		if err := managementServer.Shutdown(ctx); err != nil {
+			logger.Error("management graceful shutdown failed", "error", err)
+			_ = managementServer.Close()
+			failed = true
+		}
+	}
 	logger.Info("server stopped")
+	if failed {
+		os.Exit(1)
+	}
 }
 
 func runHealthcheck(target string) error {

@@ -1,10 +1,18 @@
 package proxy
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -18,16 +26,45 @@ import (
 const defaultWatchInterval = 2 * time.Second
 
 type Reloader struct {
-	path     string
-	interval time.Duration
-	logger   *slog.Logger
-	onReload func(config.Config)
-	handler  atomic.Pointer[http.Handler]
-	lastHash [sha256.Size]byte
+	path               string
+	interval           time.Duration
+	logger             *slog.Logger
+	onReload           func(config.Config)
+	state              atomic.Pointer[reloaderState]
+	peerListen         string
+	peerNodeID         string
+	managementListen   string
+	managementSlots    chan struct{}
+	benchmark          *benchmarkRuntime
+	ingestion          *ingestionRuntime
+	instanceID         string
+	peerSlots          chan struct{}
+	peerInferenceSlots chan struct{}
+	peerWake           chan struct{}
+	stop               chan struct{}
+	lifecycleMu        sync.Mutex
+	started            bool
+	stopped            bool
+	wg                 sync.WaitGroup
+	lastHash           [sha256.Size]byte
 	// lastReloadError is the last reload failure that was logged. Identical
 	// failures are suppressed so a broken config does not flood the logs;
 	// retries continue on every watch tick.
 	lastReloadError error
+}
+
+type reloaderState struct {
+	handler               http.Handler
+	peer                  *config.PeerConfig
+	cacheTTL              time.Duration
+	generation            uint64
+	certificate           *tls.Certificate
+	management            *config.ManagementConfig
+	managementCertificate *tls.Certificate
+	peerClients           map[string]*peerClient
+	peerCache             *peerCache
+	peerContext           context.Context
+	peerCancel            context.CancelFunc
 }
 
 func NewReloader(path string, logger *slog.Logger, onReload func(config.Config), diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (*Reloader, config.Config, error) {
@@ -40,17 +77,57 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		return nil, config.Config{}, err
 	}
 	r := &Reloader{
-		path:     path,
-		interval: defaultWatchInterval,
-		logger:   logger,
-		onReload: onReload,
+		path:               path,
+		interval:           defaultWatchInterval,
+		logger:             logger,
+		onReload:           onReload,
+		peerSlots:          make(chan struct{}, 8),
+		peerInferenceSlots: make(chan struct{}, 8),
+		managementSlots:    make(chan struct{}, 2),
+		peerWake:           make(chan struct{}, 1),
+		stop:               make(chan struct{}),
 	}
-	r.handler.Store(&handler)
+	r.benchmark, err = newBenchmarkRuntime(cfg, logger)
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	var certificate *tls.Certificate
+	if cfg.Peer != nil {
+		id := make([]byte, 16)
+		if _, err := rand.Read(id); err != nil {
+			return nil, config.Config{}, fmt.Errorf("generate proxy instance identity: %w", err)
+		}
+		r.instanceID = hex.EncodeToString(id)
+		r.peerListen, r.peerNodeID = cfg.Peer.Listen, cfg.Peer.NodeID
+		certificate, err = loadPeerCertificate(cfg.Peer)
+		if err != nil {
+			return nil, config.Config{}, err
+		}
+	}
+	var managementCertificate *tls.Certificate
+	if cfg.Management != nil {
+		r.managementListen = cfg.Management.Listen
+		managementCertificate, err = loadManagementCertificate(cfg.Management)
+		if err != nil {
+			return nil, config.Config{}, err
+		}
+	}
+	state, err := makeReloaderState(cfg, handler, 1, certificate, managementCertificate, r.peerListen != "")
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	r.state.Store(state)
 	digest, err := configDigest(path)
 	if err != nil {
 		return nil, config.Config{}, err
 	}
 	r.lastHash = digest
+	r.ingestion, err = newIngestionRuntime(cfg)
+	if err != nil {
+		state.peerCancel()
+		closePeerClients(state.peerClients)
+		return nil, config.Config{}, err
+	}
 	return r, cfg, nil
 }
 
@@ -61,18 +138,64 @@ func (r *Reloader) SetWatchInterval(interval time.Duration) {
 }
 
 func (r *Reloader) Start() {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.started || r.stopped {
+		return
+	}
+	r.started = true
+	r.wg.Add(2)
 	go r.watch()
+	go r.watchPeers()
+}
+
+func (r *Reloader) Stop() {
+	r.lifecycleMu.Lock()
+	if !r.stopped {
+		r.stopped = true
+		close(r.stop)
+		r.state.Load().peerCancel()
+	}
+	r.lifecycleMu.Unlock()
+	if r.benchmark != nil {
+		r.benchmark.jobs.Stop()
+	}
+	if r.ingestion != nil {
+		if err := r.ingestion.jobs.Stop(); err != nil {
+			r.logger.Error("ingestion record store shutdown failed", "error", err)
+		}
+	}
+	r.wg.Wait()
+	closePeerClients(r.state.Load().peerClients)
 }
 
 func (r *Reloader) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	(*r.handler.Load()).ServeHTTP(writer, request)
+	if r.benchmark != nil && (request.URL.Path == "/benchmark" || strings.HasPrefix(request.URL.Path, "/benchmark/")) {
+		r.serveBenchmark(writer, request)
+		return
+	}
+	if r.peerListen != "" && (request.URL.Path == "/peer" || strings.HasPrefix(request.URL.Path, "/peer/")) {
+		http.NotFound(writer, request)
+		return
+	}
+	if r.managementListen != "" && (request.URL.Path == "/management" || strings.HasPrefix(request.URL.Path, "/management/")) {
+		http.NotFound(writer, request)
+		return
+	}
+	r.state.Load().handler.ServeHTTP(writer, request)
 }
 
 func (r *Reloader) watch() {
+	defer r.wg.Done()
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 	last := r.lastHash
-	for range ticker.C {
+	for {
+		select {
+		case <-r.stop:
+			return
+		case <-ticker.C:
+		}
 		digest, err := configDigest(r.path)
 		if err != nil {
 			r.logger.Warn("config watch: cannot read config file", "error", err)
@@ -99,6 +222,43 @@ func (r *Reloader) reload() error {
 	if err != nil {
 		return err
 	}
+	if (cfg.Benchmark == nil) != (r.benchmark == nil) ||
+		cfg.Benchmark != nil && (*cfg.Benchmark != r.benchmark.config || cfg.DiagnosticsAPIKey != r.benchmark.diagnosticsKey) {
+		return errors.New("changing benchmark configuration or its diagnostics credential requires a restart")
+	}
+	var ingestionConfig *config.IngestionConfig
+	if cfg.Management != nil {
+		ingestionConfig = cfg.Management.Ingestion
+	}
+	if (ingestionConfig == nil) != (r.ingestion == nil) ||
+		ingestionConfig != nil && *ingestionConfig != r.ingestion.config {
+		return errors.New("changing ingestion configuration requires a restart")
+	}
+	if ingestionConfig != nil {
+		if err := validateIngestionDirectories(cfg.Management, cfg.Benchmark); err != nil {
+			return err
+		}
+	}
+	var certificate *tls.Certificate
+	if cfg.Peer != nil {
+		if r.peerListen == "" || cfg.Peer.Listen != r.peerListen || cfg.Peer.NodeID != r.peerNodeID {
+			return errors.New("enabling peer listener or changing its address or node ID requires a restart")
+		}
+		certificate, err = loadPeerCertificate(cfg.Peer)
+		if err != nil {
+			return err
+		}
+	}
+	var managementCertificate *tls.Certificate
+	if cfg.Management != nil {
+		if r.managementListen == "" || cfg.Management.Listen != r.managementListen {
+			return errors.New("enabling or changing the management listener requires a restart")
+		}
+		managementCertificate, err = loadManagementCertificate(cfg.Management)
+		if err != nil {
+			return err
+		}
+	}
 	diagnosticsService, err := diagnostics.New(cfg.Backends)
 	if err != nil {
 		return err
@@ -112,12 +272,114 @@ func (r *Reloader) reload() error {
 	if err != nil {
 		return err
 	}
-	r.handler.Store(&handler)
+	r.lifecycleMu.Lock()
+	if r.stopped {
+		r.lifecycleMu.Unlock()
+		return errors.New("configuration reloader stopped")
+	}
+	old := r.state.Load()
+	if old.generation == ^uint64(0) {
+		r.lifecycleMu.Unlock()
+		return errors.New("configuration generation exhausted")
+	}
+	state, err := makeReloaderState(cfg, handler, old.generation+1, certificate, managementCertificate, r.peerListen != "")
+	if err != nil {
+		r.lifecycleMu.Unlock()
+		return err
+	}
+	r.state.Store(state)
+	old.peerCancel()
+	closePeerClients(old.peerClients)
+	select {
+	case r.peerWake <- struct{}{}:
+	default:
+	}
+	r.lifecycleMu.Unlock()
 	if r.onReload != nil {
 		r.onReload(cfg)
 	}
 	r.logger.Info("configuration reloaded", "default_backend", cfg.DefaultBackend, "backends", len(cfg.Backends))
 	return nil
+}
+
+func makeReloaderState(cfg config.Config, handler http.Handler, generation uint64, certificate, managementCertificate *tls.Certificate, reservePeer bool) (*reloaderState, error) {
+	clients, cache, err := newPeerClients(cfg.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if reservePeer {
+		h, ok := handler.(*Handler)
+		if !ok {
+			return nil, errors.New("unexpected handler type for peer configuration")
+		}
+		h.peerCache = cache
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	if reservePeer {
+		h := handler.(*Handler)
+		h.peerClients = clients
+		h.peerContext = ctx
+		h.peerInferenceSlots = make(chan struct{}, 8)
+	}
+	return &reloaderState{
+		handler: handler, peer: copyPeerConfig(cfg.Peer), cacheTTL: cfg.ModelsCacheTTL,
+		generation: generation, certificate: certificate, peerClients: clients,
+		management: copyManagementConfig(cfg.Management), managementCertificate: managementCertificate,
+		peerCache: cache, peerContext: ctx, peerCancel: cancel,
+	}, nil
+}
+
+func loadManagementCertificate(management *config.ManagementConfig) (*tls.Certificate, error) {
+	certificate, err := tls.LoadX509KeyPair(management.TLSCertFile, management.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load management TLS key pair: %w", err)
+	}
+	return &certificate, nil
+}
+
+func copyManagementConfig(management *config.ManagementConfig) *config.ManagementConfig {
+	if management == nil {
+		return nil
+	}
+	copy := *management
+	if management.ProposalStore != nil {
+		store := *management.ProposalStore
+		copy.ProposalStore = &store
+	}
+	if management.BackupStore != nil {
+		store := *management.BackupStore
+		copy.BackupStore = &store
+	}
+	if management.Ingestion != nil {
+		ingestion := *management.Ingestion
+		copy.Ingestion = &ingestion
+	}
+	copy.Targets = make(map[string]config.ManagementTarget, len(management.Targets))
+	for id, target := range management.Targets {
+		copy.Targets[id] = target
+	}
+	return &copy
+}
+
+func loadPeerCertificate(peer *config.PeerConfig) (*tls.Certificate, error) {
+	certificate, err := tls.LoadX509KeyPair(peer.TLSCertFile, peer.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load peer TLS key pair: %w", err)
+	}
+	return &certificate, nil
+}
+
+func copyPeerConfig(peer *config.PeerConfig) *config.PeerConfig {
+	if peer == nil {
+		return nil
+	}
+	copy := *peer
+	copy.LocalBackends = append([]string(nil), peer.LocalBackends...)
+	copy.Peers = make(map[string]config.PeerGrant, len(peer.Peers))
+	for id, grant := range peer.Peers {
+		copy.Peers[id] = grant
+	}
+	return &copy
 }
 
 func configDigest(path string) ([sha256.Size]byte, error) {

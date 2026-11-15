@@ -50,13 +50,22 @@ type Service struct {
 type backendState struct {
 	Backend
 
-	mu        sync.Mutex
-	root      map[string]any
-	models    []map[string]any
-	header    http.Header
-	fetchedAt time.Time
-	lastTry   time.Time
-	lastErr   error
+	readinessMu sync.RWMutex
+	readiness   BackendReadiness
+	mu          sync.Mutex
+	root        map[string]any
+	models      []map[string]any
+	header      http.Header
+	fetchedAt   time.Time
+	lastTry     time.Time
+	lastErr     error
+}
+
+// BackendReadiness is the result of a completed local readiness check.
+type BackendReadiness struct {
+	BackendID  string
+	Status     string
+	ObservedAt time.Time
 }
 
 // BackendModel describes the models served by one backend, using cached
@@ -171,6 +180,67 @@ func (s *Service) BackendModels() []BackendModel {
 	return result
 }
 
+// BackendPrefix returns the configured public prefix without fetching a catalog.
+func (s *Service) BackendPrefix(id string) (string, bool) {
+	for _, backend := range s.backends {
+		if backend.ID == id {
+			return backend.Prefix, true
+		}
+	}
+	return "", false
+}
+
+// VisitCachedModelIDs visits explicitly selected cached backends and their
+// model IDs without copying upstream objects or making network requests.
+// Callbacks run under the individual backend's cache lock and must not call
+// back into the service. Context cancellation interrupts lock waits and scans.
+func (s *Service) VisitCachedModelIDs(ctx context.Context, selected map[string]bool, backend func(string, time.Time) error, model func(string) error) error {
+	for _, bs := range s.backends {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !selected[bs.ID] {
+			continue
+		}
+		if err := bs.visitCachedModelIDs(ctx, backend, model); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
+func (bs *backendState) visitCachedModelIDs(ctx context.Context, backend func(string, time.Time) error, model func(string) error) error {
+	if !bs.mu.TryLock() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for locked := false; !locked; {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				locked = bs.mu.TryLock()
+			}
+		}
+	}
+	defer bs.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := backend(bs.ID, bs.fetchedAt); err != nil {
+		return err
+	}
+	for _, row := range bs.models {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		id, _ := row["id"].(string)
+		if err := model(id); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
 func (s *Service) BackendStatuses(ctx context.Context) (map[string]string, error) {
 	statuses := make(map[string]string, len(s.backends))
 	var defaultErr error
@@ -181,9 +251,17 @@ func (s *Service) BackendStatuses(ctx context.Context) (map[string]string, error
 		go func() {
 			defer wg.Done()
 			err := s.backendReady(ctx, backend)
+			observedAt := time.Now()
 			status := "ready"
 			if err != nil {
 				status = "unavailable"
+			}
+			if ctx.Err() == nil {
+				backend.readinessMu.Lock()
+				if observedAt.After(backend.readiness.ObservedAt) {
+					backend.readiness = BackendReadiness{BackendID: backend.ID, Status: status, ObservedAt: observedAt}
+				}
+				backend.readinessMu.Unlock()
 			}
 			mu.Lock()
 			statuses[backend.ID] = status
@@ -195,6 +273,29 @@ func (s *Service) BackendStatuses(ctx context.Context) (map[string]string, error
 	}
 	wg.Wait()
 	return statuses, defaultErr
+}
+
+// CachedBackendReadiness returns only existing checks; it never probes backends.
+func (s *Service) CachedBackendReadiness(selected []string) []BackendReadiness {
+	wanted := make(map[string]bool, len(selected))
+	for _, id := range selected {
+		wanted[id] = true
+	}
+	results := make([]BackendReadiness, 0, len(selected))
+	for _, backend := range s.backends {
+		if !wanted[backend.ID] {
+			continue
+		}
+		backend.readinessMu.RLock()
+		result := backend.readiness
+		backend.readinessMu.RUnlock()
+		if result.ObservedAt.IsZero() {
+			result = BackendReadiness{BackendID: backend.ID, Status: "unknown"}
+		}
+		results = append(results, result)
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].BackendID < results[j].BackendID })
+	return results
 }
 
 func (s *Service) fetchCatalogs(ctx context.Context, requestHeader http.Header) []catalogResult {

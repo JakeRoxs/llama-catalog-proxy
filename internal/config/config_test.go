@@ -1,12 +1,335 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestBenchmarkConfigurationValidation(t *testing.T) {
+	token, diagnostic := strings.Repeat("b", 32), strings.Repeat("d", 32)
+	directory := t.TempDir()
+	base := fmt.Sprintf(`
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+diagnostics_api_key: %s
+benchmark:
+  token: %s
+  proxy_origin: http://127.0.0.1:8080
+  report_directory: %q
+`, diagnostic, token, directory)
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"missing diagnostics": strings.Replace(base, "diagnostics_api_key: "+diagnostic, "", 1),
+		"same credential":     strings.Replace(base, "token: "+token, "token: "+diagnostic, 1),
+		"short credential":    strings.Replace(base, "token: "+token, "token: short", 1),
+		"relative directory":  strings.Replace(base, fmt.Sprintf("report_directory: %q", directory), "report_directory: relative", 1),
+		"public origin":       strings.Replace(base, "127.0.0.1", "8.8.8.8", 1),
+		"origin path":         strings.Replace(base, ":8080", ":8080/path", 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), diagnostic) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestPeerConfigurationValidation(t *testing.T) {
+	token := strings.Repeat("a", 32)
+	base := `
+default_backend: local
+backends:
+  local: {url: http://localhost:9292}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  local_backends: [local]
+  peers:
+    node-b: {token: ` + token + `, catalog_read: true}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"self peer":                   strings.Replace(base, "node-b:", "node-a:", 1),
+		"missing backend":             strings.Replace(base, "[local]", "[missing]", 1),
+		"duplicate local":             strings.Replace(base, "[local]", "[local, local]", 1),
+		"short token":                 strings.Replace(base, token, "short", 1),
+		"bad listen":                  strings.Replace(base, "127.0.0.1:9293", "bad", 1),
+		"missing cert":                strings.Replace(base, "tls_cert_file: cert.pem", "tls_cert_file: ''", 1),
+		"duplicate token":             base + "    node-c: {token: " + token + ", catalog_read: true}\n",
+		"diagnostics key":             base + "diagnostics_api_key: " + token + "\n",
+		"diagnostics without catalog": strings.Replace(base, "catalog_read: true", "catalog_read: false, diagnostics_read: true", 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), token) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestPeerOutboundConfigurationValidation(t *testing.T) {
+	inbound, outbound := strings.Repeat("a", 32), strings.Repeat("b", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  local_backends: [local]
+  peers:
+    node-b: {token: ` + inbound + `, catalog_read: true, url: "https://peer.example:9293", outbound_token: ` + outbound + `}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"plaintext":   strings.Replace(base, "https://peer.example:9293", "http://peer.example:9293", 1),
+		"userinfo":    strings.Replace(base, "https://peer.example:9293", "https://user:pass@peer.example:9293", 1),
+		"path":        strings.Replace(base, "https://peer.example:9293", "https://peer.example:9293/path", 1),
+		"query":       strings.Replace(base, "https://peer.example:9293", "https://peer.example:9293/?x=y", 1),
+		"same token":  strings.Replace(base, outbound, inbound, 1),
+		"no outbound": strings.Replace(base, outbound, "", 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), inbound) || strings.Contains(err.Error(), outbound) {
+				t.Fatalf("invalid peer accepted or token leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestManagementConfigurationValidation(t *testing.T) {
+	token := strings.Repeat("m", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: ` + token + `
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]string{
+		"short token":              strings.Replace(base, token, "short", 1),
+		"reused diagnostics token": base + "diagnostics_api_key: " + token + "\n",
+		"reused backend token":     strings.Replace(base, "url: http://localhost:9292", "url: http://localhost:9292, api_key: "+token, 1),
+		"relative directory":       strings.Replace(base, "/config/llama-swap", "relative", 1),
+		"traversal filename":       strings.Replace(base, "config.yaml", "../config.yaml", 1),
+		"invalid target ID":        strings.Replace(base, "    local: {directory:", "    '../local': {directory:", 1),
+		"missing TLS":              strings.Replace(base, "tls_key_file: key.pem", "tls_key_file: ''", 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), token) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestIngestionConfigurationValidation(t *testing.T) {
+	preview, token, hub := strings.Repeat("m", 32), strings.Repeat("i", 32), strings.Repeat("h", 32)
+	base := fmt.Sprintf(`
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: %s
+  ingestion:
+    directory: /models
+    record_directory: /state/ingestion
+    max_records: 100
+    token: %s
+    huggingface_token: %s
+    max_bytes: 4096
+    max_directory_bytes: 8192
+    min_free_bytes: 1024
+    timeout: 1h
+    file_mode: "0640"
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+`, preview, token, hub)
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	benchmark := fmt.Sprintf("\ndiagnostics_api_key: %s\nbenchmark:\n  token: %s\n  proxy_origin: http://127.0.0.1:8080\n  report_directory: /reports\n", strings.Repeat("d", 32), strings.Repeat("b", 32))
+	for name, contents := range map[string]string{
+		"relative path":          strings.Replace(base, "directory: /models", "directory: models", 1),
+		"relative records":       strings.Replace(base, "record_directory: /state/ingestion", "record_directory: relative", 1),
+		"overlapping records":    strings.Replace(base, "record_directory: /state/ingestion", "record_directory: /models/records", 1),
+		"invalid record limit":   strings.Replace(base, "max_records: 100", "max_records: 257", 1),
+		"overlapping target":     strings.Replace(base, "directory: /models", "directory: /config", 1),
+		"missing size":           strings.Replace(base, "max_bytes: 4096", "max_bytes: 0", 1),
+		"negative quota":         strings.Replace(base, "max_directory_bytes: 8192", "max_directory_bytes: -1", 1),
+		"negative reserve":       strings.Replace(base, "min_free_bytes: 1024", "min_free_bytes: -1", 1),
+		"missing deadline":       strings.Replace(base, "timeout: 1h", "timeout: 0s", 1),
+		"invalid deadline":       strings.Replace(base, "timeout: 1h", "timeout: forever", 1),
+		"unsafe permissions":     strings.Replace(base, `"0640"`, `"0666"`, 1),
+		"reused management key":  strings.Replace(base, "token: "+token, "token: "+preview, 1),
+		"reused hub key":         strings.Replace(base, "huggingface_token: "+hub, "huggingface_token: "+token, 1),
+		"hub management key":     strings.Replace(base, "huggingface_token: "+hub, "huggingface_token: "+preview, 1),
+		"backend token as hub":   strings.Replace(base, "url: http://localhost:9292", "url: http://localhost:9292, api_key: "+hub, 1),
+		"diagnostics key as hub": base + "diagnostics_api_key: " + hub + "\n",
+		"benchmark key as hub":   base + strings.Replace(benchmark, strings.Repeat("b", 32), hub, 1),
+		"benchmark key reused":   base + strings.Replace(benchmark, strings.Repeat("b", 32), token, 1),
+		"benchmark directory":    base + strings.Replace(benchmark, "/reports", "/models/reports", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), preview) || strings.Contains(err.Error(), token) || strings.Contains(err.Error(), hub) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestProposalStoreConfigurationValidation(t *testing.T) {
+	preview, proposal := strings.Repeat("m", 32), strings.Repeat("p", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: ` + preview + `
+  proposal_store: {directory: /state/proposals, token: ` + proposal + `}
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"same credential":     strings.Replace(base, proposal, preview, 1),
+		"short credential":    strings.Replace(base, proposal, "short", 1),
+		"relative store":      strings.Replace(base, "/state/proposals", "state", 1),
+		"target directory":    strings.Replace(base, "/state/proposals", "/config/llama-swap", 1),
+		"inside target":       strings.Replace(base, "/state/proposals", "/config/llama-swap/state", 1),
+		"target inside store": strings.Replace(base, "/state/proposals", "/config", 1),
+		"backend credential":  strings.Replace(base, "url: http://localhost:9292", "url: http://localhost:9292, api_key: "+proposal, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), preview) || strings.Contains(err.Error(), proposal) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestBackupStoreConfigurationValidation(t *testing.T) {
+	preview, proposal, backup := strings.Repeat("m", 32), strings.Repeat("p", 32), strings.Repeat("b", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: ` + preview + `
+  proposal_store: {directory: /state/proposals, token: ` + proposal + `}
+  backup_store: {directory: /state/backups, token: ` + backup + `, max_backups: 8}
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	standalone := strings.Replace(base, "  proposal_store: {directory: /state/proposals, token: "+proposal+"}\n", "", 1)
+	if _, err := Load(writeConfig(t, standalone)); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"preview credential":           strings.Replace(base, backup, preview, 1),
+		"proposal credential":          strings.Replace(base, backup, proposal, 1),
+		"short credential":             strings.Replace(base, backup, "short", 1),
+		"backend credential":           strings.Replace(base, "url: http://localhost:9292", "url: http://localhost:9292, api_key: "+backup, 1),
+		"relative store":               strings.Replace(base, "/state/backups", "state", 1),
+		"target directory":             strings.Replace(base, "/state/backups", "/config/llama-swap", 1),
+		"inside target":                strings.Replace(base, "/state/backups", "/config/llama-swap/state", 1),
+		"target inside store":          strings.Replace(base, "/state/backups", "/config", 1),
+		"same proposal store":          strings.Replace(base, "/state/backups", "/state/proposals", 1),
+		"inside proposal":              strings.Replace(base, "/state/backups", "/state/proposals/backups", 1),
+		"proposal inside":              strings.Replace(base, "/state/backups", "/state", 1),
+		"missing limit":                strings.Replace(base, ", max_backups: 8", "", 1),
+		"zero limit":                   strings.Replace(base, "max_backups: 8", "max_backups: 0", 1),
+		"limit exceeds bounds":         strings.Replace(base, "max_backups: 8", "max_backups: 33", 1),
+		"standalone shared credential": strings.Replace(standalone, backup, preview, 1),
+		"standalone missing limit":     strings.Replace(standalone, ", max_backups: 8", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), preview) ||
+				strings.Contains(err.Error(), proposal) || strings.Contains(err.Error(), backup) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
+
+func TestManagementWriteConfigurationValidation(t *testing.T) {
+	preview, proposal, backup, write := strings.Repeat("m", 32), strings.Repeat("p", 32), strings.Repeat("b", 32), strings.Repeat("w", 32)
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+management:
+  listen: "127.0.0.1:9294"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  preview_token: ` + preview + `
+  proposal_store: {directory: /state/proposals, token: ` + proposal + `}
+  backup_store: {directory: /state/backups, token: ` + backup + `, max_backups: 8}
+  write_token: ` + write + `
+  targets:
+    local: {directory: /config/llama-swap, filename: config.yaml}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"preview credential":  strings.Replace(base, write, preview, 1),
+		"proposal credential": strings.Replace(base, write, proposal, 1),
+		"backup credential":   strings.Replace(base, write, backup, 1),
+		"short credential":    strings.Replace(base, write, "short", 1),
+		"backend credential":  strings.Replace(base, "url: http://localhost:9292", "url: http://localhost:9292, api_key: "+write, 1),
+		"missing proposals":   strings.Replace(base, "  proposal_store: {directory: /state/proposals, token: "+proposal+"}\n", "", 1),
+		"missing backups":     strings.Replace(base, "  backup_store: {directory: /state/backups, token: "+backup+", max_backups: 8}\n", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, contents))
+			if err == nil || strings.Contains(err.Error(), write) {
+				t.Fatalf("invalid configuration accepted or credential leaked: %v", err)
+			}
+		})
+	}
+}
 
 func TestLoadAppliesDefaultsAndEnvironmentOverrides(t *testing.T) {
 	path := writeConfig(t, `

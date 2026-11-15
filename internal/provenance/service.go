@@ -16,6 +16,7 @@ import (
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/catalog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 )
 
 // VerificationLevel describes how a provenance field's value was established.
@@ -76,7 +77,7 @@ func New() *Service {
 
 // maxIdentityRunes bounds the length of every identity component so that
 // forged or oversized identities cannot be trusted.
-const maxIdentityRunes = 256
+const maxIdentityRunes = identity.MaxModelComponentBytes
 
 // Fixed source strings. Arbitrary upstream metadata is not trusted and model
 // names/aliases are not used to infer missing provenance.
@@ -417,7 +418,7 @@ func (i ModelIdentity) Valid() bool {
 }
 
 func validIdentityComponent(value string) bool {
-	return utf8.ValidString(value) && len(value) <= maxIdentityRunes && len([]rune(value)) <= maxIdentityRunes
+	return identity.ValidModelComponent(value)
 }
 
 // Snapshot produces per-model provenance records combining catalog metadata

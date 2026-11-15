@@ -3,13 +3,19 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/privateorigin"
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,6 +54,78 @@ type Config struct {
 	// /diagnostics and /diagnostics/v1 requests. It is never echoed in
 	// errors, logs, or JSON responses.
 	DiagnosticsAPIKey string
+	Peer              *PeerConfig
+	Management        *ManagementConfig
+	Benchmark         *BenchmarkConfig
+}
+
+type BenchmarkConfig struct {
+	Token           string `yaml:"token"`
+	ProxyOrigin     string `yaml:"proxy_origin"`
+	ReportDirectory string `yaml:"report_directory"`
+}
+
+// ManagementConfig enables a separate HTTPS endpoint for local config previews.
+type ManagementConfig struct {
+	Listen        string                      `yaml:"listen"`
+	TLSCertFile   string                      `yaml:"tls_cert_file"`
+	TLSKeyFile    string                      `yaml:"tls_key_file"`
+	PreviewToken  string                      `yaml:"preview_token"`
+	ProposalStore *ProposalStoreConfig        `yaml:"proposal_store,omitempty"`
+	BackupStore   *BackupStoreConfig          `yaml:"backup_store,omitempty"`
+	WriteToken    string                      `yaml:"write_token,omitempty"`
+	Ingestion     *IngestionConfig            `yaml:"ingestion,omitempty"`
+	Targets       map[string]ManagementTarget `yaml:"targets"`
+}
+
+type IngestionConfig struct {
+	Directory         string `yaml:"directory"`
+	RecordDirectory   string `yaml:"record_directory"`
+	MaxRecords        int    `yaml:"max_records"`
+	Token             string `yaml:"token"`
+	HuggingFaceToken  string `yaml:"huggingface_token,omitempty"`
+	MaxBytes          int64  `yaml:"max_bytes"`
+	MaxDirectoryBytes int64  `yaml:"max_directory_bytes,omitempty"`
+	MinFreeBytes      int64  `yaml:"min_free_bytes,omitempty"`
+	Timeout           string `yaml:"timeout"`
+	FileMode          string `yaml:"file_mode"`
+}
+
+type ProposalStoreConfig struct {
+	Directory string `yaml:"directory"`
+	Token     string `yaml:"token"`
+}
+
+type BackupStoreConfig struct {
+	Directory  string `yaml:"directory"`
+	Token      string `yaml:"token"`
+	MaxBackups int    `yaml:"max_backups"`
+}
+
+type ManagementTarget struct {
+	Directory string `yaml:"directory"`
+	Filename  string `yaml:"filename"`
+}
+
+// PeerConfig describes the opt-in HTTPS listener and explicitly configured peers.
+type PeerConfig struct {
+	NodeID        string               `yaml:"node_id"`
+	Listen        string               `yaml:"listen"`
+	TLSCertFile   string               `yaml:"tls_cert_file"`
+	TLSKeyFile    string               `yaml:"tls_key_file"`
+	LocalBackends []string             `yaml:"local_backends"`
+	Peers         map[string]PeerGrant `yaml:"peers"`
+}
+
+type PeerGrant struct {
+	Token           string `yaml:"token"`
+	CatalogRead     bool   `yaml:"catalog_read"`
+	DiagnosticsRead bool   `yaml:"diagnostics_read"`
+	Inference       bool   `yaml:"inference"`
+	URL             string `yaml:"url"`
+	OutboundToken   string `yaml:"outbound_token"`
+	CAFile          string `yaml:"ca_file"`
+	RouteInference  bool   `yaml:"route_inference"`
 }
 
 type Backend struct {
@@ -75,6 +153,9 @@ type fileConfig struct {
 	RequestHistory     *bool              `yaml:"request_history,omitempty"`
 	RequestObservation *bool              `yaml:"request_observation,omitempty"`
 	DiagnosticsAPIKey  *string            `yaml:"diagnostics_api_key,omitempty"`
+	Peer               *PeerConfig        `yaml:"peer,omitempty"`
+	Management         *ManagementConfig  `yaml:"management,omitempty"`
+	Benchmark          *BenchmarkConfig   `yaml:"benchmark,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -101,6 +182,9 @@ func Load(path string) (Config, error) {
 		ModelsCacheTTL: defaultModelsCacheTTL,
 		RequestTimeout: defaultRequestTimeout,
 		MaxJSONBody:    defaultMaxJSONBody,
+		Peer:           raw.Peer,
+		Management:     raw.Management,
+		Benchmark:      raw.Benchmark,
 	}
 	if cfg.Backends == nil {
 		cfg.Backends = make(map[string]Backend)
@@ -199,6 +283,15 @@ func (c Config) Validate() error {
 	if err := validateDiagnosticsAPIKey(c.DiagnosticsAPIKey); err != nil {
 		return err
 	}
+	if err := validatePeer(c); err != nil {
+		return err
+	}
+	if err := validateManagement(c); err != nil {
+		return err
+	}
+	if err := validateBenchmark(c); err != nil {
+		return err
+	}
 	prefixOwners := make(map[string]string)
 	for backendID, backend := range c.Backends {
 		if strings.TrimSpace(backendID) == "" {
@@ -251,6 +344,325 @@ func (c Config) Validate() error {
 	if c.ComfyUIWaitTimeout > 0 {
 		if _, exists := c.PathRoutes["/comfyui"]; !exists {
 			return errors.New("comfyui_wait_timeout requires path_routes /comfyui")
+		}
+	}
+	return nil
+}
+
+func validateBenchmark(c Config) error {
+	b := c.Benchmark
+	if b == nil {
+		return nil
+	}
+	if c.DiagnosticsAPIKey == "" {
+		return errors.New("benchmark requires the diagnostics API")
+	}
+	if err := validateManagementToken(c, b.Token); err != nil {
+		return fmt.Errorf("benchmark credential invalid: %w", err)
+	}
+	if c.Management != nil {
+		m := c.Management
+		if b.Token == m.PreviewToken || b.Token == m.WriteToken ||
+			m.ProposalStore != nil && b.Token == m.ProposalStore.Token ||
+			m.BackupStore != nil && b.Token == m.BackupStore.Token {
+			return errors.New("benchmark and management credentials must be distinct")
+		}
+	}
+	if !filepath.IsAbs(b.ReportDirectory) || filepath.Clean(b.ReportDirectory) != b.ReportDirectory {
+		return errors.New("benchmark report directory must be an absolute clean path")
+	}
+	if c.Management != nil {
+		m := c.Management
+		dirs := make([]string, 0, len(m.Targets)+2)
+		for _, target := range m.Targets {
+			dirs = append(dirs, target.Directory)
+		}
+		if m.ProposalStore != nil {
+			dirs = append(dirs, m.ProposalStore.Directory)
+		}
+		if m.BackupStore != nil {
+			dirs = append(dirs, m.BackupStore.Directory)
+		}
+		for _, directory := range dirs {
+			if containsPath(b.ReportDirectory, directory) || containsPath(directory, b.ReportDirectory) {
+				return errors.New("benchmark reports must be separate from management stores and targets")
+			}
+		}
+	}
+	if _, err := privateorigin.Parse(b.ProxyOrigin); err != nil {
+		return fmt.Errorf("benchmark proxy origin: %w", err)
+	}
+	return nil
+}
+
+func validateManagement(c Config) error {
+	m := c.Management
+	if m == nil {
+		return nil
+	}
+	_, port, err := net.SplitHostPort(m.Listen)
+	if err != nil {
+		return errors.New("management listen must be a host:port address")
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 || m.Listen == c.Listen || (c.Peer != nil && m.Listen == c.Peer.Listen) {
+		return errors.New("management listen must use a valid distinct port")
+	}
+	if strings.TrimSpace(m.TLSCertFile) == "" || strings.TrimSpace(m.TLSKeyFile) == "" {
+		return errors.New("management TLS certificate and key files are required")
+	}
+	if err := validateManagementToken(c, m.PreviewToken); err != nil {
+		return err
+	}
+	if m.ProposalStore != nil {
+		if !filepath.IsAbs(m.ProposalStore.Directory) || filepath.Clean(m.ProposalStore.Directory) != m.ProposalStore.Directory {
+			return errors.New("proposal store directory must be an absolute clean path")
+		}
+		if m.ProposalStore.Token == m.PreviewToken {
+			return errors.New("proposal and preview credentials must be distinct")
+		}
+		if err := validateManagementToken(c, m.ProposalStore.Token); err != nil {
+			return err
+		}
+	}
+	if m.BackupStore != nil {
+		store := m.BackupStore
+		if !filepath.IsAbs(store.Directory) || filepath.Clean(store.Directory) != store.Directory {
+			return errors.New("backup store directory must be an absolute clean path")
+		}
+		if store.MaxBackups < 1 || store.MaxBackups > modelconfig.MaxBackups {
+			return errors.New("backup store max_backups must be between 1 and 32")
+		}
+		if store.Token == m.PreviewToken || m.ProposalStore != nil && store.Token == m.ProposalStore.Token {
+			return errors.New("backup, proposal, and preview credentials must be distinct")
+		}
+		if err := validateManagementToken(c, store.Token); err != nil {
+			return err
+		}
+		if m.ProposalStore != nil && (containsPath(store.Directory, m.ProposalStore.Directory) ||
+			containsPath(m.ProposalStore.Directory, store.Directory)) {
+			return errors.New("backup and proposal stores must be separate")
+		}
+	}
+	if m.WriteToken != "" {
+		if m.ProposalStore == nil || m.BackupStore == nil {
+			return errors.New("management write token requires proposal and backup stores")
+		}
+		if m.WriteToken == m.PreviewToken || m.WriteToken == m.ProposalStore.Token || m.WriteToken == m.BackupStore.Token {
+			return errors.New("management write credential must be distinct")
+		}
+		if err := validateManagementToken(c, m.WriteToken); err != nil {
+			return err
+		}
+	}
+	if m.Ingestion != nil {
+		i := m.Ingestion
+		if !filepath.IsAbs(i.Directory) || filepath.Clean(i.Directory) != i.Directory {
+			return errors.New("ingestion directory must be an absolute clean path")
+		}
+		if !filepath.IsAbs(i.RecordDirectory) || filepath.Clean(i.RecordDirectory) != i.RecordDirectory ||
+			i.MaxRecords < 1 || i.MaxRecords > 256 {
+			return errors.New("ingestion requires an absolute record directory and max_records between 1 and 256")
+		}
+		timeout, err := time.ParseDuration(i.Timeout)
+		if i.MaxBytes < 1 || err != nil || timeout <= 0 || (i.FileMode != "0600" && i.FileMode != "0640") {
+			return errors.New("ingestion requires a positive byte limit and timeout and file mode 0600 or 0640")
+		}
+		if i.MaxDirectoryBytes < 0 || i.MinFreeBytes < 0 {
+			return errors.New("ingestion disk limits cannot be negative")
+		}
+		if err := validateManagementToken(c, i.Token); err != nil {
+			return fmt.Errorf("ingestion credential invalid: %w", err)
+		}
+		credentials := []string{m.PreviewToken, m.WriteToken}
+		if m.ProposalStore != nil {
+			credentials = append(credentials, m.ProposalStore.Token)
+		}
+		if m.BackupStore != nil {
+			credentials = append(credentials, m.BackupStore.Token)
+		}
+		if c.Benchmark != nil {
+			credentials = append(credentials, c.Benchmark.Token)
+		}
+		for _, credential := range credentials {
+			if i.Token == credential || i.HuggingFaceToken != "" && i.HuggingFaceToken == credential {
+				return errors.New("ingestion credentials must be distinct from other service credentials")
+			}
+		}
+		if i.HuggingFaceToken != "" {
+			if len(i.HuggingFaceToken) > 4096 || i.HuggingFaceToken == i.Token || managementCredentialConflict(c, i.HuggingFaceToken) != nil {
+				return errors.New("invalid or reused Hugging Face credential")
+			}
+			for _, ch := range i.HuggingFaceToken {
+				if ch < 0x21 || ch > 0x7e || ch == ',' {
+					return errors.New("invalid Hugging Face credential")
+				}
+			}
+		}
+		dirs := make([]string, 0, len(m.Targets)+3)
+		for _, target := range m.Targets {
+			dirs = append(dirs, target.Directory)
+		}
+		if m.ProposalStore != nil {
+			dirs = append(dirs, m.ProposalStore.Directory)
+		}
+		if m.BackupStore != nil {
+			dirs = append(dirs, m.BackupStore.Directory)
+		}
+		if c.Benchmark != nil {
+			dirs = append(dirs, c.Benchmark.ReportDirectory)
+		}
+		if containsPath(i.Directory, i.RecordDirectory) || containsPath(i.RecordDirectory, i.Directory) {
+			return errors.New("ingestion records and model directory must be separate")
+		}
+		for _, directory := range dirs {
+			if containsPath(i.Directory, directory) || containsPath(directory, i.Directory) ||
+				containsPath(i.RecordDirectory, directory) || containsPath(directory, i.RecordDirectory) {
+				return errors.New("ingestion directory must be separate from management and benchmark directories")
+			}
+		}
+	}
+	if len(m.Targets) == 0 || len(m.Targets) > 32 {
+		return errors.New("management requires 1 to 32 targets")
+	}
+	for id, target := range m.Targets {
+		if !identity.ValidNodeID(id) || id == "." || id == ".." ||
+			!filepath.IsAbs(target.Directory) || filepath.Clean(target.Directory) != target.Directory ||
+			target.Filename == "" || target.Filename == "." || target.Filename == ".." ||
+			filepath.Base(target.Filename) != target.Filename || strings.ContainsAny(target.Filename, `/\`) {
+			return errors.New("invalid management target")
+		}
+		if m.ProposalStore != nil && (containsPath(m.ProposalStore.Directory, target.Directory) ||
+			containsPath(target.Directory, m.ProposalStore.Directory)) {
+			return errors.New("proposal store must be separate from target directories")
+		}
+		if m.BackupStore != nil && (containsPath(m.BackupStore.Directory, target.Directory) ||
+			containsPath(target.Directory, m.BackupStore.Directory)) {
+			return errors.New("backup store must be separate from target directories")
+		}
+	}
+	return nil
+}
+
+func containsPath(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func validateManagementToken(c Config, token string) error {
+	if len(token) < 32 || len(token) > 256 || token == c.DiagnosticsAPIKey {
+		return errors.New("management token must be distinct and contain 32 to 256 printable characters")
+	}
+	for _, ch := range token {
+		if ch < 0x21 || ch > 0x7e || ch == ',' {
+			return errors.New("management token contains invalid characters")
+		}
+	}
+	return managementCredentialConflict(c, token)
+}
+
+func managementCredentialConflict(c Config, token string) error {
+	if token != "" && token == c.DiagnosticsAPIKey {
+		return errors.New("management and diagnostics credentials must be distinct")
+	}
+	for _, backend := range c.Backends {
+		if token == backend.APIKey {
+			return errors.New("management and backend credentials must be distinct")
+		}
+		for _, value := range backend.Headers {
+			if value == token || value == "Bearer "+token {
+				return errors.New("management and backend credentials must be distinct")
+			}
+		}
+	}
+	if c.Peer != nil {
+		for _, grant := range c.Peer.Peers {
+			if token == grant.Token || token == grant.OutboundToken {
+				return errors.New("management and peer credentials must be distinct")
+			}
+		}
+	}
+	return nil
+}
+
+func validatePeer(c Config) error {
+	p := c.Peer
+	if p == nil {
+		return nil
+	}
+	if !identity.ValidNodeID(p.NodeID) {
+		return errors.New("peer node_id is invalid")
+	}
+	_, port, err := net.SplitHostPort(p.Listen)
+	if err != nil {
+		return errors.New("peer listen must be a host:port address")
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 || p.Listen == c.Listen {
+		return errors.New("peer listen must use a valid port distinct from the client listener")
+	}
+	if strings.TrimSpace(p.TLSCertFile) == "" || strings.TrimSpace(p.TLSKeyFile) == "" {
+		return errors.New("peer TLS certificate and key files are required")
+	}
+	if len(p.LocalBackends) > 256 || len(p.Peers) > 32 {
+		return errors.New("too many peer backends or grants")
+	}
+	local := make(map[string]bool, len(p.LocalBackends))
+	for _, id := range p.LocalBackends {
+		if _, ok := c.Backends[id]; !ok || local[id] || id == "" || !identity.ValidModelComponent(id) {
+			return errors.New("peer local_backends contains an invalid, duplicate, or undefined backend")
+		}
+		local[id] = true
+	}
+	tokens := make(map[string]bool, len(p.Peers))
+	for id, grant := range p.Peers {
+		if !identity.ValidNodeID(id) || id == p.NodeID {
+			return errors.New("peer grant has invalid or self node identity")
+		}
+		if grant.DiagnosticsRead && !grant.CatalogRead {
+			return errors.New("peer diagnostics_read requires catalog_read")
+		}
+		if grant.Token == "" && (grant.CatalogRead || grant.DiagnosticsRead || grant.Inference || grant.URL == "") {
+			return errors.New("peer grant requires an incoming token or outbound URL")
+		}
+		if grant.URL == "" {
+			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference {
+				return errors.New("peer outbound token and CA require a URL")
+			}
+		} else {
+			target, err := url.Parse(grant.URL)
+			if err != nil || len(grant.URL) > 2048 || target.Scheme != "https" || target.Hostname() == "" || target.User != nil ||
+				target.RawQuery != "" || target.Fragment != "" || (target.Path != "" && target.Path != "/") ||
+				target.RawPath != "" || target.ForceQuery || strings.TrimSpace(grant.URL) != grant.URL {
+				return errors.New("peer URL must be an HTTPS origin without credentials, path, query, or fragment")
+			}
+			if grant.OutboundToken == "" {
+				return errors.New("peer outbound token is required")
+			}
+		}
+		for _, token := range []string{grant.Token, grant.OutboundToken} {
+			if token == "" {
+				continue
+			}
+			if len(token) < 32 || len(token) > 256 || tokens[token] || token == c.DiagnosticsAPIKey {
+				return errors.New("peer tokens must be distinct and contain 32 to 256 printable characters")
+			}
+			for _, ch := range token {
+				if ch < 0x21 || ch > 0x7e || ch == ',' {
+					return errors.New("peer token contains invalid characters")
+				}
+			}
+			for _, backend := range c.Backends {
+				if token == backend.APIKey {
+					return errors.New("peer and backend credentials must be distinct")
+				}
+				for _, value := range backend.Headers {
+					if value == token || value == "Bearer "+token {
+						return errors.New("peer and backend credentials must be distinct")
+					}
+				}
+			}
+			tokens[token] = true
 		}
 	}
 	return nil

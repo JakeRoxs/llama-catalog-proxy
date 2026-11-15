@@ -1,0 +1,354 @@
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"net/http"
+	"net/http/httputil"
+	"net/textproto"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
+)
+
+const (
+	peerBackendHeader    = "X-Catalog-Peer-Backend"
+	peerModelHeader      = "X-Catalog-Peer-Model"
+	peerPathHeader       = "X-Catalog-Peer-Path"
+	peerInstanceHeader   = "X-Catalog-Peer-Instance"
+	peerGenerationHeader = "X-Catalog-Peer-Generation"
+)
+
+func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, info *routeInfo) bool {
+	if strings.Contains(r.URL.Path, peerModelPrefix) {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "peer model IDs require JSON inference requests")
+		return true
+	}
+	if isInferenceRequest(r) && r.URL.RawQuery != "" {
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil {
+			writeJSONError(h.logger, w, http.StatusBadRequest, "invalid inference query")
+			return true
+		}
+		for key, values := range query {
+			if strings.EqualFold(key, "model") {
+				for _, value := range values {
+					if strings.HasPrefix(value, peerModelPrefix) {
+						writeJSONError(h.logger, w, http.StatusBadRequest, "peer model IDs require JSON inference requests")
+						return true
+					}
+				}
+			}
+		}
+	}
+	if r.Body == nil || r.Body == http.NoBody {
+		return false
+	}
+	if r.Header.Get("Content-Encoding") != "" {
+		if isInferenceRequest(r) {
+			writeJSONError(h.logger, w, http.StatusUnsupportedMediaType, "encoded inference requests are unavailable with peer routing")
+			return true
+		}
+		return false
+	}
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if r.Header.Get("Content-Type") == "" {
+		mediaType, err = "application/json", nil
+	}
+	if err != nil {
+		if isInferenceRequest(r) {
+			writeJSONError(h.logger, w, http.StatusUnsupportedMediaType, "invalid inference content type")
+			return true
+		}
+		return false
+	}
+	if mediaType != "application/json" && mediaType != "multipart/form-data" {
+		if isInferenceRequest(r) {
+			writeJSONError(h.logger, w, http.StatusUnsupportedMediaType, "unsupported inference content type with peer routing")
+			return true
+		}
+		return false
+	}
+	if mediaType == "multipart/form-data" && !isInferenceRequest(r) {
+		return false
+	}
+	if r.ContentLength > h.maxJSONBody {
+		writeJSONError(h.logger, w, http.StatusRequestEntityTooLarge, "request body exceeds the configured limit")
+		return true
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, h.maxJSONBody+1))
+	_ = r.Body.Close()
+	if err != nil {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "request body could not be read")
+		return true
+	}
+	if int64(len(body)) > h.maxJSONBody {
+		writeJSONError(h.logger, w, http.StatusRequestEntityTooLarge, "request body exceeds the configured limit")
+		return true
+	}
+	restoreRequestBody(r, body)
+	var model string
+	var object map[string]any
+	var ambiguous bool
+	if mediaType == "multipart/form-data" {
+		model, ambiguous, err = multipartPeerModel(body, params["boundary"])
+		if err != nil {
+			writeJSONError(h.logger, w, http.StatusBadRequest, "invalid multipart request")
+			return true
+		}
+	} else {
+		model, object, ambiguous, err = jsonPeerModel(body)
+		if err != nil {
+			if isInferenceRequest(r) {
+				writeJSONError(h.logger, w, http.StatusBadRequest, "invalid JSON inference request")
+				return true
+			}
+			return false
+		}
+	}
+	if ambiguous {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "ambiguous peer model")
+		return true
+	}
+	if model == "" {
+		return false
+	}
+	*info = routeInfo{kind: "peer"}
+	if !isInferenceRequest(r) || r.URL.RawQuery != "" {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "peer model requires a supported inference path without a query")
+		return true
+	}
+	id, err := parsePeerPublicID(model)
+	if err != nil {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "invalid peer model ID")
+		return true
+	}
+	client := h.peerClients[id.OwnerNodeID]
+	source, fresh := h.peerCache.freshModel(id, time.Now())
+	if client == nil || !client.routeInference || !fresh {
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		return true
+	}
+	var rewritten []byte
+	if mediaType == "multipart/form-data" {
+		rewritten, err = rewriteMultipartModel(body, params["boundary"], model, id.LocalID, h.maxJSONBody)
+	} else {
+		object["model"] = id.LocalID
+		rewritten, err = json.Marshal(object)
+	}
+	if err != nil {
+		writeJSONError(h.logger, w, http.StatusBadRequest, "request body could not be encoded")
+		return true
+	}
+	restoreRequestBody(r, rewritten)
+	h.proxyPeerInference(w, r, client, id, source)
+	return true
+}
+
+func jsonPeerModel(body []byte) (string, map[string]any, bool, error) {
+	var object map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&object); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return "", nil, false, errors.New("invalid JSON")
+	}
+	scanner := json.NewDecoder(bytes.NewReader(body))
+	if _, err := scanner.Token(); err != nil {
+		return "", nil, false, err
+	}
+	count := 0
+	found := ""
+	for scanner.More() {
+		token, err := scanner.Token()
+		if err != nil {
+			return "", nil, false, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return "", nil, false, errors.New("invalid JSON object key")
+		}
+		var raw json.RawMessage
+		if err := scanner.Decode(&raw); err != nil {
+			return "", nil, false, err
+		}
+		if strings.EqualFold(key, "model") {
+			count++
+			var value string
+			if json.Unmarshal(raw, &value) == nil && strings.HasPrefix(value, peerModelPrefix) {
+				found = value
+				if key != "model" {
+					count++
+				}
+			}
+		}
+	}
+	return found, object, found != "" && count != 1, nil
+}
+
+func multipartPeerModel(body []byte, boundary string) (string, bool, error) {
+	if boundary == "" {
+		return "", false, errors.New("missing multipart boundary")
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	count := 0
+	found := ""
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if strings.EqualFold(part.FormName(), "model") {
+			count++
+			value, err := io.ReadAll(io.LimitReader(part, 1025))
+			if err != nil {
+				return "", false, err
+			}
+			if strings.HasPrefix(string(value), peerModelPrefix) {
+				found = string(value)
+				if part.FormName() != "model" {
+					count++
+				}
+			}
+		}
+		_ = part.Close()
+	}
+	return found, found != "" && count != 1, nil
+}
+
+func rewriteMultipartModel(body []byte, boundary, expected, replacement string, limit int64) ([]byte, error) {
+	reader := multipart.NewReader(bytes.NewReader(body), boundary)
+	var output bytes.Buffer
+	writer := multipart.NewWriter(&output)
+	if err := writer.SetBoundary(boundary); err != nil {
+		return nil, err
+	}
+	count := 0
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		headers := make(textproto.MIMEHeader)
+		for _, name := range []string{"Content-Disposition", "Content-Type"} {
+			for _, value := range part.Header.Values(name) {
+				headers.Add(name, value)
+			}
+		}
+		destination, err := writer.CreatePart(headers)
+		if err != nil {
+			return nil, err
+		}
+		if strings.EqualFold(part.FormName(), "model") {
+			count++
+			value, err := io.ReadAll(io.LimitReader(part, 1025))
+			if err != nil || part.FormName() != "model" || string(value) != expected {
+				return nil, errors.New("invalid multipart model")
+			}
+			_, err = io.WriteString(destination, replacement)
+			if err != nil {
+				return nil, err
+			}
+		} else if _, err := io.Copy(destination, part); err != nil {
+			return nil, err
+		}
+		if int64(output.Len()) > limit {
+			return nil, errJSONBodyTooLarge
+		}
+		if err := part.Close(); err != nil {
+			return nil, err
+		}
+	}
+	if count != 1 {
+		return nil, errors.New("invalid multipart model")
+	}
+	if err := writer.Close(); err != nil {
+		return nil, err
+	}
+	if int64(output.Len()) > limit {
+		return nil, errJSONBodyTooLarge
+	}
+	return output.Bytes(), nil
+}
+
+func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, client *peerClient, id nodecontract.ModelIdentity, source nodecontract.Source) {
+	select {
+	case h.peerInferenceSlots <- struct{}{}:
+		defer func() { <-h.peerInferenceSlots }()
+	default:
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer inference busy")
+		return
+	}
+	target, err := url.Parse(client.origin)
+	if err != nil {
+		h.logger.Error("invalid configured peer origin")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	stop := context.AfterFunc(h.peerContext, cancel)
+	defer func() { stop(); cancel() }()
+	r = r.WithContext(ctx)
+	proxy := &httputil.ReverseProxy{
+		Transport:     client.inferenceTransport,
+		FlushInterval: -1,
+		Rewrite: func(req *httputil.ProxyRequest) {
+			req.SetURL(target)
+			req.Out.URL.Path, req.Out.URL.RawPath, req.Out.URL.RawQuery = "/peer/v1/inference", "", ""
+			req.Out.Header = make(http.Header)
+			req.Out.Trailer = nil
+			req.Out.TransferEncoding = nil
+			req.Out.Header.Set("Content-Type", req.In.Header.Get("Content-Type"))
+			if req.Out.Header.Get("Content-Type") == "" {
+				req.Out.Header.Set("Content-Type", "application/json")
+			}
+			if accept := req.In.Header.Get("Accept"); accept != "" {
+				req.Out.Header.Set("Accept", accept)
+			}
+			req.Out.Header.Set("Authorization", "Bearer "+client.token)
+			req.Out.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte(id.BackendID)))
+			req.Out.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte(id.LocalID)))
+			req.Out.Header.Set(peerPathHeader, req.In.URL.Path)
+			req.Out.Header.Set(peerInstanceHeader, source.ProxyInstanceID)
+			req.Out.Header.Set(peerGenerationHeader, strconv.FormatUint(source.ConfigGeneration, 10))
+		},
+		ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+			h.logger.Warn("peer inference failed", "node_id", id.OwnerNodeID, "error", safeErrorDetail(err))
+			writeJSONError(h.logger, w, http.StatusBadGateway, "peer inference unavailable")
+		},
+	}
+	proxy.ServeHTTP(w, r)
+}
+
+func peerTargetHeaders(r *http.Request, nodeID string) (nodecontract.ModelIdentity, string, string, uint64, error) {
+	for _, name := range []string{peerBackendHeader, peerModelHeader, peerPathHeader, peerInstanceHeader, peerGenerationHeader} {
+		if len(r.Header.Values(name)) != 1 {
+			return nodecontract.ModelIdentity{}, "", "", 0, errors.New("invalid peer target")
+		}
+	}
+	id, err := parsePeerPublicID(peerModelPrefix + nodeID + "/" + r.Header.Get(peerBackendHeader) + "/" + r.Header.Get(peerModelHeader))
+	if err != nil {
+		return nodecontract.ModelIdentity{}, "", "", 0, err
+	}
+	path, instance := r.Header.Get(peerPathHeader), r.Header.Get(peerInstanceHeader)
+	generation, err := strconv.ParseUint(r.Header.Get(peerGenerationHeader), 10, 64)
+	if err != nil || generation == 0 || strconv.FormatUint(generation, 10) != r.Header.Get(peerGenerationHeader) {
+		return nodecontract.ModelIdentity{}, "", "", 0, fmt.Errorf("invalid peer generation")
+	}
+	return id, path, instance, generation, nil
+}

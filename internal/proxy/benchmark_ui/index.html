@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Benchmark Lab | Catalog Proxy</title>
+  <link rel="stylesheet" href="/benchmark/style.css">
+  <script defer src="/benchmark/app.js"></script>
+</head>
+<body>
+  <main>
+    <header class="masthead">
+      <div class="brand">CP</div>
+      <div><p class="eyebrow">CATALOG PROXY / PERFORMANCE</p><h1>Benchmark Lab</h1></div>
+      <span id="connection" class="connection">LOCKED</span>
+    </header>
+    <section class="intro">
+      <div><p class="eyebrow accent">CONTROLLED EVIDENCE</p><h2>Measure deliberately.<br>Compare honestly.</h2><p>Run bounded synthetic workloads against a model already observed ready. Nothing runs until you explicitly start it.</p></div>
+      <div class="notice"><strong>Before you begin</strong><p>Runs generate inference traffic and may interfere with other users. Runtime settings and active inference are not independently verified.</p></div>
+    </section>
+    <section id="security-warning" class="warning" hidden>Use HTTPS through your trusted reverse proxy, or access this page on loopback. Do not enter credentials over an insecure connection.</section>
+    <section class="unlock panel" id="unlock-panel">
+      <div><p class="eyebrow">01 / ACCESS</p><h3>Unlock the lab</h3><p>Enter the dedicated benchmark token. It stays in this page's memory and is cleared on reload.</p></div>
+      <form id="unlock-form"><label for="token">Benchmark token</label><div class="inline"><input id="token" type="password" autocomplete="off" required><button type="submit">Unlock</button></div></form>
+    </section>
+    <div id="workspace" hidden>
+      <section class="workspace">
+        <article class="panel">
+          <div class="panel-title"><span>02</span><div><p class="eyebrow">CONTROLLED RUN</p><h3>Configure a benchmark</h3></div></div>
+          <p>Use a public model ID uniquely observed ready on the selected backend.</p>
+          <form id="run-form">
+            <div class="fields">
+              <div><label for="backend">Backend ID</label><input id="backend" required maxlength="256"></div>
+              <div><label for="model">Public model ID</label><input id="model" required maxlength="256"></div>
+              <div><label for="repetitions">Repetitions / workload</label><input id="repetitions" type="number" min="1" max="3" value="1" required></div>
+              <div><label for="max-output">Max output tokens</label><input id="max-output" type="number" min="1" max="128" value="64" required></div>
+              <div><label for="temperature">Temperature</label><input id="temperature" type="number" min="0" max="2" step="0.01" value="0" required></div>
+              <div><label for="top-p">Top P</label><input id="top-p" type="number" min="0.01" max="1" step="0.01" value="1" required></div>
+              <div><label for="time-budget">Time budget (seconds)</label><input id="time-budget" type="number" min="1" max="300" value="300" required></div>
+              <div><label for="token-budget">Total output token budget</label><input id="token-budget" type="number" min="1" max="4096" value="4096" required></div>
+              <div><label for="cache-state">Declared cache state</label><select id="cache-state"><option value="unknown">Unknown</option><option value="warm">Warm</option><option value="cold">Cold</option></select></div>
+            </div>
+            <label class="consent"><input id="consent" type="checkbox" required><span>I accept that this run sends inference requests and may interfere with active users.</span></label>
+            <button type="submit" class="primary" id="start">Start benchmark</button>
+          </form>
+        </article>
+        <article class="panel state-panel">
+          <div class="panel-title"><span>03</span><div><p class="eyebrow">JOB STATUS</p><h3>Run activity</h3></div></div>
+          <p id="job-state" class="status-value">No active job</p>
+          <p id="job-detail">Run status is available only during this proxy process. Saved reports persist separately.</p>
+          <button type="button" id="refresh-job">Refresh status</button>
+          <button type="button" id="cancel" class="danger" hidden>Cancel run</button>
+          <div class="divider"></div>
+          <p class="eyebrow">EVIDENCE BOUNDARIES</p>
+          <ul><li>Serial execution with bounded requests, tokens, and time.</li><li>Cache state is declared, not verified.</li><li>Shared GPU and aggregate activity are context, not per-request attribution.</li><li>Prompt and response bodies are not shown or saved.</li></ul>
+        </article>
+      </section>
+      <section class="panel history">
+        <div class="section-head"><div><p class="eyebrow">04 / HISTORY</p><h3>Saved runs</h3></div><button id="refresh" type="button">Refresh</button></div>
+        <p id="history-note">Select a report to inspect it or choose two runs to compare.</p>
+        <div class="table-wrap"><table><thead><tr><th>Started</th><th>Model</th><th>Status</th><th>Inspect</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody id="runs"></tbody></table></div>
+        <button id="compare" type="button" disabled>Compare selected runs</button>
+      </section>
+      <section class="panel evidence" id="evidence" hidden aria-live="polite">
+        <div class="section-head"><div><p class="eyebrow">05 / EVIDENCE</p><h3 id="evidence-title">Results</h3></div></div>
+        <div id="evidence-content"></div>
+      </section>
+    </div>
+    <div id="message" class="message" role="status" aria-live="polite"></div>
+  </main>
+</body>
+</html>

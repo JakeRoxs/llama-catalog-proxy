@@ -43,6 +43,7 @@ const (
 	diagnosticSummaryPath = "/diagnostics/v1/summary"
 	// diagnosticBackendsPath is the backends capability subpath.
 	diagnosticBackendsPath = "/diagnostics/v1/backends"
+	diagnosticPeersPath    = "/diagnostics/v1/peers"
 
 	// diagnosticRequestTimeout is the per-request deadline.
 	diagnosticRequestTimeout = 10 * time.Second
@@ -138,6 +139,8 @@ func (h *Handler) serveDiagnosticsAPI(w http.ResponseWriter, r *http.Request, in
 		h.serveDiagnosticsSummary(w, r)
 	case r.URL.Path == diagnosticBackendsPath:
 		h.serveDiagnosticsBackends(w, r)
+	case r.URL.Path == diagnosticPeersPath && h.peerCache != nil:
+		h.serveDiagnosticsPeers(w, r)
 	default:
 		writeDiagnosticsError(w, http.StatusNotFound, "unknown diagnostics path")
 	}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -16,6 +17,62 @@ import (
 	"testing"
 	"time"
 )
+
+func TestVisitCachedModelIDsCancellationAndSelection(t *testing.T) {
+	service := New([]Backend{{ID: "local"}, {ID: "other"}}, nil, time.Minute, time.Second, time.Second, testLogger())
+	var local, other *backendState
+	for _, bs := range service.backends {
+		if bs.ID == "local" {
+			local = bs
+		} else {
+			other = bs
+		}
+	}
+	other.mu.Lock()
+	selectionCtx, selectionCancel := context.WithTimeout(context.Background(), time.Second)
+	defer selectionCancel()
+	err := service.VisitCachedModelIDs(selectionCtx, map[string]bool{"local": true},
+		func(id string, _ time.Time) error {
+			if id != "local" {
+				t.Errorf("unexpected backend %q", id)
+			}
+			return nil
+		}, func(string) error { return nil })
+	other.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	local.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err = service.VisitCachedModelIDs(ctx, map[string]bool{"local": true},
+		func(string, time.Time) error { t.Error("called while locked"); return nil },
+		func(string) error { return nil })
+	local.mu.Unlock()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock wait error = %v", err)
+	}
+	sentinel := errors.New("stop")
+	err = service.VisitCachedModelIDs(context.Background(), map[string]bool{"local": true},
+		func(string, time.Time) error { return sentinel }, func(string) error { return nil })
+	if !errors.Is(err, sentinel) || !local.mu.TryLock() {
+		t.Fatalf("callback error or lock leak: %v", err)
+	}
+	local.models = []map[string]any{{"id": "a"}, {"id": "b"}}
+	local.mu.Unlock()
+	scanCtx, scanCancel := context.WithCancel(context.Background())
+	calls := 0
+	err = service.VisitCachedModelIDs(scanCtx, map[string]bool{"local": true},
+		func(string, time.Time) error { return nil }, func(string) error {
+			calls++
+			scanCancel()
+			return nil
+		})
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("scan cancellation: calls=%d err=%v", calls, err)
+	}
+}
 
 func TestModelsAggregatesAndPreservesBackendObjects(t *testing.T) {
 	defaultServer := catalogServer(t, http.StatusOK, `{"object":"list","custom":"keep","data":[{"id":"local","context_length":8192,"owned_by":"local","unknown":{"keep":true}}]}`)
@@ -433,6 +490,49 @@ func TestReadinessOnlyDefaultFailureMakesUnready(t *testing.T) {
 	}
 	if statuses["optional"] != "unavailable" {
 		t.Fatalf("optional status = %q, want unavailable (bounded by health timeout)", statuses["optional"])
+	}
+}
+
+func TestCachedBackendReadinessTracksChecksWithoutProbing(t *testing.T) {
+	var calls atomic.Int32
+	var available atomic.Bool
+	available.Store(true)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		if !available.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer server.Close()
+	service := newService(t, server.URL, nil, time.Minute, nil)
+	before := service.CachedBackendReadiness([]string{"default"})
+	if len(before) != 1 || before[0].Status != "unknown" || !before[0].ObservedAt.IsZero() || calls.Load() != 0 {
+		t.Fatalf("uncached readiness = %#v calls=%d", before, calls.Load())
+	}
+	if _, err := service.BackendStatuses(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ready := service.CachedBackendReadiness([]string{"default"})
+	if len(ready) != 1 || ready[0].Status != "ready" || ready[0].ObservedAt.IsZero() || calls.Load() != 1 {
+		t.Fatalf("ready snapshot = %#v calls=%d", ready, calls.Load())
+	}
+	if len(service.CachedBackendReadiness([]string{"other"})) != 0 || calls.Load() != 1 {
+		t.Fatal("snapshot probed or included an unselected backend")
+	}
+	available.Store(false)
+	if _, err := service.BackendStatuses(context.Background()); err == nil {
+		t.Fatal("expected unavailable backend")
+	}
+	unavailable := service.CachedBackendReadiness([]string{"default"})
+	if unavailable[0].Status != "unavailable" || unavailable[0].ObservedAt.Before(ready[0].ObservedAt) {
+		t.Fatalf("unavailable snapshot = %#v", unavailable)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = service.BackendStatuses(ctx)
+	afterCanceled := service.CachedBackendReadiness([]string{"default"})
+	if afterCanceled[0] != unavailable[0] {
+		t.Fatalf("canceled probe replaced evidence: %#v", afterCanceled)
 	}
 }
 

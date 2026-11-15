@@ -134,6 +134,10 @@ type Handler struct {
 	// for the /diagnostics/v1/models endpoint. It is constructed only when the
 	// diagnostics API key is configured.
 	modelSnapshotPages *modelSnapshotPageStore
+	peerCache          *peerCache
+	peerClients        map[string]*peerClient
+	peerContext        context.Context
+	peerInferenceSlots chan struct{}
 	// pagerMu guards the model snapshot pager.
 	pagerMu sync.Mutex
 }
@@ -483,6 +487,9 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 		h.serveDiagnosticsAPI(writer, request, info)
 		return
 	}
+	if h.peerCache != nil && h.servePeerModelRoute(writer, request, info) {
+		return
+	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
 		h.servePathRoute(writer, request, info, backendID)
 		return
@@ -782,10 +789,15 @@ func (w *responseWriter) Unwrap() http.ResponseWriter {
 func (h *Handler) serveModels(writer http.ResponseWriter, request *http.Request) {
 	ctx, cancel := context.WithTimeout(request.Context(), h.catalogTimeout)
 	defer cancel()
-	response, err := h.catalog.Models(ctx, request.Header)
+	response, combined, err := h.modelCatalog(ctx, request.Header)
 	if err != nil {
-		h.logger.Error("model catalog request failed", "request_id", requestIDFromContext(request.Context()), "error", safeErrorDetail(err))
-		writeJSONError(h.logger, writer, http.StatusBadGateway, "default backend model catalog unavailable")
+		if combined {
+			h.logger.Error("combined model catalog failed", "error", err)
+			writeJSONError(h.logger, writer, http.StatusBadGateway, "combined model catalog unavailable")
+		} else {
+			h.logger.Error("model catalog request failed", "request_id", requestIDFromContext(request.Context()), "error", safeErrorDetail(err))
+			writeJSONError(h.logger, writer, http.StatusBadGateway, "default backend model catalog unavailable")
+		}
 		return
 	}
 	copyResponseHeaders(writer.Header(), response.Header)
@@ -793,6 +805,20 @@ func (h *Handler) serveModels(writer http.ResponseWriter, request *http.Request)
 	if _, err := writer.Write(response.Body); err != nil {
 		h.logger.Warn("model catalog response write failed", "request_id", requestIDFromContext(request.Context()), "error", err)
 	}
+}
+
+func (h *Handler) modelCatalog(ctx context.Context, headers http.Header) (catalog.Response, bool, error) {
+	response, err := h.catalog.Models(ctx, headers)
+	if err != nil {
+		return catalog.Response{}, false, err
+	}
+	if h.peerCache != nil {
+		response, err = h.mergePeerCatalog(response)
+		if err != nil {
+			return catalog.Response{}, true, err
+		}
+	}
+	return response, false, nil
 }
 
 func (h *Handler) serveReady(writer http.ResponseWriter, request *http.Request) {
