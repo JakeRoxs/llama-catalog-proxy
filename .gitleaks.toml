@@ -5,3 +5,8 @@ useDefault = true
 description = "Documented placeholder API keys"
 regexTarget = "secret"
 regexes = ['''replace-with-[a-z0-9-]+-api-key''']
+
+[[allowlists]]
+description = "RFC WebSocket handshake example key used in tests"
+regexTarget = "secret"
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
