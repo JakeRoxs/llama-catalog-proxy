@@ -932,12 +932,22 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	// Get cached catalog models only. No upstream /v1/models or /show calls.
 	backendModels := h.catalog.BackendModels()
 
-	// Validate model filter against the cached catalog before any collection.
-	// An unknown model filter returns 400 without echoing the raw ID and
-	// without issuing upstream requests.
-	if modelFilter != "" && !catalogModelExists(backendModels, modelFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, "model not found")
-		return
+	// Resolve model aliases against the cached backend catalog before any
+	// collection. Alias values are used only for matching; snapshots continue to
+	// expose canonical identities and never return raw alias metadata.
+	modelFilterIDs := map[string]struct{}{}
+	if modelFilter != "" {
+		modelFilterIDs = catalogModelFilterIDs(backendModels, backendFilter, modelFilter)
+		if len(modelFilterIDs) == 0 {
+			writeDiagnosticsError(w, http.StatusBadRequest, "model not found")
+			return
+		}
+	}
+	resolvedModelID := ""
+	if len(modelFilterIDs) == 1 {
+		for id := range modelFilterIDs {
+			resolvedModelID = id
+		}
 	}
 
 	// Collect diagnostics snapshots (read-only, on-demand).
@@ -1081,7 +1091,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 			continue
 		}
 		if modelFilter != "" {
-			if snap.Identity.PublicID != modelFilter && snap.Identity.LocalID != modelFilter {
+			if _, ok := modelFilterIDs[snap.Identity.PublicID]; !ok {
 				continue
 			}
 		}
@@ -1097,7 +1107,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	if modelFilter != "" && len(filtered) == 0 {
 		found := false
 		for _, snap := range modelSnaps {
-			if snap.Identity.PublicID == modelFilter || snap.Identity.LocalID == modelFilter {
+			if _, ok := modelFilterIDs[snap.Identity.PublicID]; ok {
 				found = true
 				break
 			}
@@ -1191,11 +1201,15 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		if filtered == nil {
 			filtered = []*modeldiagnostics.ModelSnapshot{}
 		}
-		writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
+		body := map[string]any{
 			"generated_at": time.Now().Format(time.RFC3339),
 			"coverage":     coverage,
 			"models":       filtered,
-		})
+		}
+		if resolvedModelID != "" {
+			body["resolved_model_id"] = resolvedModelID
+		}
+		writeDiagnosticsResponse(w, http.StatusOK, body)
 		return
 	}
 
@@ -1225,12 +1239,16 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"generated_at": page.GeneratedAt.Format(time.RFC3339),
 		"coverage":     page.Coverage,
 		"models":       page.Records,
 		"cursor":       page.Cursor,
-	})
+	}
+	if resolvedModelID != "" {
+		body["resolved_model_id"] = resolvedModelID
+	}
+	writeDiagnosticsResponse(w, http.StatusOK, body)
 }
 
 // snapByBackend returns true if a diagnostics snapshot exists for the backend.
@@ -1258,20 +1276,60 @@ func cloneModelSnapshot(m *modeldiagnostics.ModelSnapshot) *modeldiagnostics.Mod
 	return clone
 }
 
-// catalogModelExists reports whether modelFilter matches a model identity
-// (public ID or local ID) in the cached catalog. It is used to validate model
-// filters against the cache before any collection occurs.
-func catalogModelExists(backendModels []catalog.BackendModel, modelFilter string) bool {
+// catalogModelFilterIDs maps a cached catalog ID or alias to canonical public
+// model IDs. Alias metadata is consumed only for exact matching and is never
+// returned to the caller.
+func catalogModelFilterIDs(backendModels []catalog.BackendModel, backendFilter, modelFilter string) map[string]struct{} {
+	ids := make(map[string]struct{})
 	for _, bm := range backendModels {
+		if backendFilter != "" && bm.BackendID != backendFilter {
+			continue
+		}
 		for _, m := range bm.Models {
 			localID, _ := m["id"].(string)
 			if localID == "" {
 				continue
 			}
 			publicID := bm.Prefix + localID
-			if publicID == modelFilter || localID == modelFilter {
-				return true
+			if publicID == modelFilter || localID == modelFilter || catalogModelAliasMatches(m, bm.Prefix, modelFilter) {
+				ids[publicID] = struct{}{}
 			}
+		}
+	}
+	return ids
+}
+
+func catalogModelAliasMatches(model map[string]any, prefix, modelFilter string) bool {
+	if catalogAliasListMatches(model["aliases"], prefix, modelFilter) {
+		return true
+	}
+	meta, ok := model["meta"].(map[string]any)
+	if !ok {
+		return false
+	}
+	llamaSwap, ok := meta["llamaswap"].(map[string]any)
+	return ok && catalogAliasListMatches(llamaSwap["aliases"], prefix, modelFilter)
+}
+
+func catalogAliasListMatches(value any, prefix, modelFilter string) bool {
+	var aliases []any
+	switch typed := value.(type) {
+	case []any:
+		aliases = typed
+	case []string:
+		for _, alias := range typed {
+			aliases = append(aliases, alias)
+		}
+	default:
+		return false
+	}
+	for _, value := range aliases {
+		alias, ok := value.(string)
+		if !ok || alias == "" || len(alias) > maxQueryParamLength || !utf8.ValidString(alias) {
+			continue
+		}
+		if modelFilter == alias || modelFilter == prefix+alias {
+			return true
 		}
 	}
 	return false

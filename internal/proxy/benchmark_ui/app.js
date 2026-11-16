@@ -18,7 +18,7 @@ async function api(path, options = {}) {
     method: options.method || "GET",
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    credentials: "omit",
+    credentials: "same-origin",
     cache: "no-store",
     redirect: "error",
   });

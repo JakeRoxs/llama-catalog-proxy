@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/catalog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
@@ -382,6 +383,59 @@ func TestDiagnosticsModelsFilters(t *testing.T) {
 	body := rec.Body.String()
 	if strings.Contains(body, "nonexistent-model") {
 		t.Errorf("raw model ID leaked in error response")
+	}
+}
+
+func TestDiagnosticsModelsResolvesBackendAliasWithoutExposingAlias(t *testing.T) {
+	mgmt := newMockDiagnosticsServer(t)
+	defer mgmt.Close()
+	mgmt.modelsResponse = `{"data":[{"id":"model1","status":"loaded","meta":{"llamaswap":{"aliases":["model-one"]}}},{"id":"model2","status":"unloaded"}]}`
+	h := newDiagnosticsTestHandler(t, "secret-key", mgmt)
+	_, _ = h.catalog.Models(context.Background(), http.Header{})
+
+	req := httptest.NewRequest(http.MethodGet, "/diagnostics/v1/models?backend=default&model=model-one", nil)
+	req.Header.Set("Authorization", "Bearer secret-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("alias filter status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["resolved_model_id"] != "model1" {
+		t.Fatalf("resolved model ID = %v", response["resolved_model_id"])
+	}
+	models := response["models"].([]any)
+	if len(models) != 1 || models[0].(map[string]any)["identity"].(map[string]any)["public_id"] != "model1" {
+		t.Fatalf("alias did not resolve to one canonical model: %#v", models)
+	}
+	if strings.Contains(rec.Body.String(), "model-one") || strings.Contains(rec.Body.String(), `"aliases"`) {
+		t.Fatal("raw model alias leaked in diagnostics response")
+	}
+}
+
+func TestCatalogModelFilterIDsResolvesPrefixQualifiedAlias(t *testing.T) {
+	models := []catalog.BackendModel{{
+		BackendID: "bigboi",
+		Prefix:    "bigboi/",
+		Models: []map[string]any{{
+			"id": "Nemotron-3.5-Bolt-Turbo-Brilliance",
+			"meta": map[string]any{
+				"llamaswap": map[string]any{"aliases": []any{"nemotron-bolt"}},
+			},
+		}},
+	}}
+	ids := catalogModelFilterIDs(models, "bigboi", "bigboi/nemotron-bolt")
+	if len(ids) != 1 {
+		t.Fatalf("alias resolutions = %#v", ids)
+	}
+	if _, ok := ids["bigboi/Nemotron-3.5-Bolt-Turbo-Brilliance"]; !ok {
+		t.Fatalf("alias resolved to wrong canonical identity: %#v", ids)
+	}
+	if got := catalogModelFilterIDs(models, "udms", "bigboi/nemotron-bolt"); len(got) != 0 {
+		t.Fatalf("alias matched outside selected backend: %#v", got)
 	}
 }
 

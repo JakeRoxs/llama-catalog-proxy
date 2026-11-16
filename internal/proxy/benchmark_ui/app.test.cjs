@@ -7,6 +7,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 function createUI() {
+  const requests = [];
   class Element {
     constructor(tag) {
       this.tag = tag;
@@ -26,14 +27,31 @@ function createUI() {
     },
     createElement(tag) { return new Element(tag); },
   };
-  const context = vm.createContext({ document, window: { isSecureContext: true } });
+  const context = vm.createContext({
+    document,
+    window: { isSecureContext: true },
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return { ok: true, json: async () => ({}) };
+    },
+  });
   vm.runInContext(readFileSync(join(__dirname, "app.js"), "utf8"), context);
-  return { context, content: document.getElementById("evidence-content") };
+  return { context, content: document.getElementById("evidence-content"), requests };
 }
 
 function text(node) {
   return [node.textContent, ...node.children.flatMap(text)];
 }
+
+test("API requests include same-origin authentication cookies", async () => {
+  const { context, requests } = createUI();
+  context.token = "fixture-token";
+  await vm.runInContext("api('/runs')", context);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/benchmark/v1/runs");
+  assert.equal(requests[0].options.credentials, "same-origin");
+  assert.equal(requests[0].options.redirect, "error");
+});
 
 test("saved run displays measured and unknown sample evidence distinctly", () => {
   const { context, content } = createUI();

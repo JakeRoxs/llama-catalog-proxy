@@ -36,10 +36,11 @@ type APIClient struct {
 }
 
 type modelsResponse struct {
-	Records     []*modeldiagnostics.ModelSnapshot `json:"records"`
-	Cursor      string                            `json:"cursor"`
-	GeneratedAt time.Time                         `json:"generated_at"`
-	Coverage    string                            `json:"coverage"`
+	Records         []*modeldiagnostics.ModelSnapshot `json:"models"`
+	Cursor          string                            `json:"cursor"`
+	GeneratedAt     time.Time                         `json:"generated_at"`
+	Coverage        string                            `json:"coverage"`
+	ResolvedModelID string                            `json:"resolved_model_id"`
 }
 
 type chatMessage struct {
@@ -130,7 +131,8 @@ func (c *APIClient) ObserveReadyModel(ctx context.Context, backend, model string
 	}
 	snapshot := response.Records[0]
 	if snapshot == nil || !snapshot.Identity.Valid() ||
-		snapshot.Identity.BackendID != backend || snapshot.Identity.PublicID != model ||
+		snapshot.Identity.BackendID != backend ||
+		(snapshot.Identity.PublicID != model && snapshot.Identity.LocalID != model && response.ResolvedModelID != snapshot.Identity.PublicID) ||
 		snapshot.Lifecycle == nil || !snapshot.Lifecycle.Observed ||
 		snapshot.Lifecycle.CurrentState != "ready" || snapshot.Lifecycle.ObservedAt == nil ||
 		snapshot.Lifecycle.ObservedAt.IsZero() {

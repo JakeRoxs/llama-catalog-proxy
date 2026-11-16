@@ -28,7 +28,7 @@ func TestBenchmarkAPIConsentAndCancellation(t *testing.T) {
 				t.Error("wrong diagnostics credential")
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"records": []any{map[string]any{
+				"models": []any{map[string]any{
 					"identity":  map[string]string{"backend_id": "local", "public_id": "m", "local_id": "m"},
 					"lifecycle": map[string]any{"observed": true, "current_state": "ready", "observed_at": time.Now().UTC()},
 				}},

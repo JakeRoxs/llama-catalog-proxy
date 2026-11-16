@@ -78,6 +78,35 @@ func TestObserveReadyModelRejectsStaleLifecycleEvidence(t *testing.T) {
 	}
 }
 
+func TestObserveReadyModelAcceptsBackendAliasResolution(t *testing.T) {
+	const backend, alias, canonical = "bigboi", "bigboi/nemotron-bolt", "bigboi/Nemotron-3.5-Bolt-Turbo-Brilliance"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/diagnostics/v1/models" || r.URL.Query().Get("backend") != backend || r.URL.Query().Get("model") != alias {
+			t.Errorf("unexpected alias preflight request: %s %s", r.Method, r.URL.String())
+		}
+		snapshot := modeldiagnostics.ModelSnapshot{
+			Identity: modeldiagnostics.ModelIdentity{PublicID: canonical, BackendID: backend, LocalID: "Nemotron-3.5-Bolt-Turbo-Brilliance", Prefix: "bigboi/"},
+			Lifecycle: &modeldiagnostics.ModelLifecycleSnapshot{
+				CurrentState: "ready", Observed: true, ObservedAt: timePointer(time.Now()),
+			},
+		}
+		_ = json.NewEncoder(w).Encode(modelsResponse{Records: []*modeldiagnostics.ModelSnapshot{&snapshot}, ResolvedModelID: canonical})
+	}))
+	defer server.Close()
+	client, err := NewAPIClient(server.URL, "test-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.diagnosticInterval = 0
+	observation, err := client.ObserveReadyModel(context.Background(), backend, alias)
+	if err != nil {
+		t.Fatalf("alias preflight failed: %v", err)
+	}
+	if observation.Identity.PublicID != canonical {
+		t.Fatalf("resolved identity = %q", observation.Identity.PublicID)
+	}
+}
+
 func TestRunUsesBoundedSyntheticRequestsAndPersistsNoResponseText(t *testing.T) {
 	server := newFakeProxy(t, false)
 	defer server.Close()
