@@ -88,7 +88,7 @@ func TestReadSettingsDocumentRejectsInvalidSettings(t *testing.T) {
 		"llama-server -c 4294967296",
 		"llama-server --cache-ram -2",
 		"llama-server -c 4 --ctx-size 8",
-		"llama-server -c 4 --unknown confidential",
+		"llama-server -c 4 --unknown --ctx-size 5",
 	} {
 		t.Run(command, func(t *testing.T) {
 			_, err := ReadSettingsDocument("local", "example", []byte("models: {example: {cmd: '"+command+"'}}"))
@@ -111,6 +111,91 @@ func TestPreviewDocumentSupportsPlainAndQuotedScalars(t *testing.T) {
 		if err != nil || string(got.candidate) != strings.Replace(input, "-c 16", "-c 32", 1) {
 			t.Fatalf("line %q: candidate=%q error=%v", line, got.candidate, err)
 		}
+	}
+}
+
+func TestPreviewDocumentResolvesFoldedMacrosButOnlyEditsModelLocalValues(t *testing.T) {
+	input := "macros:\n" +
+		"  executable: llama-server\n" +
+		"  base: >-\n" +
+		"    ${executable} --host 0.0.0.0 --port ${PORT}\n" +
+		"  shared_cache: 1024\n" +
+		"models:\n" +
+		"  model:\n" +
+		"    cmd: >-\n" +
+		"      ${base} --ctx-size 8192 --cache-ram ${shared_cache}\n"
+	ctx := int32(16384)
+	preview, err := PreviewDocument("local", "model", []byte(input), CommandSettings{ContextSize: &ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(input, "--ctx-size 8192", "--ctx-size 16384", 1)
+	if string(preview.candidate) != want {
+		t.Fatalf("candidate changed shared macro or unrelated YAML:\n%s", preview.candidate)
+	}
+	snapshot, err := ReadSettingsDocument("local", "model", []byte(input))
+	if err != nil || snapshot.Settings.ContextSize == nil || *snapshot.Settings.ContextSize != 8192 ||
+		snapshot.Settings.CacheRAM == nil || *snapshot.Settings.CacheRAM != 1024 {
+		t.Fatalf("resolved settings = %+v, %v", snapshot.Settings, err)
+	}
+	cache := int32(2048)
+	if _, err := PreviewDocument("local", "model", []byte(input), CommandSettings{CacheRAM: &cache}); err == nil ||
+		!strings.Contains(err.Error(), "shared macro") {
+		t.Fatalf("shared macro setting was mutable per model: %v", err)
+	}
+}
+
+func TestReadSettingsResolvesModelMacroOverridesAndRejectsUnknownExpansion(t *testing.T) {
+	input := "macros: {base: 'llama-server --port ${PORT}', ctx: 8192}\n" +
+		"models:\n" +
+		"  model:\n" +
+		"    macros: {ctx: 16384}\n" +
+		"    cmd: >-\n" +
+		"      ${base} --ctx-size ${ctx}\n"
+	snapshot, err := ReadSettingsDocument("local", "model", []byte(input))
+	if err != nil || snapshot.Settings.ContextSize == nil || *snapshot.Settings.ContextSize != 16384 {
+		t.Fatalf("model macro override = %+v, %v", snapshot.Settings, err)
+	}
+	unknown := "macros: {base: 'llama-server --port ${PORT}'}\n" +
+		"models: {model: {cmd: '${base} --ctx-size ${env.MISSING}'}}\n"
+	if _, err := ReadSettingsDocument("local", "model", []byte(unknown)); err == nil {
+		t.Fatal("accepted unresolved environment expansion")
+	}
+	cyclic := "macros: {first: '${second}', second: '${first}'}\nmodels: {model: {cmd: '${first} --ctx-size 8'}}\n"
+	if _, err := ReadSettingsDocument("local", "model", []byte(cyclic)); err == nil {
+		t.Fatal("accepted cyclic command macros")
+	}
+}
+
+func TestPreviewDocumentPreservesMultilineFoldedCommandAndNestedMacros(t *testing.T) {
+	input := "macros:\n" +
+		"  llama_base: >-\n" +
+		"    llama-server --host 0.0.0.0 --port ${PORT}\n" +
+		"  llama_chat: >-\n" +
+		"    ${llama_base} --reasoning-preserve\n" +
+		"models:\n" +
+		"  model:\n" +
+		"    cmd: >\n" +
+		"      ${llama_chat}\n" +
+		"      --ctx-size 8192\n" +
+		"      --fit on\n" +
+		"      --fit-ctx 262144\n" +
+		"      --fit-target 120\n" +
+		"      --cache-ram 4096\n" +
+		"      --model /models/example.gguf\n"
+	ctx := int32(16384)
+	preview, err := PreviewDocument("local", "model", []byte(input), CommandSettings{ContextSize: &ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(input, "--ctx-size 8192", "--ctx-size 16384", 1)
+	if string(preview.candidate) != want {
+		t.Fatalf("multiline candidate changed unrelated scalar bytes:\n%s", preview.candidate)
+	}
+	snapshot, err := ReadSettingsDocument("local", "model", []byte(input))
+	if err != nil || snapshot.Settings.ContextSize == nil || *snapshot.Settings.ContextSize != 8192 ||
+		snapshot.Settings.Fit == nil || !*snapshot.Settings.Fit || snapshot.Settings.CacheRAM == nil || *snapshot.Settings.CacheRAM != 4096 {
+		t.Fatalf("nested macro settings = %+v, %v", snapshot.Settings, err)
 	}
 }
 

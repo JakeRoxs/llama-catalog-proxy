@@ -28,6 +28,7 @@ func fixtureReport() Report {
 			"artifact_read": "disabled", "artifact_write": "disabled", "config_write": "disabled",
 		},
 		Coverage: "partial",
+		PathServices: []string{"comfyui"},
 		Observations: []Observation{{
 			Identity:   ModelIdentity{OwnerNodeID: "node-a", BackendID: "gpu", LocalID: "model"},
 			State:      "supported",
@@ -90,6 +91,10 @@ func TestDecodeReportRejectsInvalidContracts(t *testing.T) {
 		{"missing generated time", func(r *Report) { r.GeneratedAt = time.Time{} }, "node-a"},
 		{"missing capability", func(r *Report) { delete(r.Capabilities, "config_write") }, "node-a"},
 		{"invalid capability", func(r *Report) { r.Capabilities["config_write"] = "allowed" }, "node-a"},
+		{"invalid path service", func(r *Report) { r.PathServices = []string{"../comfyui"} }, "node-a"},
+		{"duplicate path service", func(r *Report) { r.PathServices = []string{"comfyui", "comfyui"} }, "node-a"},
+		{"invalid path service", func(r *Report) { r.PathServices = []string{"../comfyui"} }, "node-a"},
+		{"duplicate path service", func(r *Report) { r.PathServices = []string{"comfyui", "comfyui"} }, "node-a"},
 		{"imported model", func(r *Report) { r.Observations[0].Identity.OwnerNodeID = "node-b" }, "node-a"},
 		{"empty backend", func(r *Report) { r.Observations[0].Identity.BackendID = "" }, "node-a"},
 		{"oversized model", func(r *Report) { r.Observations[0].Identity.LocalID = strings.Repeat("x", 257) }, "node-a"},

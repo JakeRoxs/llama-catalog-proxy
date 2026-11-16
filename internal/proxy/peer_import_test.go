@@ -110,15 +110,16 @@ func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 		t.Helper()
 		text := fmt.Sprintf(`default_backend: local
 diagnostics_api_key: %q
-backends: {local: {url: %q, api_key: "owner-backend-key"}}
+backends: {local: {url: %q, api_key: "owner-backend-key", prefix: %q}}
 path_routes: {"/v1": local}
 peer:
   node_id: %q
+  route_aliases: [%q]
   listen: %q
   tls_cert_file: %q
   tls_key_file: %q
   local_backends: [local]
-`, diag, backend, id, addr, cert, key)
+`, diag, backend, id+"/", id, peerID, addr, cert, key)
 		if withPeer {
 			text += fmt.Sprintf("  peers:\n    %s: {token: %q, catalog_read: true, diagnostics_read: true, inference: true, url: %q, outbound_token: %q, ca_file: %q, route_inference: true}\n",
 				peerID, incoming, "https://"+peerAddr, outgoing, peerCA)
@@ -127,8 +128,8 @@ peer:
 			t.Fatal(err)
 		}
 	}
-	write(pathA, "node-a", addrA, certA, keyA, backendA.URL, "node-b", addrB, certB, tokenA, tokenB, true)
-	write(pathB, "node-b", addrB, certB, keyB, backendB.URL, "node-a", addrA, certA, tokenB, tokenA, true)
+	write(pathA, "udms", addrA, certA, keyA, backendA.URL, "bigboi", addrB, certB, tokenA, tokenB, true)
+	write(pathB, "bigboi", addrB, certB, keyB, backendB.URL, "udms", addrA, certA, tokenB, tokenA, true)
 	a, _, err := NewReloader(pathA, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -174,8 +175,8 @@ peer:
 		t.Fatalf("peer %s did not become %s", peerID, status)
 		return peerView{}
 	}
-	viewA := waitView(a, "node-b", "fresh")
-	viewB := waitView(b, "node-a", "fresh")
+	viewA := waitView(a, "bigboi", "fresh")
+	viewB := waitView(b, "udms", "fresh")
 	if viewA.Report == nil || len(viewA.Report.Observations) != 1 ||
 		viewA.Report.Observations[0].Identity.LocalID != "model-b" ||
 		viewA.Report.Capabilities["federation_exchange"] != "enabled" ||
@@ -190,12 +191,12 @@ peer:
 		t.Fatal("two-node reports did not retain readiness evidence")
 	}
 	b.refreshPeers(b.state.Load())
-	viewB = waitView(b, "node-a", "fresh")
+	viewB = waitView(b, "udms", "fresh")
 	if viewB.Report == nil || len(viewB.Report.Observations) != 1 ||
-		viewB.Report.Observations[0].Identity.OwnerNodeID != "node-a" {
+		viewB.Report.Observations[0].Identity.OwnerNodeID != "udms" {
 		t.Fatal("imported models were re-exported")
 	}
-	modelID := peerPublicID(nodecontract.ModelIdentity{OwnerNodeID: "node-a", BackendID: "local", LocalID: "model-a"})
+	modelID := "udms/model-a"
 	clientServer := httptest.NewServer(b)
 	defer clientServer.Close()
 	catalogResp, err := http.Get(clientServer.URL + "/v1/models")
@@ -206,6 +207,27 @@ peer:
 	_ = catalogResp.Body.Close()
 	if err != nil || !strings.Contains(string(catalogBody), modelID) || !strings.Contains(string(catalogBody), `"receipt_status":"fresh"`) {
 		t.Fatalf("combined catalog missing peer: %s (%v)", catalogBody, err)
+	}
+	reverseModelID := "bigboi/model-b"
+	clientServerA := httptest.NewServer(a)
+	defer clientServerA.Close()
+	reverseCatalog, err := http.Get(clientServerA.URL + "/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reverseCatalogBody, err := io.ReadAll(reverseCatalog.Body)
+	_ = reverseCatalog.Body.Close()
+	if err != nil || !strings.Contains(string(reverseCatalogBody), reverseModelID) {
+		t.Fatalf("reverse combined catalog missing peer: %s (%v)", reverseCatalogBody, err)
+	}
+	reverseInferenceBody := fmt.Sprintf(`{"model":%q,"stream":false}`, reverseModelID)
+	reverseResponse, err := http.Post(clientServerA.URL+"/v1/chat/completions", "application/json", strings.NewReader(reverseInferenceBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = reverseResponse.Body.Close()
+	if reverseResponse.StatusCode != http.StatusOK || localInference.Load() != 1 {
+		t.Fatalf("reverse peer inference status=%d owner requests=%d", reverseResponse.StatusCode, localInference.Load())
 	}
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	inferenceBody := fmt.Sprintf(`{"model":%q,"stream":true}`, modelID)
@@ -243,7 +265,7 @@ peer:
 	}
 	multipartBody := &bytes.Buffer{}
 	form := multipart.NewWriter(multipartBody)
-	if err := form.WriteField("model", "model-b"); err != nil {
+	if err := form.WriteField("model", "bigboi/model-b"); err != nil {
 		t.Fatal(err)
 	}
 	contentType := form.FormDataContentType()
@@ -255,7 +277,7 @@ peer:
 		t.Fatal(err)
 	}
 	_ = localResp.Body.Close()
-	if localResp.StatusCode != http.StatusOK || localInference.Load() != 1 {
+	if localResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
 		t.Fatalf("local multipart status=%d count=%d", localResp.StatusCode, localInference.Load())
 	}
 	peerMultipart := &bytes.Buffer{}
@@ -284,7 +306,7 @@ peer:
 		t.Fatal(err)
 	}
 	_ = remoteResp.Body.Close()
-	if remoteResp.StatusCode != http.StatusOK || localInference.Load() != 1 {
+	if remoteResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
 		t.Fatalf("peer multipart failed or fell back: status=%d count=%d", remoteResp.StatusCode, localInference.Load())
 	}
 	select {
@@ -297,11 +319,11 @@ peer:
 		t.Fatal("owner backend did not receive multipart request")
 	}
 	unauth := httptest.NewRecorder()
-	b.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=node-a", nil))
+	b.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=udms", nil))
 	if unauth.Code != http.StatusUnauthorized {
 		t.Fatalf("diagnostics without authorization: %d", unauth.Code)
 	}
-	request := httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=node-a", nil)
+	request := httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=udms", nil)
 	request.Header.Set("Authorization", "Bearer "+diag)
 	diagnostics := httptest.NewRecorder()
 	b.ServeHTTP(diagnostics, request)
@@ -317,7 +339,7 @@ peer:
 	case b.peerWake <- struct{}{}:
 	default:
 	}
-	stale := waitView(b, "node-a", "stale")
+	stale := waitView(b, "udms", "stale")
 	if stale.Report == nil || stale.LastError != "unavailable" {
 		t.Fatalf("outage did not preserve stale report: %#v", stale)
 	}
@@ -335,7 +357,7 @@ peer:
 		t.Fatal(err)
 	}
 	_ = staleResp.Body.Close()
-	if staleResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 1 {
+	if staleResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
 		t.Fatalf("stale peer inference fell back: status=%d", staleResp.StatusCode)
 	}
 	listenerA, err = net.Listen("tcp", addrA)
@@ -347,7 +369,7 @@ peer:
 	case b.peerWake <- struct{}{}:
 	default:
 	}
-	waitView(b, "node-a", "fresh")
+	waitView(b, "udms", "fresh")
 	recoveredBody := &bytes.Buffer{}
 	form = multipart.NewWriter(recoveredBody)
 	if err := form.WriteField("model", modelID); err != nil {
@@ -362,7 +384,7 @@ peer:
 		t.Fatal(err)
 	}
 	_ = recoveredResp.Body.Close()
-	if recoveredResp.StatusCode != http.StatusOK || localInference.Load() != 1 {
+	if recoveredResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
 		t.Fatalf("recovered peer inference status=%d count=%d", recoveredResp.StatusCode, localInference.Load())
 	}
 	select {
@@ -373,11 +395,11 @@ peer:
 	case <-time.After(time.Second):
 		t.Fatal("recovered owner backend did not receive request")
 	}
-	write(pathB, "node-b", addrB, certB, keyB, backendB.URL, "node-a", addrA, certA, tokenB, tokenA, false)
+	write(pathB, "bigboi", addrB, certB, keyB, backendB.URL, "udms", addrA, certA, tokenB, tokenA, false)
 	if err := b.reload(); err != nil {
 		t.Fatal(err)
 	}
-	if views, ok := b.state.Load().peerCache.views(time.Now(), "node-a"); ok || len(views) != 0 {
+	if views, ok := b.state.Load().peerCache.views(time.Now(), "udms"); ok || len(views) != 0 {
 		t.Fatal("removed peer retained in active cache")
 	}
 	removedResp, err := http.Post(clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(inferenceBody))
@@ -385,10 +407,20 @@ peer:
 		t.Fatal(err)
 	}
 	_ = removedResp.Body.Close()
-	if removedResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 1 {
+	if removedResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
 		t.Fatalf("removed peer inference fell back: status=%d", removedResp.StatusCode)
 	}
-	if err := os.WriteFile(pathB, []byte(fmt.Sprintf("default_backend: local\nbackends: {local: {url: %q}}\n", backendB.URL)), 0o600); err != nil {
+	disabledPeerConfig := fmt.Sprintf(`default_backend: local
+backends: {local: {url: %q}}
+peer:
+  node_id: bigboi
+  route_aliases: [udms]
+  listen: %q
+  tls_cert_file: %q
+  tls_key_file: %q
+  local_backends: [local]
+`, backendB.URL, addrB, certB, keyB)
+	if err := os.WriteFile(pathB, []byte(disabledPeerConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.reload(); err != nil {
@@ -399,7 +431,7 @@ peer:
 		t.Fatal(err)
 	}
 	_ = disabledResp.Body.Close()
-	if disabledResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 1 {
+	if disabledResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
 		t.Fatalf("disabled peer inference fell back: status=%d", disabledResp.StatusCode)
 	}
 }

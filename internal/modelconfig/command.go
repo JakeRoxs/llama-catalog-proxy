@@ -37,8 +37,14 @@ type commandOption struct {
 }
 
 type parsedOption struct {
-	name  string
-	value commandToken
+	name   string
+	option commandToken
+	value  commandToken
+}
+
+type commandReplacement struct {
+	token commandToken
+	value string
 }
 
 var commandOptions = map[string]commandOption{
@@ -64,10 +70,18 @@ func RewriteCommand(command string, settings CommandSettings) (string, error) {
 }
 
 func rewriteCommand(command string, settings CommandSettings) (string, []SettingChange, error) {
+	replacements, changes, err := planCommandRewrite(command, settings, nil)
+	if err != nil {
+		return "", nil, err
+	}
+	return applyCommandReplacements(command, replacements), changes, nil
+}
+
+func planCommandRewrite(command string, settings CommandSettings, editable func(commandToken, commandToken) bool) ([]commandReplacement, []SettingChange, error) {
 	requested := make(map[string]string)
 	if settings.ContextSize != nil {
 		if *settings.ContextSize < 0 {
-			return "", nil, errors.New("context size must be non-negative")
+			return nil, nil, errors.New("context size must be non-negative")
 		}
 		requested["context"] = strconv.FormatInt(int64(*settings.ContextSize), 10)
 	}
@@ -79,48 +93,51 @@ func rewriteCommand(command string, settings CommandSettings) (string, []Setting
 	}
 	if settings.FitContext != nil {
 		if *settings.FitContext < 0 {
-			return "", nil, errors.New("fit context must be non-negative")
+			return nil, nil, errors.New("fit context must be non-negative")
 		}
 		requested["fit_context"] = strconv.FormatInt(int64(*settings.FitContext), 10)
 	}
 	if settings.FitTarget != nil {
 		if *settings.FitTarget < 0 {
-			return "", nil, errors.New("fit target must be non-negative")
+			return nil, nil, errors.New("fit target must be non-negative")
 		}
 		requested["fit_target"] = strconv.FormatInt(int64(*settings.FitTarget), 10)
 	}
 	if settings.CacheRAM != nil {
 		if *settings.CacheRAM < -1 {
-			return "", nil, errors.New("cache RAM must be at least -1")
+			return nil, nil, errors.New("cache RAM must be at least -1")
 		}
 		requested["cache_ram"] = strconv.FormatInt(int64(*settings.CacheRAM), 10)
 	}
 	if len(requested) == 0 {
-		return "", nil, errors.New("at least one command setting is required")
+		return nil, nil, errors.New("at least one command setting is required")
 	}
 	options, err := parseCommand(command)
 	if err != nil {
-		return "", nil, err
+		return nil, nil, err
 	}
-	type replacement struct {
-		token commandToken
-		value string
-	}
-	var replacements []replacement
+	var replacements []commandReplacement
 	var changes []SettingChange
 	for _, option := range options {
 		if value, ok := requested[option.name]; ok {
-			if err := validateExistingSetting(option.name, option.value.text); err != nil {
-				return "", nil, err
+			if editable != nil && !editable(option.option, option.value) {
+				return nil, nil, errors.New("requested setting is defined by a shared macro and cannot be changed per model")
 			}
-			replacements = append(replacements, replacement{token: option.value, value: value})
+			if err := validateExistingSetting(option.name, option.value.text); err != nil {
+				return nil, nil, err
+			}
+			replacements = append(replacements, commandReplacement{token: option.value, value: value})
 			changes = append(changes, SettingChange{Setting: option.name, Before: option.value.text, After: value})
 			delete(requested, option.name)
 		}
 	}
 	if len(requested) != 0 {
-		return "", nil, errors.New("requested option is absent from command")
+		return nil, nil, errors.New("requested option is absent from command")
 	}
+	return replacements, changes, nil
+}
+
+func applyCommandReplacements(command string, replacements []commandReplacement) string {
 	var result strings.Builder
 	last := 0
 	for _, change := range replacements {
@@ -129,7 +146,7 @@ func rewriteCommand(command string, settings CommandSettings) (string, []Setting
 		last = change.token.end
 	}
 	result.WriteString(command[last:])
-	return result.String(), changes, nil
+	return result.String()
 }
 
 func parseCommand(command string) ([]parsedOption, error) {
@@ -143,30 +160,64 @@ func parseCommand(command string) ([]parsedOption, error) {
 	seen := make(map[string]bool)
 	var options []parsedOption
 	for i := 1; i < len(tokens); i++ {
-		option, ok := commandOptions[tokens[i].text]
-		if !ok || seen[option.name] {
-			return nil, errors.New("unsupported or duplicate command option")
-		}
-		seen[option.name] = true
-		if !option.hasValue {
+		optionToken := tokens[i]
+		optionName, attachedValue, attached := strings.Cut(optionToken.text, "=")
+		option, ok := commandOptions[optionName]
+		if !ok {
+			if !strings.HasPrefix(optionName, "-") || optionName == "-" || optionName == "--" || optionName == "-1" {
+				return nil, errors.New("unsupported command argument")
+			}
+			if attached {
+				continue
+			}
+			if i+1 < len(tokens) {
+				next := tokens[i+1].text
+				if isKnownCommandOption(next) {
+					return nil, errors.New("ambiguous unknown command option value")
+				}
+				if !strings.HasPrefix(next, "-") || next == "-1" {
+					i++
+				}
+			}
 			continue
 		}
-		i++
-		if i >= len(tokens) || strings.HasPrefix(tokens[i].text, "-") && tokens[i].text != "-1" {
-			return nil, errors.New("invalid or missing command option value")
+		if seen[option.name] {
+			return nil, errors.New("duplicate command option")
 		}
-		if command[tokens[i].start] == '\'' && option.name != "model" {
+		seen[option.name] = true
+		var valueToken commandToken
+		if attached {
+			if !option.hasValue || attachedValue == "" {
+				return nil, errors.New("invalid or missing command option value")
+			}
+			valueToken = commandToken{text: attachedValue, start: optionToken.start + len(optionName) + 1, end: optionToken.end}
+		} else if !option.hasValue {
+			continue
+		} else {
+			i++
+			if i >= len(tokens) || strings.HasPrefix(tokens[i].text, "-") && tokens[i].text != "-1" {
+				return nil, errors.New("invalid or missing command option value")
+			}
+			valueToken = tokens[i]
+		}
+		if valueToken.start < len(command) && command[valueToken.start] == '\'' && option.name != "model" {
 			return nil, errors.New("unsupported quoted command value")
 		}
-		if option.name == "gpu_layers" && !validCreationValue(option.name, tokens[i].text) {
+		if option.name == "gpu_layers" && !validCreationValue(option.name, valueToken.text) {
 			return nil, errors.New("unsupported GPU layer setting")
 		}
-		if tokens[i].text == "${PORT}" && option.name != "port" {
+		if valueToken.text == "${PORT}" && option.name != "port" {
 			return nil, errors.New("unsupported command expansion")
 		}
-		options = append(options, parsedOption{name: option.name, value: tokens[i]})
+		options = append(options, parsedOption{name: option.name, option: optionToken, value: valueToken})
 	}
 	return options, nil
+}
+
+func isKnownCommandOption(token string) bool {
+	name, _, _ := strings.Cut(token, "=")
+	_, ok := commandOptions[name]
+	return ok
 }
 
 func readCommandSettings(command string) (CommandSettings, error) {
@@ -206,6 +257,20 @@ func readCommandSettings(command string) (CommandSettings, error) {
 	return result, nil
 }
 
+func safeQuotedCommandValue(value string) bool {
+	if !path.IsAbs(value) || path.Clean(value) != value || len(value) > 4096 {
+		return false
+	}
+	for i := range len(value) {
+		c := value[i]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || strings.ContainsRune("/ ._+()-", rune(c))) {
+			return false
+		}
+	}
+	return true
+}
+
 func validateExistingSetting(name, value string) error {
 	if name == "fit" {
 		if value == "on" || value == "off" {
@@ -226,7 +291,7 @@ func tokenizeCommand(command string) ([]commandToken, error) {
 	}
 	var tokens []commandToken
 	for i := 0; i < len(command); {
-		if command[i] == ' ' || command[i] == '\t' {
+		if command[i] == ' ' || command[i] == '\t' || command[i] == '\r' || command[i] == '\n' {
 			i++
 			continue
 		}
@@ -236,18 +301,18 @@ func tokenizeCommand(command string) ([]commandToken, error) {
 			i++
 			end := strings.IndexByte(command[i:], '\'')
 			if end < 0 {
-				return nil, errors.New("unsupported command syntax")
+				return nil, errors.New("unsupported command quoting")
 			}
 			word = command[i : i+end]
 			i += end + 1
-			if i < len(command) && command[i] != ' ' && command[i] != '\t' {
-				return nil, errors.New("unsupported command syntax")
+			if i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
+				return nil, errors.New("unsupported command quoting")
 			}
-			if _, err := quoteModelPath(word); err != nil {
-				return nil, errors.New("unsupported quoted command token")
+			if !safeQuotedCommandValue(word) {
+				return nil, errors.New("unsupported quoted command value")
 			}
 		} else {
-			for i < len(command) && command[i] != ' ' && command[i] != '\t' {
+			for i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
 				i++
 			}
 			word = command[start:i]
@@ -255,8 +320,8 @@ func tokenizeCommand(command string) ([]commandToken, error) {
 				for j := range len(word) {
 					c := word[j]
 					if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
-						c >= '0' && c <= '9' || strings.ContainsRune("/._,:+-", rune(c))) {
-						return nil, errors.New("unsupported command syntax")
+						c >= '0' && c <= '9' || strings.ContainsRune("/._,:+-=", rune(c))) {
+						return nil, errors.New("unsupported command character")
 					}
 				}
 			}

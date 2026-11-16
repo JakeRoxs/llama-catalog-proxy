@@ -122,20 +122,24 @@ type PeerConfig struct {
 	TLSKeyFile        string               `yaml:"tls_key_file"`
 	LocalBackends     []string             `yaml:"local_backends"`
 	ManagementTargets map[string]string    `yaml:"management_targets,omitempty"`
+	RouteAliases      []string             `yaml:"route_aliases,omitempty"`
+	ExposedPathRoutes map[string]string    `yaml:"exposed_path_routes,omitempty"`
 	Peers             map[string]PeerGrant `yaml:"peers"`
 }
 
 type PeerGrant struct {
-	Token           string `yaml:"token"`
-	CatalogRead     bool   `yaml:"catalog_read"`
-	DiagnosticsRead bool   `yaml:"diagnostics_read"`
-	Inference       bool   `yaml:"inference"`
-	ManageSettings  bool   `yaml:"manage_settings"`
-	URL             string `yaml:"url"`
-	OutboundToken   string `yaml:"outbound_token"`
-	CAFile          string `yaml:"ca_file"`
-	RouteInference  bool   `yaml:"route_inference"`
-	RouteManagement bool   `yaml:"route_management"`
+	Token           string            `yaml:"token"`
+	CatalogRead     bool              `yaml:"catalog_read"`
+	DiagnosticsRead bool              `yaml:"diagnostics_read"`
+	Inference       bool              `yaml:"inference"`
+	ManageSettings  bool              `yaml:"manage_settings"`
+	URL             string            `yaml:"url"`
+	OutboundToken   string            `yaml:"outbound_token"`
+	CAFile          string            `yaml:"ca_file"`
+	RouteInference  bool              `yaml:"route_inference"`
+	RouteManagement bool              `yaml:"route_management"`
+	PathAccess      []string          `yaml:"path_access,omitempty"`
+	RoutePaths      map[string]string `yaml:"route_paths,omitempty"`
 }
 
 type Backend struct {
@@ -675,8 +679,23 @@ func validatePeer(c Config) error {
 	if strings.TrimSpace(p.TLSCertFile) == "" || strings.TrimSpace(p.TLSKeyFile) == "" {
 		return errors.New("peer TLS certificate and key files are required")
 	}
-	if len(p.LocalBackends) > 256 || len(p.Peers) > 32 {
-		return errors.New("too many peer backends or grants")
+	if len(p.LocalBackends) > 256 || len(p.Peers) > 32 || len(p.RouteAliases) > 32 || len(p.ExposedPathRoutes) > 32 {
+		return errors.New("too many peer backends, grants, aliases, or exposed path routes")
+	}
+	reservedRoutes := make(map[string]bool, len(p.RouteAliases))
+	for _, id := range p.RouteAliases {
+		if !identity.ValidNodeID(id) || id == p.NodeID || reservedRoutes[id] {
+			return errors.New("peer route_aliases contains an invalid, self, or duplicate node ID")
+		}
+		reservedRoutes[id] = true
+	}
+	for name, localPath := range p.ExposedPathRoutes {
+		if !identity.ValidNodeID(name) || !isCanonicalPathPrefix(localPath) {
+			return errors.New("peer exposed_path_routes contains an invalid service name or local path")
+		}
+		if _, ok := c.PathRoutes[localPath]; !ok {
+			return errors.New("peer exposed_path_routes must reference a configured local PathRoute")
+		}
 	}
 	local := make(map[string]bool, len(p.LocalBackends))
 	for _, id := range p.LocalBackends {
@@ -697,6 +716,7 @@ func validatePeer(c Config) error {
 		}
 	}
 	tokens := make(map[string]bool, len(p.Peers))
+	peerPathPrefixes := make(map[string]string)
 	for id, grant := range p.Peers {
 		if !identity.ValidNodeID(id) || id == p.NodeID {
 			return errors.New("peer grant has invalid or self node identity")
@@ -707,11 +727,30 @@ func validatePeer(c Config) error {
 		if grant.ManageSettings && (c.Management == nil || len(p.ManagementTargets) == 0) {
 			return errors.New("peer manage_settings requires owner management targets")
 		}
-		if grant.Token == "" && (grant.CatalogRead || grant.DiagnosticsRead || grant.Inference || grant.ManageSettings || grant.URL == "") {
+		if len(grant.PathAccess) > 32 || len(grant.RoutePaths) > 32 {
+			return errors.New("too many peer path service permissions or routes")
+		}
+		seenPathAccess := make(map[string]bool, len(grant.PathAccess))
+		for _, service := range grant.PathAccess {
+			if !identity.ValidNodeID(service) || p.ExposedPathRoutes[service] == "" || seenPathAccess[service] {
+				return errors.New("peer path_access references an invalid or unexposed path service")
+			}
+			seenPathAccess[service] = true
+		}
+		for prefix, service := range grant.RoutePaths {
+			if !isCanonicalPathPrefix(prefix) || !identity.ValidNodeID(service) {
+				return errors.New("peer route_paths contains an invalid path prefix or service name")
+			}
+			if owner, duplicate := peerPathPrefixes[prefix]; duplicate {
+				return fmt.Errorf("peer path prefixes %q and %q overlap at %q", owner, id, prefix)
+			}
+			peerPathPrefixes[prefix] = id
+		}
+		if grant.Token == "" && (grant.CatalogRead || grant.DiagnosticsRead || grant.Inference || grant.ManageSettings || len(grant.PathAccess) != 0 || grant.URL == "") {
 			return errors.New("peer grant requires an incoming token or outbound URL")
 		}
 		if grant.URL == "" {
-			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference || grant.RouteManagement {
+			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference || grant.RouteManagement || len(grant.RoutePaths) != 0 {
 				return errors.New("peer outbound token and CA require a URL")
 			}
 		} else {
@@ -751,6 +790,12 @@ func validatePeer(c Config) error {
 		}
 	}
 	return nil
+}
+
+func isCanonicalPathPrefix(routePath string) bool {
+	return routePath != "" && routePath[0] == '/' && strings.TrimSpace(routePath) == routePath &&
+		!strings.ContainsAny(routePath, "?#") && path.Clean(routePath) == routePath &&
+		(routePath == "/" || !strings.HasSuffix(routePath, "/"))
 }
 
 func validHeaderName(name string) bool {

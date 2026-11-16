@@ -36,6 +36,7 @@ type peerClient struct {
 	client             *http.Client
 	routeInference     bool
 	routeManagement    bool
+	routePaths         map[string]string
 	inferenceTransport *http.Transport
 }
 
@@ -45,9 +46,10 @@ type peerCache struct {
 }
 
 type peerCacheEntry struct {
-	receipt     *nodecontract.Receipt
-	lastAttempt time.Time
-	lastError   string
+	receipt        *nodecontract.Receipt
+	lastAttempt    time.Time
+	lastError      string
+	routeInference bool
 }
 
 type peerView struct {
@@ -96,14 +98,14 @@ func newPeerClients(peer *config.PeerConfig) (map[string]*peerClient, *peerCache
 		clients[id] = &peerClient{
 			id: id, endpoint: strings.TrimSuffix(grant.URL, "/") + "/peer/v1/report", token: grant.OutboundToken,
 			origin: strings.TrimSuffix(grant.URL, "/"), routeInference: grant.RouteInference,
-			routeManagement:    grant.RouteManagement,
+			routeManagement: grant.RouteManagement, routePaths: grant.RoutePaths,
 			inferenceTransport: transport.Clone(),
 			client: &http.Client{Transport: transport, Timeout: peerReportTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			}},
 		}
 		clients[id].inferenceTransport.MaxConnsPerHost = 8
-		cache.entries[id] = peerCacheEntry{}
+		cache.entries[id] = peerCacheEntry{routeInference: grant.RouteInference}
 	}
 	return clients, cache, nil
 }

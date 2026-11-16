@@ -26,7 +26,7 @@ func TestRewriteCommandRejectsAmbiguousOrUnsafeCommands(t *testing.T) {
 		command string
 	}{
 		{"duplicate aliases", "llama-server -c 8192 --ctx-size 1024"},
-		{"unknown option", "llama-server --other foo -c 8192"},
+		{"ambiguous unknown option value", "llama-server --other --ctx-size 8192 -c 4096"},
 		{"absent option", "llama-server --port ${PORT}"},
 		{"shell operator", "llama-server -c 8192; other"},
 		{"command substitution", "llama-server -c $(value)"},
@@ -46,6 +46,19 @@ func TestRewriteCommandRejectsAmbiguousOrUnsafeCommands(t *testing.T) {
 				t.Fatalf("unexpected result: %q, %v", got, err)
 			}
 		})
+	}
+}
+
+func TestRewriteCommandPreservesUnknownSafeLlamaFlags(t *testing.T) {
+	ctx := int32(16384)
+	command := "llama-server --chat-template-file /templates/chat.jinja --metal --fast --other=value --ctx-size=8192"
+	got, err := RewriteCommand(command, CommandSettings{ContextSize: &ctx})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(command, "--ctx-size=8192", "--ctx-size=16384", 1)
+	if got != want {
+		t.Fatalf("unknown pass-through flags changed: got %q want %q", got, want)
 	}
 }
 

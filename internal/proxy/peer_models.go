@@ -21,6 +21,10 @@ func peerPublicID(id nodecontract.ModelIdentity) string {
 		base64.RawURLEncoding.EncodeToString([]byte(id.LocalID))
 }
 
+func peerRouteID(id nodecontract.ModelIdentity) string {
+	return id.OwnerNodeID + "/" + id.LocalID
+}
+
 func parsePeerPublicID(publicID string) (nodecontract.ModelIdentity, error) {
 	value, ok := strings.CutPrefix(publicID, peerModelPrefix)
 	if !ok {
@@ -78,6 +82,12 @@ func (c *peerCache) catalogModels(now time.Time) []peerCatalogModel {
 		if age < 0 || age > peerRetention {
 			continue
 		}
+		localIDCounts := make(map[string]int, len(entry.receipt.Report.Observations))
+		for _, observation := range entry.receipt.Report.Observations {
+			if observation.State == "supported" {
+				localIDCounts[observation.Identity.LocalID]++
+			}
+		}
 		status := "stale"
 		if entry.lastError == "" && age <= peerFreshAge {
 			status = "fresh"
@@ -86,8 +96,12 @@ func (c *peerCache) catalogModels(now time.Time) []peerCatalogModel {
 			if obs.State != "supported" {
 				continue
 			}
+			publicID := peerPublicID(obs.Identity)
+			if entry.routeInference && localIDCounts[obs.Identity.LocalID] == 1 {
+				publicID = peerRouteID(obs.Identity)
+			}
 			models = append(models, peerCatalogModel{
-				ID: peerPublicID(obs.Identity), Object: "model", OwnedBy: obs.Identity.OwnerNodeID,
+				ID: publicID, Object: "model", OwnedBy: obs.Identity.OwnerNodeID,
 				CatalogProxy: peerCatalogProvenance{
 					Identity: obs.Identity, ObservedAt: obs.ObservedAt, Freshness: obs.Freshness,
 					Coverage: obs.Coverage, ReceiptStatus: status,
@@ -97,6 +111,26 @@ func (c *peerCache) catalogModels(now time.Time) []peerCatalogModel {
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models
+}
+
+func (c *peerCache) modelForRoute(nodeID, localID string) (nodecontract.ModelIdentity, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry, ok := c.entries[nodeID]
+	if !ok || entry.receipt == nil || !entry.routeInference {
+		return nodecontract.ModelIdentity{}, false
+	}
+	var identity nodecontract.ModelIdentity
+	for _, observation := range entry.receipt.Report.Observations {
+		if observation.State != "supported" || observation.Identity.OwnerNodeID != nodeID || observation.Identity.LocalID != localID {
+			continue
+		}
+		if identity.OwnerNodeID != "" {
+			return nodecontract.ModelIdentity{}, false
+		}
+		identity = observation.Identity
+	}
+	return identity, identity.OwnerNodeID != ""
 }
 
 func (c *peerCache) freshModel(id nodecontract.ModelIdentity, now time.Time) (nodecontract.Source, bool) {
@@ -134,6 +168,27 @@ func (h *Handler) mergePeerCatalog(response catalog.Response) (catalog.Response,
 	if err := json.Unmarshal(root["data"], &local); err != nil {
 		return catalog.Response{}, err
 	}
+	peerModels := h.peerCache.catalogModels(time.Now())
+	peerIDs := make(map[string]struct{}, len(peerModels))
+	for _, model := range peerModels {
+		peerIDs[model.ID] = struct{}{}
+	}
+	reservedRoutes := make(map[string]struct{}, len(h.peerRouteAliases)+len(h.peerClients))
+	for id := range h.peerRouteAliases {
+		client := h.peerClients[id]
+		if client == nil || client.routeInference {
+			reservedRoutes[id] = struct{}{}
+		}
+	}
+	for id, client := range h.peerClients {
+		if client.routeInference {
+			reservedRoutes[id] = struct{}{}
+		}
+	}
+	peerPrefixes := make([]string, 0, len(reservedRoutes))
+	for id := range reservedRoutes {
+		peerPrefixes = append(peerPrefixes, id+"/")
+	}
 	combined := make([]json.RawMessage, 0, len(local))
 	for _, item := range local {
 		var model struct {
@@ -146,9 +201,24 @@ func (h *Handler) mergePeerCatalog(response catalog.Response) (catalog.Response,
 			h.logger.Warn("local catalog model conflicts with reserved peer namespace")
 			continue
 		}
+		ownedByPeerRoute := false
+		for _, prefix := range peerPrefixes {
+			if strings.HasPrefix(model.ID, prefix) {
+				ownedByPeerRoute = true
+				break
+			}
+		}
+		if ownedByPeerRoute {
+			continue
+		}
+		if _, duplicate := peerIDs[model.ID]; duplicate {
+			// When inference is explicitly routed through the peer, prefer the owner-verified model
+			// identity over the legacy static backend entry with the same public prefix.
+			continue
+		}
 		combined = append(combined, item)
 	}
-	for _, model := range h.peerCache.catalogModels(time.Now()) {
+	for _, model := range peerModels {
 		data, err := json.Marshal(model)
 		if err != nil {
 			return catalog.Response{}, err

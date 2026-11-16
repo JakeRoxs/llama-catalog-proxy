@@ -24,6 +24,7 @@ const (
 	peerDiagnostics
 	peerInference
 	peerManageSettings
+	peerPathService
 )
 
 // PeerTLSConfig serves the currently installed peer certificate. Removing peer
@@ -49,6 +50,10 @@ func (r *Reloader) PeerHandler() http.Handler {
 func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.TLS == nil {
 		http.Error(w, "TLS required", http.StatusForbidden)
+		return
+	}
+	if req.URL.Path == peerPathEndpoint {
+		r.servePeerPath(w, req)
 		return
 	}
 	if req.URL.RawQuery != "" {
@@ -118,6 +123,10 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "peer report unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	for service := range peer.ExposedPathRoutes {
+		report.PathServices = append(report.PathServices, service)
+	}
+	slices.Sort(report.PathServices)
 	if len(state.peerClients) != 0 {
 		report.Capabilities["federation_exchange"] = "enabled"
 	}
@@ -202,7 +211,8 @@ func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope)
 			authorized = (scope == peerCatalog && peer.CatalogRead) ||
 				(scope == peerDiagnostics && peer.DiagnosticsRead) ||
 				(scope == peerInference && peer.Inference) ||
-				(scope == peerManageSettings && peer.ManageSettings)
+				(scope == peerManageSettings && peer.ManageSettings) ||
+				(scope == peerPathService && len(peer.PathAccess) != 0)
 		}
 	}
 	if matches != 1 || !authorized {

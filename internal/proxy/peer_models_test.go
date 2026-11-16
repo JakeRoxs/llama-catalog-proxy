@@ -61,6 +61,85 @@ func TestPeerModelIDsAndCatalogCollisions(t *testing.T) {
 	}
 }
 
+func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
+	now := time.Now()
+	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "comfyui_auto"}
+	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
+	cache.update("bigboi", &nodecontract.Receipt{
+		AuthenticatedNodeID: "bigboi", ReceivedAt: now,
+		Report: nodecontract.Report{Observations: []nodecontract.Observation{{
+			Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh", Coverage: "complete",
+		}}},
+	}, "", now)
+	h := &Handler{logger: discardLogger(), peerCache: cache,
+		peerClients: map[string]*peerClient{"bigboi": {routeInference: true}}}
+	response, err := h.mergePeerCatalog(catalog.Response{Body: []byte(`{"data":[{"id":"udms/local"},{"id":"bigboi/comfyui_auto"}]}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Data) != 2 || result.Data[0].ID != "udms/local" || result.Data[1].ID != "bigboi/comfyui_auto" || result.Data[1].OwnedBy != "bigboi" {
+		t.Fatalf("combined catalog did not preserve aliases/provenance: %s", response.Body)
+	}
+}
+
+func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
+	now := time.Now()
+	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "comfyui_auto"}
+	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
+		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
+			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh"}}}}
+	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
+	cache.update("bigboi", receipt, "", now)
+	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
+		peerClients: map[string]*peerClient{"bigboi": {routeInference: true}}}
+	body := `{"prompt":{"1":{"class_type":"KSampler"}}}`
+	req := httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	if h.servePeerModelRoute(response, req, &routeInfo{}) {
+		t.Fatalf("ComfyUI path was intercepted by model alias router: status=%d", response.Code)
+	}
+	restored, err := io.ReadAll(req.Body)
+	if err != nil || string(restored) != body {
+		t.Fatalf("ComfyUI path body was changed: %q (%v)", restored, err)
+	}
+}
+
+func TestPeerRouteAliasIsReservedWhilePeerInferenceIsConfigured(t *testing.T) {
+	now := time.Now()
+	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "model"}
+	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
+		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
+			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh"}}}}
+	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
+	cache.update("bigboi", receipt, "unavailable", now)
+	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
+		peerClients: map[string]*peerClient{"bigboi": {routeInference: true}}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"bigboi/model"}`))
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	handled := h.servePeerModelRoute(response, req, &routeInfo{})
+	if !handled || response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("stale alias fell back: handled=%v status=%d", handled, response.Code)
+	}
+	h.peerClients["bigboi"].routeInference = false
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"bigboi/model"}`))
+	req.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	if h.servePeerModelRoute(response, req, &routeInfo{}) {
+		t.Fatalf("disabled peer alias intercepted the legacy static route: status=%d", response.Code)
+	}
+}
+
 func TestMultipartPeerInspection(t *testing.T) {
 	peerID := peerPublicID(nodecontract.ModelIdentity{OwnerNodeID: "node-a", BackendID: "local", LocalID: "model"})
 	makeBody := func(fields ...string) ([]byte, string) {
@@ -141,7 +220,7 @@ func TestPeerRoutingRejectsAmbiguousModelFields(t *testing.T) {
 		`{"model":"` + id + `","model":"local"}`,
 		`{"model":"local","Model":"` + id + `"}`,
 	} {
-		_, _, ambiguous, err := jsonPeerModel([]byte(body))
+		_, _, ambiguous, err := jsonPeerModel([]byte(body), func(value string) bool { return strings.HasPrefix(value, peerModelPrefix) })
 		if err != nil || !ambiguous {
 			t.Fatalf("ambiguous request accepted: %s", body)
 		}

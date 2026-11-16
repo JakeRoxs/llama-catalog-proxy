@@ -43,7 +43,7 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		for key, values := range query {
 			if strings.EqualFold(key, "model") {
 				for _, value := range values {
-					if strings.HasPrefix(value, peerModelPrefix) {
+					if h.isPeerPublicModelID(value) {
 						writeJSONError(h.logger, w, http.StatusBadRequest, "peer model IDs require JSON inference requests")
 						return true
 					}
@@ -101,13 +101,13 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 	var object map[string]any
 	var ambiguous bool
 	if mediaType == "multipart/form-data" {
-		model, ambiguous, err = multipartPeerModel(body, params["boundary"])
+		model, ambiguous, err = multipartPeerModel(body, params["boundary"], h.isPeerPublicModelID)
 		if err != nil {
 			writeJSONError(h.logger, w, http.StatusBadRequest, "invalid multipart request")
 			return true
 		}
 	} else {
-		model, object, ambiguous, err = jsonPeerModel(body)
+		model, object, ambiguous, err = jsonPeerModel(body, h.isPeerPublicModelID)
 		if err != nil {
 			if isInferenceRequest(r) {
 				writeJSONError(h.logger, w, http.StatusBadRequest, "invalid JSON inference request")
@@ -128,12 +128,18 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		writeJSONError(h.logger, w, http.StatusBadRequest, "peer model requires a supported inference path without a query")
 		return true
 	}
-	id, err := parsePeerPublicID(model)
+	id, client, matched, err := h.resolvePeerPublicModel(model)
+	if !matched {
+		return false
+	}
 	if err != nil {
 		writeJSONError(h.logger, w, http.StatusBadRequest, "invalid peer model ID")
 		return true
 	}
-	client := h.peerClients[id.OwnerNodeID]
+	if id.OwnerNodeID == "" {
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		return true
+	}
 	source, fresh := h.peerCache.freshModel(id, time.Now())
 	if client == nil || !client.routeInference || !fresh {
 		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
@@ -155,7 +161,7 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 	return true
 }
 
-func jsonPeerModel(body []byte) (string, map[string]any, bool, error) {
+func jsonPeerModel(body []byte, isPeerModel func(string) bool) (string, map[string]any, bool, error) {
 	var object map[string]any
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
@@ -168,6 +174,7 @@ func jsonPeerModel(body []byte) (string, map[string]any, bool, error) {
 	}
 	count := 0
 	found := ""
+	peerFound := false
 	for scanner.More() {
 		token, err := scanner.Token()
 		if err != nil {
@@ -184,24 +191,31 @@ func jsonPeerModel(body []byte) (string, map[string]any, bool, error) {
 		if strings.EqualFold(key, "model") {
 			count++
 			var value string
-			if json.Unmarshal(raw, &value) == nil && strings.HasPrefix(value, peerModelPrefix) {
-				found = value
-				if key != "model" {
-					count++
+			if json.Unmarshal(raw, &value) == nil {
+				if found == "" {
+					found = value
+				}
+				if isPeerModel(value) {
+					found = value
+					peerFound = true
+					if key != "model" {
+						count++
+					}
 				}
 			}
 		}
 	}
-	return found, object, found != "" && count != 1, nil
+	return found, object, peerFound && count != 1, nil
 }
 
-func multipartPeerModel(body []byte, boundary string) (string, bool, error) {
+func multipartPeerModel(body []byte, boundary string, isPeerModel func(string) bool) (string, bool, error) {
 	if boundary == "" {
 		return "", false, errors.New("missing multipart boundary")
 	}
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
 	count := 0
 	found := ""
+	peerFound := false
 	for {
 		part, err := reader.NextPart()
 		if err == io.EOF {
@@ -216,8 +230,13 @@ func multipartPeerModel(body []byte, boundary string) (string, bool, error) {
 			if err != nil {
 				return "", false, err
 			}
-			if strings.HasPrefix(string(value), peerModelPrefix) {
-				found = string(value)
+			model := string(value)
+			if found == "" {
+				found = model
+			}
+			if isPeerModel(model) {
+				found = model
+				peerFound = true
 				if part.FormName() != "model" {
 					count++
 				}
@@ -225,7 +244,52 @@ func multipartPeerModel(body []byte, boundary string) (string, bool, error) {
 		}
 		_ = part.Close()
 	}
-	return found, found != "" && count != 1, nil
+	return found, peerFound && count != 1, nil
+}
+
+func (h *Handler) isPeerPublicModelID(publicID string) bool {
+	if strings.HasPrefix(publicID, peerModelPrefix) {
+		return true
+	}
+	owner, model, ok := strings.Cut(publicID, "/")
+	if !ok || model == "" {
+		return false
+	}
+	if client := h.peerClients[owner]; client != nil {
+		return client.routeInference
+	}
+	_, reserved := h.peerRouteAliases[owner]
+	return reserved
+}
+
+func (h *Handler) resolvePeerPublicModel(publicID string) (nodecontract.ModelIdentity, *peerClient, bool, error) {
+	if strings.HasPrefix(publicID, peerModelPrefix) {
+		id, err := parsePeerPublicID(publicID)
+		if err != nil {
+			return nodecontract.ModelIdentity{}, nil, true, err
+		}
+		return id, h.peerClients[id.OwnerNodeID], true, nil
+	}
+	if h.peerCache == nil {
+		return nodecontract.ModelIdentity{}, nil, false, nil
+	}
+	owner, localID, ok := strings.Cut(publicID, "/")
+	if !ok || localID == "" {
+		return nodecontract.ModelIdentity{}, nil, false, nil
+	}
+	client := h.peerClients[owner]
+	if client == nil {
+		_, reserved := h.peerRouteAliases[owner]
+		return nodecontract.ModelIdentity{}, nil, reserved, nil
+	}
+	if !client.routeInference {
+		return nodecontract.ModelIdentity{}, nil, false, nil
+	}
+	id, found := h.peerCache.modelForRoute(owner, localID)
+	if !found {
+		return nodecontract.ModelIdentity{}, client, true, nil
+	}
+	return id, client, true, nil
 }
 
 func rewriteMultipartModel(body []byte, boundary, expected, replacement string, limit int64) ([]byte, error) {

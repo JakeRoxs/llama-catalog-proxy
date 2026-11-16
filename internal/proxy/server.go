@@ -136,6 +136,9 @@ type Handler struct {
 	modelSnapshotPages *modelSnapshotPageStore
 	peerCache          *peerCache
 	peerClients        map[string]*peerClient
+	peerRouteAliases   map[string]struct{}
+	peerPathRoutes     []peerPathRoute
+	peerPathSlots      chan struct{}
 	peerContext        context.Context
 	peerInferenceSlots chan struct{}
 	// pagerMu guards the model snapshot pager.
@@ -295,6 +298,14 @@ func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagno
 		// ServeHTTP only when request_observation is enabled.
 		history:            historyStore(cfg),
 		requestObservation: cfg.RequestObservation,
+	}
+	if cfg.Peer != nil {
+		h.peerRouteAliases = make(map[string]struct{}, len(cfg.Peer.RouteAliases))
+		for _, id := range cfg.Peer.RouteAliases {
+			h.peerRouteAliases[id] = struct{}{}
+		}
+		h.peerPathRoutes = buildPeerPathRoutes(cfg.Peer)
+		h.peerPathSlots = make(chan struct{}, 8)
 	}
 
 	// Diagnostics API auth boundary: collectors and the concurrency/rate
@@ -488,6 +499,9 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 		return
 	}
 	if h.peerCache != nil && h.servePeerModelRoute(writer, request, info) {
+		return
+	}
+	if h.servePeerPathRoute(writer, request, info) {
 		return
 	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
@@ -709,12 +723,17 @@ func (h *Handler) routeModel(model string) (string, string) {
 }
 
 func (h *Handler) routePath(requestPath string) (string, bool) {
+	backendID, _, matched := h.routePathMatch(requestPath)
+	return backendID, matched
+}
+
+func (h *Handler) routePathMatch(requestPath string) (string, string, bool) {
 	for _, candidate := range h.pathRoutes {
 		if candidate.prefix == "/" || requestPath == candidate.prefix || strings.HasPrefix(requestPath, candidate.prefix+"/") {
-			return candidate.backendID, true
+			return candidate.backendID, candidate.prefix, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func restoreRequestBody(request *http.Request, body []byte) {

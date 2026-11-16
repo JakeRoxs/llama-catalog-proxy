@@ -41,6 +41,7 @@ type Reloader struct {
 	instanceID         string
 	peerSlots          chan struct{}
 	peerInferenceSlots chan struct{}
+	peerPathSlots      chan struct{}
 	peerWake           chan struct{}
 	stop               chan struct{}
 	lifecycleMu        sync.Mutex
@@ -84,6 +85,7 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		onReload:           onReload,
 		peerSlots:          make(chan struct{}, 8),
 		peerInferenceSlots: make(chan struct{}, 8),
+		peerPathSlots:      make(chan struct{}, 4),
 		managementSlots:    make(chan struct{}, 2),
 		peerWake:           make(chan struct{}, 1),
 		stop:               make(chan struct{}),

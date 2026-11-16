@@ -91,6 +91,7 @@ type Report struct {
 	Capabilities     Capabilities        `json:"capabilities"`
 	Coverage         string              `json:"coverage"`
 	Observations     []Observation       `json:"observations"`
+	PathServices     []string            `json:"path_services,omitempty"`
 	BackendReadiness *[]BackendReadiness `json:"backend_readiness,omitempty"`
 }
 
@@ -168,6 +169,16 @@ func (r Report) validate(authenticatedNodeID string) error {
 	}
 	if len(r.Capabilities) > maxCapabilities {
 		return errors.New("too many advertised capabilities")
+	}
+	if len(r.PathServices) > 32 {
+		return errors.New("too many advertised path services")
+	}
+	pathServices := make(map[string]bool, len(r.PathServices))
+	for _, service := range r.PathServices {
+		if !validNodeID(service) || pathServices[service] {
+			return errors.New("invalid or duplicate advertised path service")
+		}
+		pathServices[service] = true
 	}
 	for _, name := range capabilityNames {
 		if r.Capabilities[name] != "enabled" && r.Capabilities[name] != "disabled" {

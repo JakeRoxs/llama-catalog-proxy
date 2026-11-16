@@ -36,11 +36,15 @@ type SettingsSnapshot struct {
 }
 
 func ReadSettingsDocument(targetID, modelID string, data []byte) (SettingsSnapshot, error) {
-	command, _, _, err := findCommand(targetID, modelID, data)
+	root, model, command, err := findCommandNodes(targetID, modelID, data)
 	if err != nil {
 		return SettingsSnapshot{}, err
 	}
-	settings, err := readCommandSettings(command.Value)
+	mapped, err := expandCommandForModel(data, root, model, modelID, command)
+	if err != nil {
+		return SettingsSnapshot{}, err
+	}
+	settings, err := readCommandSettings(mapped.text)
 	if err != nil {
 		return SettingsSnapshot{}, err
 	}
@@ -53,18 +57,46 @@ func ReadSettingsDocument(targetID, modelID string, data []byte) (SettingsSnapsh
 // PreviewDocument edits one exact model command without performing filesystem access.
 // The target identifier is a caller-provided identity, not a path.
 func PreviewDocument(targetID, modelID string, data []byte, settings CommandSettings) (Preview, error) {
-	command, start, end, err := findCommand(targetID, modelID, data)
+	root, model, command, err := findCommandNodes(targetID, modelID, data)
 	if err != nil {
 		return Preview{}, err
 	}
-	rewritten, changes, err := rewriteCommand(command.Value, settings)
+	mapped, err := expandCommandForModel(data, root, model, modelID, command)
 	if err != nil {
 		return Preview{}, err
 	}
-	candidate := make([]byte, 0, len(data)-(end-start)+len(rewritten))
-	candidate = append(candidate, data[:start]...)
-	candidate = append(candidate, rewritten...)
-	candidate = append(candidate, data[end:]...)
+	replacements, changes, err := planCommandRewrite(mapped.text, settings, func(option, value commandToken) bool {
+		_, _, optionEditable := commandSourceRangeForToken(mapped, option)
+		_, _, valueEditable := commandSourceRangeForToken(mapped, value)
+		return optionEditable && valueEditable
+	})
+	if err != nil {
+		return Preview{}, err
+	}
+	type rawReplacement struct {
+		start, end int
+		value      string
+	}
+	rawReplacements := make([]rawReplacement, 0, len(replacements))
+	for _, replacement := range replacements {
+		start, end, ok := commandSourceRangeForToken(mapped, replacement.token)
+		if !ok || start < 0 || end > len(data) ||
+			!bytes.Equal(data[start:end], []byte(mapped.text[replacement.token.start:replacement.token.end])) {
+			return Preview{}, errors.New("requested setting source is not a directly editable model command value")
+		}
+		rawReplacements = append(rawReplacements, rawReplacement{start: start, end: end, value: replacement.value})
+	}
+	candidate := make([]byte, 0, len(data)+len(rawReplacements)*8)
+	last := 0
+	for _, replacement := range rawReplacements {
+		if replacement.start < last {
+			return Preview{}, errors.New("overlapping command settings")
+		}
+		candidate = append(candidate, data[last:replacement.start]...)
+		candidate = append(candidate, replacement.value...)
+		last = replacement.end
+	}
+	candidate = append(candidate, data[last:]...)
 	if len(candidate) > maxConfigBytes {
 		return Preview{}, errors.New("proposed configuration exceeds size limit")
 	}
@@ -80,35 +112,31 @@ func sourceRevision(data []byte) string {
 	return hex.EncodeToString(revision[:])
 }
 
-func findCommand(targetID, modelID string, data []byte) (*yaml.Node, int, int, error) {
+func findCommandNodes(targetID, modelID string, data []byte) (*yaml.Node, *yaml.Node, *yaml.Node, error) {
 	if !identity.ValidNodeID(targetID) || targetID == "." || targetID == ".." ||
 		modelID == "" || !identity.ValidModelComponent(modelID) {
-		return nil, 0, 0, errors.New("invalid target or model identity")
+		return nil, nil, nil, errors.New("invalid target or model identity")
 	}
 	root, err := parseConfigDocument(data)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 	models, err := mappingValue(root, "models")
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 	model, err := mappingValue(models, modelID)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 	command, err := mappingValue(model, "cmd")
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, nil, nil, err
 	}
 	if command.Kind != yaml.ScalarNode || command.Tag != "!!str" || command.Anchor != "" {
-		return nil, 0, 0, errors.New("unsupported command representation")
+		return nil, nil, nil, errors.New("unsupported command representation")
 	}
-	start, end, err := commandSourceRange(data, command)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	return command, start, end, nil
+	return root, model, command, nil
 }
 
 func parseConfigDocument(data []byte) (*yaml.Node, error) {
