@@ -1,4 +1,5 @@
 name: Publish container image
+run-name: Publish container image ${{ inputs.version || github.ref_name }}
 
 on:
   push:
