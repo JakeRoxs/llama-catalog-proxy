@@ -22,7 +22,7 @@ import (
 const (
 	defaultListen         = "0.0.0.0:8080"
 	defaultHealthPath     = "/health"
-	defaultModelsCacheTTL = 15 * time.Second
+	defaultModelsCacheTTL = 5 * time.Minute
 	defaultRequestTimeout = 10 * time.Second
 	defaultLogLevel       = "INFO"
 	defaultMaxJSONBody    = 64 << 20

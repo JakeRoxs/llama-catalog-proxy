@@ -133,8 +133,9 @@ func localReport(source Source, localBackends []string, generatedAt time.Time, f
 			return errors.New("ambiguous duplicate local model identity")
 		}
 		observedAt := fetchedAt
+		expiresAt := fetchedAt.Add(freshnessWindow)
 		observation := Observation{
-			Identity: identity, State: "supported", ObservedAt: &observedAt,
+			Identity: identity, State: "supported", ObservedAt: &observedAt, ExpiresAt: &expiresAt,
 			Freshness: freshness, Coverage: "unknown",
 		}
 		if len(observations) == MaxObservations {

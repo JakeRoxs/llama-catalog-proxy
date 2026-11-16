@@ -18,6 +18,77 @@ import (
 	"time"
 )
 
+func TestRefreshBackendModelsKeepsPeerEvidenceCurrent(t *testing.T) {
+	var calls atomic.Int32
+	var unavailable atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		if unavailable.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"model"}]}`))
+	}))
+	defer server.Close()
+	service := New([]Backend{
+		{ID: "local", URL: mustParseURL(t, server.URL), Default: true},
+		{ID: "unselected", URL: mustParseURL(t, server.URL)},
+	}, server.Client(), 5*time.Minute, time.Second, time.Second, testLogger())
+	ctx := context.Background()
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	local := service.backends[0]
+	if calls.Load() != 1 || local.fetchedAt.IsZero() || !service.backends[1].fetchedAt.IsZero() {
+		t.Fatal("refresh did not initialize only the selected cache")
+	}
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	if calls.Load() != 1 {
+		t.Fatal("fresh catalog was unnecessarily refreshed")
+	}
+	old := time.Now().Add(-time.Minute)
+	local.fetchedAt = old
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	if calls.Load() != 2 || !local.fetchedAt.After(old) {
+		t.Fatal("five-minute public TTL prevented peer evidence refresh")
+	}
+	unavailable.Store(true)
+	local.fetchedAt = old
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	if calls.Load() != 3 || !local.fetchedAt.Equal(old) {
+		t.Fatal("failed refresh fabricated fresh evidence")
+	}
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	if calls.Load() != 3 {
+		t.Fatal("failed refresh was not rate limited")
+	}
+	unavailable.Store(false)
+	local.lastTry = old
+	service.RefreshBackendModels(ctx, []string{"local"}, 7*time.Second)
+	if calls.Load() != 4 || !local.fetchedAt.After(old) || local.lastErr != nil {
+		t.Fatal("peer refresh did not recover from upstream failure")
+	}
+}
+
+func TestRefreshBackendModelsHonorsCancellationWhileLocked(t *testing.T) {
+	service := New([]Backend{{ID: "local"}}, nil, time.Minute, time.Second, time.Second, testLogger())
+	service.backends[0].mu.Lock()
+	defer service.backends[0].mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		service.RefreshBackendModels(ctx, []string{"local"}, time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("refresh ignored cancellation waiting for catalog lock")
+	}
+}
+
 func TestVisitCachedModelIDsCancellationAndSelection(t *testing.T) {
 	service := New([]Backend{{ID: "local"}, {ID: "other"}}, nil, time.Minute, time.Second, time.Second, testLogger())
 	var local, other *backendState

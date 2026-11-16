@@ -76,14 +76,21 @@ checks do not replace the last completed observation. Results include their actu
 and source freshness, using `models_cache_ttl` as the freshness window. A ready health endpoint
 does not prove a specific model is loaded or inference will succeed. Omitted readiness evidence
 means it was not supplied, not that the backend is healthy.
+The default `models_cache_ttl` is five minutes. For peer-published models, the owner applies this
+TTL to the catalog observation and includes its absolute `expires_at` in each report. The owner
+refreshes explicitly owned backend catalogs in the background before that TTL expires; this does
+not depend on frontend `/v1/models` traffic. A receiver requires both a fresh peer report and
+unexpired owner evidence. Report freshness is a separate 30-second connectivity check and does not
+reset or extend the owner catalog's expiration. Failed owner catalog refreshes never extend it.
 
 For outbound exchange, configure the peer's HTTPS origin and its separately issued token. The optional
 `ca_file` replaces system trust with the specified PEM trust roots; without it, system roots are
-used. Peers are polled every 15 seconds with bounded concurrency, a five-second timeout, no redirects,
-and report validation against the configured node ID. A failed refresh preserves the last report as
-stale for at most 15 minutes. A successful receipt is considered fresh for 30 seconds; receipt
-freshness does not prove that the underlying source observations are fresh. Peer outages do not
-change local readiness.
+used. Peers are polled at most every 15 seconds with bounded concurrency, a five-second timeout, no
+redirects, and report validation against the configured node ID. Polling runs more frequently when
+needed to refresh catalogs configured with a shorter `models_cache_ttl`. A failed refresh preserves
+the last report as stale for at most 15 minutes. A successful receipt is considered fresh for
+30 seconds; receipt freshness does not prove that the underlying source observations are fresh or
+extend their owner-provided expiration. Peer outages do not change local readiness.
 
 The public catalog includes peer models under `@peer/<node>/<backend>/<model>`, where backend and
 local model ID are unpadded base64url encodings of their exact UTF-8 bytes. Identical names and
@@ -648,7 +655,7 @@ path_routes:
 # the same backend endpoint. Requires path_routes /comfyui. Timeout returns HTTP 504.
 # comfyui_wait_timeout: 45m
 
-models_cache_ttl: 15s
+models_cache_ttl: 5m
 request_timeout: 10s
 # health_timeout: 2s   # inherits request_timeout when omitted
 # catalog_timeout: 20s # inherits request_timeout when omitted

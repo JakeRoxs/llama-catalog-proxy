@@ -64,11 +64,12 @@ func TestPeerModelIDsAndCatalogCollisions(t *testing.T) {
 func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 	now := time.Now()
 	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "comfyui_auto"}
+	expiresAt := now.Add(time.Minute)
 	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
 	cache.update("bigboi", &nodecontract.Receipt{
 		AuthenticatedNodeID: "bigboi", ReceivedAt: now,
 		Report: nodecontract.Report{Observations: []nodecontract.Observation{{
-			Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh", Coverage: "complete",
+			Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh", Coverage: "complete",
 		}}},
 	}, "", now)
 	h := &Handler{logger: discardLogger(), peerCache: cache,
@@ -94,9 +95,10 @@ func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
 	now := time.Now()
 	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "comfyui_auto"}
+	expiresAt := now.Add(time.Minute)
 	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
 		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
-			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh"}}}}
+			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh"}}}}
 	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
 	cache.update("bigboi", receipt, "", now)
 	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
@@ -117,9 +119,10 @@ func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
 func TestPeerRouteAliasIsReservedWhilePeerInferenceIsConfigured(t *testing.T) {
 	now := time.Now()
 	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "model"}
+	expiresAt := now.Add(time.Minute)
 	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
 		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
-			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, Freshness: "fresh"}}}}
+			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh"}}}}
 	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
 	cache.update("bigboi", receipt, "unavailable", now)
 	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
@@ -236,11 +239,12 @@ func TestPeerRoutingRejectsAmbiguousModelFields(t *testing.T) {
 
 func TestPeerRoutingRequiresFreshSourceEvidence(t *testing.T) {
 	now := time.Now()
+	expiresAt := now.Add(5 * time.Minute)
 	id := nodecontract.ModelIdentity{OwnerNodeID: "node-a", BackendID: "local", LocalID: "model"}
 	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "node-a", ReceivedAt: now, Report: nodecontract.Report{
 		Source:      nodecontract.Source{NodeID: "node-a", ProxyInstanceID: strings.Repeat("a", 32), ConfigGeneration: 1},
 		GeneratedAt: now, Capabilities: nodecontract.Capabilities{"catalog_read": "enabled"},
-		Observations: []nodecontract.Observation{{Identity: id, State: "supported", ObservedAt: &now, Freshness: "fresh"}},
+		Observations: []nodecontract.Observation{{Identity: id, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh"}},
 	}}
 	cache := &peerCache{entries: map[string]peerCacheEntry{"node-a": {}}}
 	cache.update("node-a", receipt, "", now)
@@ -257,7 +261,18 @@ func TestPeerRoutingRequiresFreshSourceEvidence(t *testing.T) {
 		t.Fatalf("outbound inference without grant status=%d", response.Code)
 	}
 	if _, ok := cache.freshModel(id, now.Add(peerFreshAge+time.Second)); ok {
-		t.Fatal("aged source observation accepted")
+		t.Fatal("stale peer receipt accepted despite valid owner evidence")
+	}
+	reportAt := now.Add(peerFreshAge + time.Second)
+	refreshedReceipt := *receipt
+	refreshedReceipt.ReceivedAt = reportAt
+	refreshedReceipt.Report.GeneratedAt = reportAt
+	cache.update("node-a", &refreshedReceipt, "", reportAt)
+	if _, ok := cache.freshModel(id, reportAt); !ok {
+		t.Fatal("owner evidence inside its validity window rejected after a fresh peer report")
+	}
+	if _, ok := cache.freshModel(id, expiresAt); ok {
+		t.Fatal("expired owner catalog evidence accepted")
 	}
 	cache.update("node-a", nil, "unavailable", now)
 	if _, ok := cache.freshModel(id, now); ok {

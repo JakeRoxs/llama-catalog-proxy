@@ -227,20 +227,54 @@ func (r *Reloader) refreshPeers(state *reloaderState) {
 
 func (r *Reloader) watchPeers() {
 	defer r.wg.Done()
-	ticker := time.NewTicker(peerRefreshInterval)
-	defer ticker.Stop()
 	for {
 		state := r.state.Load()
+		r.refreshPeerCatalogs(state)
 		if len(state.peerClients) != 0 {
 			r.refreshPeers(state)
 		}
+		timer := time.NewTimer(peerRefreshIntervalForTTL(state.cacheTTL))
 		select {
 		case <-r.stop:
+			timer.Stop()
 			return
 		case <-r.peerWake:
-		case <-ticker.C:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
 		}
 	}
+}
+
+func peerRefreshIntervalForTTL(ttl time.Duration) time.Duration {
+	if ttl <= 0 {
+		return peerRefreshInterval
+	}
+	interval := ttl / 3
+	if interval < 250*time.Millisecond {
+		interval = 250 * time.Millisecond
+	}
+	return min(interval, peerRefreshInterval)
+}
+
+func (r *Reloader) refreshPeerCatalogs(state *reloaderState) {
+	if state.peer == nil || len(state.peer.LocalBackends) == 0 {
+		return
+	}
+	handler, ok := state.handler.(*Handler)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(state.peerContext, peerReportTimeout)
+	defer cancel()
+	// Reports remain cache-only, but refresh owner caches before the configured
+	// catalog TTL expires, independent of frontend catalog traffic.
+	refreshAge := state.cacheTTL * 2 / 3
+	if refreshAge <= 0 {
+		return
+	}
+	handler.catalog.RefreshBackendModels(ctx, state.peer.LocalBackends, refreshAge)
 }
 
 func closePeerClients(clients map[string]*peerClient) {

@@ -13,6 +13,8 @@ import (
 
 var fixtureTime = time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 
+func timePointer(value time.Time) *time.Time { return &value }
+
 func fixtureReport() Report {
 	return Report{
 		ProtocolVersion:  Version{Major: 1, Minor: 0},
@@ -33,6 +35,7 @@ func fixtureReport() Report {
 			Identity:   ModelIdentity{OwnerNodeID: "node-a", BackendID: "gpu", LocalID: "model"},
 			State:      "supported",
 			ObservedAt: &fixtureTime,
+			ExpiresAt:  timePointer(fixtureTime.Add(5 * time.Minute)),
 			Freshness:  "fresh",
 			Coverage:   "complete",
 		}},
@@ -68,6 +71,7 @@ func TestDecodeReportPreservesEvidenceAndReceipt(t *testing.T) {
 	}
 	if !got.ReceivedAt.Equal(fixtureTime.Add(time.Minute)) ||
 		!got.Report.Observations[0].ObservedAt.Equal(fixtureTime) ||
+		!got.Report.Observations[0].ExpiresAt.Equal(fixtureTime.Add(5*time.Minute)) ||
 		got.AuthenticatedNodeID != "node-a" {
 		t.Fatalf("receipt and source evidence = %#v", got)
 	}
@@ -101,6 +105,9 @@ func TestDecodeReportRejectsInvalidContracts(t *testing.T) {
 		{"duplicate identity", func(r *Report) { r.Observations = append(r.Observations, r.Observations[0]) }, "node-a"},
 		{"invalid state", func(r *Report) { r.Observations[0].State = "invented" }, "node-a"},
 		{"fresh with no observation time", func(r *Report) { r.Observations[0].ObservedAt = nil }, "node-a"},
+		{"expiration before observation", func(r *Report) {
+			r.Observations[0].ExpiresAt = timePointer(fixtureTime.Add(-time.Second))
+		}, "node-a"},
 		{"supported with unknown observation time", func(r *Report) {
 			r.Observations[0].ObservedAt = nil
 			r.Observations[0].Freshness = "unknown"

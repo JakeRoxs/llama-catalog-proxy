@@ -37,7 +37,8 @@ func TestLocalReportExportsOnlyExplicitlySelectedBackends(t *testing.T) {
 	for i, want := range []string{"a", "z"} {
 		got := report.Observations[i]
 		if got.Identity != (ModelIdentity{OwnerNodeID: source.NodeID, BackendID: "local", LocalID: want}) ||
-			got.Freshness != "fresh" || got.ObservedAt == nil || !got.ObservedAt.Equal(fixtureTime) {
+			got.Freshness != "fresh" || got.ObservedAt == nil || !got.ObservedAt.Equal(fixtureTime) ||
+			got.ExpiresAt == nil || !got.ExpiresAt.Equal(fixtureTime.Add(time.Minute)) {
 			t.Fatalf("observation %d = %#v", i, got)
 		}
 	}

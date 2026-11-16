@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -318,14 +319,53 @@ func (s *Service) fetchCatalogs(ctx context.Context, requestHeader http.Header) 
 }
 
 func (s *Service) backendCatalog(ctx context.Context, backend *backendState, requestHeader http.Header) (map[string]any, []map[string]any, http.Header, error) {
-	backend.mu.Lock()
+	return s.backendCatalogWithTTL(ctx, backend, requestHeader, s.ttl)
+}
+
+// RefreshBackendModels refreshes only selected backend caches with a tighter
+// maximum age than the public catalog TTL. Failed refreshes retain their original
+// observation timestamps, so consumers can still reject stale evidence.
+func (s *Service) RefreshBackendModels(ctx context.Context, selected []string, maxAge time.Duration) {
+	if maxAge <= 0 {
+		return
+	}
+	ttl := min(s.ttl, maxAge)
+	var workers sync.WaitGroup
+	for _, backend := range s.backends {
+		if !slices.Contains(selected, backend.ID) {
+			continue
+		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			_, _, _, _ = s.backendCatalogWithTTL(ctx, backend, nil, ttl)
+		}()
+	}
+	workers.Wait()
+}
+
+func (s *Service) backendCatalogWithTTL(ctx context.Context, backend *backendState, requestHeader http.Header, ttl time.Duration) (map[string]any, []map[string]any, http.Header, error) {
+	if !backend.mu.TryLock() {
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for !backend.mu.TryLock() {
+			select {
+			case <-ctx.Done():
+				return nil, nil, nil, ctx.Err()
+			case <-ticker.C:
+			}
+		}
+	}
 	defer backend.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
 
 	now := time.Now()
-	if backend.root != nil && now.Sub(backend.fetchedAt) < s.ttl {
+	if backend.root != nil && now.Sub(backend.fetchedAt) < ttl {
 		return backend.root, backend.models, backend.header, nil
 	}
-	if backend.lastErr != nil && now.Sub(backend.lastTry) < s.ttl {
+	if backend.lastErr != nil && now.Sub(backend.lastTry) < ttl {
 		if backend.root != nil {
 			return backend.root, backend.models, backend.header, nil
 		}

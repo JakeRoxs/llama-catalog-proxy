@@ -566,7 +566,7 @@ backends:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Listen != "127.0.0.1:9090" || cfg.ModelsCacheTTL != 15*time.Second || cfg.RequestTimeout != 3*time.Second {
+	if cfg.Listen != "127.0.0.1:9090" || cfg.ModelsCacheTTL != 5*time.Minute || cfg.RequestTimeout != 3*time.Second {
 		t.Fatalf("defaults or overrides not applied: %#v", cfg)
 	}
 	if cfg.Backends["remote"].Prefix != "remote/" {

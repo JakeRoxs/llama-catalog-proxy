@@ -47,6 +47,7 @@ type Observation struct {
 	Identity   ModelIdentity `json:"identity"`
 	State      string        `json:"state"`
 	ObservedAt *time.Time    `json:"observed_at,omitempty"`
+	ExpiresAt  *time.Time    `json:"expires_at,omitempty"`
 	Freshness  string        `json:"freshness"`
 	Coverage   string        `json:"coverage"`
 }
@@ -205,6 +206,7 @@ func (r Report) validate(authenticatedNodeID string) error {
 		if !validState(observation.State) || !validCoverage(observation.Coverage) ||
 			!validFreshness(observation.Freshness) ||
 			(observation.ObservedAt != nil && observation.ObservedAt.IsZero()) ||
+			(observation.ExpiresAt != nil && (observation.ExpiresAt.IsZero() || observation.ObservedAt == nil || !observation.ExpiresAt.After(*observation.ObservedAt))) ||
 			(observation.ObservedAt == nil && observation.Freshness != "unknown") ||
 			((observation.State == "supported" || observation.State == "partial") && observation.ObservedAt == nil) {
 			return errors.New("invalid observation evidence")

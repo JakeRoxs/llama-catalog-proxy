@@ -23,6 +23,55 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
+func TestPeerWatcherRefreshesOwnerCatalogWithoutFrontendRequests(t *testing.T) {
+	refreshed := make(chan struct{}, 1)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			t.Errorf("unexpected upstream request %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"data":[{"id":"model"}]}`))
+		refreshed <- struct{}{}
+	}))
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	cfg.ModelsCacheTTL = 5 * time.Minute
+	handler := newHandler(t, cfg).(*Handler)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &Reloader{stop: make(chan struct{})}
+	r.state.Store(&reloaderState{
+		handler: handler, peerContext: ctx,
+		peer: &config.PeerConfig{NodeID: "owner", LocalBackends: []string{"default"}},
+	})
+	r.wg.Add(1)
+	go r.watchPeers()
+	defer func() {
+		close(r.stop)
+		cancel()
+		r.wg.Wait()
+	}()
+	select {
+	case <-refreshed:
+	case <-time.After(time.Second):
+		t.Fatal("owner without outbound peers did not refresh its catalog")
+	}
+	// Wait for the completed refresh before projecting the cache-only report.
+	r.refreshPeerCatalogs(r.state.Load())
+	now := time.Now()
+	report, err := nodecontract.LocalReportFromCatalog(ctx, nodecontract.Source{
+		NodeID: "owner", ProxyInstanceID: strings.Repeat("a", 32), ConfigGeneration: 1,
+	},
+		[]string{"default"}, handler.catalog, now, cfg.ModelsCacheTTL)
+	if err != nil || len(report.Observations) != 1 {
+		t.Fatalf("owner report: %v, %#v", err, report)
+	}
+	cache := &peerCache{entries: make(map[string]peerCacheEntry)}
+	cache.update("owner", &nodecontract.Receipt{Report: report, ReceivedAt: now}, "", now)
+	if _, ok := cache.freshModel(report.Observations[0].Identity, now); !ok {
+		t.Fatal("background-refreshed owner model is not routable")
+	}
+}
+
 func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 	type inferenceEvent struct {
 		model, authorization, apiKey, private, partPrivate, file string
