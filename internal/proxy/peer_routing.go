@@ -10,6 +10,7 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/textproto"
@@ -380,9 +381,9 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
 			req.Out.URL.Path, req.Out.URL.RawPath, req.Out.URL.RawQuery = "/peer/v1/inference", "", ""
-			req.Out.Header = make(http.Header)
 			req.Out.Trailer = nil
 			req.Out.TransferEncoding = nil
+			req.Out.Header = copyPeerClientAddressHeaders(req.In)
 			req.Out.Header.Set("Content-Type", req.In.Header.Get("Content-Type"))
 			if req.Out.Header.Get("Content-Type") == "" {
 				req.Out.Header.Set("Content-Type", "application/json")
@@ -403,6 +404,28 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 		},
 	}
 	proxy.ServeHTTP(w, r)
+}
+
+func copyPeerClientAddressHeaders(req *http.Request) http.Header {
+	forwarded := make(http.Header)
+	for _, name := range []string{"X-Forwarded-For", "X-Real-IP"} {
+		for _, value := range req.Header.Values(name) {
+			forwarded.Add(name, value)
+		}
+	}
+	if forwarded.Get("X-Forwarded-For") == "" {
+		address := forwarded.Get("X-Real-IP")
+		if address == "" {
+			address = req.RemoteAddr
+			if host, _, err := net.SplitHostPort(address); err == nil {
+				address = host
+			}
+		}
+		if address != "" {
+			forwarded.Set("X-Forwarded-For", address)
+		}
+	}
+	return forwarded
 }
 
 func peerTargetHeaders(r *http.Request, nodeID string) (nodecontract.ModelIdentity, string, string, uint64, error) {

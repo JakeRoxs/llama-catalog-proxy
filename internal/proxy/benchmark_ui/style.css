@@ -51,5 +51,6 @@ td button { padding: .35rem .6rem; font-size: .8rem; }
 .evidence h4 { margin: 1.5rem 0 .6rem; color: var(--accent); }
 .evidence p + p { margin-top: .5rem; }
 [hidden] { display: none !important; }
+#workspace.read-only .workspace, #workspace.read-only .comparison-column { display: none; }
 @media (max-width: 850px) { .intro, .workspace, .unlock { grid-template-columns: 1fr; } .intro { gap: 2rem; } .workspace .panel + .panel { border-left: 1px solid var(--line); border-top: 0; } }
 @media (max-width: 520px) { .fields { grid-template-columns: 1fr; } .inline { flex-direction: column; } main { padding-inline: .75rem; } }

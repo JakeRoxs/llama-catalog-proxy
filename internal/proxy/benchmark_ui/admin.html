@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>Catalog Proxy Admin</title>
+  <link rel="stylesheet" href="/admin/admin.css">
+  <script src="/admin/admin.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <a class="brand" href="/admin/" aria-label="Catalog Proxy Admin home"><span class="brand-mark">CP</span><span>CATALOG PROXY <small>CONTROL PLANE</small></span></a>
+      <a class="back-link" href="/benchmark/">Benchmark Lab <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <section id="login-panel" class="gate" hidden>
+      <p class="eyebrow">LOCAL ADMIN SESSION</p>
+      <h1>Sign in to this node</h1>
+      <p class="lede">Your identity and role are checked locally. Peer access remains separately scoped by each node.</p>
+      <a class="button primary" href="/admin/auth/login">Continue with identity provider <span aria-hidden="true">→</span></a>
+      <p id="login-error" class="notice" role="status" hidden></p>
+    </section>
+
+    <section id="denied-panel" class="gate" hidden>
+      <p class="eyebrow">ACCESS NOT GRANTED</p>
+      <h1>Administrator role required</h1>
+      <p class="lede">The identity provider authenticated you, but this node did not grant the view role.</p>
+      <form id="logout-form"><input type="hidden" id="csrf-logout"><button class="button quiet" type="submit">Sign out</button></form>
+    </section>
+
+    <section id="dashboard" hidden>
+      <div class="page-heading">
+        <div><p class="eyebrow">FEDERATION / LOCAL VIEW</p><h1>Node overview</h1><p class="lede">Read-only catalog and peer status from this proxy.</p></div>
+        <div class="session"><span id="signed-in-as"></span><form id="signout-form"><input type="hidden" id="csrf-signout"><button class="button quiet" type="submit">Sign out</button></form></div>
+      </div>
+
+      <div id="load-error" class="notice" role="status" hidden></div>
+      <div class="metrics">
+        <article class="metric"><span class="eyebrow">LOCAL NODE</span><strong id="node-id">—</strong></article>
+        <article class="metric"><span class="eyebrow">MODELS VISIBLE</span><strong id="model-count">—</strong></article>
+        <article class="metric"><span class="eyebrow">PEERS REPORTED</span><strong id="peer-count">—</strong></article>
+        <article class="metric"><span class="eyebrow">SNAPSHOT</span><strong id="snapshot-at">—</strong></article>
+        <article class="metric"><span class="eyebrow">REQUESTS / 24H</span><strong id="request-count">Unknown</strong><small id="request-summary-state">Summary unavailable</small></article>
+        <article class="metric"><span class="eyebrow">P50 DURATION</span><strong id="request-p50">Unknown</strong><small id="duration-samples">Sample count unknown</small></article>
+      </div>
+
+      <div class="columns">
+        <section class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">CATALOG</p><h2>Selectable models</h2></div><button id="refresh" class="button quiet" type="button">Refresh</button></div>
+          <p class="small-note">Catalog presence is not a guarantee that a model is loaded or currently ready.</p>
+          <div class="table-wrap"><table><thead><tr><th>Public ID</th><th>Owner</th></tr></thead><tbody id="models"></tbody></table></div>
+          <p id="models-empty" class="empty" hidden>No model entries are currently available.</p>
+        </section>
+        <section class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">TRUSTED CONNECTIONS</p><h2>Peer status</h2></div></div>
+          <div id="peers" class="peer-list"></div>
+          <p id="peers-empty" class="empty" hidden>No peers are configured.</p>
+          <p class="small-note">Status reflects the last peer report; it does not guarantee a model is loaded or ready.</p>
+        </section>
+      </div>
+      <section class="panel outcomes-panel">
+        <div class="panel-heading"><div><p class="eyebrow">OBSERVATIONS</p><h2>Request outcomes / last 24 hours</h2></div></div>
+        <div id="request-outcomes" class="outcome-list"><p class="empty">Unknown until request history is enabled.</p></div>
+      </section>
+      <section class="panel outcomes-panel">
+        <div class="panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Recent proxy requests</h2></div><span class="small-note">last 24 hours · max 50</span></div>
+        <p id="activity-state" class="empty">Request history availability is unknown.</p>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Backend</th><th>HTTP outcome</th><th>Duration</th></tr></thead><tbody id="activity"></tbody></table></div>
+      </section>
+      <footer>Settings writes, inference, enrollment, and path-service grants are not available in this read-only view.</footer>
+    </section>
+  </main>
+</body>
+</html>

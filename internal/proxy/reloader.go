@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,8 @@ type Reloader struct {
 	managementSlots    chan struct{}
 	delegatedStores    *config.DelegatedStoreConfig
 	benchmark          *benchmarkRuntime
+	adminAuth          *adminAuth
+	managementUIConfig *config.ManagementUIConfig
 	ingestion          *ingestionRuntime
 	instanceID         string
 	peerSlots          chan struct{}
@@ -94,6 +97,11 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 	if err != nil {
 		return nil, config.Config{}, err
 	}
+	r.adminAuth, err = newAdminAuth(cfg.ManagementUI, logger, http.DefaultClient)
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	r.managementUIConfig = cfg.ManagementUI
 	var certificate *tls.Certificate
 	if cfg.Peer != nil {
 		id := make([]byte, 16)
@@ -181,6 +189,22 @@ func (r *Reloader) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 		r.serveBenchmark(writer, request)
 		return
 	}
+	if request.URL.Path == "/admin" || strings.HasPrefix(request.URL.Path, "/admin/") {
+		if r.adminAuth == nil {
+			http.NotFound(writer, request)
+			return
+		}
+		if request.URL.Path == "/admin/api/v1/overview" {
+			r.serveAdminOverview(writer, request)
+			return
+		}
+		if request.URL.Path == "/admin/api/v1/activity" {
+			r.serveAdminActivity(writer, request)
+			return
+		}
+		r.adminAuth.ServeHTTP(writer, request)
+		return
+	}
 	if r.peerListen != "" && (request.URL.Path == "/peer" || strings.HasPrefix(request.URL.Path, "/peer/")) {
 		http.NotFound(writer, request)
 		return
@@ -232,6 +256,9 @@ func (r *Reloader) reload() error {
 	if (cfg.Benchmark == nil) != (r.benchmark == nil) ||
 		cfg.Benchmark != nil && (*cfg.Benchmark != r.benchmark.config || cfg.DiagnosticsAPIKey != r.benchmark.diagnosticsKey) {
 		return errors.New("changing benchmark configuration or its diagnostics credential requires a restart")
+	}
+	if !reflect.DeepEqual(cfg.ManagementUI, r.managementUIConfig) {
+		return errors.New("changing management_ui authentication requires a restart")
 	}
 	var ingestionConfig *config.IngestionConfig
 	if cfg.Management != nil {

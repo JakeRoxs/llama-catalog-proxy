@@ -57,12 +57,26 @@ type Config struct {
 	Peer              *PeerConfig
 	Management        *ManagementConfig
 	Benchmark         *BenchmarkConfig
+	ManagementUI      *ManagementUIConfig
 }
 
 type BenchmarkConfig struct {
 	Token           string `yaml:"token"`
 	ProxyOrigin     string `yaml:"proxy_origin"`
 	ReportDirectory string `yaml:"report_directory"`
+	PublicReadOnly  bool   `yaml:"public_read_only,omitempty"`
+}
+
+type ManagementUIConfig struct {
+	IssuerURL      string              `yaml:"issuer_url"`
+	ClientID       string              `yaml:"client_id"`
+	ClientSecret   string              `yaml:"client_secret"`
+	RedirectURL    string              `yaml:"redirect_url"`
+	GroupsClaim    string              `yaml:"groups_claim,omitempty"`
+	Scopes         []string            `yaml:"scopes,omitempty"`
+	RoleGroups     map[string][]string `yaml:"role_groups"`
+	SessionTTL     string              `yaml:"session_ttl,omitempty"`
+	SessionIdleTTL string              `yaml:"session_idle_ttl,omitempty"`
 }
 
 // ManagementConfig enables a separate HTTPS endpoint for local config previews.
@@ -153,23 +167,24 @@ type Backend struct {
 }
 
 type fileConfig struct {
-	Listen             string             `yaml:"listen"`
-	LogLevel           string             `yaml:"log_level"`
-	DefaultBackend     string             `yaml:"default_backend"`
-	Backends           map[string]Backend `yaml:"backends"`
-	PathRoutes         map[string]string  `yaml:"path_routes"`
-	ModelsCacheTTL     string             `yaml:"models_cache_ttl"`
-	RequestTimeout     string             `yaml:"request_timeout"`
-	HealthTimeout      string             `yaml:"health_timeout"`
-	CatalogTimeout     string             `yaml:"catalog_timeout"`
-	ComfyUIWaitTimeout string             `yaml:"comfyui_wait_timeout"`
-	MaxJSONBody        *int64             `yaml:"max_json_request_body_bytes"`
-	RequestHistory     *bool              `yaml:"request_history,omitempty"`
-	RequestObservation *bool              `yaml:"request_observation,omitempty"`
-	DiagnosticsAPIKey  *string            `yaml:"diagnostics_api_key,omitempty"`
-	Peer               *PeerConfig        `yaml:"peer,omitempty"`
-	Management         *ManagementConfig  `yaml:"management,omitempty"`
-	Benchmark          *BenchmarkConfig   `yaml:"benchmark,omitempty"`
+	Listen             string              `yaml:"listen"`
+	LogLevel           string              `yaml:"log_level"`
+	DefaultBackend     string              `yaml:"default_backend"`
+	Backends           map[string]Backend  `yaml:"backends"`
+	PathRoutes         map[string]string   `yaml:"path_routes"`
+	ModelsCacheTTL     string              `yaml:"models_cache_ttl"`
+	RequestTimeout     string              `yaml:"request_timeout"`
+	HealthTimeout      string              `yaml:"health_timeout"`
+	CatalogTimeout     string              `yaml:"catalog_timeout"`
+	ComfyUIWaitTimeout string              `yaml:"comfyui_wait_timeout"`
+	MaxJSONBody        *int64              `yaml:"max_json_request_body_bytes"`
+	RequestHistory     *bool               `yaml:"request_history,omitempty"`
+	RequestObservation *bool               `yaml:"request_observation,omitempty"`
+	DiagnosticsAPIKey  *string             `yaml:"diagnostics_api_key,omitempty"`
+	Peer               *PeerConfig         `yaml:"peer,omitempty"`
+	Management         *ManagementConfig   `yaml:"management,omitempty"`
+	Benchmark          *BenchmarkConfig    `yaml:"benchmark,omitempty"`
+	ManagementUI       *ManagementUIConfig `yaml:"management_ui,omitempty"`
 }
 
 func Load(path string) (Config, error) {
@@ -199,6 +214,7 @@ func Load(path string) (Config, error) {
 		Peer:           raw.Peer,
 		Management:     raw.Management,
 		Benchmark:      raw.Benchmark,
+		ManagementUI:   raw.ManagementUI,
 	}
 	if cfg.Backends == nil {
 		cfg.Backends = make(map[string]Backend)
@@ -306,6 +322,9 @@ func (c Config) Validate() error {
 	if err := validateBenchmark(c); err != nil {
 		return err
 	}
+	if err := validateManagementUI(c); err != nil {
+		return err
+	}
 	prefixOwners := make(map[string]string)
 	for backendID, backend := range c.Backends {
 		if strings.TrimSpace(backendID) == "" {
@@ -405,6 +424,108 @@ func validateBenchmark(c Config) error {
 	}
 	if _, err := privateorigin.Parse(b.ProxyOrigin); err != nil {
 		return fmt.Errorf("benchmark proxy origin: %w", err)
+	}
+	return nil
+}
+
+func validateManagementUI(c Config) error {
+	ui := c.ManagementUI
+	if ui == nil {
+		return nil
+	}
+	issuer, err := url.Parse(ui.IssuerURL)
+	if err != nil || issuer.Scheme != "https" || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" {
+		return errors.New("management_ui issuer_url must be an HTTPS issuer without credentials, query, or fragment")
+	}
+	redirect, err := url.Parse(ui.RedirectURL)
+	if err != nil || redirect.Scheme != "https" || redirect.Host == "" || redirect.User != nil || redirect.RawQuery != "" ||
+		redirect.Fragment != "" || redirect.Path != "/admin/auth/callback" {
+		return errors.New("management_ui redirect_url must be HTTPS and end at /admin/auth/callback")
+	}
+	if ui.ClientID == "" || len(ui.ClientID) > 256 || ui.ClientSecret == "" || len(ui.ClientSecret) > 4096 {
+		return errors.New("management_ui OIDC client ID and client secret are required")
+	}
+	for _, ch := range ui.ClientID {
+		if ch < 0x21 || ch > 0x7e {
+			return errors.New("management_ui client_id contains invalid characters")
+		}
+	}
+	for _, ch := range ui.ClientSecret {
+		if ch < 0x21 || ch > 0x7e {
+			return errors.New("management_ui client_secret contains invalid characters")
+		}
+	}
+	if err := managementCredentialConflict(c, ui.ClientSecret); err != nil {
+		return fmt.Errorf("management_ui client_secret: %w", err)
+	}
+	if c.Management != nil && (ui.ClientSecret == c.Management.PreviewToken || ui.ClientSecret == c.Management.WriteToken ||
+		c.Management.DelegationToken != "" && ui.ClientSecret == c.Management.DelegationToken ||
+		c.Management.ProposalStore != nil && ui.ClientSecret == c.Management.ProposalStore.Token ||
+		c.Management.BackupStore != nil && ui.ClientSecret == c.Management.BackupStore.Token) {
+		return errors.New("management_ui client_secret must be distinct from management credentials")
+	}
+	if c.Benchmark != nil && ui.ClientSecret == c.Benchmark.Token {
+		return errors.New("management_ui client_secret must be distinct from benchmark credentials")
+	}
+	if ui.GroupsClaim != "" {
+		if len(ui.GroupsClaim) > 64 {
+			return errors.New("management_ui groups_claim is too long")
+		}
+		for _, ch := range ui.GroupsClaim {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '-' || ch == '.') {
+				return errors.New("management_ui groups_claim contains invalid characters")
+			}
+		}
+	}
+	if len(ui.Scopes) > 16 {
+		return errors.New("management_ui has too many OIDC scopes")
+	}
+	seenScopes := make(map[string]bool, len(ui.Scopes))
+	for _, scope := range ui.Scopes {
+		if scope == "" || len(scope) > 128 || seenScopes[scope] || strings.ContainsAny(scope, " \t\r\n") {
+			return errors.New("management_ui contains an invalid or duplicate OIDC scope")
+		}
+		seenScopes[scope] = true
+	}
+	allowedRoles := map[string]bool{"view": true, "operate": true, "configure_models": true, "administer_federation": true}
+	if len(ui.RoleGroups) == 0 || len(ui.RoleGroups) > len(allowedRoles) {
+		return errors.New("management_ui role_groups must define at least one supported role")
+	}
+	for role, groups := range ui.RoleGroups {
+		if !allowedRoles[role] || len(groups) == 0 || len(groups) > 64 {
+			return errors.New("management_ui role_groups contains an unsupported role or empty group list")
+		}
+		seen := make(map[string]bool, len(groups))
+		for _, group := range groups {
+			if group == "" || len(group) > 256 || seen[group] {
+				return errors.New("management_ui role_groups contains an invalid or duplicate group")
+			}
+			for _, ch := range group {
+				if ch < 0x21 || ch > 0x7e {
+					return errors.New("management_ui role group contains invalid characters")
+				}
+			}
+			seen[group] = true
+		}
+	}
+	absoluteTTL := 8 * time.Hour
+	if ui.SessionTTL != "" {
+		var err error
+		absoluteTTL, err = time.ParseDuration(ui.SessionTTL)
+		if err != nil || absoluteTTL < 5*time.Minute || absoluteTTL > 24*time.Hour {
+			return errors.New("management_ui session_ttl must be between 5m and 24h")
+		}
+	}
+	idleTTL := 30 * time.Minute
+	if ui.SessionIdleTTL != "" {
+		var err error
+		idleTTL, err = time.ParseDuration(ui.SessionIdleTTL)
+		if err != nil || idleTTL < time.Minute || idleTTL > absoluteTTL {
+			return errors.New("management_ui session_idle_ttl must be between 1m and session_ttl")
+		}
+	}
+	if idleTTL > absoluteTTL {
+		return errors.New("management_ui session_idle_ttl cannot exceed session_ttl")
 	}
 	return nil
 }

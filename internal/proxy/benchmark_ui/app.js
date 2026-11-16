@@ -12,7 +12,8 @@ function message(text) {
 }
 
 async function api(path, options = {}) {
-  const headers = { Authorization: `Bearer ${token}` };
+	const headers = {};
+	if (token) headers.Authorization = `Bearer ${token}`;
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   const response = await fetch(`/benchmark/v1${path}`, {
     method: options.method || "GET",
@@ -167,18 +168,25 @@ async function refreshRuns() {
     cell(row, run.started_at);
     cell(row, `${run.backend} / ${run.model}`);
     cell(row, run.status);
-    const inspect = document.createElement("button");
-    inspect.type = "button";
-    inspect.textContent = "View";
-    inspect.addEventListener("click", async () => {
-      try { displayRun(await api(`/runs/${encodeURIComponent(run.run_id)}`)); message(""); }
-      catch (error) { message(error.message); }
+      const inspect = document.createElement("button");
+      inspect.type = "button";
+      inspect.textContent = publicReadOnlyMode && !token ? "Unlock to inspect" : "View";
+      inspect.addEventListener("click", async () => {
+        if (publicReadOnlyMode && !token) {
+          byId("unlock-panel").hidden = false;
+          message("Enter the benchmark token to inspect full reports or run a benchmark.");
+          byId("token").focus();
+          return;
+        }
+        try { displayRun(await api(`/runs/${encodeURIComponent(run.run_id)}`)); message(""); }
+        catch (error) { message(error.message); }
     });
     const action = document.createElement("td");
     action.appendChild(inspect);
     row.appendChild(action);
     for (const side of ["baseline", "candidate"]) {
       const td = document.createElement("td");
+      td.className = "comparison-column";
       const radio = document.createElement("input");
       radio.type = "radio";
       radio.name = side;
@@ -199,6 +207,28 @@ async function refreshRuns() {
   byId("history-note").textContent = result.truncated
     ? "Showing at most 100 reports, selected by file modification time."
     : result.runs.length ? "Select a report to inspect it or choose two runs to compare." : "No saved reports.";
+}
+
+let publicReadOnlyMode = false;
+
+async function enterPublicReadOnlyView() {
+  if (document.documentElement.dataset.publicReadOnly !== "true") return;
+  publicReadOnlyMode = true;
+  try {
+    await refreshRuns();
+    byId("unlock-panel").hidden = true;
+    byId("workspace").hidden = false;
+    byId("workspace").classList.add("read-only");
+    byId("run-panel").hidden = true;
+    byId("job-panel").hidden = true;
+    byId("compare").hidden = true;
+    byId("read-only-note").hidden = false;
+    byId("connection").textContent = "READ ONLY";
+    byId("history-note").textContent = "Saved run summaries are visible without a token. Unlock to inspect full reports or compare runs.";
+  } catch (error) {
+    publicReadOnlyMode = false;
+    if (error.status !== 401) message(error.message);
+  }
 }
 
 async function refreshJob() {
@@ -238,8 +268,14 @@ byId("unlock-form").addEventListener("submit", async (event) => {
   try {
     await refreshRuns();
     await refreshJob();
+    publicReadOnlyMode = false;
     byId("unlock-panel").hidden = true;
     byId("workspace").hidden = false;
+    byId("workspace").classList.remove("read-only");
+    byId("run-panel").hidden = false;
+    byId("job-panel").hidden = false;
+    byId("compare").hidden = false;
+    byId("read-only-note").hidden = true;
     byId("connection").textContent = "UNLOCKED";
     message("");
   } catch (error) {
@@ -291,4 +327,6 @@ byId("compare").addEventListener("click", async () => {
 if (!window.isSecureContext) {
   byId("security-warning").hidden = false;
   byId("unlock-form").querySelector("button").disabled = true;
+} else {
+  void enterPublicReadOnlyView();
 }

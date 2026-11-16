@@ -54,7 +54,7 @@ func TestBenchmarkAPIConsentAndCancellation(t *testing.T) {
 	configText := fmt.Sprintf(`default_backend: local
 backends: {local: {url: %q}}
 diagnostics_api_key: %q
-benchmark: {token: %q, proxy_origin: %q, report_directory: %q}
+benchmark: {token: %q, proxy_origin: %q, report_directory: %q, public_read_only: true}
 `, server.URL, diagnostic, token, server.URL, directory)
 	if err := os.WriteFile(path, []byte(configText), 0o600); err != nil {
 		t.Fatal(err)
@@ -79,7 +79,8 @@ benchmark: {token: %q, proxy_origin: %q, report_directory: %q}
 	}
 	page := request(http.MethodGet, "/benchmark/", "", "", "")
 	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "Benchmark Lab") ||
-		!strings.Contains(page.Header().Get("Content-Security-Policy"), "script-src 'self'") {
+		!strings.Contains(page.Header().Get("Content-Security-Policy"), "script-src 'self'") ||
+		!strings.Contains(page.Body.String(), `data-public-read-only="true"`) {
 		t.Fatalf("benchmark page = %d, CSP %q", page.Code, page.Header().Get("Content-Security-Policy"))
 	}
 	for _, asset := range []string{"/benchmark/app.js", "/benchmark/style.css"} {
@@ -147,6 +148,19 @@ benchmark: {token: %q, proxy_origin: %q, report_directory: %q}
 	if got.Code != http.StatusOK || !strings.Contains(got.Body.String(), status.RunID) {
 		t.Fatalf("run listing = %d %s", got.Code, got.Body.String())
 	}
+	publicListing := request(http.MethodGet, "/benchmark/v1/runs", "", "", "")
+	if publicListing.Code != http.StatusOK || !strings.Contains(publicListing.Body.String(), status.RunID) {
+		t.Fatalf("public read-only run listing = %d %s", publicListing.Code, publicListing.Body.String())
+	}
+	if got := request(http.MethodGet, "/benchmark/v1/runs", "", "https://other.example", ""); got.Code != http.StatusForbidden {
+		t.Fatalf("public read-only cross-origin listing = %d", got.Code)
+	}
+	if got := request(http.MethodGet, "/benchmark/v1/runs/"+status.RunID, "", "", ""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("public read-only report details = %d", got.Code)
+	}
+	if got := request(http.MethodGet, "/benchmark/v1/jobs/current", "", "", ""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("public read-only active-job status = %d", got.Code)
+	}
 	got = request(http.MethodGet, "/benchmark/v1/runs/"+status.RunID, token, "", "")
 	if got.Code != http.StatusOK || strings.Contains(got.Body.String(), "TOOL_ROUND_TRIP_OK") {
 		t.Fatalf("saved report = %d", got.Code)
@@ -162,5 +176,32 @@ benchmark: {token: %q, proxy_origin: %q, report_directory: %q}
 	}
 	if err := reloader.reload(); err == nil {
 		t.Fatal("benchmark token change did not require restart")
+	}
+}
+
+func TestBenchmarkPublicReadOnlyDefaultsOff(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
+	defer server.Close()
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := configPath(t)
+	configText := fmt.Sprintf("default_backend: local\nbackends: {local: {url: %q}}\ndiagnostics_api_key: %q\nbenchmark: {token: %q, proxy_origin: %q, report_directory: %q}\n",
+		server.URL, strings.Repeat("d", 32), strings.Repeat("b", 32), server.URL, directory)
+	if err := os.WriteFile(path, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reloader, _, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reloader.Stop()
+	request := httptest.NewRequest(http.MethodGet, "http://proxy.test/benchmark/v1/runs", nil)
+	response := httptest.NewRecorder()
+	reloader.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized || calls.Load() != 0 {
+		t.Fatalf("default no-auth listing = %d, backend calls=%d", response.Code, calls.Load())
 	}
 }

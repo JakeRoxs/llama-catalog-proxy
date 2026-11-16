@@ -75,9 +75,33 @@ func TestPeerRefreshIntervalTracksShortCatalogTTL(t *testing.T) {
 	}
 }
 
+func TestCopyPeerClientAddressHeadersUsesObservedAddressAndAllowlist(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.RemoteAddr = "192.0.2.45:54321"
+	req.Header.Set("Cookie", "private-session")
+	got := copyPeerClientAddressHeaders(req)
+	if got.Get("X-Forwarded-For") != "192.0.2.45" || got.Get("Cookie") != "" {
+		t.Fatalf("fallback address headers = %v", got)
+	}
+
+	req.Header.Set("X-Forwarded-For", "203.0.113.7")
+	req.Header.Set("X-Real-IP", "203.0.113.8")
+	got = copyPeerClientAddressHeaders(req)
+	if got.Get("X-Forwarded-For") != "203.0.113.7" || got.Get("X-Real-IP") != "203.0.113.8" || got.Get("Cookie") != "" {
+		t.Fatalf("preserved address headers = %v", got)
+	}
+
+	req.Header.Del("X-Forwarded-For")
+	got = copyPeerClientAddressHeaders(req)
+	if got.Get("X-Forwarded-For") != "203.0.113.8" || got.Get("X-Real-IP") != "203.0.113.8" {
+		t.Fatalf("X-Real-IP-only fallback headers = %v", got)
+	}
+}
+
 func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 	type inferenceEvent struct {
 		model, authorization, apiKey, private, partPrivate, file string
+		forwardedFor, realIP                                     string
 	}
 	events := make(chan inferenceEvent, 4)
 	canceled := make(chan struct{}, 1)
@@ -145,7 +169,11 @@ func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 					t.Error(err)
 					return
 				}
-				event := inferenceEvent{authorization: request.Header.Get("Authorization"), apiKey: request.Header.Get("X-Api-Key"), private: request.Header.Get("X-Private")}
+				event := inferenceEvent{
+					authorization: request.Header.Get("Authorization"), apiKey: request.Header.Get("X-Api-Key"),
+					private: request.Header.Get("X-Private"), forwardedFor: request.Header.Get("X-Forwarded-For"),
+					realIP: request.Header.Get("X-Real-IP"),
+				}
 				for {
 					part, err := reader.NextPart()
 					if err == io.EOF {
@@ -177,7 +205,11 @@ func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 				t.Error(err)
 				return
 			}
-			events <- inferenceEvent{model: body.Model, authorization: request.Header.Get("Authorization"), apiKey: request.Header.Get("X-Api-Key"), private: request.Header.Get("X-Private")}
+			events <- inferenceEvent{
+				model: body.Model, authorization: request.Header.Get("Authorization"),
+				apiKey: request.Header.Get("X-Api-Key"), private: request.Header.Get("X-Private"),
+				forwardedFor: request.Header.Get("X-Forwarded-For"), realIP: request.Header.Get("X-Real-IP"),
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = io.WriteString(w, "data: first\n\n")
 			w.(http.Flusher).Flush()
@@ -338,6 +370,8 @@ peer:
 	inferenceReq.Header.Set("Authorization", "Bearer client-inference-secret")
 	inferenceReq.Header.Set("X-Api-Key", "client-inference-secret")
 	inferenceReq.Header.Set("X-Private", "client-private-value")
+	inferenceReq.Header.Set("X-Forwarded-For", "203.0.113.77")
+	inferenceReq.Header.Set("X-Real-IP", "203.0.113.77")
 	stream, err := (&http.Client{Timeout: 4 * time.Second}).Do(inferenceReq)
 	if err != nil {
 		t.Fatal(err)
@@ -349,7 +383,8 @@ peer:
 	select {
 	case event := <-events:
 		if event.model != "model-a" || event.authorization != "Bearer owner-backend-key" ||
-			event.apiKey != "owner-backend-key" || event.private != "" {
+			event.apiKey != "owner-backend-key" || event.private != "" ||
+			!strings.HasPrefix(event.forwardedFor, "203.0.113.77") || event.realIP != "203.0.113.77" {
 			t.Fatalf("credential or model isolation failed: %#v", event)
 		}
 	case <-time.After(time.Second):

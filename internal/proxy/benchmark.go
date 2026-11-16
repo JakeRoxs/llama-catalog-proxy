@@ -91,9 +91,7 @@ func (r *Reloader) serveBenchmark(w http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodGet && r.serveBenchmarkAsset(w, req) {
 		return
 	}
-	auth := req.Header.Values("Authorization")
-	if len(auth) != 1 || !strings.HasPrefix(auth[0], "Bearer ") ||
-		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth[0], "Bearer ")), []byte(r.benchmark.config.Token)) != 1 {
+	if !publicBenchmarkReadOnlyRequest(r.benchmark.config, req) && !benchmarkBearerAuthorized(req, r.benchmark.config.Token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -146,6 +144,13 @@ func (r *Reloader) serveBenchmarkAsset(w http.ResponseWriter, req *http.Request)
 		http.Error(w, "benchmark UI unavailable", http.StatusInternalServerError)
 		return true
 	}
+	if path == "benchmark_ui/index.html" {
+		publicReadOnly := `data-public-read-only="false"`
+		if r.benchmark.config.PublicReadOnly {
+			publicReadOnly = `data-public-read-only="true"`
+		}
+		data = bytes.Replace(data, []byte(`data-public-read-only="false"`), []byte(publicReadOnly), 1)
+	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	w.Header().Set("Referrer-Policy", "no-referrer")
@@ -153,6 +158,17 @@ func (r *Reloader) serveBenchmarkAsset(w http.ResponseWriter, req *http.Request)
 		r.logger.Warn("benchmark UI response failed", "error", err)
 	}
 	return true
+}
+
+func benchmarkBearerAuthorized(req *http.Request, token string) bool {
+	authorization := req.Header.Values("Authorization")
+	return len(authorization) == 1 && strings.HasPrefix(authorization[0], "Bearer ") &&
+		subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(authorization[0], "Bearer ")), []byte(token)) == 1
+}
+
+func publicBenchmarkReadOnlyRequest(config config.BenchmarkConfig, req *http.Request) bool {
+	return config.PublicReadOnly && req.Method == http.MethodGet && req.URL.Path == "/benchmark/v1/runs" &&
+		req.URL.RawQuery == "" && req.URL.RawPath == "" && req.URL.EscapedPath() == req.URL.Path
 }
 
 func sameBenchmarkOrigin(req *http.Request) bool {

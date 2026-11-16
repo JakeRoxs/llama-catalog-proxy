@@ -6,13 +6,20 @@ const { join } = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-function createUI() {
+function createUI(publicReadOnly = false) {
   const requests = [];
   class Element {
     constructor(tag) {
       this.tag = tag;
       this.children = [];
       this.textContent = "";
+      this.hidden = false;
+      this.classes = new Set();
+      this.classList = {
+        add: (value) => this.classes.add(value),
+        remove: (value) => this.classes.delete(value),
+        contains: (value) => this.classes.has(value),
+      };
     }
     appendChild(child) { this.children.push(child); return child; }
     append(...children) { this.children.push(...children); }
@@ -21,6 +28,7 @@ function createUI() {
   }
   const elements = new Map();
   const document = {
+    documentElement: { dataset: { publicReadOnly: publicReadOnly ? "true" : "false" } },
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, new Element("div"));
       return elements.get(id);
@@ -32,7 +40,7 @@ function createUI() {
     window: { isSecureContext: true },
     fetch: async (url, options) => {
       requests.push({ url, options });
-      return { ok: true, json: async () => ({}) };
+      return { ok: true, json: async () => url.endsWith("/runs") ? { runs: [], truncated: false } : ({}) };
     },
   });
   vm.runInContext(readFileSync(join(__dirname, "app.js"), "utf8"), context);
@@ -42,6 +50,22 @@ function createUI() {
 function text(node) {
   return [node.textContent, ...node.children.flatMap(text)];
 }
+
+test("public read-only mode lists saved summaries without a benchmark token or write controls", async () => {
+  const { context, requests } = createUI(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "/benchmark/v1/runs");
+  assert.equal(requests[0].options.method || "GET", "GET");
+  assert.equal(requests[0].options.headers.Authorization, undefined);
+  assert.equal(requests[0].options.credentials, "same-origin");
+  assert.equal(context.document.getElementById("workspace").hidden, false);
+  assert.equal(context.document.getElementById("workspace").classList.contains("read-only"), true);
+  assert.equal(context.document.getElementById("run-panel").hidden, true);
+  assert.equal(context.document.getElementById("job-panel").hidden, true);
+  assert.equal(context.document.getElementById("compare").hidden, true);
+  assert.equal(context.document.getElementById("read-only-note").hidden, false);
+});
 
 test("API requests include same-origin authentication cookies", async () => {
   const { context, requests } = createUI();

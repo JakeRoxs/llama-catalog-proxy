@@ -118,10 +118,19 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	req.URL.Path, req.URL.RawPath, req.URL.RawQuery = path, "", ""
 	accept := req.Header.Get("Accept")
 	originalContentType := req.Header.Get("Content-Type")
+	addressHeaders := make(http.Header)
+	for _, name := range []string{"X-Forwarded-For", "X-Real-IP"} {
+		for _, value := range req.Header.Values(name) {
+			addressHeaders.Add(name, value)
+		}
+	}
 	req.Header = make(http.Header)
 	req.Trailer = nil
 	req.TransferEncoding = nil
 	req.Header.Set("Content-Type", originalContentType)
+	for name, values := range addressHeaders {
+		req.Header[name] = values
+	}
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}

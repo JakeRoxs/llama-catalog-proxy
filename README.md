@@ -103,7 +103,11 @@ sufficiently synchronized; future timestamps are treated as unknown for routing.
 
 Peer inference supports JSON and multipart requests on the proxy's known inference POST paths,
 without query parameters. Incoming client authorization and arbitrary headers are not sent to the
-peer; the owner applies its own backend credentials. Multipart part headers other than
+peer; the owner applies its own backend credentials. `X-Forwarded-For` and `X-Real-IP` are preserved
+for llama-swap's activity `Source/Caller` and in-flight `Address` attribution. When neither address
+header is provided, the requesting proxy supplies the connection address as `X-Forwarded-For`.
+Forwarded addresses are informational and may be inaccurate; they do not identify or authorize a
+caller. Multipart part headers other than
 `Content-Disposition` and `Content-Type` are stripped for peer traffic. When peer routing is
 enabled, multipart inference bodies are buffered for model inspection and limited by
 `max_json_request_body_bytes`; local multipart requests within that limit remain unchanged.

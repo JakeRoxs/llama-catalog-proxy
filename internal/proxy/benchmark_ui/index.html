@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-public-read-only="false">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -25,7 +25,7 @@
     </section>
     <div id="workspace" hidden>
       <section class="workspace">
-        <article class="panel">
+        <article class="panel" id="run-panel">
           <div class="panel-title"><span>02</span><div><p class="eyebrow">CONTROLLED RUN</p><h3>Configure a benchmark</h3></div></div>
           <p>Use a public model ID uniquely observed ready on the selected backend.</p>
           <form id="run-form">
@@ -44,7 +44,7 @@
             <button type="submit" class="primary" id="start">Start benchmark</button>
           </form>
         </article>
-        <article class="panel state-panel">
+        <article class="panel state-panel" id="job-panel">
           <div class="panel-title"><span>03</span><div><p class="eyebrow">JOB STATUS</p><h3>Run activity</h3></div></div>
           <p id="job-state" class="status-value">No active job</p>
           <p id="job-detail">Run status is available only during this proxy process. Saved reports persist separately.</p>
@@ -58,7 +58,8 @@
       <section class="panel history">
         <div class="section-head"><div><p class="eyebrow">04 / HISTORY</p><h3>Saved runs</h3></div><button id="refresh" type="button">Refresh</button></div>
         <p id="history-note">Select a report to inspect it or choose two runs to compare.</p>
-        <div class="table-wrap"><table><thead><tr><th>Started</th><th>Model</th><th>Status</th><th>Inspect</th><th>Baseline</th><th>Candidate</th></tr></thead><tbody id="runs"></tbody></table></div>
+        <p id="read-only-note" class="warning" hidden>Read-only public view. Anyone who can reach this listener can see saved run IDs, model names, times, and statuses; use only on a trusted network. Unlock with the benchmark token to inspect full reports or run benchmarks.</p>
+        <div class="table-wrap"><table><thead><tr><th>Started</th><th>Model</th><th>Status</th><th>Inspect</th><th class="comparison-column">Baseline</th><th class="comparison-column">Candidate</th></tr></thead><tbody id="runs"></tbody></table></div>
         <button id="compare" type="button" disabled>Compare selected runs</button>
       </section>
       <section class="panel evidence" id="evidence" hidden aria-live="polite">
