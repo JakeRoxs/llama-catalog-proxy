@@ -27,7 +27,7 @@ func fixtureReport() Report {
 			"catalog_read": "enabled", "diagnostics_read": "disabled", "federation_exchange": "enabled",
 			"artifact_read": "disabled", "artifact_write": "disabled", "config_write": "disabled",
 		},
-		Coverage: "partial",
+		Coverage:     "partial",
 		PathServices: []string{"comfyui"},
 		Observations: []Observation{{
 			Identity:   ModelIdentity{OwnerNodeID: "node-a", BackendID: "gpu", LocalID: "model"},
