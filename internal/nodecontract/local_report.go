@@ -37,7 +37,7 @@ func (h *observationHeap) Pop() any {
 // LocalReport projects explicitly selected backend caches without issuing
 // upstream requests. Callers must establish ownership of selected backends.
 func LocalReport(source Source, localBackends []string, caches []catalog.BackendModel, generatedAt time.Time, freshnessWindow time.Duration) (Report, error) {
-	return localReport(source, localBackends, generatedAt, freshnessWindow, func(selected map[string]bool, visitBackend func(string, time.Time) error, visitModel func(string) error) error {
+	return localReport(source, localBackends, generatedAt, freshnessWindow, func(selected map[string]bool, visitBackend func(string, time.Time) error, visitModel func(string, []string) error) error {
 		for _, backend := range caches {
 			if !selected[backend.BackendID] {
 				continue
@@ -46,8 +46,11 @@ func LocalReport(source Source, localBackends []string, caches []catalog.Backend
 				return err
 			}
 			for _, model := range backend.Models {
+				if catalog.IsAliasModelRow(model) {
+					continue
+				}
 				id, _ := model["id"].(string)
-				if err := visitModel(id); err != nil {
+				if err := visitModel(id, catalog.ModelAliases(model)); err != nil {
 					return err
 				}
 			}
@@ -62,12 +65,12 @@ func LocalReportFromCatalog(ctx context.Context, source Source, localBackends []
 	if service == nil {
 		return Report{}, errors.New("catalog service is required")
 	}
-	return localReport(source, localBackends, generatedAt, freshnessWindow, func(selected map[string]bool, backend func(string, time.Time) error, model func(string) error) error {
+	return localReport(source, localBackends, generatedAt, freshnessWindow, func(selected map[string]bool, backend func(string, time.Time) error, model func(string, []string) error) error {
 		return service.VisitCachedModelIDs(ctx, selected, backend, model)
 	})
 }
 
-func localReport(source Source, localBackends []string, generatedAt time.Time, freshnessWindow time.Duration, visit func(map[string]bool, func(string, time.Time) error, func(string) error) error) (Report, error) {
+func localReport(source Source, localBackends []string, generatedAt time.Time, freshnessWindow time.Duration, visit func(map[string]bool, func(string, time.Time) error, func(string, []string) error) error) (Report, error) {
 	if generatedAt.IsZero() || freshnessWindow <= 0 || len(localBackends) > maxLocalBackends {
 		return Report{}, errors.New("invalid local report time, freshness window, or backend count")
 	}
@@ -118,7 +121,7 @@ func localReport(source Source, localBackends []string, generatedAt time.Time, f
 			report.Coverage = "partial"
 		}
 		return nil
-	}, func(id string) error {
+	}, func(id string, aliases []string) error {
 		if fetchedAt.IsZero() {
 			return nil
 		}
@@ -136,7 +139,7 @@ func localReport(source Source, localBackends []string, generatedAt time.Time, f
 		expiresAt := fetchedAt.Add(freshnessWindow)
 		observation := Observation{
 			Identity: identity, State: "supported", ObservedAt: &observedAt, ExpiresAt: &expiresAt,
-			Freshness: freshness, Coverage: "unknown",
+			Aliases: append([]string(nil), aliases...), Freshness: freshness, Coverage: "unknown",
 		}
 		if len(observations) == MaxObservations {
 			truncated = true

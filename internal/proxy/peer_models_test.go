@@ -69,7 +69,7 @@ func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 	cache.update("bigboi", &nodecontract.Receipt{
 		AuthenticatedNodeID: "bigboi", ReceivedAt: now,
 		Report: nodecontract.Report{Observations: []nodecontract.Observation{{
-			Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh", Coverage: "complete",
+			Identity: identity, Aliases: []string{"comfyui-alias"}, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh", Coverage: "complete",
 		}}},
 	}, "", now)
 	h := &Handler{logger: discardLogger(), peerCache: cache,
@@ -80,8 +80,9 @@ func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 	}
 	var result struct {
 		Data []struct {
-			ID      string `json:"id"`
-			OwnedBy string `json:"owned_by"`
+			ID      string         `json:"id"`
+			OwnedBy string         `json:"owned_by"`
+			Meta    map[string]any `json:"meta"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body, &result); err != nil {
@@ -89,6 +90,19 @@ func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 	}
 	if len(result.Data) != 2 || result.Data[0].ID != "udms/local" || result.Data[1].ID != "bigboi/comfyui_auto" || result.Data[1].OwnedBy != "bigboi" {
 		t.Fatalf("combined catalog did not preserve aliases/provenance: %s", response.Body)
+	}
+	if got := result.Data[1].Meta["llamaswap"].(map[string]any)["aliases"].([]any); len(got) != 1 || got[0] != "comfyui-alias" {
+		t.Fatalf("peer alias metadata = %#v", result.Data[1].Meta)
+	}
+	for _, tc := range []struct {
+		backend string
+		model   string
+		found   bool
+	}{{"", "comfyui-alias", true}, {"local", "comfyui-alias", true}, {"other", "comfyui-alias", false}} {
+		resolved, found := cache.modelForRoute("bigboi", tc.backend, tc.model)
+		if found != tc.found || (found && resolved != identity) {
+			t.Fatalf("route backend=%q model=%q resolved=%#v found=%v", tc.backend, tc.model, resolved, found)
+		}
 	}
 }
 

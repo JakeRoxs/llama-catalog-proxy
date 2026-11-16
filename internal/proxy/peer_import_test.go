@@ -14,6 +14,7 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -84,10 +85,56 @@ func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 	makeBackend := func(id string) *httptest.Server {
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 			if request.Method == http.MethodGet {
-				_, _ = fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
+				if id == "model-b" {
+					_, _ = io.WriteString(w, `{"data":[{"id":"model-b","meta":{"llamaswap":{"aliases":["model-b-alias"]}}}]}`)
+				} else {
+					_, _ = fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
+				}
 				return
 			}
 			if id == "model-b" {
+				model := ""
+				if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
+					reader, err := request.MultipartReader()
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					for {
+						part, err := reader.NextPart()
+						if err == io.EOF {
+							break
+						}
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						data, err := io.ReadAll(part)
+						_ = part.Close()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						if part.FormName() == "model" {
+							model = string(data)
+						}
+					}
+					if model != "bigboi/model-b" {
+						t.Errorf("local multipart model = %q", model)
+					}
+				} else {
+					var body struct {
+						Model string `json:"model"`
+					}
+					if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+						t.Error(err)
+						return
+					}
+					model = body.Model
+					if model != "model-b-alias" {
+						t.Errorf("peer alias was not preserved to the backend: %q", model)
+					}
+				}
 				localInference.Add(1)
 				_, _ = io.WriteString(w, `{"ok":true}`)
 				return
@@ -230,6 +277,7 @@ peer:
 	viewB := waitView(b, "udms", "fresh")
 	if viewA.Report == nil || len(viewA.Report.Observations) != 1 ||
 		viewA.Report.Observations[0].Identity.LocalID != "model-b" ||
+		!slices.Contains(viewA.Report.Observations[0].Aliases, "model-b-alias") ||
 		viewA.Report.Capabilities["federation_exchange"] != "enabled" ||
 		viewB.Report == nil || len(viewB.Report.Observations) != 1 ||
 		viewB.Report.Observations[0].Identity.LocalID != "model-a" {
@@ -259,7 +307,7 @@ peer:
 	if err != nil || !strings.Contains(string(catalogBody), modelID) || !strings.Contains(string(catalogBody), `"receipt_status":"fresh"`) {
 		t.Fatalf("combined catalog missing peer: %s (%v)", catalogBody, err)
 	}
-	reverseModelID := "bigboi/model-b"
+	reverseModelID := "bigboi/model-b-alias"
 	clientServerA := httptest.NewServer(a)
 	defer clientServerA.Close()
 	reverseCatalog, err := http.Get(clientServerA.URL + "/v1/models")
@@ -268,7 +316,7 @@ peer:
 	}
 	reverseCatalogBody, err := io.ReadAll(reverseCatalog.Body)
 	_ = reverseCatalog.Body.Close()
-	if err != nil || !strings.Contains(string(reverseCatalogBody), reverseModelID) {
+	if err != nil || !strings.Contains(string(reverseCatalogBody), `"id":"bigboi/model-b"`) || !strings.Contains(string(reverseCatalogBody), `"model-b-alias"`) {
 		t.Fatalf("reverse combined catalog missing peer: %s (%v)", reverseCatalogBody, err)
 	}
 	reverseInferenceBody := fmt.Sprintf(`{"model":%q,"stream":false}`, reverseModelID)

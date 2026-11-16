@@ -71,6 +71,31 @@ func TestRefreshBackendModelsKeepsPeerEvidenceCurrent(t *testing.T) {
 	}
 }
 
+func TestModelsPreservesLlamaSwapAliasMetadataAndAliasRows(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"data":[{"id":"canonical","meta":{"llamaswap":{"aliases":["short"]}}},{"id":"short","meta":{"llamaswap":{"type":"alias","modelID":"canonical"}}}]}`)
+	}))
+	defer server.Close()
+	service := New([]Backend{{ID: "local", URL: mustParseURL(t, server.URL), Prefix: "bigboi/", Default: true}}, server.Client(), time.Minute, time.Second, time.Second, testLogger())
+	response, err := service.Models(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Data) != 2 || body.Data[0]["id"] != "bigboi/canonical" || body.Data[1]["id"] != "bigboi/short" {
+		t.Fatalf("prefixed alias catalog entries = %#v", body.Data)
+	}
+	meta := body.Data[0]["meta"].(map[string]any)["llamaswap"].(map[string]any)
+	if aliases := meta["aliases"].([]any); len(aliases) != 1 || aliases[0] != "short" {
+		t.Fatalf("canonical alias metadata = %#v", meta)
+	}
+}
+
 func TestRefreshBackendModelsHonorsCancellationWhileLocked(t *testing.T) {
 	service := New([]Backend{{ID: "local"}}, nil, time.Minute, time.Second, time.Second, testLogger())
 	service.backends[0].mu.Lock()
@@ -108,7 +133,7 @@ func TestVisitCachedModelIDsCancellationAndSelection(t *testing.T) {
 				t.Errorf("unexpected backend %q", id)
 			}
 			return nil
-		}, func(string) error { return nil })
+		}, func(string, []string) error { return nil })
 	other.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
@@ -119,14 +144,14 @@ func TestVisitCachedModelIDsCancellationAndSelection(t *testing.T) {
 	defer cancel()
 	err = service.VisitCachedModelIDs(ctx, map[string]bool{"local": true},
 		func(string, time.Time) error { t.Error("called while locked"); return nil },
-		func(string) error { return nil })
+		func(string, []string) error { return nil })
 	local.mu.Unlock()
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("lock wait error = %v", err)
 	}
 	sentinel := errors.New("stop")
 	err = service.VisitCachedModelIDs(context.Background(), map[string]bool{"local": true},
-		func(string, time.Time) error { return sentinel }, func(string) error { return nil })
+		func(string, time.Time) error { return sentinel }, func(string, []string) error { return nil })
 	if !errors.Is(err, sentinel) || !local.mu.TryLock() {
 		t.Fatalf("callback error or lock leak: %v", err)
 	}
@@ -135,13 +160,37 @@ func TestVisitCachedModelIDsCancellationAndSelection(t *testing.T) {
 	scanCtx, scanCancel := context.WithCancel(context.Background())
 	calls := 0
 	err = service.VisitCachedModelIDs(scanCtx, map[string]bool{"local": true},
-		func(string, time.Time) error { return nil }, func(string) error {
+		func(string, time.Time) error { return nil }, func(string, []string) error {
 			calls++
 			scanCancel()
 			return nil
 		})
 	if !errors.Is(err, context.Canceled) || calls != 1 {
 		t.Fatalf("scan cancellation: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestVisitCachedModelIDsReturnsCanonicalAliasesOnly(t *testing.T) {
+	service := New([]Backend{{ID: "local"}}, nil, time.Minute, time.Second, time.Second, testLogger())
+	backend := service.backends[0]
+	backend.models = []map[string]any{
+		{"id": "canonical", "meta": map[string]any{"llamaswap": map[string]any{"aliases": []any{"short", "other"}}}},
+		{"id": "short", "meta": map[string]any{"llamaswap": map[string]any{"type": "alias", "modelID": "canonical"}}},
+	}
+	backend.fetchedAt = time.Now()
+	var visited []string
+	var aliases []string
+	err := service.VisitCachedModelIDs(context.Background(), map[string]bool{"local": true},
+		func(string, time.Time) error { return nil }, func(id string, modelAliases []string) error {
+			visited = append(visited, id)
+			aliases = append(aliases, modelAliases...)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(visited, []string{"canonical"}) || !reflect.DeepEqual(aliases, []string{"other", "short"}) {
+		t.Fatalf("visited IDs/aliases = %#v / %#v", visited, aliases)
 	}
 }
 

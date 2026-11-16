@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/catalog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
@@ -73,10 +75,18 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	var rewritten []byte
+	aliases := handler.modelAliases(id.BackendID, id.LocalID)
 	if contentType == "multipart/form-data" {
-		rewritten, err = rewriteMultipartModel(body, params["boundary"], id.LocalID, id.LocalID, handler.maxJSONBody)
+		requestedModel, ambiguous, parseErr := multipartPeerModel(body, params["boundary"], func(model string) bool {
+			return model == id.LocalID || modelHasAlias(aliases, model)
+		})
+		if parseErr != nil || ambiguous || requestedModel == "" {
+			err = errors.New("invalid peer model")
+		} else {
+			rewritten, err = rewriteMultipartModel(body, params["boundary"], requestedModel, requestedModel, handler.maxJSONBody)
+		}
 	} else {
-		rewritten, err = verifyOwnerModelBody(body, id.LocalID)
+		rewritten, err = verifyOwnerModelBody(body, id.LocalID, aliases...)
 	}
 	if err != nil {
 		http.Error(w, "invalid peer model", http.StatusBadRequest)
@@ -125,7 +135,25 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	handler.proxies[id.BackendID].ServeHTTP(w, req)
 }
 
-func verifyOwnerModelBody(body []byte, expected string) ([]byte, error) {
+func (h *Handler) modelAliases(backendID, localID string) []string {
+	if h.catalog == nil {
+		return nil
+	}
+	for _, backend := range h.catalog.BackendModels() {
+		if backend.BackendID != backendID {
+			continue
+		}
+		for _, model := range backend.Models {
+			id, _ := model["id"].(string)
+			if id == localID && !catalog.IsAliasModelRow(model) {
+				return catalog.ModelAliases(model)
+			}
+		}
+	}
+	return nil
+}
+
+func verifyOwnerModelBody(body []byte, expected string, aliases ...string) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.UseNumber()
 	var object map[string]any
@@ -157,7 +185,8 @@ func verifyOwnerModelBody(body []byte, expected string) ([]byte, error) {
 			count++
 		}
 	}
-	if model, ok := object["model"].(string); !ok || model != expected || count != 1 {
+	model, ok := object["model"].(string)
+	if !ok || (model != expected && !modelHasAlias(aliases, model)) || count != 1 {
 		return nil, io.ErrUnexpectedEOF
 	}
 	return json.Marshal(object)

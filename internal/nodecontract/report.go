@@ -20,6 +20,7 @@ import (
 const (
 	MaxReportBytes  = 1 << 20
 	MaxObservations = 1000
+	MaxModelAliases = 64
 	maxJSONDepth    = 32
 	maxFeatures     = 32
 	maxCapabilities = 64
@@ -45,6 +46,7 @@ type ModelIdentity struct {
 // Observation describes catalog membership, not verified weights or runtime state.
 type Observation struct {
 	Identity   ModelIdentity `json:"identity"`
+	Aliases    []string      `json:"aliases,omitempty"`
 	State      string        `json:"state"`
 	ObservedAt *time.Time    `json:"observed_at,omitempty"`
 	ExpiresAt  *time.Time    `json:"expires_at,omitempty"`
@@ -203,6 +205,19 @@ func (r Report) validate(authenticatedNodeID string) error {
 			return errors.New("ambiguous duplicate model identity")
 		}
 		seen[id] = struct{}{}
+		if len(observation.Aliases) > MaxModelAliases {
+			return errors.New("too many model aliases")
+		}
+		seenAliases := make(map[string]struct{}, len(observation.Aliases))
+		for _, alias := range observation.Aliases {
+			if alias == "" || !identity.ValidModelComponent(alias) {
+				return errors.New("invalid model alias")
+			}
+			if _, exists := seenAliases[alias]; exists {
+				return errors.New("duplicate model alias")
+			}
+			seenAliases[alias] = struct{}{}
+		}
 		if !validState(observation.State) || !validCoverage(observation.Coverage) ||
 			!validFreshness(observation.Freshness) ||
 			(observation.ObservedAt != nil && observation.ObservedAt.IsZero()) ||

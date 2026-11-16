@@ -15,9 +15,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 )
 
 const maxCatalogBytes = 64 << 20
+
+const maxModelAliases = 64
 
 const showEnrichmentConcurrency = 8
 
@@ -191,11 +195,71 @@ func (s *Service) BackendPrefix(id string) (string, bool) {
 	return "", false
 }
 
+// ModelAliases returns bounded, exact aliases advertised by a backend model
+// catalog. Llama-swap exposes them in meta.llamaswap.aliases; a top-level
+// aliases field is accepted for compatible backends. Alias-list records are
+// not model identities and should be skipped when projecting canonical rows.
+func ModelAliases(model map[string]any) []string {
+	values := make([]any, 0)
+	if aliases, ok := model["aliases"].([]any); ok {
+		values = append(values, aliases...)
+	} else if aliases, ok := model["aliases"].([]string); ok {
+		for _, alias := range aliases {
+			values = append(values, alias)
+		}
+	}
+	if meta, ok := model["meta"].(map[string]any); ok {
+		if llamaSwap, ok := meta["llamaswap"].(map[string]any); ok {
+			if aliases, ok := llamaSwap["aliases"].([]any); ok {
+				values = append(values, aliases...)
+			} else if aliases, ok := llamaSwap["aliases"].([]string); ok {
+				for _, alias := range aliases {
+					values = append(values, alias)
+				}
+			}
+		}
+	}
+	result := make([]string, 0, min(len(values), maxModelAliases))
+	seen := make(map[string]struct{}, cap(result))
+	for _, value := range values {
+		alias, ok := value.(string)
+		if !ok || !identity.ValidModelComponent(alias) || alias == "" {
+			continue
+		}
+		if _, exists := seen[alias]; exists {
+			continue
+		}
+		seen[alias] = struct{}{}
+		result = append(result, alias)
+		if len(result) == maxModelAliases {
+			break
+		}
+	}
+	sort.Strings(result)
+	return result
+}
+
+// IsAliasModelRow reports whether a catalog row is a llama-swap's optional
+// duplicate alias entry. Canonical model rows already contain its aliases.
+func IsAliasModelRow(model map[string]any) bool {
+	meta, ok := model["meta"].(map[string]any)
+	if !ok {
+		return false
+	}
+	llamaSwap, ok := meta["llamaswap"].(map[string]any)
+	if !ok {
+		return false
+	}
+	typeName, _ := llamaSwap["type"].(string)
+	return typeName == "alias"
+}
+
 // VisitCachedModelIDs visits explicitly selected cached backends and their
-// model IDs without copying upstream objects or making network requests.
+// canonical model IDs and aliases without copying upstream objects or making
+// network requests.
 // Callbacks run under the individual backend's cache lock and must not call
 // back into the service. Context cancellation interrupts lock waits and scans.
-func (s *Service) VisitCachedModelIDs(ctx context.Context, selected map[string]bool, backend func(string, time.Time) error, model func(string) error) error {
+func (s *Service) VisitCachedModelIDs(ctx context.Context, selected map[string]bool, backend func(string, time.Time) error, model func(string, []string) error) error {
 	for _, bs := range s.backends {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -210,7 +274,7 @@ func (s *Service) VisitCachedModelIDs(ctx context.Context, selected map[string]b
 	return ctx.Err()
 }
 
-func (bs *backendState) visitCachedModelIDs(ctx context.Context, backend func(string, time.Time) error, model func(string) error) error {
+func (bs *backendState) visitCachedModelIDs(ctx context.Context, backend func(string, time.Time) error, model func(string, []string) error) error {
 	if !bs.mu.TryLock() {
 		ticker := time.NewTicker(5 * time.Millisecond)
 		defer ticker.Stop()
@@ -234,8 +298,11 @@ func (bs *backendState) visitCachedModelIDs(ctx context.Context, backend func(st
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if IsAliasModelRow(row) {
+			continue
+		}
 		id, _ := row["id"].(string)
-		if err := model(id); err != nil {
+		if err := model(id, ModelAliases(row)); err != nil {
 			return err
 		}
 	}

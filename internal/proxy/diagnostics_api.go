@@ -1286,6 +1286,9 @@ func catalogModelFilterIDs(backendModels []catalog.BackendModel, backendFilter, 
 			continue
 		}
 		for _, m := range bm.Models {
+			if catalog.IsAliasModelRow(m) {
+				continue
+			}
 			localID, _ := m["id"].(string)
 			if localID == "" {
 				continue
@@ -1300,34 +1303,7 @@ func catalogModelFilterIDs(backendModels []catalog.BackendModel, backendFilter, 
 }
 
 func catalogModelAliasMatches(model map[string]any, prefix, modelFilter string) bool {
-	if catalogAliasListMatches(model["aliases"], prefix, modelFilter) {
-		return true
-	}
-	meta, ok := model["meta"].(map[string]any)
-	if !ok {
-		return false
-	}
-	llamaSwap, ok := meta["llamaswap"].(map[string]any)
-	return ok && catalogAliasListMatches(llamaSwap["aliases"], prefix, modelFilter)
-}
-
-func catalogAliasListMatches(value any, prefix, modelFilter string) bool {
-	var aliases []any
-	switch typed := value.(type) {
-	case []any:
-		aliases = typed
-	case []string:
-		for _, alias := range typed {
-			aliases = append(aliases, alias)
-		}
-	default:
-		return false
-	}
-	for _, value := range aliases {
-		alias, ok := value.(string)
-		if !ok || alias == "" || len(alias) > maxQueryParamLength || !utf8.ValidString(alias) {
-			continue
-		}
+	for _, alias := range catalog.ModelAliases(model) {
 		if modelFilter == alias || modelFilter == prefix+alias {
 			return true
 		}

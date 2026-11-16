@@ -128,7 +128,7 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		writeJSONError(h.logger, w, http.StatusBadRequest, "peer model requires a supported inference path without a query")
 		return true
 	}
-	id, client, matched, err := h.resolvePeerPublicModel(model)
+	id, client, requestedLocalID, matched, err := h.resolvePeerPublicModel(model)
 	if !matched {
 		return false
 	}
@@ -147,9 +147,9 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 	}
 	var rewritten []byte
 	if mediaType == "multipart/form-data" {
-		rewritten, err = rewriteMultipartModel(body, params["boundary"], model, id.LocalID, h.maxJSONBody)
+		rewritten, err = rewriteMultipartModel(body, params["boundary"], model, requestedLocalID, h.maxJSONBody)
 	} else {
-		object["model"] = id.LocalID
+		object["model"] = requestedLocalID
 		rewritten, err = json.Marshal(object)
 	}
 	if err != nil {
@@ -262,34 +262,40 @@ func (h *Handler) isPeerPublicModelID(publicID string) bool {
 	return reserved
 }
 
-func (h *Handler) resolvePeerPublicModel(publicID string) (nodecontract.ModelIdentity, *peerClient, bool, error) {
+func (h *Handler) resolvePeerPublicModel(publicID string) (nodecontract.ModelIdentity, *peerClient, string, bool, error) {
 	if strings.HasPrefix(publicID, peerModelPrefix) {
 		id, err := parsePeerPublicID(publicID)
 		if err != nil {
-			return nodecontract.ModelIdentity{}, nil, true, err
+			return nodecontract.ModelIdentity{}, nil, "", true, err
 		}
-		return id, h.peerClients[id.OwnerNodeID], true, nil
+		requestedLocalID := id.LocalID
+		if h.peerCache != nil {
+			if resolved, found := h.peerCache.modelForRoute(id.OwnerNodeID, id.BackendID, requestedLocalID); found {
+				id = resolved
+			}
+		}
+		return id, h.peerClients[id.OwnerNodeID], requestedLocalID, true, nil
 	}
 	if h.peerCache == nil {
-		return nodecontract.ModelIdentity{}, nil, false, nil
+		return nodecontract.ModelIdentity{}, nil, "", false, nil
 	}
-	owner, localID, ok := strings.Cut(publicID, "/")
-	if !ok || localID == "" {
-		return nodecontract.ModelIdentity{}, nil, false, nil
+	owner, requestedLocalID, ok := strings.Cut(publicID, "/")
+	if !ok || requestedLocalID == "" {
+		return nodecontract.ModelIdentity{}, nil, "", false, nil
 	}
 	client := h.peerClients[owner]
 	if client == nil {
 		_, reserved := h.peerRouteAliases[owner]
-		return nodecontract.ModelIdentity{}, nil, reserved, nil
+		return nodecontract.ModelIdentity{}, nil, requestedLocalID, reserved, nil
 	}
 	if !client.routeInference {
-		return nodecontract.ModelIdentity{}, nil, false, nil
+		return nodecontract.ModelIdentity{}, nil, "", false, nil
 	}
-	id, found := h.peerCache.modelForRoute(owner, localID)
+	id, found := h.peerCache.modelForRoute(owner, "", requestedLocalID)
 	if !found {
-		return nodecontract.ModelIdentity{}, client, true, nil
+		return nodecontract.ModelIdentity{}, client, requestedLocalID, true, nil
 	}
-	return id, client, true, nil
+	return id, client, requestedLocalID, true, nil
 }
 
 func rewriteMultipartModel(body []byte, boundary, expected, replacement string, limit int64) ([]byte, error) {

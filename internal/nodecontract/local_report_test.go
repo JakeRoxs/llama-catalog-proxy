@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,7 +22,8 @@ func TestLocalReportExportsOnlyExplicitlySelectedBackends(t *testing.T) {
 	source := fixtureReport().Source
 	caches := []catalog.BackendModel{
 		{BackendID: "local", Prefix: "local/", FetchedAt: fixtureTime, Models: []map[string]any{
-			{"id": "z", "secret_metadata": "not exported"},
+			{"id": "z", "secret_metadata": "not exported", "meta": map[string]any{"llamaswap": map[string]any{"aliases": []any{"z-short"}}}},
+			{"id": "z-short", "meta": map[string]any{"llamaswap": map[string]any{"type": "alias", "modelID": "z"}}},
 			{"id": "a"},
 		}},
 		{BackendID: "remote", FetchedAt: fixtureTime, Models: []map[string]any{{"id": "peer-model"}}},
@@ -41,6 +43,9 @@ func TestLocalReportExportsOnlyExplicitlySelectedBackends(t *testing.T) {
 			got.ExpiresAt == nil || !got.ExpiresAt.Equal(fixtureTime.Add(time.Minute)) {
 			t.Fatalf("observation %d = %#v", i, got)
 		}
+		if want == "z" && !reflect.DeepEqual(got.Aliases, []string{"z-short"}) {
+			t.Fatalf("model aliases = %#v", got.Aliases)
+		}
 	}
 }
 
@@ -48,7 +53,7 @@ func TestLocalReportFromCatalogUsesOnlySelectedCachedModels(t *testing.T) {
 	var requests atomic.Int32
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		requests.Add(1)
-		_, _ = io.WriteString(w, `{"data":[{"id":"local-model","sensitive":"must-not-export"},{"id":"other"}]}`)
+		_, _ = io.WriteString(w, `{"data":[{"id":"local-model","sensitive":"must-not-export","meta":{"llamaswap":{"aliases":["local-short"]}}},{"id":"local-short","meta":{"llamaswap":{"type":"alias","modelID":"local-model"}}},{"id":"other"}]}`)
 	}))
 	defer local.Close()
 	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -85,6 +90,9 @@ func TestLocalReportFromCatalogUsesOnlySelectedCachedModels(t *testing.T) {
 	for _, observation := range report.Observations {
 		if observation.Identity.BackendID != "local" || observation.ObservedAt == nil || observation.Freshness != "fresh" {
 			t.Fatalf("unexpected observation: %#v", observation)
+		}
+		if observation.Identity.LocalID == "local-model" && !reflect.DeepEqual(observation.Aliases, []string{"local-short"}) {
+			t.Fatalf("cached model aliases = %#v", observation.Aliases)
 		}
 	}
 }

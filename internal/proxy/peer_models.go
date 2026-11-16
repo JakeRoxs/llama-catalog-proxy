@@ -59,6 +59,7 @@ type peerCatalogModel struct {
 	ID           string                `json:"id"`
 	Object       string                `json:"object"`
 	OwnedBy      string                `json:"owned_by"`
+	Meta         map[string]any        `json:"meta,omitempty"`
 	CatalogProxy peerCatalogProvenance `json:"catalog_proxy"`
 }
 
@@ -100,20 +101,24 @@ func (c *peerCache) catalogModels(now time.Time) []peerCatalogModel {
 			if entry.routeInference && localIDCounts[obs.Identity.LocalID] == 1 {
 				publicID = peerRouteID(obs.Identity)
 			}
-			models = append(models, peerCatalogModel{
+			model := peerCatalogModel{
 				ID: publicID, Object: "model", OwnedBy: obs.Identity.OwnerNodeID,
 				CatalogProxy: peerCatalogProvenance{
 					Identity: obs.Identity, ObservedAt: obs.ObservedAt, Freshness: obs.Freshness,
 					Coverage: obs.Coverage, ReceiptStatus: status,
 				},
-			})
+			}
+			if len(obs.Aliases) > 0 {
+				model.Meta = map[string]any{"llamaswap": map[string]any{"aliases": obs.Aliases}}
+			}
+			models = append(models, model)
 		}
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models
 }
 
-func (c *peerCache) modelForRoute(nodeID, localID string) (nodecontract.ModelIdentity, bool) {
+func (c *peerCache) modelForRoute(nodeID, backendID, modelID string) (nodecontract.ModelIdentity, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	entry, ok := c.entries[nodeID]
@@ -122,7 +127,9 @@ func (c *peerCache) modelForRoute(nodeID, localID string) (nodecontract.ModelIde
 	}
 	var identity nodecontract.ModelIdentity
 	for _, observation := range entry.receipt.Report.Observations {
-		if observation.State != "supported" || observation.Identity.OwnerNodeID != nodeID || observation.Identity.LocalID != localID {
+		if observation.State != "supported" || observation.Identity.OwnerNodeID != nodeID ||
+			(backendID != "" && observation.Identity.BackendID != backendID) ||
+			(observation.Identity.LocalID != modelID && !modelHasAlias(observation.Aliases, modelID)) {
 			continue
 		}
 		if identity.OwnerNodeID != "" {
@@ -131,6 +138,15 @@ func (c *peerCache) modelForRoute(nodeID, localID string) (nodecontract.ModelIde
 		identity = observation.Identity
 	}
 	return identity, identity.OwnerNodeID != ""
+}
+
+func modelHasAlias(aliases []string, modelID string) bool {
+	for _, alias := range aliases {
+		if alias == modelID {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *peerCache) freshModel(id nodecontract.ModelIdentity, now time.Time) (nodecontract.Source, bool) {
