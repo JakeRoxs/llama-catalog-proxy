@@ -23,7 +23,7 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
-func TestPeerWatcherRefreshesOwnerCatalogWithoutFrontendRequests(t *testing.T) {
+func TestPeerCatalogRefreshKeepsOwnerEvidenceWithinConfiguredTTL(t *testing.T) {
 	refreshed := make(chan struct{}, 1)
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
@@ -38,25 +38,18 @@ func TestPeerWatcherRefreshesOwnerCatalogWithoutFrontendRequests(t *testing.T) {
 	handler := newHandler(t, cfg).(*Handler)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	r := &Reloader{stop: make(chan struct{})}
-	r.state.Store(&reloaderState{
+	state := &reloaderState{
 		handler: handler, peerContext: ctx,
-		peer: &config.PeerConfig{NodeID: "owner", LocalBackends: []string{"default"}},
-	})
-	r.wg.Add(1)
-	go r.watchPeers()
-	defer func() {
-		close(r.stop)
-		cancel()
-		r.wg.Wait()
-	}()
+		peer:     &config.PeerConfig{NodeID: "owner", LocalBackends: []string{"default"}},
+		cacheTTL: cfg.ModelsCacheTTL,
+	}
+	r := &Reloader{}
+	r.refreshPeerCatalogs(state)
 	select {
 	case <-refreshed:
 	case <-time.After(time.Second):
-		t.Fatal("owner without outbound peers did not refresh its catalog")
+		t.Fatal("owner without frontend catalog traffic did not refresh its cache")
 	}
-	// Wait for the completed refresh before projecting the cache-only report.
-	r.refreshPeerCatalogs(r.state.Load())
 	now := time.Now()
 	report, err := nodecontract.LocalReportFromCatalog(ctx, nodecontract.Source{
 		NodeID: "owner", ProxyInstanceID: strings.Repeat("a", 32), ConfigGeneration: 1,
@@ -69,6 +62,15 @@ func TestPeerWatcherRefreshesOwnerCatalogWithoutFrontendRequests(t *testing.T) {
 	cache.update("owner", &nodecontract.Receipt{Report: report, ReceivedAt: now}, "", now)
 	if _, ok := cache.freshModel(report.Observations[0].Identity, now); !ok {
 		t.Fatal("background-refreshed owner model is not routable")
+	}
+}
+
+func TestPeerRefreshIntervalTracksShortCatalogTTL(t *testing.T) {
+	if got := peerRefreshIntervalForTTL(30 * time.Second); got != 10*time.Second {
+		t.Fatalf("refresh interval = %v, want 10s", got)
+	}
+	if got := peerRefreshIntervalForTTL(5 * time.Minute); got != peerRefreshInterval {
+		t.Fatalf("refresh interval = %v, want %v", got, peerRefreshInterval)
 	}
 }
 

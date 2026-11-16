@@ -152,10 +152,7 @@ func (c *peerCache) freshModel(id nodecontract.ModelIdentity, now time.Time) (no
 			continue
 		}
 		age := now.Sub(*observation.ObservedAt)
-		if age < 0 || observation.ExpiresAt == nil || !now.Before(*observation.ExpiresAt) {
-			continue
-		}
-		if age >= 0 {
+		if age >= 0 && observation.ExpiresAt != nil && now.Before(*observation.ExpiresAt) {
 			return receipt.Report.Source, true
 		}
 	}
