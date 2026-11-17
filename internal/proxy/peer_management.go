@@ -20,6 +20,7 @@ var (
 type delegatedSettingsRequest struct {
 	Owner    modelconfig.DelegatedOwner  `json:"owner"`
 	Backend  string                      `json:"backend_id"`
+	TargetID string                      `json:"target_id,omitempty"`
 	Model    string                      `json:"model_id"`
 	Revision string                      `json:"revision"`
 	Settings modelconfig.CommandSettings `json:"settings"`
@@ -38,12 +39,38 @@ type delegatedSettingsApply struct {
 // A future forwarding operation must recheck the state under the lifecycle
 // lock before taking effect; this point-in-time check grants no peer access.
 func (r *Reloader) delegatedCallerAuthorized(req *http.Request, state *reloaderState) bool {
-	return req != nil && req.TLS != nil && state != nil && state.management != nil &&
-		r.state.Load() == state && managementBearerAuthorized(req, state.management.DelegationToken)
+	if req == nil || req.TLS == nil || state == nil || state.management == nil || r.state.Load() != state {
+		return false
+	}
+	if managementBearerAuthorized(req, state.management.DelegationToken) {
+		return true
+	}
+	if r.adminAuth == nil {
+		return false
+	}
+	if _, ok := r.adminAuth.RequireRole(req, "configure_models"); !ok {
+		return false
+	}
+	return req.Method == http.MethodGet || r.adminAuth.RequireCSRF(req)
+}
+
+func delegatedOwnerGrantAllows(state *reloaderState, requesterNodeID, backendID, targetID, modelID string) bool {
+	if state == nil || state.peer == nil {
+		return false
+	}
+	if state.peer.FederationID == "" {
+		return true
+	}
+	if state.management == nil || state.management.DelegatedStore == nil || state.management.DelegatedStore.GrantDirectory == "" {
+		return false
+	}
+	allowed, err := modelconfig.OwnerGrantAuthorizes(
+		state.management.DelegatedStore.GrantDirectory, requesterNodeID, "manage_settings", backendID, targetID, modelID)
+	return err == nil && allowed
 }
 
 // A receiving node must separately authorize its local caller.
-func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest, lifetime time.Duration) (modelconfig.DelegatedProposal, error) {
+func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest, lifetime time.Duration) (result modelconfig.DelegatedProposal, retErr error) {
 	if req == nil || req.TLS == nil || state == nil {
 		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
@@ -51,6 +78,16 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	if !ok {
 		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.proposal.create", "", input.Model, "")
+	if auditErr != nil {
+		return modelconfig.DelegatedProposal{}, auditErr
+	}
+	auditTarget, auditCorrelation := "", ""
+	defer func() {
+		if err := finishAudit(auditTx, auditOutcomeForError(retErr), auditTarget, input.Model, auditCorrelation); err != nil {
+			retErr = errDelegationOutcomeUnknown
+		}
+	}()
 	if r.state.Load() != state {
 		return modelconfig.DelegatedProposal{}, errDelegationChanged
 	}
@@ -64,9 +101,13 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 		return modelconfig.DelegatedProposal{}, errDelegationTarget
 	}
 	targetID, ok := state.peer.ManagementTargets[input.Backend]
+	auditTarget = targetID
 	target, targetExists := state.management.Targets[targetID]
-	if !ok || !targetExists {
+	if !ok || !targetExists || input.TargetID != "" && input.TargetID != targetID {
 		return modelconfig.DelegatedProposal{}, errDelegationTarget
+	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
 	stores := state.management.DelegatedStore
 	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
@@ -87,6 +128,7 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
+	auditCorrelation = proposal.Proposal.ID
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 	if r.stopped || r.state.Load() != state {
@@ -98,6 +140,9 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	if !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
 		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalStore
 	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	}
 	if err := modelconfig.SaveDelegatedProposal(stores.ProposalDirectory, proposal); err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
@@ -107,7 +152,7 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 // recoverDelegatedSettingsProposal returns a unique exact match for the
 // currently authenticated management peer. The shared peer credential proves
 // scope possession, not an individual or the original request's delivery state.
-func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
+func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (result modelconfig.DelegatedProposal, retErr error) {
 	if req == nil || req.TLS == nil || state == nil {
 		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
@@ -120,6 +165,16 @@ func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *re
 	if !ok {
 		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.proposal.recover", input.TargetID, input.Model, "")
+	if auditErr != nil {
+		return modelconfig.DelegatedProposal{}, auditErr
+	}
+	auditTarget, auditCorrelation := input.TargetID, ""
+	defer func() {
+		if err := finishAudit(auditTx, auditOutcomeForError(retErr), auditTarget, input.Model, auditCorrelation); err != nil {
+			retErr = errDelegationOutcomeUnknown
+		}
+	}()
 	if err := req.Context().Err(); err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
@@ -131,11 +186,15 @@ func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *re
 		return modelconfig.DelegatedProposal{}, errDelegationTarget
 	}
 	targetID, ok := state.peer.ManagementTargets[input.Backend]
-	if !ok {
+	if !ok || input.TargetID != "" && input.TargetID != targetID {
 		return modelconfig.DelegatedProposal{}, errDelegationTarget
 	}
+	auditTarget = targetID
 	if _, ok := state.management.Targets[targetID]; !ok {
 		return modelconfig.DelegatedProposal{}, errDelegationTarget
+	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
+		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
 	}
 	stores := state.management.DelegatedStore
 	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
@@ -145,8 +204,12 @@ func (r *Reloader) recoverDelegatedSettingsProposal(req *http.Request, state *re
 		Owner: owner, RequesterNode: requester, BackendID: input.Backend, TargetID: targetID,
 		ModelID: input.Model, Revision: input.Revision, Settings: input.Settings,
 	}
-	return modelconfig.RecoverDelegatedProposal(stores.ProposalDirectory, query,
+	result, retErr = modelconfig.RecoverDelegatedProposal(stores.ProposalDirectory, query,
 		modelconfig.DelegatedSettingsCredentialScope, time.Now())
+	if retErr == nil {
+		auditCorrelation = result.Proposal.ID
+	}
+	return result, retErr
 }
 
 func (r *Reloader) separateDelegatedStore(store string, state *reloaderState) bool {
@@ -167,7 +230,7 @@ func (r *Reloader) separateDelegatedStore(store string, state *reloaderState) bo
 
 // The receiving node must separately authorize its caller and collect the
 // acknowledgments; peer authentication does not identify an individual.
-func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderState, input delegatedSettingsApply) (modelconfig.DelegatedOperation, bool, error) {
+func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderState, input delegatedSettingsApply) (record modelconfig.DelegatedOperation, committed bool, retErr error) {
 	if req == nil || req.TLS == nil || state == nil {
 		return modelconfig.DelegatedOperation{}, false, errDelegationUnauthorized
 	}
@@ -180,6 +243,16 @@ func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderStat
 	if !ok {
 		return modelconfig.DelegatedOperation{}, false, errDelegationUnauthorized
 	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.apply", "", "", "")
+	if auditErr != nil {
+		return modelconfig.DelegatedOperation{}, false, auditErr
+	}
+	auditTarget, auditModel, auditCorrelation := "", "", ""
+	defer func() {
+		if err := finishAudit(auditTx, auditOutcomeForError(retErr), auditTarget, auditModel, auditCorrelation); err != nil {
+			retErr = errDelegationOutcomeUnknown
+		}
+	}()
 	if err := req.Context().Err(); err != nil {
 		return modelconfig.DelegatedOperation{}, false, err
 	}
@@ -205,14 +278,29 @@ func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderStat
 	if !r.separateDelegatedExecutionStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
 		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrProposalStore
 	}
+	proposal, err := modelconfig.LoadDelegatedProposal(stores.ProposalDirectory, input.ProposalID)
+	if err != nil {
+		return modelconfig.DelegatedOperation{}, false, err
+	}
+	if proposal.RequesterNode != requester || proposal.BackendID != input.Backend || proposal.Proposal.TargetID != targetID {
+		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrDelegatedProposalBinding
+	}
+	auditTarget, auditModel = targetID, proposal.Proposal.ModelID
+	if modelconfig.ValidDelegatedOperationID(input.OperationID) {
+		auditCorrelation = input.OperationID
+	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, proposal.Proposal.ModelID) {
+		return modelconfig.DelegatedOperation{}, false, errDelegationUnauthorized
+	}
 	binding := modelconfig.DelegatedApplyBinding{
 		Owner: modelconfig.DelegatedOwner{
 			NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation,
 		},
 		RequesterNode: requester, BackendID: input.Backend, TargetID: targetID, ReviewRevision: input.ReviewRevision,
 	}
-	return modelconfig.ApplyStoredDelegatedProposal(stores.ProposalDirectory, stores.OperationDirectory, input.ProposalID, input.OperationID,
+	record, committed, retErr = modelconfig.ApplyStoredDelegatedProposal(stores.ProposalDirectory, stores.OperationDirectory, input.ProposalID, input.OperationID,
 		target.Directory, target.Filename, management.BackupStore.Directory, management.BackupStore.MaxBackups, binding)
+	return record, committed, retErr
 }
 
 func (r *Reloader) separateDelegatedExecutionStores(state *reloaderState, proposals, operations string) bool {
@@ -239,13 +327,22 @@ func (r *Reloader) separateDelegatedExecutionStores(state *reloaderState, propos
 }
 
 func (r *Reloader) separateDelegatedStores(state *reloaderState, proposals, operations string) bool {
-	return r.separateDelegatedStore(proposals, state) && r.separateDelegatedStore(operations, state) &&
-		separateDirectories(proposals, operations)
+	if !r.separateDelegatedStore(proposals, state) || !r.separateDelegatedStore(operations, state) ||
+		!separateDirectories(proposals, operations) {
+		return false
+	}
+	if state.management != nil && state.management.DelegatedStore != nil && state.management.DelegatedStore.GrantDirectory != "" {
+		grants := state.management.DelegatedStore.GrantDirectory
+		if !r.separateDelegatedStore(grants, state) || !separateDirectories(grants, proposals) || !separateDirectories(grants, operations) {
+			return false
+		}
+	}
+	return true
 }
 
 // Only the currently authorized originating peer may inspect its operation.
 // Historical records remain readable after an owner restart or target change.
-func (r *Reloader) peerDelegatedOperation(req *http.Request, state *reloaderState, proposalID, operationID string) (modelconfig.DelegatedOperation, error) {
+func (r *Reloader) peerDelegatedOperation(req *http.Request, state *reloaderState, proposalID, operationID string) (record modelconfig.DelegatedOperation, retErr error) {
 	if req == nil || req.TLS == nil || state == nil {
 		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
 	}
@@ -258,6 +355,16 @@ func (r *Reloader) peerDelegatedOperation(req *http.Request, state *reloaderStat
 	if !ok {
 		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
 	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.operation.read", "", "", "")
+	if auditErr != nil {
+		return modelconfig.DelegatedOperation{}, auditErr
+	}
+	auditTarget, auditModel, auditCorrelation := "", "", ""
+	defer func() {
+		if err := finishAudit(auditTx, auditOutcomeForError(retErr), auditTarget, auditModel, auditCorrelation); err != nil {
+			retErr = errDelegationOutcomeUnknown
+		}
+	}()
 	if err := req.Context().Err(); err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}
@@ -274,6 +381,16 @@ func (r *Reloader) peerDelegatedOperation(req *http.Request, state *reloaderStat
 	}
 	if record.Owner.NodeID != state.peer.NodeID || record.RequesterNode != requester || record.OperationID != operationID {
 		return modelconfig.DelegatedOperation{}, modelconfig.ErrProposalNotFound
+	}
+	auditTarget, auditModel = record.TargetID, record.ModelID
+	if modelconfig.ValidDelegatedOperationID(operationID) {
+		auditCorrelation = operationID
+	}
+	if !delegatedOwnerGrantAllows(state, requester, record.BackendID, record.TargetID, record.ModelID) {
+		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
+	}
+	if !delegatedOwnerGrantAllows(state, requester, record.BackendID, record.TargetID, record.ModelID) {
+		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
 	}
 	return record, nil
 }

@@ -249,6 +249,9 @@ func newReverseProxy(cfg config.Config, logger *slog.Logger, backendID string, b
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
 			request.SetXForwarded()
+			if preservePeerAddressHeaders(request.In.Context()) {
+				preservePeerForwardedAddress(request.Out.Header, request.In.Header)
+			}
 			applyBackendHeaders(request.Out.Header, backend)
 			setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
 		},
@@ -258,6 +261,28 @@ func newReverseProxy(cfg config.Config, logger *slog.Logger, backendID string, b
 		},
 		FlushInterval: -1,
 		ErrorHandler:  proxyErrorHandler(logger, backendID),
+	}
+}
+
+func preservePeerAddressHeaders(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	preserved, _ := ctx.Value(peerAddressHeadersContextKey{}).(bool)
+	return preserved
+}
+
+func preservePeerForwardedAddress(out, in http.Header) {
+	var forwarded []string
+	for _, value := range in.Values("X-Forwarded-For") {
+		forwarded = append(forwarded, value)
+	}
+	if len(forwarded) > 0 {
+		forwarded = append(forwarded, out.Values("X-Forwarded-For")...)
+		out.Set("X-Forwarded-For", strings.Join(forwarded, ", "))
+	}
+	if realIP := in.Values("X-Real-IP"); len(realIP) > 0 {
+		out[http.CanonicalHeaderKey("X-Real-IP")] = append([]string(nil), realIP...)
 	}
 }
 

@@ -33,7 +33,7 @@
     <section id="dashboard" hidden>
       <div class="page-heading">
         <div><p class="eyebrow">FEDERATION / LOCAL VIEW</p><h1>Node overview</h1><p class="lede">Read-only catalog and peer status from this proxy.</p></div>
-        <div class="session"><span id="signed-in-as"></span><form id="signout-form"><input type="hidden" id="csrf-signout"><button class="button quiet" type="submit">Sign out</button></form></div>
+        <div class="session"><span id="signed-in-as"></span><button id="refresh" class="button quiet" type="button">Refresh snapshot</button><form id="signout-form"><input type="hidden" id="csrf-signout"><button class="button quiet" type="submit">Sign out</button></form></div>
       </div>
 
       <div id="load-error" class="notice" role="status" hidden></div>
@@ -48,7 +48,7 @@
 
       <div class="columns">
         <section class="panel">
-          <div class="panel-heading"><div><p class="eyebrow">CATALOG</p><h2>Selectable models</h2></div><button id="refresh" class="button quiet" type="button">Refresh</button></div>
+          <div class="panel-heading"><div><p class="eyebrow">CATALOG</p><h2>Selectable models</h2></div></div>
           <p class="small-note">Catalog presence is not a guarantee that a model is loaded or currently ready.</p>
           <div class="table-wrap"><table><thead><tr><th>Public ID</th><th>Owner</th></tr></thead><tbody id="models"></tbody></table></div>
           <p id="models-empty" class="empty" hidden>No model entries are currently available.</p>
@@ -57,7 +57,7 @@
           <div class="panel-heading"><div><p class="eyebrow">TRUSTED CONNECTIONS</p><h2>Peer status</h2></div></div>
           <div id="peers" class="peer-list"></div>
           <p id="peers-empty" class="empty" hidden>No peers are configured.</p>
-          <p class="small-note">Status reflects the last peer report; it does not guarantee a model is loaded or ready.</p>
+          <p class="small-note">Report freshness is not current reachability. Identity membership, configured grants, and model readiness are shown separately; model readiness may be unknown.</p>
         </section>
       </div>
       <section class="panel outcomes-panel">
@@ -65,11 +65,133 @@
         <div id="request-outcomes" class="outcome-list"><p class="empty">Unknown until request history is enabled.</p></div>
       </section>
       <section class="panel outcomes-panel">
-        <div class="panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Recent proxy requests</h2></div><span class="small-note">last 24 hours · max 50</span></div>
+        <div class="panel-heading"><div><p class="eyebrow">ACTIVITY</p><h2>Recent proxy requests</h2></div><span class="small-note">last 24 hours · max 50 · manual refresh · not process logs</span></div>
         <p id="activity-state" class="empty">Request history availability is unknown.</p>
         <div class="table-wrap"><table><thead><tr><th>Time</th><th>Backend</th><th>HTTP outcome</th><th>Duration</th></tr></thead><tbody id="activity"></tbody></table></div>
       </section>
-      <footer>Settings writes, inference, enrollment, and path-service grants are not available in this read-only view.</footer>
+      <section class="panel outcomes-panel">
+        <div class="panel-heading"><div><p class="eyebrow">FEDERATION POLICY</p><h2>Certificate revocation freshness</h2></div></div>
+        <p id="federation-policy-state" class="empty">No federation revocation policy is configured.</p>
+        <div class="table-wrap"><table><thead><tr><th>Direction</th><th>State</th><th>CRL updated</th><th>Expires</th><th>Max age</th></tr></thead><tbody id="federation-policy"></tbody></table></div>
+      </section>
+      <section id="pairing-panel" class="panel outcomes-panel" hidden>
+        <div class="panel-heading"><div><p class="eyebrow">IDENTITY / LOCAL APPROVAL</p><h2>Pair federation nodes</h2></div></div>
+        <p class="small-note">Pairing establishes identity membership only; it grants no operation scopes. Invitation codes are single-use and shown only when created. Pairing requires operator-CA mTLS on both nodes.</p>
+        <div id="pairing-notice" class="notice" role="status" hidden></div>
+        <div class="pairing-forms">
+          <form id="invite-form">
+            <h3>Create invitation</h3>
+            <label for="invite-node-id">Expected node ID</label>
+            <input id="invite-node-id" name="node_id" required autocomplete="off" pattern="[A-Za-z0-9._-]+">
+            <button class="button primary" type="submit">Create one-time code</button>
+          </form>
+          <form id="join-form">
+            <h3>Join another node</h3>
+            <label for="join-url">Peer HTTPS origin</label>
+            <input id="join-url" name="url" type="url" required placeholder="https://peer.example">
+            <label for="join-code">Invitation code</label>
+            <input id="join-code" name="invitation_code" required autocomplete="off" spellcheck="false">
+            <button class="button primary" type="submit">Join with invitation</button>
+          </form>
+        </div>
+        <div id="created-invitation" class="invite-result" hidden>
+          <strong>One-time invitation code</strong>
+          <code id="invitation-code"></code>
+          <span id="invitation-expiry" class="small-note"></span>
+          <button id="copy-invitation" class="button quiet" type="button">Copy code</button>
+        </div>
+        <div class="pairing-columns">
+          <div>
+            <h3>Paired identities</h3>
+            <div class="table-wrap"><table><thead><tr><th>Node ID</th><th>Certificate SHA-256</th><th>Paired</th><th></th></tr></thead><tbody id="paired-members"></tbody></table></div>
+            <p id="members-empty" class="empty" hidden>No paired identities.</p>
+          </div>
+          <div>
+            <h3>Pending invitations</h3>
+            <div class="table-wrap"><table><thead><tr><th>Expected node</th><th>Expires</th><th></th></tr></thead><tbody id="pending-invitations"></tbody></table></div>
+            <p id="invitations-empty" class="empty" hidden>No pending invitations.</p>
+          </div>
+        </div>
+        <div class="pairing-columns grant-section">
+          <div>
+            <h3>Owner-approved settings grants</h3>
+            <p class="small-note">The static `ManageSettings` peer flag is a hard ceiling. Grants below narrow it to named target/model pairs and never authorize inference.</p>
+            <form id="owner-grant-form" class="grant-form">
+              <label for="grant-requester">Paired requester node ID</label>
+              <input id="grant-requester" required autocomplete="off">
+              <label for="grant-backend">Locally owned backend ID</label>
+              <input id="grant-backend" required autocomplete="off">
+              <label for="grant-models">Model IDs, comma-separated</label>
+              <input id="grant-models" required autocomplete="off" placeholder="repo/model-a">
+              <label for="grant-expiry">Grant lifetime</label>
+              <input id="grant-expiry" required value="30d" autocomplete="off">
+              <label class="confirm-row"><input id="grant-confirm" type="checkbox" required> I approve this target-scoped settings grant.</label>
+              <button class="button primary" type="submit">Approve settings grant</button>
+            </form>
+          </div>
+          <div>
+            <h3>Current owner grants</h3>
+            <p id="owner-grants-unavailable" class="small-note" hidden>Owner grant store is not configured.</p>
+            <div class="table-wrap"><table><thead><tr><th>Requester</th><th>Target / models</th><th>Expires</th><th></th></tr></thead><tbody id="owner-grants"></tbody></table></div>
+            <p id="owner-grants-empty" class="empty" hidden>No owner grants.</p>
+          </div>
+        </div>
+        <div class="audit-section">
+          <h3>Local audit trail</h3>
+          <p class="small-note">Local verified OIDC subjects are recorded. Peer-side human identity remains unknown; no user assertion is forwarded between nodes.</p>
+          <p id="audit-state" class="empty">Audit availability is unknown.</p>
+          <div class="table-wrap"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Target</th><th>Outcome</th></tr></thead><tbody id="audit-events"></tbody></table></div>
+        </div>
+      </section>
+      <section id="remote-settings-panel" class="panel outcomes-panel" hidden>
+        <div class="panel-heading"><div><p class="eyebrow">DELEGATED SETTINGS</p><h2>Review remote model settings</h2></div></div>
+        <p class="small-note">Only owner-granted typed settings are available. No raw YAML, secrets, trust roots, peer scopes, inference, or arbitrary commands are exposed.</p>
+        <div id="remote-settings-notice" class="notice" role="status" hidden></div>
+        <form id="remote-grant-load" class="grant-form">
+          <label for="remote-owner-id">Owner node ID</label>
+          <input id="remote-owner-id" required autocomplete="off">
+          <button class="button quiet" type="submit">Load my owner grants</button>
+        </form>
+        <div id="remote-grant-selection" class="grant-form" hidden>
+          <label for="remote-grant-select">Owner-approved backend / target grant</label>
+          <select id="remote-grant-select"></select>
+          <label for="remote-model-select">Approved model</label>
+          <select id="remote-model-select"></select>
+          <button id="remote-load-snapshot" class="button quiet" type="button">Load typed settings snapshot</button>
+        </div>
+        <p id="remote-settings-current" class="small-note" hidden></p>
+        <form id="remote-settings-form" class="grant-form" hidden>
+          <h3>Request changes (blank means unchanged)</h3>
+          <label for="setting-context">Context size</label><input id="setting-context" type="number" min="0" max="2147483647" step="1">
+          <label for="setting-fit">Fit</label><select id="setting-fit"><option value="">Unchanged</option><option value="on">On</option><option value="off">Off</option></select>
+          <label for="setting-fit-context">Fit context</label><input id="setting-fit-context" type="number" min="0" max="2147483647" step="1">
+          <label for="setting-fit-target">Fit target</label><input id="setting-fit-target" type="number" min="0" max="2147483647" step="1">
+          <label for="setting-cache-ram">Cache RAM</label><input id="setting-cache-ram" type="number" min="0" max="2147483647" step="1">
+          <button class="button primary" type="submit">Preview exact changes</button>
+        </form>
+        <div id="remote-settings-preview" class="invite-result" hidden>
+          <strong>Owner-generated preview</strong>
+          <span id="remote-preview-revision" class="small-note"></span>
+          <div class="table-wrap"><table><thead><tr><th>Setting</th><th>Before</th><th>After</th></tr></thead><tbody id="remote-preview-changes"></tbody></table></div>
+          <button id="remote-create-proposal" class="button primary" type="button">Create review proposal</button>
+          <button id="remote-recover-proposal" class="button quiet" type="button">Recover prior proposal after uncertain response</button>
+        </div>
+        <div id="remote-settings-review" class="invite-result" hidden>
+          <strong>Review before apply</strong>
+          <span id="remote-review-expiry" class="small-note"></span>
+          <label class="confirm-row"><input id="ack-review" type="checkbox"> I reviewed the exact diff.</label>
+          <label class="confirm-row"><input id="ack-disruption" type="checkbox"> I acknowledge possible inference disruption.</label>
+          <label class="confirm-row"><input id="ack-exclusive" type="checkbox"> I acknowledge an exclusive maintenance window.</label>
+          <button id="remote-apply" class="button primary" type="button">Apply reviewed proposal once</button>
+        </div>
+        <div id="remote-operation" class="invite-result" hidden>
+          <strong>Operation status</strong>
+          <code id="remote-operation-id"></code>
+          <span id="remote-operation-state" class="small-note"></span>
+          <button id="remote-check-operation" class="button quiet" type="button">Check this operation; do not retry automatically</button>
+        </div>
+      </section>
+      <footer>Only named model-settings grants can be approved here; pairing never grants them implicitly. Inference and path-service access remain separately scoped.</footer>
     </section>
   </main>
 </body>

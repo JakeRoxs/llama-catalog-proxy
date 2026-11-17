@@ -2,13 +2,16 @@ package proxy
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
-	"math"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/correlation"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 )
 
 type adminModelSummary struct {
@@ -18,9 +21,13 @@ type adminModelSummary struct {
 }
 
 type adminPeerSummary struct {
-	NodeID     string     `json:"node_id"`
-	Status     string     `json:"status"`
-	ReceivedAt *time.Time `json:"received_at,omitempty"`
+	NodeID              string     `json:"node_id"`
+	Status              string     `json:"status"`
+	ReceivedAt          *time.Time `json:"received_at,omitempty"`
+	IdentityState       string     `json:"identity_state"`
+	AuthorizationState  string     `json:"authorization_state"`
+	ConfiguredScopes    []string   `json:"configured_scopes"`
+	ModelReadinessState string     `json:"model_readiness_state"`
 }
 
 type adminRequestSummary struct {
@@ -31,13 +38,32 @@ type adminRequestSummary struct {
 	DurationSampleCount int            `json:"duration_sample_count"`
 }
 
+type adminCRLTimeSummary struct {
+	State         string     `json:"state"`
+	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	MaxAgeSeconds int64      `json:"max_age_seconds"`
+}
+
+type adminPeerCRLSummary struct {
+	NodeID string `json:"node_id"`
+	adminCRLTimeSummary
+}
+
+type adminFederationPolicySummary struct {
+	State     string                `json:"state"`
+	ClientCRL adminCRLTimeSummary   `json:"client_crl"`
+	PeerCRLs  []adminPeerCRLSummary `json:"peer_crls"`
+}
+
 type adminOverview struct {
-	NodeID              string               `json:"node_id,omitempty"`
-	Models              []adminModelSummary  `json:"models"`
-	Peers               []adminPeerSummary   `json:"peers"`
-	RequestSummary      *adminRequestSummary `json:"request_summary,omitempty"`
-	RequestSummaryState string               `json:"request_summary_state"`
-	Updated             time.Time            `json:"updated_at"`
+	NodeID              string                       `json:"node_id,omitempty"`
+	Models              []adminModelSummary          `json:"models"`
+	Peers               []adminPeerSummary           `json:"peers"`
+	FederationPolicy    adminFederationPolicySummary `json:"federation_policy"`
+	RequestSummary      *adminRequestSummary         `json:"request_summary,omitempty"`
+	RequestSummaryState string                       `json:"request_summary_state"`
+	Updated             time.Time                    `json:"updated_at"`
 }
 
 type adminActivityEvent struct {
@@ -106,77 +132,125 @@ func (r *Reloader) serveAdminOverview(w http.ResponseWriter, req *http.Request) 
 		models = append(models, adminModelSummary{ID: model.ID, Object: model.Object, OwnedBy: model.OwnedBy})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
-	overview := adminOverview{Models: models, Peers: []adminPeerSummary{}, Updated: time.Now().UTC(), RequestSummaryState: "not_configured"}
+	now := time.Now()
+	overview := adminOverview{
+		Models: models, Peers: []adminPeerSummary{}, Updated: now.UTC(), RequestSummaryState: "not_configured",
+		FederationPolicy: adminFederationPolicySummary{State: "not_configured", PeerCRLs: []adminPeerCRLSummary{}},
+	}
 	if state.peer != nil {
 		overview.NodeID = state.peer.NodeID
+		if state.peer.FederationID != "" {
+			overview.FederationPolicy = summarizeFederationCRLs(state, now)
+		}
 	}
 	if state.peerCache != nil {
 		views, _ := state.peerCache.views(time.Now(), "")
 		for _, view := range views {
-			overview.Peers = append(overview.Peers, adminPeerSummary{
+			peer := adminPeerSummary{
 				NodeID: view.NodeID, Status: view.Status, ReceivedAt: view.ReceivedAt,
-			})
+				IdentityState: "not_configured", AuthorizationState: "not_configured",
+				ConfiguredScopes: []string{}, ModelReadinessState: "unknown",
+			}
+			if state.peer != nil {
+				if state.peer.FederationID != "" {
+					if state.pairingStore == nil {
+						peer.IdentityState = "unavailable"
+					} else {
+						member, paired, err := state.pairingStore.LookupMember(view.NodeID)
+						switch {
+						case err != nil:
+							peer.IdentityState = "unavailable"
+						case !paired:
+							peer.IdentityState = "not_paired"
+						case member.NodeID != "":
+							peer.IdentityState = "paired"
+						}
+					}
+				} else {
+					peer.IdentityState = "legacy_bearer"
+				}
+				if grant, ok := state.peer.Peers[view.NodeID]; ok {
+					peer.ConfiguredScopes = configuredPeerScopes(grant)
+					if len(peer.ConfiguredScopes) == 0 {
+						peer.AuthorizationState = "no_scopes"
+					} else {
+						peer.AuthorizationState = "scopes_configured"
+					}
+				}
+			}
+			overview.Peers = append(overview.Peers, peer)
 		}
 	}
-	if handler.history != nil {
-		now := time.Now()
-		records := handler.history.Query(correlation.QueryFilter{
-			TimeStart: now.Add(-24 * time.Hour), TimeEnd: now, Limit: maxDiagnosticSummaryLimit,
-		})
-		overview.RequestSummary = summarizeAdminRequestHistory(records)
-		overview.RequestSummaryState = "available"
+	if handler.diagnosticsAPIKey != "" {
+		internalRequest := httptest.NewRequest(http.MethodGet, "http://internal/diagnostics/v1/summary", nil)
+		internalRequest.Header.Set("Authorization", "Bearer "+handler.diagnosticsAPIKey)
+		recorder := httptest.NewRecorder()
+		handler.serveDiagnosticsAPI(recorder, internalRequest, &routeInfo{kind: routeInfoKindLocal})
+		if recorder.Code == http.StatusOK {
+			var summary adminRequestSummary
+			if json.Unmarshal(recorder.Body.Bytes(), &summary) == nil {
+				overview.RequestSummary = &summary
+				overview.RequestSummaryState = "available"
+			} else {
+				overview.RequestSummaryState = "unavailable"
+			}
+		} else if recorder.Code == http.StatusServiceUnavailable {
+			overview.RequestSummaryState = "unavailable"
+		}
 	}
 	writeJSON(r.logger, w, http.StatusOK, overview)
 }
 
-func summarizeAdminRequestHistory(records []*correlation.CorrelationRecord) *adminRequestSummary {
-	summary := &adminRequestSummary{
-		Count: len(records), Outcomes: make(map[string]int), GenerationOutcomes: make(map[string]int),
-		DurationMS: map[string]any{"sample_count": 0},
+func configuredPeerScopes(grant config.PeerGrant) []string {
+	var scopes []string
+	if grant.CatalogRead {
+		scopes = append(scopes, "catalog_read")
 	}
-	var durations []float64
-	for _, record := range records {
-		if record == nil {
-			continue
+	if grant.DiagnosticsRead {
+		scopes = append(scopes, "diagnostics_read")
+	}
+	if grant.Inference {
+		scopes = append(scopes, "inference")
+	}
+	if grant.ManageSettings {
+		scopes = append(scopes, "manage_settings")
+	}
+	if len(grant.PathAccess) > 0 {
+		scopes = append(scopes, "path_access")
+	}
+	sort.Strings(scopes)
+	return scopes
+}
+
+func summarizeFederationCRLs(state *reloaderState, now time.Time) adminFederationPolicySummary {
+	policy := adminFederationPolicySummary{State: "fresh", PeerCRLs: []adminPeerCRLSummary{}}
+	maxAge := state.peer.RevocationMaxAge()
+	policy.ClientCRL = summarizeCRLTime(state.peerClientCRLs, maxAge, now)
+	if policy.ClientCRL.State != "fresh" {
+		policy.State = policy.ClientCRL.State
+	}
+	for nodeID, client := range state.peerClients {
+		status := summarizeCRLTime(client.serverCRLs, client.crlMaxAge, now)
+		policy.PeerCRLs = append(policy.PeerCRLs, adminPeerCRLSummary{NodeID: nodeID, adminCRLTimeSummary: status})
+		if status.State != "fresh" && policy.State == "fresh" {
+			policy.State = status.State
 		}
-		outcome := record.Status
-		if outcome == "" {
-			outcome = "unknown"
-		}
-		summary.Outcomes[outcome]++
-		if record.ProxyObservation != nil {
-			if record.ProxyObservation.GenerationOutcome != "" {
-				summary.GenerationOutcomes[record.ProxyObservation.GenerationOutcome]++
-			}
-			if record.ProxyObservation.TotalDurationMs != nil {
-				durations = append(durations, *record.ProxyObservation.TotalDurationMs)
-				continue
-			}
-		}
-		if duration, ok := record.Metadata["duration_ms"].(int64); ok && duration >= 0 {
-			durations = append(durations, float64(duration))
-		}
 	}
-	if len(durations) == 0 {
-		return summary
+	sort.Slice(policy.PeerCRLs, func(i, j int) bool { return policy.PeerCRLs[i].NodeID < policy.PeerCRLs[j].NodeID })
+	return policy
+}
+
+func summarizeCRLTime(crls []*x509.RevocationList, maxAge time.Duration, now time.Time) adminCRLTimeSummary {
+	status := federation.CRLPolicyTime(crls, maxAge, now)
+	summary := adminCRLTimeSummary{State: status.State, MaxAgeSeconds: int64(status.MaxAge.Seconds())}
+	if !status.UpdatedAt.IsZero() {
+		updated := status.UpdatedAt.UTC()
+		summary.UpdatedAt = &updated
 	}
-	sort.Float64s(durations)
-	total := 0.0
-	for _, duration := range durations {
-		total += duration
+	if !status.ExpiresAt.IsZero() {
+		expires := status.ExpiresAt.UTC()
+		summary.ExpiresAt = &expires
 	}
-	p50 := int(math.Ceil(0.5*float64(len(durations)))) - 1
-	if p50 < 0 {
-		p50 = 0
-	}
-	if p50 >= len(durations) {
-		p50 = len(durations) - 1
-	}
-	sampleCount := len(durations)
-	summary.DurationMS = map[string]any{
-		"mean": total / float64(sampleCount), "p50": durations[p50], "sample_count": sampleCount,
-	}
-	summary.DurationSampleCount = sampleCount
 	return summary
 }
 

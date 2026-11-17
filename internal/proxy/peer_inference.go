@@ -15,6 +15,8 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
+type peerAddressHeadersContextKey struct{}
+
 func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -114,6 +116,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	ctx = context.WithValue(ctx, requestIDKey{}, generateRequestID())
+	ctx = context.WithValue(ctx, peerAddressHeadersContextKey{}, true)
 	req = req.WithContext(ctx)
 	req.URL.Path, req.URL.RawPath, req.URL.RawQuery = path, "", ""
 	accept := req.Header.Get("Accept")

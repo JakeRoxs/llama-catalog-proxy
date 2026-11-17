@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
@@ -34,6 +36,8 @@ type peerClient struct {
 	origin             string
 	token              string
 	client             *http.Client
+	serverCRLs         []*x509.RevocationList
+	crlMaxAge          time.Duration
 	routeInference     bool
 	routeManagement    bool
 	routePaths         map[string]string
@@ -62,43 +66,104 @@ type peerView struct {
 }
 
 func newPeerClients(peer *config.PeerConfig) (map[string]*peerClient, *peerCache, error) {
+	return newPeerClientsWithMembership(peer, nil)
+}
+
+func newPeerClientsWithMembership(peer *config.PeerConfig, membership *federation.PairingStore) (map[string]*peerClient, *peerCache, error) {
 	clients := make(map[string]*peerClient)
 	cache := &peerCache{entries: make(map[string]peerCacheEntry)}
 	if peer == nil {
 		return clients, cache, nil
+	}
+	var clientCertificates []tls.Certificate
+	if peer.FederationID != "" {
+		certificate, err := tls.LoadX509KeyPair(peer.TLSCertFile, peer.TLSKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("load peer client identity: %w", err)
+		}
+		if len(certificate.Certificate) == 0 {
+			return nil, nil, fmt.Errorf("peer client identity certificate is empty")
+		}
+		leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse peer client identity certificate: %w", err)
+		}
+		certificate.Leaf = leaf
+		if err := validatePeerIdentityCertificate(leaf, peer.FederationID, peer.NodeID); err != nil {
+			return nil, nil, fmt.Errorf("invalid peer client identity certificate: %w", err)
+		}
+		clientCertificates = []tls.Certificate{certificate}
 	}
 	for id, grant := range peer.Peers {
 		if grant.URL == "" {
 			continue
 		}
 		var roots *x509.CertPool
+		var serverCRLs []*x509.RevocationList
 		if grant.CAFile != "" {
-			file, err := os.Open(grant.CAFile)
+			if peer.FederationID != "" {
+				var err error
+				roots, err = federation.LoadTrustRoots(grant.CAFile)
+				if err != nil {
+					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
+				}
+			} else {
+				file, err := os.Open(grant.CAFile)
+				if err != nil {
+					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
+				}
+				data, readErr := io.ReadAll(io.LimitReader(file, maxPeerCABytes+1))
+				closeErr := file.Close()
+				if readErr != nil || closeErr != nil {
+					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
+				}
+				roots = x509.NewCertPool()
+				if len(data) > maxPeerCABytes || !roots.AppendCertsFromPEM(data) {
+					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
+				}
+			}
+		}
+		if peer.FederationID != "" {
+			var err error
+			serverCRLs, err = federation.LoadCRLs(grant.CRLFile, peer.RevocationMaxAge())
 			if err != nil {
-				return nil, nil, fmt.Errorf("open peer CA for %q: %w", id, err)
-			}
-			data, readErr := io.ReadAll(io.LimitReader(file, maxPeerCABytes+1))
-			closeErr := file.Close()
-			if readErr != nil {
-				return nil, nil, fmt.Errorf("read peer CA for %q: %w", id, readErr)
-			}
-			if closeErr != nil {
-				return nil, nil, fmt.Errorf("close peer CA for %q: %w", id, closeErr)
-			}
-			roots = x509.NewCertPool()
-			if len(data) > maxPeerCABytes || !roots.AppendCertsFromPEM(data) {
-				return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
+				return nil, nil, fmt.Errorf("invalid peer CRL for %q", id)
 			}
 		}
 		transport := &http.Transport{
-			TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots},
+			TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: clientCertificates},
 			DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
 			IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: peerReportTimeout,
+		}
+		if peer.FederationID != "" {
+			if membership == nil {
+				return nil, nil, errors.New("peer membership store unavailable")
+			}
+			transport.DisableKeepAlives = true
+			transport.TLSClientConfig.VerifyConnection = func(connection tls.ConnectionState) error {
+				if len(connection.VerifiedChains) == 0 || len(connection.PeerCertificates) == 0 {
+					return errors.New("peer server identity unavailable")
+				}
+				if federation.VerifyCertificateRevocation(connection.VerifiedChains, serverCRLs, peer.RevocationMaxAge(), time.Now()) != nil {
+					return errors.New("peer server certificate is revoked or CRL is stale")
+				}
+				serverCert := connection.PeerCertificates[0]
+				serverNodeID, err := federation.PeerIdentityNodeID(serverCert, peer.FederationID)
+				if err != nil || serverNodeID != id {
+					return errors.New("peer server identity mismatch")
+				}
+				member, ok := membership.GetMember(id)
+				if !ok || member.Fingerprint != federation.CertificateFingerprint(serverCert) {
+					return errors.New("peer is not paired with this certificate")
+				}
+				return nil
+			}
 		}
 		clients[id] = &peerClient{
 			id: id, endpoint: strings.TrimSuffix(grant.URL, "/") + "/peer/v1/report", token: grant.OutboundToken,
 			origin: strings.TrimSuffix(grant.URL, "/"), routeInference: grant.RouteInference,
-			routeManagement: grant.RouteManagement, routePaths: grant.RoutePaths,
+			routeManagement: grant.RouteManagement, routePaths: grant.RoutePaths, serverCRLs: serverCRLs,
+			crlMaxAge:          peer.RevocationMaxAge(),
 			inferenceTransport: transport.Clone(),
 			client: &http.Client{Transport: transport, Timeout: peerReportTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse

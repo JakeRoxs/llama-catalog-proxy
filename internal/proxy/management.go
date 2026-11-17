@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/subtle"
 	"crypto/tls"
@@ -8,10 +9,14 @@ import (
 	"errors"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"strings"
 	"unicode"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/auditlog"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
@@ -31,7 +36,157 @@ func (r *Reloader) ManagementTLSConfig() *tls.Config {
 }
 
 func (r *Reloader) ManagementHandler() http.Handler {
-	return http.HandlerFunc(r.serveManagement)
+	return http.HandlerFunc(r.serveManagementAudited)
+}
+
+type auditResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *auditResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *auditResponseWriter) Write(data []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *auditResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *auditResponseWriter) Flush() {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *auditResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
+
+func (w *auditResponseWriter) Push(target string, options *http.PushOptions) error {
+	pusher, ok := w.ResponseWriter.(http.Pusher)
+	if !ok {
+		return http.ErrNotSupported
+	}
+	return pusher.Push(target, options)
+}
+
+func (r *Reloader) serveManagementAudited(w http.ResponseWriter, req *http.Request) {
+	state := r.state.Load()
+	var tx *auditlog.Transaction
+	if state != nil && state.auditStore != nil {
+		var err error
+		tx, err = state.auditStore.Begin(r.managementAuditEvent(req, state))
+		if err != nil {
+			http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	} else if state != nil && state.peer != nil && state.peer.FederationID != "" {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	tracked := &auditResponseWriter{ResponseWriter: w}
+	r.serveManagement(tracked, req)
+	if tx != nil {
+		outcome := "unknown"
+		if tracked.status >= 200 && tracked.status < 300 {
+			outcome = "succeeded"
+		} else if tracked.status == http.StatusUnauthorized || tracked.status == http.StatusForbidden {
+			outcome = "denied"
+		} else if tracked.status < 500 {
+			outcome = "failed"
+		}
+		if err := tx.Finish(outcome); err != nil {
+			r.logger.Error("management audit completion failed", "outcome", "unknown", "error", err)
+		}
+	}
+}
+
+func (r *Reloader) managementAuditEvent(req *http.Request, state *reloaderState) auditlog.Event {
+	event := auditlog.Event{LocalNodeID: r.peerNodeID, PrincipalType: "unknown", UserIdentityState: "unknown", Action: managementAuditAction(req)}
+	if state.peer != nil {
+		event.LocalNodeID = state.peer.NodeID
+	}
+	if req == nil || state.management == nil {
+		return event
+	}
+	if token := state.management.DelegationToken; managementBearerAuthorized(req, token) {
+		event.PrincipalType = "delegation_token"
+	} else if managementMachinePrincipal(req, state.management) {
+		event.PrincipalType = "machine_token"
+	} else if r.adminAuth != nil {
+		if subject, ok := r.adminAuth.RequireRole(req, "configure_models"); ok {
+			event.PrincipalType = "oidc"
+			event.UserIdentityState = "verified_local"
+			event.IdentityIssuer = r.adminAuth.config.IssuerURL
+			event.VerifiedUserSubject = subject
+			event.Role = "configure_models"
+		}
+	}
+	if len(req.URL.Query()["target_id"]) == 1 {
+		candidate := req.URL.Query().Get("target_id")
+		if identity.ValidNodeID(candidate) {
+			event.TargetID = candidate
+		}
+	}
+	if len(req.URL.Query()["model_id"]) == 1 {
+		candidate := req.URL.Query().Get("model_id")
+		if identity.ValidModelComponent(candidate) {
+			event.ModelID = candidate
+		}
+	}
+	if len(req.URL.Query()["operation_id"]) == 1 {
+		candidate := req.URL.Query().Get("operation_id")
+		if modelconfig.ValidDelegatedOperationID(candidate) {
+			event.CorrelationID = candidate
+		}
+	}
+	return event
+}
+
+func managementMachinePrincipal(req *http.Request, management *config.ManagementConfig) bool {
+	if req == nil || management == nil {
+		return false
+	}
+	if managementBearerAuthorized(req, management.PreviewToken) || managementBearerAuthorized(req, management.WriteToken) {
+		return true
+	}
+	if management.BackupStore != nil && managementBearerAuthorized(req, management.BackupStore.Token) {
+		return true
+	}
+	return management.ProposalStore != nil && managementBearerAuthorized(req, management.ProposalStore.Token)
+}
+
+func managementAuditAction(req *http.Request) string {
+	if req == nil {
+		return "management.unknown"
+	}
+	path := req.URL.Path
+	switch {
+	case strings.Contains(path, "/preview"):
+		return "management.preview"
+	case strings.Contains(path, "/proposal"):
+		return "management.proposal"
+	case strings.Contains(path, "/operation"):
+		return "management.operation"
+	case strings.Contains(path, "/backup"):
+		return "management.backup"
+	case strings.Contains(path, "/ingestion"):
+		return "management.ingestion"
+	case strings.Contains(path, "/apply"):
+		return "management.apply"
+	default:
+		return "management.request"
+	}
 }
 
 func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {

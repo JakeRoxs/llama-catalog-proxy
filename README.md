@@ -70,6 +70,161 @@ both directions default to false.
 reports; it requires `catalog_read: true` and defaults to false. It does not grant access to the
 local diagnostics API or other diagnostic data.
 
+#### Optional operator-CA mutual TLS identity
+
+For CA-verified peer identities, configure the same federation ID and operator CA bundle on every
+member. Each node must generate and protect its own private key locally. Have the operator-managed CA
+issue a certificate for that node with both `serverAuth` and `clientAuth` extended usages and exactly
+one federation identity URI SAN, `spiffe://<federation-id>/node/<node-id>`. Never copy a node private
+key to another host or put a CA private key in proxy configuration.
+
+On the node, generate a key and CSR locally (replace the federation and node IDs with the configured
+values). The CA must enforce the URI SAN and both TLS usages in its signing profile; requested CSR
+extensions are not trusted as CA policy:
+
+```sh
+umask 077
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out node-a-key.pem
+openssl req -new -key node-a-key.pem -subj "/CN=node-a" \
+  -addext "subjectAltName=URI:spiffe://lab.example/node/node-a" \
+  -out node-a.csr
+```
+
+After the external CA issues the certificate, install its leaf and any required intermediates in
+`tls_cert_file`, keep the matching private key at `tls_key_file`, and restart to enable the mTLS
+identity mode. The private key never leaves that node.
+
+```yaml
+peer:
+  federation_id: lab.example
+  client_ca_file: /config/federation-ca.pem
+  client_crl_file: /config/federation.crl.pem
+  crl_max_age: 24h
+  membership_directory: /var/lib/llama-catalog-proxy/federation
+  audit_directory: /var/lib/llama-catalog-proxy/audit
+  tls_cert_file: /config/node-a-cert.pem
+  tls_key_file: /config/node-a-key.pem
+```
+
+`client_ca_file` and `client_crl_file` verify incoming client chains and revocation. For each outbound
+peer, `ca_file` and `crl_file` verify that peer's server chain and revocation; the local
+`tls_cert_file`/`tls_key_file` pair is also sent
+as the client identity (include required intermediate certificates after the leaf in the PEM
+certificate file). Both sides check the exact federation/node URI and the paired certificate
+fingerprint. Outbound mTLS peer transports do not reuse connections, so a membership removal or CA
+rotation is checked on the next request. The receiver also matches the client identity to the node ID
+authorized by its bearer token. The bearer token remains required and
+continues to determine the independently configured operation scopes; a certificate alone grants no
+catalog, inference, diagnostics, settings, or path-service permission. There is no bearer-only fallback
+when `federation_id` is configured. Existing peers must be provisioned with certificates before
+enabling this mode on either side.
+
+Use short-lived certificates (maximum 30 days) and current CA-signed CRL bundles. Every issuing CA in
+the chain must have a signed CRL in the configured bundle; missing, untrusted, revoked, future-dated,
+or stale CRLs fail closed. Use full CRLs; delta/indirect CRLs and unsupported critical CRL extensions
+are rejected. The default `crl_max_age` is 24 hours; configure between one minute and 30
+days to match the CA's publication cadence. Global certificate revocation requires distributing the
+new CRL to every node. A local membership revoke blocks that node immediately but is not a substitute
+for CA revocation at other nodes.
+
+Certificate issuance, trust-root distribution, CRL publication, and renewal remain operator-PKI
+responsibilities; the proxy does not fetch CRLs or OCSP. CA, CRL, and node certificate files are loaded
+at startup/config reload; replacing file contents alone does not reload them. Freshness is checked on
+each mTLS request, so an in-memory CRL fails closed after its `nextUpdate` or configured max age.
+Membership and permission grants remain separate: paired identity membership is stored in the protected
+`membership_directory`, while operation scopes remain explicit peer grants. The directory must
+already exist with owner-only permissions; updates are serialized across local CLI and proxy
+processes, and the membership record file is written with mode `0600`. Pairing state permission/owner
+checks are currently supported on Linux, macOS, FreeBSD, OpenBSD, and NetBSD; other operating systems
+fail closed until an equivalent ACL verifier is available. Invitations are not scope grants.
+
+#### Local audit evidence
+
+`audit_directory` is required when `peer.federation_id` is enabled. Its owner-only store keeps local
+audit events for 30 days, up to 10,000 records, 16 MiB total, and 2 MiB per day. It records
+action/outcome, relevant node/target/model IDs, and OIDC issuer/subject for
+verified local browser actions. Local CLI events identify the service-account UID. Remote peer actions
+record the verified requester node while the human user is explicitly `unknown`; no user assertion or
+browser identity is forwarded between nodes. Bearer tokens, invitation codes, settings values, raw
+YAML, and inference content are never stored in audit events.
+
+The audit UI/API is restricted to `administer_federation`. Privileged actions fail before execution if
+a start record cannot be durably stored; if completion cannot be recorded after an action, the event
+remains `started/unknown` and the outcome must be inspected rather than retried automatically. The log
+is protected local evidence, not a signed tamper-proof export; use a separate host audit/backup system
+for independent retention. If its capacity is reached, new privileged actions fail closed.
+
+#### Federation backup and recovery
+
+`membership_directory/pairing.json` contains paired node IDs, current certificate fingerprints,
+revoked fingerprints, invitation hashes, and consumed-invitation replay evidence. It does not contain
+private keys, raw invitation codes, peer bearer grants, or CA keys. Treat it as protected identity
+state, and back it up separately from configuration, CA/CRL files, audit records, and operation stores.
+The proxy cannot detect a restore of the entire host to an old snapshot; a stale but not-yet-expired
+CA-signed CRL can permit revocation delay up to the configured `crl_max_age`.
+
+After any restore where current identity/revocation state cannot be proven:
+
+1. Keep peer communication disabled while checking the current CA CRL and the restored member list.
+2. If state freshness is uncertain, do not restore the old `pairing.json` as active trust. Have the CA
+   revoke prior certificates and issue new short-lived node certificates, then distribute the current
+   CRL to every node.
+3. Start with an empty protected membership store and re-pair using new one-time invitations.
+4. Reapply peer operation scopes separately; pairing itself never restores scopes or bearer tokens.
+
+If the current CA CRL is absent, invalid, or stale, mTLS verification fails closed. The local CLI can
+revoke and re-pair identities when OIDC is unavailable, but it cannot replace the operator CA's global
+revocation action.
+
+During an IdP outage, the web panel denies login rather than falling back to anonymous access; the
+local service-account CLI remains available for membership revoke/re-pair. During a CA or network
+outage, existing peer traffic works only while its certificate and loaded CRLs remain valid; after
+`nextUpdate`/`crl_max_age`, federation traffic fails closed and report receipts become stale. Local
+catalog and non-peer operations remain independent of a central dashboard or CRL-distribution service.
+
+#### Certificate renewal
+
+Renew before the current 30-day certificate expires. There is no implicit overlap: a local invitation
+re-pair replaces the member fingerprint and records the old fingerprint as revoked. For a multi-node
+federation, update each owner's member record with the new certificate and distribute/reload the CA CRL
+on every node. Until the updated CRL is loaded, stale-policy acceptance is bounded by `crl_max_age`;
+there is no automatic global propagation.
+
+1. Generate a fresh key and CSR on the node, have the operator CA issue a certificate with the same
+   federation/node URI, and prepare the updated CRL.
+2. Create a new one-time invitation for that existing node ID on each peer that stores its identity.
+3. Install the new cert/key on the renewing node, update its CRL files, and restart/reload it. Use the
+   CLI `peer join` or the OIDC pairing panel to consume each invitation; peer grants/scopes remain
+   unchanged.
+4. Install and reload the current CRL and certificate bundle on every node. Verify the policy panel is
+   fresh and the report receipt status recovers before removing old backup material.
+
+An authorized local `administer_federation` user can create an invitation and join another node from
+the `/admin/` pairing panel. The CLI provides the same operations over the same store; run it as the
+proxy service account, which must own the protected membership directory:
+
+```sh
+llama-catalog-proxy peer invite create --config /config/config.yaml --node-id node-b
+llama-catalog-proxy peer invite list --config /config/config.yaml
+llama-catalog-proxy peer join --config /config/config.yaml --url https://node-a.example \
+  --invitation-file /run/private/node-a-invitation.json
+llama-catalog-proxy peer members list --config /config/config.yaml
+llama-catalog-proxy peer members revoke --config /config/config.yaml --node-id node-b
+```
+
+The `invite create` JSON output includes the one-time secret code. Transfer it out of band and keep
+any temporary file owner-only (for example, create it under `umask 077`). `peer join` accepts either
+that JSON output or the raw code from a protected regular file; it deliberately does not accept the
+secret as a command-line argument. The web panel displays a new code only once, and its invitation
+list never returns codes. Create and join actions use the same pairing store as the CLI, so concurrent
+operations serialize safely across processes.
+
+Both interfaces perform only identity pairing. They do not add peer scope grants or change static
+bearer-token configuration; authorized operations remain separately configured. Revoking a paired
+member immediately blocks it locally and prevents re-pairing with that revoked certificate. Also
+remove or rotate its configured bearer grant and follow the operator PKI's revocation procedure for
+complete credential revocation.
+
 Readiness evidence is limited to the last completed local `/ready` health check for each explicitly
 owned backend. Peer reports do not trigger probes. Before a check the status is `unknown`; canceled
 checks do not replace the last completed observation. Results include their actual observation time
@@ -119,47 +274,51 @@ With `diagnostics_api_key` configured, `GET /diagnostics/v1/peers` lists peer re
 existing diagnostics bearer token, not a peer token. Reloading configuration clears peer snapshots,
 then starts new refreshes; removed peers disappear immediately.
 
-For future delegated management, an owner may associate an explicitly owned backend with an
-existing local management target using `peer.management_targets`, for example
-`management_targets: {local: llama-swap}`. This operator-declared binding is not evidence that the
-backend actually uses that target. It does not grant authorization or enable remote management;
-delegated management actions are not yet available.
-An owner may also configure `manage_settings: true` on an incoming peer grant as a separate,
-default-off scope. It requires an incoming peer token and at least one management target binding.
-This grant is currently inactive: it does not expose a route, advertise an action, or authorize a
-local caller. Do not rely on it until delegated management is available.
-The separate outgoing peer setting `route_management: true` reserves permission to contact that
-configured peer for future management requests. It requires the peer URL and outbound token, is
-independent of inference routing, and currently enables no management endpoints.
-On the receiving node, optional `management.delegation_token` reserves a separate shared caller
-credential for that future workflow. It must differ from all other configured service credentials
-and does not identify an individual. It currently enables no endpoints. A receiving-only management
-configuration may omit `preview_token` and local targets; its HTTPS listener, certificate, and key
-are still required. Existing local management operations remain disabled in that configuration.
+Remote settings delegation requires an operator-owned target. An owner associates an explicitly
+owned backend with a local management target using `peer.management_targets`, for example
+`management_targets: {local: llama-swap}`. This binding is not evidence that the backend actually uses
+that target. `manage_settings: true` is a coarse per-peer ceiling; mTLS peers additionally require an
+unexpired owner grant bound to the paired requester, backend, target, and explicit model IDs. Grants
+never enable inference, path services, trust changes, or arbitrary commands. Legacy bearer-only peers
+retain the existing static scope behavior during migration. The outgoing `route_management: true`
+setting only allows the requester node to contact that configured peer; it does not grant owner-side
+permission.
 
-For the future owner-side workflow, optional `management.delegated_store` reserves two separate
-private directories:
+The owner grants targeted model settings through the local OIDC administrator panel/API or the local
+service-account CLI. Browser initiation requires the `configure_models` role; a non-browser caller
+continues to use `management.delegation_token`. Grant creation/revocation requires the local
+`administer_federation` role or service-account access. The existing 023 proposal/review/apply flow
+remains authoritative, and both the static `ManageSettings` ceiling and current durable target/model
+grant are checked on each proposal, recovery, apply, and operation lookup. Revocation blocks the next
+authorization check; it does not cancel a write already past its authorization boundary.
+
+The CLI grant commands are `peer grants create`, `peer grants list`, and `peer grants revoke`. The
+create command requires a requester node, locally owned backend, comma-separated model IDs, and a
+bounded expiry. A confirmation flag is required because this changes owner authorization.
+
+For owner-side delegated management, `management.delegated_store` uses separate protected directories:
 
 ```yaml
 management:
   delegated_store:
     proposal_directory: /state/delegated-proposals
     operation_directory: /state/delegated-operations
+    grant_directory: /state/delegated-grants
 ```
 
-An existing `backup_store` is required. The directories must already exist, be owned by the proxy
-user with no group or world permissions, and be separate from each other, management targets,
-other stores, ingestion data, and benchmark reports. Enabling or changing their paths requires a
-restart; disabling them can be reloaded. Preserve both directories and the operation-store clock
-marker across restarts. Deleting, replacing, or rolling back this protected state can lose audit
-and replay protection; the proxy cannot detect all external state rollback. This configuration
-does not enable or advertise delegated actions or expose audit endpoints.
+An existing `backup_store` is required. The proposal, operation, grant, and backup directories must
+already exist, be owned by the proxy user with no group/world permissions, and be separate from each
+other, targets, ingestion data, and benchmark reports. In mTLS mode, `grant_directory` is required
+when any peer has `manage_settings: true`. Preserve each store and the operation-store clock marker
+across restarts. Stale backup restoration is not auto-detected; follow the credential-recovery
+procedure above and re-issue identities if current state is uncertain. The protected owner-grant and
+model-target store operations are currently supported on Linux; other platforms fail closed.
 
-Adding the listener, changing its address or node ID requires a restart. Credential grants, owned
-backends, and TLS file paths reload with the configuration; removing `peer` disables peer access.
-Certificate contents are reloaded when the configuration file changes. Invalid reloads retain the
-previous configuration. The client listener reserves `/peer` while the peer listener is configured
-at startup, preventing peer credentials sent to that path from reaching a backend.
+Adding the listener, changing its address or node ID requires a restart. Scope ceilings, target
+bindings, CRL max age, and TLS/CRL paths reload with the configuration; removing `peer` disables peer
+access. Certificate/CRL contents are reloaded when the configuration file changes. Invalid reloads
+retain the previous configuration. The client listener reserves `/peer` while the peer listener is
+configured at startup, preventing peer credentials sent to that path from reaching a backend.
 
 ### Experimental local configuration read and preview
 
@@ -862,6 +1021,54 @@ per-round acceptance,
 active inference state, and applied runtime sampling/draft configuration are unsupported or unknown.
 These synthetic checks are regression evidence for the tested behavior, not a general model-quality
 score or proof that a configuration is faster.
+
+### Experimental administrator web UI
+
+The optional administrator UI is available at `/admin/` when `management_ui` is configured. It
+authenticates each local user through an OIDC provider. The `view` role sees the catalog, peer receipt
+summary, bounded request aggregates, and recent request activity. The activity panel is manually
+refreshed from in-memory `request_history`; it is not a process-log viewer. Users with
+`administer_federation` can create/join invitations, revoke paired identities, and approve/revoke
+target-scoped settings grants. Pairing changes only identity membership; it does not grant operation
+scopes. No general YAML editor or remote shell is available.
+
+Register a confidential OIDC client with authorization-code flow and PKCE S256. Its exact callback URI
+must match `redirect_url`:
+
+```yaml
+management_ui:
+  issuer_url: "https://identity.example/"
+  client_id: "catalog-proxy"
+  client_secret: "<secret-from-protected-runtime-config>"
+  redirect_url: "https://catalog.example/admin/auth/callback"
+  groups_claim: groups
+  role_groups:
+    view: ["catalog-viewers"]
+    administer_federation: ["federation-admins"]
+    configure_models: ["model-configurators"]
+```
+
+`issuer_url` and `redirect_url` must use HTTPS. Store `client_secret` in protected runtime
+configuration, keep it distinct from all machine credentials, and do not commit it. Map only groups
+that should have local UI access. Supported local roles are `view`, `operate`, `configure_models`, and
+`administer_federation`. The latter enables local pairing and grant administration but does not grant
+peer operation scopes. `configure_models` authorizes same-origin typed BFF proposal/recovery/apply and
+operation-status APIs; every remote mutation still requires an owner grant. The admin page exposes
+typed settings only, never raw YAML. `operate` has no UI actions yet. The default OIDC scopes are
+`openid profile email`; configure `groups_claim` when the provider uses a different claim name.
+
+The default session lifetime is eight hours absolute and 30 minutes idle; configured absolute lifetime
+must be 5 minutes to 24 hours and idle lifetime must be at least one minute and no greater than the
+absolute lifetime. Sessions and login transactions are bounded and held only in process memory, so a
+restart clears them. The session cookie is Secure, HttpOnly, SameSite=Lax, and session-bound. Changing
+`management_ui` authentication settings requires a restart. Provider failure returns an error rather
+than allowing anonymous access.
+
+The application enforces the session and role checks itself; it does not trust forwarded-user headers.
+Because cookies and the callback require HTTPS, serve `/admin/` over a trusted HTTPS origin and
+restrict direct access to the plain-HTTP listener to trusted networks. Reverse-proxy authentication
+alone does not protect a directly reachable listener. Existing machine APIs continue to use their
+separate bearer credentials; those credentials must not be copied into browser code or storage.
 
 ### Agent-facing MCP diagnostics
 

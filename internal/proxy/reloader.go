@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -17,8 +18,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/auditlog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/provenance"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/timing"
@@ -34,6 +38,11 @@ type Reloader struct {
 	state              atomic.Pointer[reloaderState]
 	peerListen         string
 	peerNodeID         string
+	peerFederationID   string
+	peerMembershipDir  string
+	peerAuditDir       string
+	pairingStore       *federation.PairingStore
+	auditStore         *auditlog.Store
 	managementListen   string
 	managementSlots    chan struct{}
 	delegatedStores    *config.DelegatedStoreConfig
@@ -64,6 +73,10 @@ type reloaderState struct {
 	cacheTTL              time.Duration
 	generation            uint64
 	certificate           *tls.Certificate
+	peerClientCAs         *x509.CertPool
+	peerClientCRLs        []*x509.RevocationList
+	pairingStore          *federation.PairingStore
+	auditStore            *auditlog.Store
 	management            *config.ManagementConfig
 	managementCertificate *tls.Certificate
 	peerClients           map[string]*peerClient
@@ -93,6 +106,15 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		peerWake:           make(chan struct{}, 1),
 		stop:               make(chan struct{}),
 	}
+	initialized := false
+	defer func() {
+		if !initialized && r.pairingStore != nil {
+			_ = r.pairingStore.Close()
+		}
+		if !initialized && r.auditStore != nil {
+			_ = r.auditStore.Close()
+		}
+	}()
 	r.benchmark, err = newBenchmarkRuntime(cfg, logger)
 	if err != nil {
 		return nil, config.Config{}, err
@@ -114,6 +136,21 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		if err != nil {
 			return nil, config.Config{}, err
 		}
+		if cfg.Peer.FederationID != "" {
+			r.peerFederationID = cfg.Peer.FederationID
+			r.peerMembershipDir = cfg.Peer.MembershipDirectory
+			r.pairingStore, err = federation.OpenPairingStore(cfg.Peer.MembershipDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
+			if err != nil {
+				return nil, config.Config{}, fmt.Errorf("open peer membership store: %w", err)
+			}
+		}
+		if cfg.Peer.AuditDirectory != "" {
+			r.peerAuditDir = cfg.Peer.AuditDirectory
+			r.auditStore, err = auditlog.Open(cfg.Peer.AuditDirectory, cfg.Peer.NodeID)
+			if err != nil {
+				return nil, config.Config{}, fmt.Errorf("open peer audit store: %w", err)
+			}
+		}
 	}
 	var managementCertificate *tls.Certificate
 	if cfg.Management != nil {
@@ -127,13 +164,27 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 			return nil, config.Config{}, err
 		}
 	}
-	state, err := makeReloaderState(cfg, handler, 1, certificate, managementCertificate, r.peerListen != "")
+	state, err := makeReloaderState(cfg, handler, 1, certificate, managementCertificate, r.peerListen != "", r.pairingStore, r.auditStore)
 	if err != nil {
+		if r.pairingStore != nil {
+			_ = r.pairingStore.Close()
+		}
+		if r.auditStore != nil {
+			_ = r.auditStore.Close()
+		}
 		return nil, config.Config{}, err
 	}
 	r.state.Store(state)
 	digest, err := configDigest(path)
 	if err != nil {
+		state.peerCancel()
+		closePeerClients(state.peerClients)
+		if r.pairingStore != nil {
+			_ = r.pairingStore.Close()
+		}
+		if r.auditStore != nil {
+			_ = r.auditStore.Close()
+		}
 		return nil, config.Config{}, err
 	}
 	r.lastHash = digest
@@ -141,8 +192,15 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 	if err != nil {
 		state.peerCancel()
 		closePeerClients(state.peerClients)
+		if r.pairingStore != nil {
+			_ = r.pairingStore.Close()
+		}
+		if r.auditStore != nil {
+			_ = r.auditStore.Close()
+		}
 		return nil, config.Config{}, err
 	}
+	initialized = true
 	return r, cfg, nil
 }
 
@@ -182,6 +240,16 @@ func (r *Reloader) Stop() {
 	}
 	r.wg.Wait()
 	closePeerClients(r.state.Load().peerClients)
+	if r.pairingStore != nil {
+		if err := r.pairingStore.Close(); err != nil {
+			r.logger.Error("peer membership store shutdown failed", "error", err)
+		}
+	}
+	if r.auditStore != nil {
+		if err := r.auditStore.Close(); err != nil {
+			r.logger.Error("peer audit store shutdown failed", "error", err)
+		}
+	}
 }
 
 func (r *Reloader) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -200,6 +268,18 @@ func (r *Reloader) ServeHTTP(writer http.ResponseWriter, request *http.Request) 
 		}
 		if request.URL.Path == "/admin/api/v1/activity" {
 			r.serveAdminActivity(writer, request)
+			return
+		}
+		if request.URL.Path == adminAuditPath {
+			r.serveAdminAuditEvents(writer, request)
+			return
+		}
+		if request.URL.Path == adminManagementPath || strings.HasPrefix(request.URL.Path, adminManagementPath+"/") {
+			r.serveAdminManagement(writer, request)
+			return
+		}
+		if request.URL.Path == adminPairingPath || strings.HasPrefix(request.URL.Path, adminPairingPath+"/") {
+			r.serveAdminPairing(writer, request)
 			return
 		}
 		r.adminAuth.ServeHTTP(writer, request)
@@ -282,6 +362,9 @@ func (r *Reloader) reload() error {
 		if r.peerListen == "" || cfg.Peer.Listen != r.peerListen || cfg.Peer.NodeID != r.peerNodeID {
 			return errors.New("enabling peer listener or changing its address or node ID requires a restart")
 		}
+		if cfg.Peer.FederationID != r.peerFederationID || cfg.Peer.MembershipDirectory != r.peerMembershipDir || cfg.Peer.AuditDirectory != r.peerAuditDir {
+			return errors.New("changing peer federation identity or protected state directories requires a restart")
+		}
 		certificate, err = loadPeerCertificate(cfg.Peer)
 		if err != nil {
 			return err
@@ -320,7 +403,7 @@ func (r *Reloader) reload() error {
 		r.lifecycleMu.Unlock()
 		return errors.New("configuration generation exhausted")
 	}
-	state, err := makeReloaderState(cfg, handler, old.generation+1, certificate, managementCertificate, r.peerListen != "")
+	state, err := makeReloaderState(cfg, handler, old.generation+1, certificate, managementCertificate, r.peerListen != "", r.pairingStore, r.auditStore)
 	if err != nil {
 		r.lifecycleMu.Unlock()
 		return err
@@ -340,8 +423,21 @@ func (r *Reloader) reload() error {
 	return nil
 }
 
-func makeReloaderState(cfg config.Config, handler http.Handler, generation uint64, certificate, managementCertificate *tls.Certificate, reservePeer bool) (*reloaderState, error) {
-	clients, cache, err := newPeerClients(cfg.Peer)
+func makeReloaderState(cfg config.Config, handler http.Handler, generation uint64, certificate, managementCertificate *tls.Certificate, reservePeer bool, pairingStore *federation.PairingStore, auditStore *auditlog.Store) (*reloaderState, error) {
+	peerClientCAs, err := loadPeerClientCAs(cfg.Peer)
+	if err != nil {
+		return nil, err
+	}
+	peerClientCRLs, err := loadPeerClientCRLs(cfg.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Management != nil && cfg.Management.DelegatedStore != nil && cfg.Management.DelegatedStore.GrantDirectory != "" {
+		if err := modelconfig.ValidateOwnerGrantStore(cfg.Management.DelegatedStore.GrantDirectory); err != nil {
+			return nil, err
+		}
+	}
+	clients, cache, err := newPeerClientsWithMembership(cfg.Peer, pairingStore)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +457,8 @@ func makeReloaderState(cfg config.Config, handler http.Handler, generation uint6
 	}
 	return &reloaderState{
 		handler: handler, peer: copyPeerConfig(cfg.Peer), cacheTTL: cfg.ModelsCacheTTL,
-		generation: generation, certificate: certificate, peerClients: clients,
+		generation: generation, certificate: certificate, peerClientCAs: peerClientCAs, peerClientCRLs: peerClientCRLs,
+		pairingStore: pairingStore, auditStore: auditStore, peerClients: clients,
 		management: copyManagementConfig(cfg.Management), managementCertificate: managementCertificate,
 		peerCache: cache, peerContext: ctx, peerCancel: cancel,
 	}, nil
@@ -408,7 +505,34 @@ func loadPeerCertificate(peer *config.PeerConfig) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load peer TLS key pair: %w", err)
 	}
+	if peer.FederationID != "" {
+		if len(certificate.Certificate) == 0 {
+			return nil, errors.New("peer identity certificate is empty")
+		}
+		leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+		if err != nil {
+			return nil, fmt.Errorf("parse peer identity certificate: %w", err)
+		}
+		certificate.Leaf = leaf
+		if err := validatePeerIdentityCertificate(leaf, peer.FederationID, peer.NodeID); err != nil {
+			return nil, fmt.Errorf("invalid peer identity certificate: %w", err)
+		}
+	}
 	return &certificate, nil
+}
+
+func loadPeerClientCAs(peer *config.PeerConfig) (*x509.CertPool, error) {
+	if peer == nil || peer.FederationID == "" {
+		return nil, nil
+	}
+	return federation.LoadTrustRoots(peer.ClientCAFile)
+}
+
+func loadPeerClientCRLs(peer *config.PeerConfig) ([]*x509.RevocationList, error) {
+	if peer == nil || peer.FederationID == "" {
+		return nil, nil
+	}
+	return federation.LoadCRLs(peer.ClientCRLFile, peer.RevocationMaxAge())
 }
 
 func copyPeerConfig(peer *config.PeerConfig) *config.PeerConfig {

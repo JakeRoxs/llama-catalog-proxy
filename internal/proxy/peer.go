@@ -12,10 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
 const peerReportTimeout = 5 * time.Second
+const peerEnrollmentPath = "/peer/v1/enroll"
+const peerInvitationHeader = "X-Llama-Catalog-Invite"
 
 type peerScope int
 
@@ -32,12 +35,23 @@ const (
 func (r *Reloader) PeerTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
-		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-			certificate := r.state.Load().certificate
-			if certificate == nil {
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			state := r.state.Load()
+			if state == nil || state.certificate == nil {
 				return nil, errors.New("peer listener disabled")
 			}
-			return certificate, nil
+			config := &tls.Config{
+				MinVersion:   tls.VersionTLS12,
+				Certificates: []tls.Certificate{*state.certificate},
+			}
+			if state.peer != nil && state.peer.FederationID != "" {
+				if state.peerClientCAs == nil {
+					return nil, errors.New("peer client CA unavailable")
+				}
+				config.ClientAuth = tls.RequireAndVerifyClientCert
+				config.ClientCAs = state.peerClientCAs
+			}
+			return config, nil
 		},
 	}
 }
@@ -50,6 +64,10 @@ func (r *Reloader) PeerHandler() http.Handler {
 func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.TLS == nil {
 		http.Error(w, "TLS required", http.StatusForbidden)
+		return
+	}
+	if req.URL.Path == peerEnrollmentPath {
+		r.servePeerEnrollment(w, req)
 		return
 	}
 	if req.URL.Path == peerPathEndpoint {
@@ -65,6 +83,15 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	switch req.URL.Path {
+	case peerSettingsGrantsPath:
+		r.servePeerDelegatedSettingsGrants(w, req)
+		return
+	case peerSettingsSnapshotPath:
+		r.servePeerDelegatedSettingsSnapshot(w, req)
+		return
+	case peerSettingsPreviewPath:
+		r.servePeerDelegatedSettingsPreview(w, req)
+		return
 	case peerSettingsProposalPath:
 		r.servePeerDelegatedSettingsProposal(w, req)
 		return
@@ -164,6 +191,77 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if req.URL.RawQuery != "" || req.URL.RawPath != "" || req.ContentLength != 0 || len(req.TransferEncoding) != 0 ||
+		len(req.Header.Values("Authorization")) != 0 {
+		req.Close = true
+		w.Header().Set("Connection", "close")
+		http.Error(w, "invalid enrollment request", http.StatusBadRequest)
+		return
+	}
+	codes := req.Header.Values(peerInvitationHeader)
+	if len(codes) != 1 || len(codes[0]) > 64 {
+		http.Error(w, "invalid invitation", http.StatusUnauthorized)
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped {
+		http.Error(w, "peer service unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state := r.state.Load()
+	if state == nil || state.peer == nil || state.peer.FederationID == "" || state.pairingStore == nil || req.TLS == nil ||
+		len(req.TLS.VerifiedChains) == 0 || len(req.TLS.PeerCertificates) == 0 {
+		http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	clientCert := req.TLS.PeerCertificates[0]
+	nodeID, err := peerIdentityNodeID(clientCert, state.peer.FederationID)
+	if err != nil || verifyPeerClientIdentity(req.TLS.PeerCertificates, state.peerClientCAs, state.peerClientCRLs, state.peer.RevocationMaxAge(), state.peer.FederationID, nodeID) != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, nodeID, "pairing.accept", nodeID, "", "")
+	if auditErr != nil {
+		http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	member, err := state.pairingStore.ConsumeInvitation(codes[0], nodeID, peerCertificateFingerprint(clientCert), time.Now())
+	if finishAudit(auditTx, auditOutcomeForError(err), nodeID, "", "") != nil {
+		http.Error(w, "peer enrollment outcome unknown", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		if errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitationFull) {
+			http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if errors.Is(err, federation.ErrMemberExists) {
+			http.Error(w, "identity already paired", http.StatusConflict)
+			return
+		}
+		http.Error(w, "invalid invitation", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(struct {
+		State        string    `json:"state"`
+		FederationID string    `json:"federation_id"`
+		LocalNodeID  string    `json:"local_node_id"`
+		NodeID       string    `json:"node_id"`
+		PairedAt     time.Time `json:"paired_at"`
+	}{"paired", state.peer.FederationID, state.peer.NodeID, member.NodeID, member.PairedAt})
+}
+
 func delegatedSettingsEnabled(state *reloaderState) bool {
 	if state == nil || state.peer == nil || state.management == nil ||
 		len(state.peer.ManagementTargets) == 0 || state.management.WriteToken == "" ||
@@ -217,6 +315,17 @@ func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope)
 	}
 	if matches != 1 || !authorized {
 		return "", false
+	}
+	if state.peer.FederationID != "" {
+		if req.TLS == nil || len(req.TLS.VerifiedChains) == 0 ||
+			verifyPeerClientIdentity(req.TLS.PeerCertificates, state.peerClientCAs, state.peerClientCRLs, state.peer.RevocationMaxAge(), state.peer.FederationID, nodeID) != nil ||
+			state.pairingStore == nil {
+			return "", false
+		}
+		member, paired := state.pairingStore.GetMember(nodeID)
+		if !paired || member.Fingerprint != peerCertificateFingerprint(req.TLS.PeerCertificates[0]) {
+			return "", false
+		}
 	}
 	return nodeID, true
 }

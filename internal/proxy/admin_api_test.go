@@ -36,9 +36,6 @@ func TestAdminOverviewRequiresLocalViewRoleAndRedactsBackendFields(t *testing.T)
 	now := time.Now()
 	handler.peerCache = &peerCache{entries: make(map[string]peerCacheEntry)}
 	handler.peerCache.update("bigboi", nil, "private-upstream-detail", now)
-	handler.history = correlation.New()
-	handler.history.RegisterRequest("0123456789abcdef0123456789abcdef", "local", "", now.Add(-time.Minute))
-	handler.history.CompleteRequest("0123456789abcdef0123456789abcdef", 25*time.Millisecond, "http_success")
 	auth, err := newAdminAuth(&config.ManagementUIConfig{
 		IssuerURL: "https://identity.example", ClientID: "catalog", ClientSecret: strings.Repeat("c", 32),
 		RedirectURL: "https://catalog.example/admin/auth/callback", RoleGroups: map[string][]string{"view": {"viewers"}},
@@ -76,12 +73,7 @@ func TestAdminOverviewRequiresLocalViewRoleAndRedactsBackendFields(t *testing.T)
 	var result struct {
 		NodeID              string `json:"node_id"`
 		RequestSummaryState string `json:"request_summary_state"`
-		RequestSummary      struct {
-			Count      int            `json:"count"`
-			Outcomes   map[string]int `json:"outcomes"`
-			DurationMS map[string]any `json:"duration_ms"`
-		} `json:"request_summary"`
-		Models []struct {
+		Models              []struct {
 			ID string `json:"id"`
 		} `json:"models"`
 		Peers []struct {
@@ -92,8 +84,7 @@ func TestAdminOverviewRequiresLocalViewRoleAndRedactsBackendFields(t *testing.T)
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
 		t.Fatalf("dashboard response = %d %s", response.Code, response.Body.String())
 	}
-	if result.NodeID != "udms" || result.RequestSummaryState != "available" || result.RequestSummary.Count != 1 ||
-		result.RequestSummary.Outcomes["http_success"] != 1 || len(result.Models) != 1 || result.Models[0].ID != "udms/model-a" ||
+	if result.NodeID != "udms" || result.RequestSummaryState != "not_configured" || len(result.Models) != 1 || result.Models[0].ID != "udms/model-a" ||
 		len(result.Peers) != 1 || result.Peers[0].NodeID != "bigboi" || result.Peers[0].Status != "unavailable" {
 		t.Fatalf("unexpected safe dashboard summary: %s", response.Body.String())
 	}
@@ -151,5 +142,62 @@ func TestAdminActivityRequiresViewAndReturnsSanitizedRecentEvents(t *testing.T) 
 		if strings.Contains(response.Body.String(), forbidden) {
 			t.Fatalf("activity BFF leaked %q: %s", forbidden, response.Body.String())
 		}
+	}
+}
+
+func TestAdminOverviewUsesConfiguredBoundedRequestSummary(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer backend.Close()
+
+	logger := discardLogger()
+	httpHandler, err := New(config.Config{
+		Listen: "0.0.0.0:8080", LogLevel: "INFO", DefaultBackend: "local",
+		Backends:       map[string]config.Backend{"local": {URL: backend.URL}},
+		ModelsCacheTTL: time.Minute, RequestTimeout: time.Second, HealthTimeout: time.Second,
+		CatalogTimeout: time.Second, MaxJSONBody: 1 << 20, RequestHistory: true,
+		DiagnosticsAPIKey: strings.Repeat("d", 32),
+	}, logger, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := httpHandler.(*Handler)
+	now := time.Now()
+	handler.history.RegisterRequest("0123456789abcdef0123456789abcdef", "local", "", now.Add(-time.Minute))
+	handler.history.CompleteRequest("0123456789abcdef0123456789abcdef", 25*time.Millisecond, "http_success")
+
+	auth, err := newAdminAuth(&config.ManagementUIConfig{
+		IssuerURL: "https://identity.example", ClientID: "catalog", ClientSecret: strings.Repeat("c", 32),
+		RedirectURL: "https://catalog.example/admin/auth/callback", RoleGroups: map[string][]string{"view": {"viewers"}},
+	}, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth.sessions["view-session"] = adminSession{subject: "local-user", roles: []string{"view"}, csrf: "csrf",
+		lastSeen: now, expiresAt: now.Add(time.Hour)}
+	reloader := &Reloader{logger: logger, adminAuth: auth}
+	reloader.state.Store(&reloaderState{handler: handler})
+
+	request := httptest.NewRequest(http.MethodGet, "https://catalog.example/admin/api/v1/overview", nil)
+	request.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "view-session"})
+	response := httptest.NewRecorder()
+	reloader.ServeHTTP(response, request)
+	var result struct {
+		RequestSummaryState string `json:"request_summary_state"`
+		RequestSummary      struct {
+			Count    int            `json:"count"`
+			Outcomes map[string]int `json:"outcomes"`
+		} `json:"request_summary"`
+	}
+	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &result) != nil {
+		t.Fatalf("dashboard response = %d %s", response.Code, response.Body.String())
+	}
+	if result.RequestSummaryState != "available" || result.RequestSummary.Count != 1 || result.RequestSummary.Outcomes["http_success"] != 1 {
+		t.Fatalf("configured request summary = %s", response.Body.String())
+	}
+	if strings.Contains(response.Body.String(), "0123456789abcdef") || strings.Contains(response.Body.String(), "request_id") {
+		t.Fatalf("dashboard exposed request identity: %s", response.Body.String())
 	}
 }

@@ -71,6 +71,13 @@ func (h *dynamicLevelHandler) setLevel(level slog.Level) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "peer" {
+		if err := runPeerCommand(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			peerCommandError(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	configPath := flag.String("config", "/config/config.yaml", "path to YAML configuration")
 	healthcheckURL := flag.String("healthcheck", "", "check an HTTP health endpoint and exit")
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")

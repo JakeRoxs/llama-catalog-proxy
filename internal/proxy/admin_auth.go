@@ -332,6 +332,14 @@ func (a *adminAuth) RequireRole(req *http.Request, role string) (string, bool) {
 	return "", false
 }
 
+func (a *adminAuth) AuthenticatedPrincipal(req *http.Request) (string, []string, bool) {
+	session, ok := a.sessionForRequest(req)
+	if !ok {
+		return "", nil, false
+	}
+	return session.subject, append([]string(nil), session.roles...), true
+}
+
 func (a *adminAuth) RequireCSRF(req *http.Request) bool {
 	session, ok := a.sessionForRequest(req)
 	return ok && sameBenchmarkOrigin(req) && a.validCSRF(req, session)

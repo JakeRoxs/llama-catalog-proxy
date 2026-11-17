@@ -3,9 +3,11 @@ package proxy
 import (
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
@@ -17,6 +19,9 @@ const (
 	peerSettingsApplyPath            = "/peer/v1/management/settings/apply"
 	peerSettingsProposalPath         = "/peer/v1/management/settings/proposals"
 	peerSettingsProposalRecoveryPath = "/peer/v1/management/settings/proposals/recover"
+	peerSettingsGrantsPath           = "/peer/v1/management/settings/grants"
+	peerSettingsSnapshotPath         = "/peer/v1/management/settings/snapshot"
+	peerSettingsPreviewPath          = "/peer/v1/management/settings/preview"
 	receivedSettingsPathPrefix       = "/management/v1/delegation/settings/"
 	receivedSettingsProposalPath     = receivedSettingsPathPrefix + "proposals"
 	receivedSettingsRecoveryPath     = receivedSettingsPathPrefix + "proposals/recover"
@@ -225,6 +230,181 @@ func (r *Reloader) preparePeerDelegatedSettings(w http.ResponseWriter, req *http
 		return nil, false
 	}
 	return state, true
+}
+
+func (r *Reloader) preparePeerDelegatedSettingsGet(w http.ResponseWriter, req *http.Request, path string) (*reloaderState, string, bool) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if req.TLS == nil {
+		http.Error(w, "TLS required", http.StatusForbidden)
+		return nil, "", false
+	}
+	if req.URL.Path != path || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path || req.URL.RawQuery != "" || req.URL.ForceQuery {
+		http.NotFound(w, req)
+		return nil, "", false
+	}
+	if req.Method != http.MethodGet || req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return nil, "", false
+	}
+	select {
+	case r.peerSlots <- struct{}{}:
+	default:
+		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
+		return nil, "", false
+	}
+	state := r.state.Load()
+	requester, ok := authenticatedPeer(req, state, peerManageSettings)
+	if !ok {
+		<-r.peerSlots
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, "", false
+	}
+	return state, requester, true
+}
+
+func (r *Reloader) servePeerDelegatedSettingsGrants(w http.ResponseWriter, req *http.Request) {
+	state, requester, ok := r.preparePeerDelegatedSettingsGet(w, req, peerSettingsGrantsPath)
+	if !ok {
+		return
+	}
+	defer func() { <-r.peerSlots }()
+	if state.peer == nil || state.peer.FederationID == "" || state.management == nil ||
+		state.management.DelegatedStore == nil || state.management.DelegatedStore.GrantDirectory == "" {
+		http.Error(w, "target grants unavailable", http.StatusForbidden)
+		return
+	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "delegation.grants.list", "", "", "")
+	if auditErr != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	grants, err := modelconfig.ListOwnerGrants(state.management.DelegatedStore.GrantDirectory)
+	if finishAudit(auditTx, auditOutcomeForError(err), "", "", "") != nil {
+		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		http.Error(w, "owner grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	active := make([]modelconfig.OwnerGrant, 0, len(grants))
+	now := time.Now()
+	for _, grant := range grants {
+		if grant.RequesterNodeID == requester && grant.Action == "manage_settings" && now.Before(grant.ExpiresAt) {
+			active = append(active, grant)
+		}
+	}
+	writeJSON(r.logger, w, http.StatusOK, struct {
+		Owner  modelconfig.DelegatedOwner `json:"owner"`
+		Grants []modelconfig.OwnerGrant   `json:"grants"`
+	}{modelconfig.DelegatedOwner{NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation}, active})
+}
+
+type delegatedSettingsTargetRequest struct {
+	BackendID string `json:"backend_id"`
+	TargetID  string `json:"target_id"`
+	ModelID   string `json:"model_id"`
+}
+
+type delegatedSettingsPreviewRequest struct {
+	BackendID string                      `json:"backend_id"`
+	TargetID  string                      `json:"target_id"`
+	ModelID   string                      `json:"model_id"`
+	Settings  modelconfig.CommandSettings `json:"settings"`
+}
+
+func (r *Reloader) servePeerDelegatedSettingsSnapshot(w http.ResponseWriter, req *http.Request) {
+	state, ok := r.preparePeerDelegatedSettings(w, req, peerSettingsSnapshotPath)
+	if !ok {
+		return
+	}
+	defer func() { <-r.peerSlots }()
+	var input delegatedSettingsTargetRequest
+	if err := decodeBenchmarkJSON(req, &input); err != nil {
+		http.Error(w, "invalid settings snapshot request", http.StatusBadRequest)
+		return
+	}
+	requester, _ := authenticatedPeer(req, state, peerManageSettings)
+	target, err := r.authorizedDelegatedSettingsTarget(state, requester, input.BackendID, input.TargetID, input.ModelID)
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.snapshot.read", input.TargetID, input.ModelID, "")
+	if auditErr != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	snapshot, err := modelconfig.ReadSettingsTarget(target.Directory, target.Filename, input.TargetID, input.ModelID)
+	if finishAudit(auditTx, auditOutcomeForError(err), input.TargetID, input.ModelID, "") != nil {
+		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	writeJSON(r.logger, w, http.StatusOK, struct {
+		Owner    modelconfig.DelegatedOwner   `json:"owner"`
+		Snapshot modelconfig.SettingsSnapshot `json:"snapshot"`
+	}{modelconfig.DelegatedOwner{NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation}, snapshot})
+}
+
+func (r *Reloader) servePeerDelegatedSettingsPreview(w http.ResponseWriter, req *http.Request) {
+	state, ok := r.preparePeerDelegatedSettings(w, req, peerSettingsPreviewPath)
+	if !ok {
+		return
+	}
+	defer func() { <-r.peerSlots }()
+	var input delegatedSettingsPreviewRequest
+	if err := decodeBenchmarkJSON(req, &input); err != nil {
+		http.Error(w, "invalid settings preview request", http.StatusBadRequest)
+		return
+	}
+	requester, _ := authenticatedPeer(req, state, peerManageSettings)
+	target, err := r.authorizedDelegatedSettingsTarget(state, requester, input.BackendID, input.TargetID, input.ModelID)
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.preview", input.TargetID, input.ModelID, "")
+	if auditErr != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	preview, err := modelconfig.PreviewTarget(target.Directory, target.Filename, input.TargetID, input.ModelID, input.Settings)
+	if finishAudit(auditTx, auditOutcomeForError(err), input.TargetID, input.ModelID, "") != nil {
+		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return
+	}
+	writeJSON(r.logger, w, http.StatusOK, struct {
+		Owner   modelconfig.DelegatedOwner `json:"owner"`
+		Preview modelconfig.Preview        `json:"preview"`
+	}{modelconfig.DelegatedOwner{NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation}, preview})
+}
+
+func (r *Reloader) authorizedDelegatedSettingsTarget(state *reloaderState, requester, backendID, targetID, modelID string) (config.ManagementTarget, error) {
+	if state == nil || state.peer == nil || state.management == nil || !slices.Contains(state.peer.LocalBackends, backendID) {
+		return config.ManagementTarget{}, errDelegationTarget
+	}
+	configuredTarget, ok := state.peer.ManagementTargets[backendID]
+	if !ok || configuredTarget != targetID {
+		return config.ManagementTarget{}, errDelegationTarget
+	}
+	target, ok := state.management.Targets[targetID]
+	if !ok {
+		return config.ManagementTarget{}, errDelegationTarget
+	}
+	if !delegatedOwnerGrantAllows(state, requester, backendID, targetID, modelID) {
+		return config.ManagementTarget{}, errDelegationUnauthorized
+	}
+	return target, nil
 }
 
 // This internal handler is not registered on the peer listener.

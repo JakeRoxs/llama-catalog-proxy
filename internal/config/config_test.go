@@ -136,6 +136,86 @@ peer:
 	}
 }
 
+func TestPeerFederationIdentityRequiresTrustedClientCA(t *testing.T) {
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  federation_id: lab.example
+  client_ca_file: /certs/federation-ca.pem
+  client_crl_file: /certs/federation.crl.pem
+  crl_max_age: 24h
+  membership_directory: /var/lib/catalog-proxy/federation
+  audit_directory: /var/lib/catalog-proxy/audit
+  peers: {}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatalf("valid federation identity config rejected: %v", err)
+	}
+	cases := map[string]string{
+		"missing client CA":               strings.Replace(base, "  client_ca_file: /certs/federation-ca.pem\n", "", 1),
+		"missing client CRL":              strings.Replace(base, "  client_crl_file: /certs/federation.crl.pem\n", "", 1),
+		"missing membership store":        strings.Replace(base, "  membership_directory: /var/lib/catalog-proxy/federation\n", "", 1),
+		"missing audit store":             strings.Replace(base, "  audit_directory: /var/lib/catalog-proxy/audit\n", "", 1),
+		"invalid CRL age":                 strings.Replace(base, "  crl_max_age: 24h\n", "  crl_max_age: 90d\n", 1),
+		"client CA without federation ID": strings.Replace(base, "  federation_id: lab.example\n", "", 1),
+		"invalid federation ID":           strings.Replace(base, "lab.example", "invalid_domain", 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("invalid federation identity config accepted")
+			}
+		})
+	}
+}
+
+func TestMTLSPeerGrantRequiresServerCAAndCRL(t *testing.T) {
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  federation_id: lab.example
+  client_ca_file: /certs/federation-ca.pem
+  client_crl_file: /certs/federation.crl.pem
+  membership_directory: /var/lib/catalog-proxy/federation
+  audit_directory: /var/lib/catalog-proxy/audit
+  peers:
+    node-b:
+      token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      catalog_read: true
+      url: https://node-b.example:9293
+      outbound_token: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      ca_file: /certs/federation-ca.pem
+      crl_file: /certs/federation.crl.pem
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatalf("valid mTLS peer grant rejected: %v", err)
+	}
+	withSettings := strings.Replace(base, "      catalog_read: true\n", "      catalog_read: true\n      manage_settings: true\n", 1)
+	if _, err := Load(writeConfig(t, withSettings)); err == nil {
+		t.Fatal("mTLS manage_settings grant without protected owner grant store was accepted")
+	}
+	for name, contents := range map[string]string{
+		"missing server CA":  strings.Replace(base, "      ca_file: /certs/federation-ca.pem\n", "", 1),
+		"missing server CRL": strings.Replace(base, "      crl_file: /certs/federation.crl.pem\n", "", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("mTLS outbound grant without CA/CRL was accepted")
+			}
+		})
+	}
+}
+
 func TestPeerOutboundConfigurationValidation(t *testing.T) {
 	inbound, outbound := strings.Repeat("a", 32), strings.Repeat("b", 32)
 	base := `

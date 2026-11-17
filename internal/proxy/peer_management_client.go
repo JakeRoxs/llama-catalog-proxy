@@ -162,6 +162,183 @@ func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *re
 	return proposal, nil
 }
 
+func (r *Reloader) forwardDelegatedSettingsGrants(req *http.Request, state *reloaderState, owner string) (modelconfig.DelegatedOwner, []modelconfig.OwnerGrant, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationUnauthorized
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		return modelconfig.DelegatedOwner{}, nil, errDelegationBusy
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationChanged
+	}
+	if !r.delegatedCallerAuthorized(req, state) {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationUnauthorized
+	}
+	if state.peer == nil || owner == "" || owner == state.peer.NodeID {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
+	}
+	client := state.peerClients[owner]
+	if client == nil || !client.routeManagement || client.id != owner {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
+	}
+	remote, err := http.NewRequestWithContext(req.Context(), http.MethodGet, client.origin+peerSettingsGrantsPath, nil)
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
+	}
+	remote.Header.Set("Authorization", "Bearer "+client.token)
+	remote.Header.Set("Accept", "application/json")
+	response, err := client.client.Do(remote)
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
+	}
+	var result struct {
+		Owner  modelconfig.DelegatedOwner `json:"owner"`
+		Grants []modelconfig.OwnerGrant   `json:"grants"`
+	}
+	if decodeDelegatedPeerJSON(response, &result) != nil || !validDelegatedOwnerIdentity(result.Owner, owner) || len(result.Grants) > modelconfig.MaxOwnerGrants {
+		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerResponse
+	}
+	for _, grant := range result.Grants {
+		if !modelconfig.ValidOwnerGrant(grant) || grant.RequesterNodeID != state.peer.NodeID || grant.Action != "manage_settings" || !time.Now().Before(grant.ExpiresAt) {
+			return modelconfig.DelegatedOwner{}, nil, errDelegationPeerResponse
+		}
+	}
+	return result.Owner, result.Grants, nil
+}
+
+func (r *Reloader) forwardDelegatedSettingsSnapshot(req *http.Request, state *reloaderState, owner string, input delegatedSettingsTargetRequest) (modelconfig.DelegatedOwner, modelconfig.SettingsSnapshot, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationUnauthorized
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationBusy
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationChanged
+	}
+	if !r.delegatedCallerAuthorized(req, state) {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationUnauthorized
+	}
+	client := state.peerClients[owner]
+	if state.peer == nil || owner == "" || owner == state.peer.NodeID || client == nil || !client.routeManagement || client.id != owner {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
+	}
+	payload, err := json.Marshal(input)
+	if err != nil || len(payload) > maxManagementRequest {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, modelconfig.ErrDelegatedProposalInvalid
+	}
+	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost, client.origin+peerSettingsSnapshotPath, bytes.NewReader(payload))
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
+	}
+	remote.Header.Set("Authorization", "Bearer "+client.token)
+	remote.Header.Set("Content-Type", "application/json")
+	remote.Header.Set("Accept", "application/json")
+	response, err := client.client.Do(remote)
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
+	}
+	var result struct {
+		Owner    modelconfig.DelegatedOwner   `json:"owner"`
+		Snapshot modelconfig.SettingsSnapshot `json:"snapshot"`
+	}
+	if decodeDelegatedPeerJSON(response, &result) != nil || !validDelegatedOwnerIdentity(result.Owner, owner) ||
+		result.Snapshot.TargetID != input.TargetID || result.Snapshot.ModelID != input.ModelID || result.Snapshot.Revision == "" ||
+		result.Snapshot.Validation != "yaml_syntax_and_supported_command_only" {
+		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerResponse
+	}
+	return result.Owner, result.Snapshot, nil
+}
+
+func (r *Reloader) forwardDelegatedSettingsPreview(req *http.Request, state *reloaderState, owner string, input delegatedSettingsPreviewRequest) (modelconfig.DelegatedOwner, modelconfig.Preview, error) {
+	if req == nil || req.TLS == nil || state == nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationUnauthorized
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationBusy
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped || r.state.Load() != state {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationChanged
+	}
+	if !r.delegatedCallerAuthorized(req, state) {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationUnauthorized
+	}
+	client := state.peerClients[owner]
+	if state.peer == nil || owner == "" || owner == state.peer.NodeID || client == nil || !client.routeManagement || client.id != owner {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
+	}
+	payload, err := json.Marshal(input)
+	if err != nil || len(payload) > maxManagementRequest {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, modelconfig.ErrDelegatedProposalInvalid
+	}
+	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost, client.origin+peerSettingsPreviewPath, bytes.NewReader(payload))
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
+	}
+	remote.Header.Set("Authorization", "Bearer "+client.token)
+	remote.Header.Set("Content-Type", "application/json")
+	remote.Header.Set("Accept", "application/json")
+	response, err := client.client.Do(remote)
+	if err != nil {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
+	}
+	var result struct {
+		Owner   modelconfig.DelegatedOwner `json:"owner"`
+		Preview modelconfig.Preview        `json:"preview"`
+	}
+	if decodeDelegatedPeerJSON(response, &result) != nil || !validDelegatedOwnerIdentity(result.Owner, owner) ||
+		result.Preview.TargetID != input.TargetID || result.Preview.ModelID != input.ModelID || result.Preview.Revision == "" ||
+		result.Preview.Validation != "yaml_syntax_and_supported_command_only" || !validDelegatedSettingChanges(result.Preview.Changes) {
+		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerResponse
+	}
+	return result.Owner, result.Preview, nil
+}
+
+func validDelegatedOwnerIdentity(owner modelconfig.DelegatedOwner, expectedNodeID string) bool {
+	return owner.NodeID == expectedNodeID && modelconfig.ValidDelegatedOperationID(owner.ProxyInstanceID) && owner.ConfigGeneration > 0
+}
+
+func validDelegatedSettingChanges(changes []modelconfig.SettingChange) bool {
+	if len(changes) > 5 {
+		return false
+	}
+	allowed := map[string]bool{"context": true, "fit": true, "fit_context": true, "fit_target": true, "cache_ram": true}
+	for _, change := range changes {
+		if !allowed[change.Setting] || len(change.Before) > 256 || len(change.After) > 256 {
+			return false
+		}
+	}
+	return true
+}
+
 // Recovery is a read-only exact-match lookup; repeating it does not reserve an
 // operation or authorize a write. Each successful owner lookup appends a
 // bounded audit event, so transport failure is reported without auto-retry.

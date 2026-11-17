@@ -23,6 +23,7 @@ const (
 	defaultListen         = "0.0.0.0:8080"
 	defaultHealthPath     = "/health"
 	defaultModelsCacheTTL = 5 * time.Minute
+	defaultPeerCRLMaxAge  = 24 * time.Hour
 	defaultRequestTimeout = 10 * time.Second
 	defaultLogLevel       = "INFO"
 	defaultMaxJSONBody    = 64 << 20
@@ -97,6 +98,7 @@ type ManagementConfig struct {
 type DelegatedStoreConfig struct {
 	ProposalDirectory  string `yaml:"proposal_directory"`
 	OperationDirectory string `yaml:"operation_directory"`
+	GrantDirectory     string `yaml:"grant_directory,omitempty"`
 }
 
 type IngestionConfig struct {
@@ -130,15 +132,21 @@ type ManagementTarget struct {
 
 // PeerConfig describes the opt-in HTTPS listener and explicitly configured peers.
 type PeerConfig struct {
-	NodeID            string               `yaml:"node_id"`
-	Listen            string               `yaml:"listen"`
-	TLSCertFile       string               `yaml:"tls_cert_file"`
-	TLSKeyFile        string               `yaml:"tls_key_file"`
-	LocalBackends     []string             `yaml:"local_backends"`
-	ManagementTargets map[string]string    `yaml:"management_targets,omitempty"`
-	RouteAliases      []string             `yaml:"route_aliases,omitempty"`
-	ExposedPathRoutes map[string]string    `yaml:"exposed_path_routes,omitempty"`
-	Peers             map[string]PeerGrant `yaml:"peers"`
+	NodeID              string               `yaml:"node_id"`
+	Listen              string               `yaml:"listen"`
+	TLSCertFile         string               `yaml:"tls_cert_file"`
+	TLSKeyFile          string               `yaml:"tls_key_file"`
+	FederationID        string               `yaml:"federation_id,omitempty"`
+	ClientCAFile        string               `yaml:"client_ca_file,omitempty"`
+	ClientCRLFile       string               `yaml:"client_crl_file,omitempty"`
+	CRLMaxAge           string               `yaml:"crl_max_age,omitempty"`
+	MembershipDirectory string               `yaml:"membership_directory,omitempty"`
+	AuditDirectory      string               `yaml:"audit_directory,omitempty"`
+	LocalBackends       []string             `yaml:"local_backends"`
+	ManagementTargets   map[string]string    `yaml:"management_targets,omitempty"`
+	RouteAliases        []string             `yaml:"route_aliases,omitempty"`
+	ExposedPathRoutes   map[string]string    `yaml:"exposed_path_routes,omitempty"`
+	Peers               map[string]PeerGrant `yaml:"peers"`
 }
 
 type PeerGrant struct {
@@ -150,10 +158,22 @@ type PeerGrant struct {
 	URL             string            `yaml:"url"`
 	OutboundToken   string            `yaml:"outbound_token"`
 	CAFile          string            `yaml:"ca_file"`
+	CRLFile         string            `yaml:"crl_file,omitempty"`
 	RouteInference  bool              `yaml:"route_inference"`
 	RouteManagement bool              `yaml:"route_management"`
 	PathAccess      []string          `yaml:"path_access,omitempty"`
 	RoutePaths      map[string]string `yaml:"route_paths,omitempty"`
+}
+
+func (p *PeerConfig) RevocationMaxAge() time.Duration {
+	if p == nil || p.CRLMaxAge == "" {
+		return defaultPeerCRLMaxAge
+	}
+	maxAge, err := time.ParseDuration(p.CRLMaxAge)
+	if err != nil {
+		return 0
+	}
+	return maxAge
 }
 
 type Backend struct {
@@ -325,6 +345,9 @@ func (c Config) Validate() error {
 	if err := validateManagementUI(c); err != nil {
 		return err
 	}
+	if err := validatePeerAuditStoreSeparation(c); err != nil {
+		return err
+	}
 	prefixOwners := make(map[string]string)
 	for backendID, backend := range c.Backends {
 		if strings.TrimSpace(backendID) == "" {
@@ -377,6 +400,47 @@ func (c Config) Validate() error {
 	if c.ComfyUIWaitTimeout > 0 {
 		if _, exists := c.PathRoutes["/comfyui"]; !exists {
 			return errors.New("comfyui_wait_timeout requires path_routes /comfyui")
+		}
+	}
+	return nil
+}
+
+func validatePeerAuditStoreSeparation(c Config) error {
+	if c.Peer == nil || c.Peer.AuditDirectory == "" {
+		return nil
+	}
+	auditDirectory := c.Peer.AuditDirectory
+	var directories []string
+	if c.Peer.MembershipDirectory != "" {
+		directories = append(directories, c.Peer.MembershipDirectory)
+	}
+	if c.Management != nil {
+		for _, target := range c.Management.Targets {
+			directories = append(directories, target.Directory)
+		}
+		if c.Management.ProposalStore != nil {
+			directories = append(directories, c.Management.ProposalStore.Directory)
+		}
+		if c.Management.BackupStore != nil {
+			directories = append(directories, c.Management.BackupStore.Directory)
+		}
+		if c.Management.DelegatedStore != nil {
+			directories = append(directories, c.Management.DelegatedStore.ProposalDirectory, c.Management.DelegatedStore.OperationDirectory,
+				c.Management.DelegatedStore.GrantDirectory)
+		}
+		if c.Management.Ingestion != nil {
+			directories = append(directories, c.Management.Ingestion.Directory, c.Management.Ingestion.RecordDirectory)
+		}
+	}
+	if c.Benchmark != nil {
+		directories = append(directories, c.Benchmark.ReportDirectory)
+	}
+	for _, directory := range directories {
+		if directory == "" {
+			continue
+		}
+		if containsPath(auditDirectory, directory) || containsPath(directory, auditDirectory) {
+			return errors.New("audit directory must be separate from membership, grants, proposals, operations, and other stores")
 		}
 	}
 	return nil
@@ -713,6 +777,9 @@ func validateManagement(c Config) error {
 				return errors.New("delegated store directories must be absolute clean paths")
 			}
 		}
+		if stores.GrantDirectory != "" && (!filepath.IsAbs(stores.GrantDirectory) || filepath.Clean(stores.GrantDirectory) != stores.GrantDirectory) {
+			return errors.New("delegated grant directory must be an absolute clean path")
+		}
 		dirs := []string{m.BackupStore.Directory}
 		if m.ProposalStore != nil {
 			dirs = append(dirs, m.ProposalStore.Directory)
@@ -730,10 +797,28 @@ func validateManagement(c Config) error {
 			containsPath(stores.OperationDirectory, stores.ProposalDirectory) {
 			return errors.New("delegated proposal and operation stores must be separate")
 		}
+		if stores.GrantDirectory != "" && (containsPath(stores.GrantDirectory, stores.ProposalDirectory) ||
+			containsPath(stores.ProposalDirectory, stores.GrantDirectory) || containsPath(stores.GrantDirectory, stores.OperationDirectory) ||
+			containsPath(stores.OperationDirectory, stores.GrantDirectory)) {
+			return errors.New("delegated grant, proposal, and operation stores must be separate")
+		}
+		if stores.GrantDirectory != "" && (c.Peer == nil || c.Peer.FederationID == "") {
+			return errors.New("delegated grant store requires a configured peer federation identity")
+		}
 		for _, directory := range dirs {
 			if containsPath(stores.ProposalDirectory, directory) || containsPath(directory, stores.ProposalDirectory) ||
 				containsPath(stores.OperationDirectory, directory) || containsPath(directory, stores.OperationDirectory) {
 				return errors.New("delegated stores must be separate from other stores and targets")
+			}
+			if stores.GrantDirectory != "" && (containsPath(stores.GrantDirectory, directory) || containsPath(directory, stores.GrantDirectory)) {
+				return errors.New("delegated grant store must be separate from other stores and targets")
+			}
+		}
+	}
+	if c.Peer != nil && c.Peer.FederationID != "" {
+		for _, grant := range c.Peer.Peers {
+			if grant.ManageSettings && (m == nil || m.DelegatedStore == nil || m.DelegatedStore.GrantDirectory == "") {
+				return errors.New("mTLS manage_settings grants require management.delegated_store.grant_directory")
 			}
 		}
 	}
@@ -800,6 +885,25 @@ func validatePeer(c Config) error {
 	if strings.TrimSpace(p.TLSCertFile) == "" || strings.TrimSpace(p.TLSKeyFile) == "" {
 		return errors.New("peer TLS certificate and key files are required")
 	}
+	if p.AuditDirectory != "" && (!filepath.IsAbs(p.AuditDirectory) || filepath.Clean(p.AuditDirectory) != p.AuditDirectory) {
+		return errors.New("peer audit_directory must be an absolute clean path")
+	}
+	if p.FederationID != "" {
+		if !validFederationID(p.FederationID) || strings.TrimSpace(p.ClientCAFile) == "" ||
+			strings.TrimSpace(p.ClientCRLFile) == "" || !filepath.IsAbs(p.ClientCRLFile) || filepath.Clean(p.ClientCRLFile) != p.ClientCRLFile ||
+			!filepath.IsAbs(p.MembershipDirectory) || filepath.Clean(p.MembershipDirectory) != p.MembershipDirectory ||
+			!filepath.IsAbs(p.AuditDirectory) || filepath.Clean(p.AuditDirectory) != p.AuditDirectory {
+			return errors.New("peer federation identity requires CA/CRL files and absolute membership/audit directories")
+		}
+		if containsPath(p.AuditDirectory, p.MembershipDirectory) || containsPath(p.MembershipDirectory, p.AuditDirectory) {
+			return errors.New("peer audit and membership directories must be separate")
+		}
+		if maxAge := p.RevocationMaxAge(); maxAge < time.Minute || maxAge > 30*24*time.Hour {
+			return errors.New("peer crl_max_age must be between one minute and 30 days")
+		}
+	} else if p.ClientCAFile != "" || p.ClientCRLFile != "" || p.MembershipDirectory != "" || p.CRLMaxAge != "" {
+		return errors.New("peer client trust files, membership_directory, and crl_max_age require federation_id")
+	}
 	if len(p.LocalBackends) > 256 || len(p.Peers) > 32 || len(p.RouteAliases) > 32 || len(p.ExposedPathRoutes) > 32 {
 		return errors.New("too many peer backends, grants, aliases, or exposed path routes")
 	}
@@ -839,6 +943,9 @@ func validatePeer(c Config) error {
 	tokens := make(map[string]bool, len(p.Peers))
 	peerPathPrefixes := make(map[string]string)
 	for id, grant := range p.Peers {
+		if grant.CRLFile != "" && p.FederationID == "" {
+			return errors.New("peer crl_file requires federation_id")
+		}
 		if !identity.ValidNodeID(id) || id == p.NodeID {
 			return errors.New("peer grant has invalid or self node identity")
 		}
@@ -871,10 +978,16 @@ func validatePeer(c Config) error {
 			return errors.New("peer grant requires an incoming token or outbound URL")
 		}
 		if grant.URL == "" {
-			if grant.OutboundToken != "" || grant.CAFile != "" || grant.RouteInference || grant.RouteManagement || len(grant.RoutePaths) != 0 {
+			if grant.OutboundToken != "" || grant.CAFile != "" || grant.CRLFile != "" || grant.RouteInference || grant.RouteManagement || len(grant.RoutePaths) != 0 {
 				return errors.New("peer outbound token and CA require a URL")
 			}
 		} else {
+			if p.FederationID != "" && (grant.CAFile == "" || grant.CRLFile == "") {
+				return errors.New("mTLS peer URL requires ca_file and crl_file")
+			}
+			if grant.CRLFile != "" && (!filepath.IsAbs(grant.CRLFile) || filepath.Clean(grant.CRLFile) != grant.CRLFile) {
+				return errors.New("peer crl_file must be an absolute path")
+			}
 			target, err := url.Parse(grant.URL)
 			if err != nil || len(grant.URL) > 2048 || target.Scheme != "https" || target.Hostname() == "" || target.User != nil ||
 				target.RawQuery != "" || target.Fragment != "" || (target.Path != "" && target.Path != "/") ||
@@ -911,6 +1024,23 @@ func validatePeer(c Config) error {
 		}
 	}
 	return nil
+}
+
+func validFederationID(value string) bool {
+	if len(value) == 0 || len(value) > 253 || strings.ToLower(value) != value {
+		return false
+	}
+	for _, label := range strings.Split(value, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, ch := range label {
+			if !(ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isCanonicalPathPrefix(routePath string) bool {
