@@ -174,6 +174,57 @@ peer:
 	}
 }
 
+func TestPeerDiscoveryRequiresAnExplicitMTLSBoundEndpointAndInterface(t *testing.T) {
+	base := `
+default_backend: local
+backends: {local: {url: http://localhost:9292}}
+peer:
+  node_id: node-a
+  listen: "127.0.0.1:9293"
+  tls_cert_file: cert.pem
+  tls_key_file: key.pem
+  federation_id: lab.example
+  client_ca_file: /certs/federation-ca.pem
+  client_crl_file: /certs/federation.crl.pem
+  crl_max_age: 24h
+  membership_directory: /var/lib/catalog-proxy/federation
+  audit_directory: /var/lib/catalog-proxy/audit
+  catalog_grant_directory: /var/lib/catalog-proxy/catalog-grants
+  discovery:
+    enabled: true
+    interface: eth0
+    advertise_url: https://192.168.1.10:9293
+  peers: {}
+`
+	if _, err := Load(writeConfig(t, base)); err != nil {
+		t.Fatalf("valid discovery configuration rejected: %v", err)
+	}
+	if _, err := Load(writeConfig(t, strings.Replace(base, "192.168.1.10", "node-a.local", 1))); err != nil {
+		t.Fatalf("valid .local discovery endpoint rejected: %v", err)
+	}
+	cases := map[string]string{
+		"missing interface":                   strings.Replace(base, "    interface: eth0\n", "", 1),
+		"unsafe interface":                    strings.Replace(base, "interface: eth0", "interface: ../eth0", 1),
+		"non-HTTPS endpoint":                  strings.Replace(base, "https://192.168.1.10:9293", "http://192.168.1.10:9293", 1),
+		"public IP endpoint":                  strings.Replace(base, "192.168.1.10", "203.0.113.10", 1),
+		"loopback IP endpoint":                strings.Replace(base, "192.168.1.10", "127.0.0.1", 1),
+		"endpoint path":                       strings.Replace(base, "https://192.168.1.10:9293", "https://192.168.1.10:9293/peer", 1),
+		"port mismatch":                       strings.Replace(base, "192.168.1.10:9293", "192.168.1.10:443", 1),
+		"non-local hostname":                  strings.Replace(base, "192.168.1.10", "proxy.example.com", 1),
+		"without federation":                  strings.Replace(base, "  federation_id: lab.example\n", "", 1),
+		"missing catalog grant directory":     strings.Replace(base, "  catalog_grant_directory: /var/lib/catalog-proxy/catalog-grants\n", "", 1),
+		"overlapping catalog grant directory": strings.Replace(base, "/var/lib/catalog-proxy/catalog-grants", "/var/lib/catalog-proxy/federation/grants", 1),
+		"federation ID too long for TXT":      strings.Replace(base, "lab.example", strings.Repeat("a", 63)+"."+strings.Repeat("b", 63)+"."+strings.Repeat("c", 63)+"."+strings.Repeat("d", 50), 1),
+	}
+	for name, contents := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, contents)); err == nil {
+				t.Fatal("invalid peer discovery configuration accepted")
+			}
+		})
+	}
+}
+
 func TestMTLSPeerGrantRequiresServerCAAndCRL(t *testing.T) {
 	base := `
 default_backend: local

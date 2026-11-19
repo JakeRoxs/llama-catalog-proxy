@@ -47,6 +47,12 @@ func (r *Reloader) serveAdminPairing(w http.ResponseWriter, req *http.Request) {
 		r.createAdminPairingInvitation(w, req)
 	case req.URL.Path == adminPairingPath+"/join" && req.Method == http.MethodPost:
 		r.joinAdminPairing(w, req)
+	case req.URL.Path == adminPairingPath+"/catalog-grants" && req.Method == http.MethodGet:
+		r.listAdminCatalogGrants(w, req)
+	case req.URL.Path == adminPairingPath+"/catalog-grants" && req.Method == http.MethodPost:
+		r.createAdminCatalogGrant(w, req)
+	case strings.HasPrefix(req.URL.Path, adminPairingPath+"/catalog-grants/") && req.Method == http.MethodDelete:
+		r.revokeAdminCatalogGrant(w, req, strings.TrimPrefix(req.URL.Path, adminPairingPath+"/catalog-grants/"))
 	case req.URL.Path == adminPairingPath+"/grants" && req.Method == http.MethodGet:
 		r.listAdminOwnerGrants(w, req)
 	case req.URL.Path == adminPairingPath+"/grants" && req.Method == http.MethodPost:
@@ -60,6 +66,133 @@ func (r *Reloader) serveAdminPairing(w http.ResponseWriter, req *http.Request) {
 	default:
 		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.NotFound(w, req)
+	}
+}
+
+type adminCatalogGrantView struct {
+	federation.CatalogReadGrant
+	Active bool `json:"active"`
+}
+
+func (r *Reloader) listAdminCatalogGrants(w http.ResponseWriter, _ *http.Request) {
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "catalog grant store unavailable", status)
+		return
+	}
+	grants, err := state.catalogGrantStore.ListCatalogReadGrants()
+	if err != nil {
+		http.Error(w, "catalog grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result := make([]adminCatalogGrantView, 0, len(grants))
+	for _, grant := range grants {
+		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
+		if err != nil {
+			http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		result = append(result, adminCatalogGrantView{CatalogReadGrant: grant, Active: paired && member.Fingerprint == grant.Fingerprint})
+	}
+	writeJSON(r.logger, w, http.StatusOK, map[string]any{"state": "available", "grants": result})
+}
+
+func (r *Reloader) createAdminCatalogGrant(w http.ResponseWriter, req *http.Request) {
+	var input struct {
+		NodeID string `json:"node_id"`
+	}
+	if err := decodeAdminPairingJSON(w, req, &input); err != nil || input.NodeID == "" {
+		http.Error(w, "invalid catalog grant request", http.StatusBadRequest)
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped {
+		http.Error(w, "catalog grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "catalog grant store unavailable", status)
+		return
+	}
+	member, paired, err := state.pairingStore.LookupMember(input.NodeID)
+	if err != nil {
+		http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !paired {
+		http.Error(w, "catalog read can only be granted to a paired identity", http.StatusConflict)
+		return
+	}
+	transaction, err := r.beginAdminAudit(req, "catalog_read_grant.create", input.NodeID, "", "")
+	if err != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	grant, err := state.catalogGrantStore.GrantCatalogRead(member, time.Now())
+	if !r.finishAdminMutation(w, transaction, err, input.NodeID, "", "") {
+		return
+	}
+	if err != nil {
+		http.Error(w, "catalog grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	r.wakePeerRefresh()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{"grant": grant})
+}
+
+func (r *Reloader) revokeAdminCatalogGrant(w http.ResponseWriter, req *http.Request, nodeID string) {
+	if strings.Contains(nodeID, "/") || !identity.ValidNodeID(nodeID) {
+		http.Error(w, "invalid node ID", http.StatusBadRequest)
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped {
+		http.Error(w, "catalog grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "catalog grant store unavailable", status)
+		return
+	}
+	transaction, err := r.beginAdminAudit(req, "catalog_read_grant.revoke", nodeID, "", "")
+	if err != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	err = state.catalogGrantStore.RevokeCatalogRead(nodeID)
+	if !r.finishAdminMutation(w, transaction, err, nodeID, "", "") {
+		return
+	}
+	if err != nil {
+		if errors.Is(err, federation.ErrCatalogGrantMissing) {
+			http.NotFound(w, req)
+		} else {
+			http.Error(w, "catalog grant store unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	r.wakePeerRefresh()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (r *Reloader) adminCatalogGrantStores() (*reloaderState, int) {
+	state := r.state.Load()
+	if state == nil || state.peer == nil || state.peer.FederationID == "" || state.pairingStore == nil || state.catalogGrantStore == nil {
+		return nil, http.StatusServiceUnavailable
+	}
+	return state, 0
+}
+
+func (r *Reloader) wakePeerRefresh() {
+	select {
+	case r.peerWake <- struct{}{}:
+	default:
 	}
 }
 

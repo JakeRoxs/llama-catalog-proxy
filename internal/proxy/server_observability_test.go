@@ -74,7 +74,11 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/custom", nil))
+	request := httptest.NewRequest(http.MethodGet, "/custom", nil)
+	request.RemoteAddr = "192.0.2.12:54321"
+	request.Header.Set("X-Forwarded-For", "198.51.100.8")
+	request.Header.Set("User-Agent", "ComfyUI-Test/1.0")
+	handler.ServeHTTP(recorder, request)
 	requestID := recorder.Header().Get("X-Request-ID")
 	if requestID == "" {
 		t.Fatal("no X-Request-ID returned to client")
@@ -90,6 +94,15 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 	}
 	if !logContains(logs.String(), "route_kind", "default") {
 		t.Fatalf("default route kind not logged: %s", logs.String())
+	}
+	for key, value := range map[string]string{
+		"client_addr":     "192.0.2.12:54321",
+		"x_forwarded_for": "198.51.100.8",
+		"user_agent":      "ComfyUI-Test/1.0",
+	} {
+		if !logContains(logs.String(), key, value) {
+			t.Fatalf("%s not present in request summary log: %s", key, logs.String())
+		}
 	}
 }
 

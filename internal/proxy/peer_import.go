@@ -38,6 +38,7 @@ type peerClient struct {
 	client             *http.Client
 	serverCRLs         []*x509.RevocationList
 	crlMaxAge          time.Duration
+	dynamic            bool
 	routeInference     bool
 	routeManagement    bool
 	routePaths         map[string]string
@@ -53,6 +54,7 @@ type peerCacheEntry struct {
 	receipt        *nodecontract.Receipt
 	lastAttempt    time.Time
 	lastError      string
+	dynamic        bool
 	routeInference bool
 }
 
@@ -180,7 +182,9 @@ func (c *peerClient) fetch(ctx context.Context) (*nodecontract.Receipt, string) 
 	if err != nil {
 		return nil, "request_error"
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, "unavailable"
@@ -207,9 +211,14 @@ func (c *peerClient) fetch(ctx context.Context) (*nodecontract.Receipt, string) 
 }
 
 func (c *peerCache) update(id string, receipt *nodecontract.Receipt, reason string, now time.Time) {
+	c.updateSource(id, receipt, reason, now, false)
+}
+
+func (c *peerCache) updateSource(id string, receipt *nodecontract.Receipt, reason string, now time.Time, dynamic bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry := c.entries[id]
+	entry.dynamic = dynamic
 	entry.lastAttempt, entry.lastError = now, reason
 	if receipt != nil {
 		entry.receipt = receipt
@@ -217,6 +226,31 @@ func (c *peerCache) update(id string, receipt *nodecontract.Receipt, reason stri
 		entry.receipt = nil
 	}
 	c.entries[id] = entry
+}
+
+func (c *peerCache) retainDynamic(authorized map[string]struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for nodeID, entry := range c.entries {
+		if !entry.dynamic {
+			continue
+		}
+		if _, ok := authorized[nodeID]; !ok {
+			delete(c.entries, nodeID)
+		}
+	}
+}
+
+func (c *peerCache) markDynamicUnavailable(nodeID, reason string, now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[nodeID]
+	entry.dynamic = true
+	entry.lastAttempt, entry.lastError = now, reason
+	if entry.receipt != nil && now.Sub(entry.receipt.ReceivedAt) > peerRetention {
+		entry.receipt = nil
+	}
+	c.entries[nodeID] = entry
 }
 
 func (c *peerCache) views(now time.Time, selected string) ([]peerView, bool) {
@@ -259,6 +293,10 @@ func (c *peerCache) views(now time.Time, selected string) ([]peerView, bool) {
 }
 
 func (r *Reloader) refreshPeers(state *reloaderState) {
+	r.refreshPeerClients(state, state.peerClients)
+}
+
+func (r *Reloader) refreshPeerClients(state *reloaderState, clients map[string]*peerClient) {
 	jobs := make(chan *peerClient)
 	var workers sync.WaitGroup
 	for range peerRefreshWorkers {
@@ -270,14 +308,14 @@ func (r *Reloader) refreshPeers(state *reloaderState) {
 				if state.peerContext.Err() != nil {
 					continue
 				}
-				state.peerCache.update(client.id, receipt, reason, time.Now())
+				state.peerCache.updateSource(client.id, receipt, reason, time.Now(), client.dynamic)
 				if reason != "" {
 					r.logger.Warn("peer report refresh failed", "node_id", client.id, "reason", reason)
 				}
 			}
 		}()
 	}
-	for _, client := range state.peerClients {
+	for _, client := range clients {
 		select {
 		case <-state.peerContext.Done():
 			close(jobs)
@@ -295,8 +333,49 @@ func (r *Reloader) watchPeers() {
 	for {
 		state := r.state.Load()
 		r.refreshPeerCatalogs(state)
-		if len(state.peerClients) != 0 {
-			r.refreshPeers(state)
+		clients := state.peerClients
+		var dynamicClients map[string]*peerClient
+		if state.peer != nil && state.peer.Discovery != nil && state.peer.Discovery.Enabled {
+			discovered, err := r.buildDiscoveredPeerClients(state)
+			dynamicClients = discovered.clients
+			state.peerCache.retainDynamic(discovered.authorizedIDs)
+			now := time.Now()
+			for nodeID := range discovered.authorizedIDs {
+				if _, configured := state.peerClients[nodeID]; configured {
+					continue
+				}
+				if _, found := discovered.clients[nodeID]; found {
+					continue
+				}
+				reason := discovered.unavailable[nodeID]
+				if reason == "" {
+					reason = "not_discovered"
+				}
+				state.peerCache.markDynamicUnavailable(nodeID, reason, now)
+			}
+			if err != nil && state.peerContext.Err() == nil {
+				if r.lastPeerDiscoveryError != err.Error() {
+					r.logger.Warn("peer mDNS catalog discovery failed", "error", err)
+					r.lastPeerDiscoveryError = err.Error()
+				}
+			} else if err == nil {
+				r.lastPeerDiscoveryError = ""
+			}
+			clients = make(map[string]*peerClient, len(state.peerClients)+len(dynamicClients))
+			for nodeID, client := range state.peerClients {
+				clients[nodeID] = client
+			}
+			for nodeID, client := range dynamicClients {
+				if _, exists := clients[nodeID]; !exists {
+					clients[nodeID] = client
+				}
+			}
+		}
+		if len(clients) != 0 {
+			r.refreshPeerClients(state, clients)
+		}
+		if len(dynamicClients) != 0 {
+			closePeerClients(dynamicClients)
 		}
 		timer := time.NewTimer(peerRefreshIntervalForTTL(state.cacheTTL))
 		select {

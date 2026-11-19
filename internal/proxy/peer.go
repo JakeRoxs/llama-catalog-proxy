@@ -289,6 +289,9 @@ func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope)
 		return "", false
 	}
 	values := req.Header.Values("Authorization")
+	if len(values) == 0 {
+		return authenticatedCatalogGrantPeer(req, state, scope)
+	}
 	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
 		return "", false
 	}
@@ -326,6 +329,29 @@ func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope)
 		if !paired || member.Fingerprint != peerCertificateFingerprint(req.TLS.PeerCertificates[0]) {
 			return "", false
 		}
+	}
+	return nodeID, true
+}
+
+func authenticatedCatalogGrantPeer(req *http.Request, state *reloaderState, scope peerScope) (string, bool) {
+	if scope != peerCatalog || state.peer.FederationID == "" || state.catalogGrantStore == nil ||
+		state.pairingStore == nil || req.TLS == nil || len(req.TLS.VerifiedChains) == 0 ||
+		len(req.TLS.PeerCertificates) == 0 {
+		return "", false
+	}
+	certificate := req.TLS.PeerCertificates[0]
+	nodeID, err := peerIdentityNodeID(certificate, state.peer.FederationID)
+	if err != nil || verifyPeerClientIdentity(req.TLS.PeerCertificates, state.peerClientCAs,
+		state.peerClientCRLs, state.peer.RevocationMaxAge(), state.peer.FederationID, nodeID) != nil {
+		return "", false
+	}
+	member, paired, err := state.pairingStore.LookupMember(nodeID)
+	if err != nil || !paired || member.Fingerprint != peerCertificateFingerprint(certificate) {
+		return "", false
+	}
+	allowed, err := state.catalogGrantStore.AllowsCatalogRead(nodeID, member.Fingerprint)
+	if err != nil || !allowed {
+		return "", false
 	}
 	return nodeID, true
 }

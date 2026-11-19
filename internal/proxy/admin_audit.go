@@ -140,7 +140,7 @@ func auditOutcomeForError(err error) string {
 		return "denied"
 	}
 	if errors.Is(err, auditlog.ErrUnavailable) || errors.Is(err, auditlog.ErrCapacity) ||
-		errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitation) ||
+		errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitation) || errors.Is(err, federation.ErrCatalogGrantStore) ||
 		errors.Is(err, modelconfig.ErrOwnerGrantStore) || errors.Is(err, errDelegationPeerUnavailable) ||
 		errors.Is(err, errDelegationPeerResponse) || errors.Is(err, errDelegationProposalUnknown) ||
 		errors.Is(err, errDelegationOutcomeUnknown) {

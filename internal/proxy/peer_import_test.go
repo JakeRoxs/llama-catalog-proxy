@@ -3,6 +3,8 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -21,6 +23,8 @@ import (
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/discovery"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
@@ -63,6 +67,129 @@ func TestPeerCatalogRefreshKeepsOwnerEvidenceWithinConfiguredTTL(t *testing.T) {
 	cache.update("owner", &nodecontract.Receipt{Report: report, ReceivedAt: now}, "", now)
 	if _, ok := cache.freshModel(report.Observations[0].Identity, now); !ok {
 		t.Fatal("background-refreshed owner model is not routable")
+	}
+}
+
+func TestPeerCacheDropsRevokedDynamicCatalogButRetainsStaticAndGrantedPeers(t *testing.T) {
+	now := time.Now().UTC()
+	cache := &peerCache{entries: make(map[string]peerCacheEntry)}
+	cache.updateSource("static-peer", nil, "", now, false)
+	cache.updateSource("granted-peer", nil, "", now, true)
+	cache.updateSource("revoked-peer", nil, "", now, true)
+	cache.retainDynamic(map[string]struct{}{"granted-peer": {}})
+	if _, ok := cache.entries["static-peer"]; !ok {
+		t.Fatal("static peer cache was removed with dynamic grant cleanup")
+	}
+	if entry, ok := cache.entries["granted-peer"]; !ok || !entry.dynamic {
+		t.Fatal("active dynamic grant cache was removed")
+	}
+	if _, ok := cache.entries["revoked-peer"]; ok {
+		t.Fatal("revoked dynamic catalog cache remained available")
+	}
+	cache.markDynamicUnavailable("granted-peer", "not_discovered", now.Add(time.Second))
+	if entry := cache.entries["granted-peer"]; entry.lastError != "not_discovered" {
+		t.Fatalf("unavailable dynamic peer cache error = %q", entry.lastError)
+	}
+}
+
+func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.T) {
+	ca, caKey, roots := newPeerIdentityTestCA(t)
+	localCertificate, _ := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-a")
+	serverCertificate, serverLeaf := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
+	var requests atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		if request.Method != http.MethodGet || request.URL.Path != "/peer/v1/report" {
+			t.Errorf("unexpected discovered peer request %s %s", request.Method, request.URL.Path)
+		}
+		if request.Header.Get("Authorization") != "" {
+			t.Errorf("mTLS-only catalog request carried Authorization: %q", request.Header.Get("Authorization"))
+		}
+		now := time.Now().UTC()
+		expires := now.Add(time.Minute)
+		report := nodecontract.Report{
+			ProtocolVersion: nodecontract.Version{Major: 1}, RequiredFeatures: []string{},
+			Source:      nodecontract.Source{NodeID: "node-b", ProxyInstanceID: strings.Repeat("b", 32), ConfigGeneration: 1},
+			GeneratedAt: now,
+			Capabilities: nodecontract.Capabilities{
+				"catalog_read": "enabled", "diagnostics_read": "disabled", "federation_exchange": "enabled",
+				"artifact_read": "disabled", "artifact_write": "disabled", "config_write": "disabled",
+			},
+			Coverage: "complete", Observations: []nodecontract.Observation{{
+				Identity: nodecontract.ModelIdentity{OwnerNodeID: "node-b", BackendID: "gpu", LocalID: "model"},
+				State:    "supported", ObservedAt: &now, ExpiresAt: &expires, Freshness: "fresh", Coverage: "complete",
+			}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(report); err != nil {
+			t.Errorf("encode test peer report: %v", err)
+		}
+	}))
+	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots}
+	server.StartTLS()
+	defer server.Close()
+
+	membershipDir, grantDir := t.TempDir(), t.TempDir()
+	for _, directory := range []string{membershipDir, grantDir} {
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	members, err := federation.OpenPairingStore(membershipDir, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer members.Close()
+	now := time.Now().UTC()
+	member, err := members.AddMember("node-b", peerCertificateFingerprint(serverLeaf), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, err := federation.OpenCatalogGrantStore(grantDir, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grants.Close()
+	if _, err := grants.GrantCatalogRead(member, now); err != nil {
+		t.Fatal(err)
+	}
+	state := &reloaderState{
+		peer: &config.PeerConfig{NodeID: "node-a", FederationID: "lab.example", Discovery: &config.PeerDiscoveryConfig{
+			Enabled: true, Interface: "lan0", AdvertiseURL: "https://node-a.local:9293",
+		}},
+		certificate: &localCertificate, peerClientCAs: roots,
+		peerClientCRLs: []*x509.RevocationList{newPeerIdentityTestCRL(t, ca, caKey)},
+		pairingStore:   members, catalogGrantStore: grants, peerContext: context.Background(), cacheTTL: time.Minute,
+	}
+	discovered, err := (&Reloader{}).buildDiscoveredPeerClientsWithBrowse(state, func(_ context.Context, settings discovery.Settings, timeout time.Duration) (discovery.CandidateResult, error) {
+		if settings.NodeID != "node-a" || settings.FederationID != "lab.example" || settings.Interface != "lan0" || timeout < 250*time.Millisecond {
+			t.Fatalf("dynamic discovery settings = %+v, timeout %v", settings, timeout)
+		}
+		return discovery.CandidateResult{Candidates: []discovery.Candidate{{
+			NodeID: "node-b", FederationID: "lab.example", PeerURL: server.URL,
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := discovered.clients["node-b"]
+	if client == nil || !client.dynamic || client.token != "" || len(discovered.authorizedIDs) != 1 {
+		t.Fatalf("dynamic peer client set = %+v / %+v", client, discovered)
+	}
+	defer closePeerClients(map[string]*peerClient{"node-b": client})
+	receipt, reason := client.fetch(context.Background())
+	if reason != "" || receipt == nil || receipt.AuthenticatedNodeID != "node-b" || len(receipt.Report.Observations) != 1 {
+		t.Fatalf("mTLS catalog fetch = %#v, reason %q", receipt, reason)
+	}
+	if err := grants.RevokeCatalogRead("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if receipt, reason := client.fetch(context.Background()); receipt != nil || reason != "unavailable" {
+		t.Fatalf("revoked mTLS catalog fetch = %#v, reason %q", receipt, reason)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("report requests after grant revocation = %d, want 1", got)
 	}
 }
 

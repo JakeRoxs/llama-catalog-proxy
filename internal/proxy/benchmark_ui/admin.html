@@ -114,6 +114,24 @@
         </div>
         <div class="pairing-columns grant-section">
           <div>
+            <h3>Explicit catalog-read grants</h3>
+            <p class="small-note">Pairing grants identity only. This separate grant authorizes catalog reports for the paired certificate fingerprint; it does not authorize inference, settings, or path services.</p>
+            <form id="catalog-read-form" class="grant-form">
+              <label for="catalog-read-node">Currently paired node ID</label>
+              <input id="catalog-read-node" required autocomplete="off">
+              <label class="confirm-row"><input id="catalog-read-confirm" type="checkbox" required> I approve catalog metadata access for this paired certificate.</label>
+              <button class="button primary" type="submit">Grant catalog read</button>
+            </form>
+          </div>
+          <div>
+            <h3>Current catalog-read grants</h3>
+            <p id="catalog-grants-unavailable" class="small-note" hidden>Catalog grant store is not configured.</p>
+            <div class="table-wrap"><table><thead><tr><th>Node ID</th><th>Certificate SHA-256</th><th>State</th><th></th></tr></thead><tbody id="catalog-read-grants"></tbody></table></div>
+            <p id="catalog-grants-empty" class="empty" hidden>No catalog-read grants.</p>
+          </div>
+        </div>
+        <div class="pairing-columns grant-section">
+          <div>
             <h3>Owner-approved settings grants</h3>
             <p class="small-note">The static `ManageSettings` peer flag is a hard ceiling. Grants below narrow it to named target/model pairs and never authorize inference.</p>
             <form id="owner-grant-form" class="grant-form">
@@ -191,7 +209,7 @@
           <button id="remote-check-operation" class="button quiet" type="button">Check this operation; do not retry automatically</button>
         </div>
       </section>
-      <footer>Only named model-settings grants can be approved here; pairing never grants them implicitly. Inference and path-service access remain separately scoped.</footer>
+      <footer>Catalog-read and named model-settings grants are explicit local approvals; pairing never grants them implicitly. Inference and path-service access remain separately scoped.</footer>
     </section>
   </main>
 </body>

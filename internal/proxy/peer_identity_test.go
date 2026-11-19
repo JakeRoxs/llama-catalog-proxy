@@ -239,6 +239,80 @@ func TestAuthenticatedPeerRequiresVerifiedMatchingClientIdentity(t *testing.T) {
 	}
 }
 
+func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) {
+	ca, caKey, roots := newPeerIdentityTestCA(t)
+	_, valid := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
+	_, rotated := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
+	membershipDir, grantDir := t.TempDir(), t.TempDir()
+	for _, directory := range []string{membershipDir, grantDir} {
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	members, err := federation.OpenPairingStore(membershipDir, "lab.example", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer members.Close()
+	grants, err := federation.OpenCatalogGrantStore(grantDir, "lab.example", "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grants.Close()
+	now := time.Now().UTC()
+	member, err := members.AddMember("node-b", peerCertificateFingerprint(valid), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &reloaderState{
+		peer:          &config.PeerConfig{NodeID: "owner", FederationID: "lab.example"},
+		peerClientCAs: roots, peerClientCRLs: []*x509.RevocationList{newPeerIdentityTestCRL(t, ca, caKey)},
+		pairingStore: members, catalogGrantStore: grants,
+	}
+	request := httptest.NewRequest(http.MethodGet, "https://peer.example/peer/v1/report", nil)
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{valid}, VerifiedChains: [][]*x509.Certificate{{valid, ca}}}
+	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+		t.Fatal("paired membership without a catalog grant authorized report access")
+	}
+	if _, err := grants.GrantCatalogRead(member, now); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
+		t.Fatalf("explicit mTLS catalog grant denied: %q %v", nodeID, ok)
+	}
+	if _, ok := authenticatedPeer(request, state, peerInference); ok {
+		t.Fatal("catalog grant authorized inference")
+	}
+	request.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
+	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+		t.Fatal("invalid bearer token fell back to mTLS-only authorization")
+	}
+	request.Header.Del("Authorization")
+	if _, err := members.AddMember("node-b", peerCertificateFingerprint(rotated), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotated}, VerifiedChains: [][]*x509.Certificate{{rotated, ca}}}
+	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+		t.Fatal("certificate rotation inherited the previous catalog grant")
+	}
+	rotatedMember, ok, err := members.LookupMember("node-b")
+	if err != nil || !ok {
+		t.Fatalf("rotated membership lookup = %+v, %v, %v", rotatedMember, ok, err)
+	}
+	if _, err := grants.GrantCatalogRead(rotatedMember, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
+		t.Fatalf("re-granted rotated identity denied: %q %v", nodeID, ok)
+	}
+	if err := grants.RevokeCatalogRead("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+		t.Fatal("revoked catalog grant remained authorized")
+	}
+}
+
 func TestCurrentCRLBlocksIdentityFromRestoredOldMembershipSnapshot(t *testing.T) {
 	ca, caKey, roots := newPeerIdentityTestCA(t)
 	_, leaf := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")

@@ -203,13 +203,14 @@ async function loadPairing(roles) {
   panel.hidden = !allowed;
   if (!allowed) return;
   try {
-    const [members, invitations, grants, audit] = await Promise.all([
+    const [members, invitations, grants, catalogGrants, audit] = await Promise.all([
       pairingRequest("/admin/api/v1/federation/members"),
       pairingRequest("/admin/api/v1/federation/invitations"),
       pairingRequest("/admin/api/v1/federation/grants").catch(() => null),
+      pairingRequest("/admin/api/v1/federation/catalog-grants").catch(() => null),
       pairingRequest("/admin/api/v1/audit/events?limit=50").catch(() => null),
     ]);
-    renderPairing(members, invitations, grants, audit);
+    renderPairing(members, invitations, grants, catalogGrants, audit);
   } catch {
     pairingNotice("Pairing state is unavailable on this node.", true);
   }
@@ -499,7 +500,7 @@ function enableRemoteSettingsAfterTerminal() {
   for (const element of byId("remote-settings-form").querySelectorAll("input,select,button")) element.disabled = false;
 }
 
-function renderPairing(memberData, invitationData, grantData, auditData) {
+function renderPairing(memberData, invitationData, grantData, catalogGrantData, auditData) {
   const members = byId("paired-members");
   members.replaceChildren();
   const list = memberData.members || [];
@@ -578,6 +579,36 @@ function renderPairing(memberData, invitationData, grantData, auditData) {
     grantsTable.append(row);
   }
 
+  const catalogTable = byId("catalog-read-grants");
+  catalogTable.replaceChildren();
+  const catalogGrants = catalogGrantData?.grants || [];
+  const catalogGrantsReady = catalogGrantData?.state === "available";
+  byId("catalog-read-form").hidden = !catalogGrantsReady;
+  byId("catalog-grants-unavailable").hidden = catalogGrantsReady;
+  byId("catalog-grants-empty").hidden = !catalogGrantsReady || catalogGrants.length !== 0;
+  for (const grant of catalogGrants) {
+    const row = document.createElement("tr");
+    const node = document.createElement("td");
+    const fingerprint = document.createElement("td");
+    const state = document.createElement("td");
+    const action = document.createElement("td");
+    const revoke = document.createElement("button");
+    node.textContent = grant.node_id;
+    fingerprint.textContent = grant.certificate_sha256;
+    state.textContent = grant.active ? "Active for paired certificate" : "Inactive; re-grant after pairing certificate rotation";
+    revoke.type = "button";
+    revoke.className = "button quiet";
+    revoke.textContent = "Revoke catalog read";
+    revoke.addEventListener("click", () => {
+      if (window.confirm(`Revoke catalog read for ${grant.node_id}? This does not revoke identity membership.`)) {
+        void removeCatalogGrant(grant.node_id);
+      }
+    });
+    action.append(revoke);
+    row.append(node, fingerprint, state, action);
+    catalogTable.append(row);
+  }
+
   const auditTable = byId("audit-events");
   auditTable.replaceChildren();
   if (!auditData || auditData.state !== "available") {
@@ -602,6 +633,34 @@ function renderPairing(memberData, invitationData, grantData, auditData) {
     outcome.textContent = `${event.phase}: ${event.outcome}`;
     row.append(time, actor, action, target, outcome);
     auditTable.append(row);
+  }
+}
+
+async function removeCatalogGrant(nodeID) {
+  try {
+    await pairingRequest(`/admin/api/v1/federation/catalog-grants/${encodeURIComponent(nodeID)}`, "DELETE");
+    pairingNotice("Catalog-read grant revoked; identity membership remains.");
+    await refreshDashboard();
+  } catch {
+    pairingNotice("Catalog grant revocation outcome may be unknown. Refresh the grant list before retrying.", true);
+  }
+}
+
+async function createCatalogGrant(event) {
+  event.preventDefault();
+  if (!byId("catalog-read-confirm").checked) {
+    pairingNotice("Explicit catalog-read grant confirmation is required.", true);
+    return;
+  }
+  const nodeID = byId("catalog-read-node").value.trim();
+  try {
+    await pairingRequest("/admin/api/v1/federation/catalog-grants", "POST", { node_id: nodeID });
+    byId("catalog-read-node").value = "";
+    byId("catalog-read-confirm").checked = false;
+    pairingNotice("Catalog read approved for the current paired certificate; pairing itself grants no scopes.");
+    await refreshDashboard();
+  } catch {
+    pairingNotice("Catalog grant outcome may be unknown. Refresh the grant list before retrying.", true);
   }
 }
 
@@ -716,6 +775,7 @@ byId("invite-form").addEventListener("submit", createInvitation);
 byId("join-form").addEventListener("submit", joinWithInvitation);
 byId("copy-invitation").addEventListener("click", copyInvitation);
 byId("owner-grant-form").addEventListener("submit", createOwnerGrant);
+byId("catalog-read-form").addEventListener("submit", createCatalogGrant);
 byId("remote-grant-load").addEventListener("submit", loadRemoteGrants);
 byId("remote-grant-select").addEventListener("change", populateRemoteModels);
 byId("remote-load-snapshot").addEventListener("click", loadRemoteSnapshot);

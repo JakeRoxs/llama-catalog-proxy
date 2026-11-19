@@ -37,7 +37,8 @@ The optional HTTPS peer listener serves `GET /peer/v1/report` and `POST /peer/v1
 Reports export cached catalog
 IDs from explicitly selected local backends; it does not refresh catalogs or contact backends.
 Caches are populated by normal client catalog requests. Missing and incomplete evidence remains
-unknown or partial. There is no peer discovery or recursive report forwarding.
+unknown or partial. Optional mDNS discovery lists untrusted candidates only; reports are not forwarded
+recursively.
 
 ```yaml
 peer:
@@ -69,6 +70,73 @@ both directions default to false.
 `diagnostics_read: true` separately permits that peer to receive backend readiness evidence in
 reports; it requires `catalog_read: true` and defaults to false. It does not grant access to the
 local diagnostics API or other diagnostic data.
+
+For the current manual onboarding flow, choose stable node IDs first, configure and verify each
+node's certificate identity/trust and peer listener reachability, then exchange inbound and outbound
+tokens out of band. The local `token` authorizes the remote node's requests to this node; the local
+`outbound_token` is sent to the remote node and must match its `token`. Reciprocal links use distinct
+tokens for the two directions. Enable only the scopes needed in each direction, configure the
+counterpart independently, and pair identities separately; pairing alone does not create grants.
+Validate the local file with `--check-config` and inspect a secret-free handoff summary with:
+
+```sh
+llama-catalog-proxy peer config plan --config /config/config.yaml
+```
+
+The planner reads and validates the existing configuration through the canonical config loader. It
+reports configured directions, scope names, and counterpart field names, but does not show URLs,
+credentials, or certificate paths, modify configuration, verify the other node's configuration, or
+establish trust.
+
+When `peer` is configured, `node_id`, `listen`, `tls_cert_file`, and `tls_key_file` are required;
+`local_backends` and `peers` may be empty. `federation_id` opts into mTLS identity membership and
+requires the local client CA/CRL files plus protected membership and audit directories. For each
+peer grant, `token` is needed for inbound requests and `url` plus `outbound_token` for outbound
+requests. Outside federation mTLS, outbound `ca_file` may be omitted only when system TLS roots are
+appropriate. Federation mTLS requires both peer `ca_file` and `crl_file`. Every operation scope
+defaults off; path service access/routes, owner-management grants, aliases, and backend ownership are
+separately configured features.
+
+Optional mDNS/DNS-SD candidate advertisements and browsing require a federation-enabled peer listener
+and a selected multicast interface. Configure `peer.discovery` explicitly on each node:
+
+```yaml
+peer:
+  catalog_grant_directory: /var/lib/catalog-proxy/catalog-grants
+  discovery:
+    enabled: true
+    interface: eth0
+    advertise_url: https://proxy-a.local:9293
+```
+
+`advertise_url` is that node's own HTTPS peer-listener origin; its port must match `peer.listen`, and
+the URL host must match a DNS/IP subject alternative name on the peer certificate. It is announced
+only on the selected interface. List up to 64 candidates with
+`llama-catalog-proxy peer discover --config /config/config.yaml`; its JSON `truncated` field reports
+when more results may be available. Discovery output is untrusted and does not enroll a member, create
+credentials, configure a peer grant, or activate inference/path/settings routes. Pair using
+`peer join --discover-node-id <node-id>` and a protected one-time invitation. The proxy starts its
+advertisement only when the feature is enabled; if the selected interface cannot advertise, it logs a
+warning and continues without discovery. Changes to the discovery settings require a proxy restart.
+The separate `catalog_grant_directory` must be owner-only (mode `0700`); its grant file is mode `0600`.
+To poll paired members
+without static peer URLs or bearer credentials, each receiving node must also grant `catalog_read`
+explicitly through the federation admin UI or the local CLI:
+
+```sh
+llama-catalog-proxy peer catalog-grants create --node-id node-b --acknowledge
+```
+
+Grant on both sides for bidirectional catalog exchange. These grants bind to the current paired
+certificate fingerprint; certificate rotation requires a fresh grant. Inference, diagnostics,
+settings, and path-service access are not implied. When a matching static outbound `PeerGrant` URL is
+present it remains the polling source; remove that static URL to use the dynamically discovered mDNS
+endpoint. Static token/scope grants remain available for other peer operations.
+
+mDNS is link-local. Default Docker bridge networks generally do not forward multicast between hosts,
+and a container's bridge address may not be reachable from another host. Cross-host discovery in the
+current Docker deployment therefore remains unverified; a host-networked listener or suitable
+multicast-capable network/sidecar is required. No deployment or host networking changes are included.
 
 #### Optional operator-CA mutual TLS identity
 
@@ -102,6 +170,7 @@ peer:
   crl_max_age: 24h
   membership_directory: /var/lib/llama-catalog-proxy/federation
   audit_directory: /var/lib/llama-catalog-proxy/audit
+  catalog_grant_directory: /var/lib/llama-catalog-proxy/catalog-grants
   tls_cert_file: /config/node-a-cert.pem
   tls_key_file: /config/node-a-key.pem
 ```
@@ -112,12 +181,14 @@ peer, `ca_file` and `crl_file` verify that peer's server chain and revocation; t
 as the client identity (include required intermediate certificates after the leaf in the PEM
 certificate file). Both sides check the exact federation/node URI and the paired certificate
 fingerprint. Outbound mTLS peer transports do not reuse connections, so a membership removal or CA
-rotation is checked on the next request. The receiver also matches the client identity to the node ID
-authorized by its bearer token. The bearer token remains required and
-continues to determine the independently configured operation scopes; a certificate alone grants no
-catalog, inference, diagnostics, settings, or path-service permission. There is no bearer-only fallback
-when `federation_id` is configured. Existing peers must be provisioned with certificates before
-enabling this mode on either side.
+rotation is checked on the next request. Static `PeerGrant` requests still require their bearer token
+and independently configured scope. For dynamic catalog polling only, the receiver accepts a
+bearer-free `/peer/v1/report` request when the mTLS identity is currently paired and an explicit
+`catalog_read` grant matches that certificate fingerprint in the separate protected catalog grant
+store. This grant cannot authorize diagnostics, inference, settings, or path services; pairing alone
+still grants nothing. Remove a static outbound URL for a node when using its dynamically discovered
+catalog endpoint. Existing peers must be provisioned with certificates before enabling mTLS on either
+side.
 
 Use short-lived certificates (maximum 30 days) and current CA-signed CRL bundles. Every issuing CA in
 the chain must have a signed CRL in the configured bundle; missing, untrusted, revoked, future-dated,
@@ -207,10 +278,27 @@ proxy service account, which must own the protected membership directory:
 llama-catalog-proxy peer invite create --config /config/config.yaml --node-id node-b
 llama-catalog-proxy peer invite list --config /config/config.yaml
 llama-catalog-proxy peer join --config /config/config.yaml --url https://node-a.example \
+  --expected-node-id node-a \
   --invitation-file /run/private/node-a-invitation.json
 llama-catalog-proxy peer members list --config /config/config.yaml
 llama-catalog-proxy peer members revoke --config /config/config.yaml --node-id node-b
 ```
+
+When mDNS discovery is enabled, `peer join` can select a candidate without manually supplying its
+URL:
+
+```sh
+llama-catalog-proxy peer join --config /config/config.yaml --discover-node-id node-a \
+  --invitation-file /run/private/node-a-invitation.json
+```
+
+The selected node ID is checked against the peer's TLS identity before the invitation is submitted.
+Pairing still requires the protected one-time invitation; truncated candidate lists and ambiguous
+multiple endpoints for one node ID are rejected. This avoids manually supplying the URL for pairing,
+but it does not itself grant catalog access. With `catalog_grant_directory` configured, report clients
+are created automatically for currently paired identities that have an active, separate catalog-read
+grant; endpoints are resolved from mDNS during refresh. A static outbound `PeerGrant` takes precedence
+for its node. Inference and other operation routes remain separately configured.
 
 The `invite create` JSON output includes the one-time secret code. Transfer it out of band and keep
 any temporary file owner-only (for example, create it under `umask 077`). `peer join` accepts either
@@ -219,11 +307,12 @@ secret as a command-line argument. The web panel displays a new code only once, 
 list never returns codes. Create and join actions use the same pairing store as the CLI, so concurrent
 operations serialize safely across processes.
 
-Both interfaces perform only identity pairing. They do not add peer scope grants or change static
-bearer-token configuration; authorized operations remain separately configured. Revoking a paired
-member immediately blocks it locally and prevents re-pairing with that revoked certificate. Also
-remove or rotate its configured bearer grant and follow the operator PKI's revocation procedure for
-complete credential revocation.
+Both interfaces perform only identity pairing. They do not add catalog-read or other operation grants.
+An administrator must explicitly grant catalog read through the admin panel or `peer catalog-grants`
+CLI; static bearer-token and operation grants remain separately configured. Revoking a paired member
+immediately blocks it locally and prevents re-pairing with that revoked certificate. Also revoke any
+active catalog-read grant, remove or rotate configured static bearer grants, and follow the operator
+PKI's revocation procedure for complete credential revocation.
 
 Readiness evidence is limited to the last completed local `/ready` health check for each explicitly
 owned backend. Peer reports do not trigger probes. Before a check the status is `unknown`; canceled

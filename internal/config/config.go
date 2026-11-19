@@ -132,21 +132,29 @@ type ManagementTarget struct {
 
 // PeerConfig describes the opt-in HTTPS listener and explicitly configured peers.
 type PeerConfig struct {
-	NodeID              string               `yaml:"node_id"`
-	Listen              string               `yaml:"listen"`
-	TLSCertFile         string               `yaml:"tls_cert_file"`
-	TLSKeyFile          string               `yaml:"tls_key_file"`
-	FederationID        string               `yaml:"federation_id,omitempty"`
-	ClientCAFile        string               `yaml:"client_ca_file,omitempty"`
-	ClientCRLFile       string               `yaml:"client_crl_file,omitempty"`
-	CRLMaxAge           string               `yaml:"crl_max_age,omitempty"`
-	MembershipDirectory string               `yaml:"membership_directory,omitempty"`
-	AuditDirectory      string               `yaml:"audit_directory,omitempty"`
-	LocalBackends       []string             `yaml:"local_backends"`
-	ManagementTargets   map[string]string    `yaml:"management_targets,omitempty"`
-	RouteAliases        []string             `yaml:"route_aliases,omitempty"`
-	ExposedPathRoutes   map[string]string    `yaml:"exposed_path_routes,omitempty"`
-	Peers               map[string]PeerGrant `yaml:"peers"`
+	NodeID                string               `yaml:"node_id"`
+	Listen                string               `yaml:"listen"`
+	TLSCertFile           string               `yaml:"tls_cert_file"`
+	TLSKeyFile            string               `yaml:"tls_key_file"`
+	FederationID          string               `yaml:"federation_id,omitempty"`
+	ClientCAFile          string               `yaml:"client_ca_file,omitempty"`
+	ClientCRLFile         string               `yaml:"client_crl_file,omitempty"`
+	CRLMaxAge             string               `yaml:"crl_max_age,omitempty"`
+	MembershipDirectory   string               `yaml:"membership_directory,omitempty"`
+	AuditDirectory        string               `yaml:"audit_directory,omitempty"`
+	CatalogGrantDirectory string               `yaml:"catalog_grant_directory,omitempty"`
+	LocalBackends         []string             `yaml:"local_backends"`
+	ManagementTargets     map[string]string    `yaml:"management_targets,omitempty"`
+	RouteAliases          []string             `yaml:"route_aliases,omitempty"`
+	ExposedPathRoutes     map[string]string    `yaml:"exposed_path_routes,omitempty"`
+	Discovery             *PeerDiscoveryConfig `yaml:"discovery,omitempty"`
+	Peers                 map[string]PeerGrant `yaml:"peers"`
+}
+
+type PeerDiscoveryConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Interface    string `yaml:"interface"`
+	AdvertiseURL string `yaml:"advertise_url"`
 }
 
 type PeerGrant struct {
@@ -410,6 +418,7 @@ func validatePeerAuditStoreSeparation(c Config) error {
 		return nil
 	}
 	auditDirectory := c.Peer.AuditDirectory
+	catalogGrantDirectory := c.Peer.CatalogGrantDirectory
 	var directories []string
 	if c.Peer.MembershipDirectory != "" {
 		directories = append(directories, c.Peer.MembershipDirectory)
@@ -442,6 +451,12 @@ func validatePeerAuditStoreSeparation(c Config) error {
 		if containsPath(auditDirectory, directory) || containsPath(directory, auditDirectory) {
 			return errors.New("audit directory must be separate from membership, grants, proposals, operations, and other stores")
 		}
+		if catalogGrantDirectory != "" && (containsPath(catalogGrantDirectory, directory) || containsPath(directory, catalogGrantDirectory)) {
+			return errors.New("catalog grant directory must be separate from membership, audit, and other stores")
+		}
+	}
+	if catalogGrantDirectory != "" && (containsPath(catalogGrantDirectory, auditDirectory) || containsPath(auditDirectory, catalogGrantDirectory)) {
+		return errors.New("catalog grant directory must be separate from audit directory")
 	}
 	return nil
 }
@@ -888,6 +903,9 @@ func validatePeer(c Config) error {
 	if p.AuditDirectory != "" && (!filepath.IsAbs(p.AuditDirectory) || filepath.Clean(p.AuditDirectory) != p.AuditDirectory) {
 		return errors.New("peer audit_directory must be an absolute clean path")
 	}
+	if p.CatalogGrantDirectory != "" && (!filepath.IsAbs(p.CatalogGrantDirectory) || filepath.Clean(p.CatalogGrantDirectory) != p.CatalogGrantDirectory) {
+		return errors.New("peer catalog_grant_directory must be an absolute clean path")
+	}
 	if p.FederationID != "" {
 		if !validFederationID(p.FederationID) || strings.TrimSpace(p.ClientCAFile) == "" ||
 			strings.TrimSpace(p.ClientCRLFile) == "" || !filepath.IsAbs(p.ClientCRLFile) || filepath.Clean(p.ClientCRLFile) != p.ClientCRLFile ||
@@ -903,6 +921,46 @@ func validatePeer(c Config) error {
 		}
 	} else if p.ClientCAFile != "" || p.ClientCRLFile != "" || p.MembershipDirectory != "" || p.CRLMaxAge != "" {
 		return errors.New("peer client trust files, membership_directory, and crl_max_age require federation_id")
+	}
+	if p.Discovery != nil && p.Discovery.Enabled {
+		if p.FederationID == "" || len(p.FederationID) > 241 || p.CatalogGrantDirectory == "" {
+			return errors.New("peer discovery requires mTLS federation identity and catalog_grant_directory")
+		}
+		iface := p.Discovery.Interface
+		if iface == "" || len(iface) > 64 || strings.TrimSpace(iface) != iface || strings.ContainsAny(iface, `/\\`) {
+			return errors.New("peer discovery requires a valid multicast interface name")
+		}
+		discoveryURL, err := url.Parse(p.Discovery.AdvertiseURL)
+		if err != nil || len(p.Discovery.AdvertiseURL) > 246 || discoveryURL == nil || discoveryURL.Scheme != "https" ||
+			discoveryURL.Hostname() == "" || discoveryURL.User != nil || discoveryURL.Opaque != "" ||
+			(discoveryURL.Path != "" && discoveryURL.Path != "/") || discoveryURL.RawPath != "" ||
+			discoveryURL.RawQuery != "" || discoveryURL.ForceQuery || discoveryURL.Fragment != "" ||
+			discoveryURL.RawFragment != "" || strings.TrimSpace(p.Discovery.AdvertiseURL) != p.Discovery.AdvertiseURL {
+			return errors.New("peer discovery advertise_url must be an HTTPS origin without credentials, path, query, or fragment")
+		}
+		_, listenPort, _ := net.SplitHostPort(p.Listen)
+		advertisePort := discoveryURL.Port()
+		if advertisePort == "" {
+			advertisePort = "443"
+		}
+		if advertisePort != listenPort {
+			return errors.New("peer discovery advertise_url port must match peer listen port")
+		}
+		discoveryHost := strings.ToLower(discoveryURL.Hostname())
+		if ip := net.ParseIP(discoveryHost); ip != nil {
+			if !ip.IsPrivate() || ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+				return errors.New("peer discovery advertise_url IP must be a private unicast address")
+			}
+		} else if !validFederationID(discoveryHost) || !strings.HasSuffix(discoveryHost, ".local") {
+			return errors.New("peer discovery advertise_url hostname must use the .local domain")
+		}
+	}
+	if p.CatalogGrantDirectory != "" && (p.FederationID == "" || p.Discovery == nil || !p.Discovery.Enabled) {
+		return errors.New("peer catalog_grant_directory requires federation mTLS and enabled discovery")
+	}
+	if p.CatalogGrantDirectory != "" && (containsPath(p.CatalogGrantDirectory, p.MembershipDirectory) ||
+		containsPath(p.MembershipDirectory, p.CatalogGrantDirectory)) {
+		return errors.New("peer catalog grant and membership directories must be separate")
 	}
 	if len(p.LocalBackends) > 256 || len(p.Peers) > 32 || len(p.RouteAliases) > 32 || len(p.ExposedPathRoutes) > 32 {
 		return errors.New("too many peer backends, grants, aliases, or exposed path routes")

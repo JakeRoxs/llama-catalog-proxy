@@ -435,7 +435,14 @@ func (s *PairingStore) RemoveInvitation(nodeID string) error {
 }
 
 func (s *PairingStore) Join(ctx context.Context, endpoint, code string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (Membership, error) {
+	return s.JoinExpected(ctx, endpoint, "", code, certificate, roots, crls, maxCRLAge)
+}
+
+func (s *PairingStore) JoinExpected(ctx context.Context, endpoint, expectedNodeID, code string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (Membership, error) {
 	if !validInvitationCode(code) || roots == nil || len(crls) == 0 || len(certificate.Certificate) == 0 {
+		return Membership{}, ErrInvitation
+	}
+	if expectedNodeID != "" && !identity.ValidNodeID(expectedNodeID) {
 		return Membership{}, ErrInvitation
 	}
 	origin, err := validEndpoint(endpoint)
@@ -463,7 +470,7 @@ func (s *PairingStore) Join(ctx context.Context, endpoint, code string, certific
 					return ErrInvitation
 				}
 				remoteID, err := PeerIdentityNodeID(state.PeerCertificates[0], s.federationID)
-				if err != nil {
+				if err != nil || (expectedNodeID != "" && remoteID != expectedNodeID) {
 					return ErrInvitation
 				}
 				revoked, err := s.IsCertificateRevoked(remoteID, CertificateFingerprint(state.PeerCertificates[0]))
@@ -505,7 +512,8 @@ func (s *PairingStore) Join(ctx context.Context, endpoint, code string, certific
 		PairedAt     time.Time `json:"paired_at"`
 	}
 	if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.State != "paired" ||
-		result.FederationID != s.federationID || result.NodeID != s.localNodeID || !identity.ValidNodeID(result.LocalNodeID) {
+		result.FederationID != s.federationID || result.NodeID != s.localNodeID || !identity.ValidNodeID(result.LocalNodeID) ||
+		(expectedNodeID != "" && result.LocalNodeID != expectedNodeID) {
 		return Membership{}, ErrInvitation
 	}
 	serverCert := response.TLS.PeerCertificates[0]

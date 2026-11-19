@@ -21,6 +21,7 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/auditlog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/diagnostics"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/discovery"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modeldiagnostics"
@@ -31,40 +32,45 @@ import (
 const defaultWatchInterval = 2 * time.Second
 
 type Reloader struct {
-	path               string
-	interval           time.Duration
-	logger             *slog.Logger
-	onReload           func(config.Config)
-	state              atomic.Pointer[reloaderState]
-	peerListen         string
-	peerNodeID         string
-	peerFederationID   string
-	peerMembershipDir  string
-	peerAuditDir       string
-	pairingStore       *federation.PairingStore
-	auditStore         *auditlog.Store
-	managementListen   string
-	managementSlots    chan struct{}
-	delegatedStores    *config.DelegatedStoreConfig
-	benchmark          *benchmarkRuntime
-	adminAuth          *adminAuth
-	managementUIConfig *config.ManagementUIConfig
-	ingestion          *ingestionRuntime
-	instanceID         string
-	peerSlots          chan struct{}
-	peerInferenceSlots chan struct{}
-	peerPathSlots      chan struct{}
-	peerWake           chan struct{}
-	stop               chan struct{}
-	lifecycleMu        sync.Mutex
-	started            bool
-	stopped            bool
-	wg                 sync.WaitGroup
-	lastHash           [sha256.Size]byte
+	path                string
+	interval            time.Duration
+	logger              *slog.Logger
+	onReload            func(config.Config)
+	state               atomic.Pointer[reloaderState]
+	peerListen          string
+	peerNodeID          string
+	peerFederationID    string
+	peerMembershipDir   string
+	peerAuditDir        string
+	peerCatalogGrantDir string
+	peerDiscovery       *config.PeerDiscoveryConfig
+	mdnsAdvertiser      *discovery.Advertiser
+	pairingStore        *federation.PairingStore
+	catalogGrantStore   *federation.CatalogGrantStore
+	auditStore          *auditlog.Store
+	managementListen    string
+	managementSlots     chan struct{}
+	delegatedStores     *config.DelegatedStoreConfig
+	benchmark           *benchmarkRuntime
+	adminAuth           *adminAuth
+	managementUIConfig  *config.ManagementUIConfig
+	ingestion           *ingestionRuntime
+	instanceID          string
+	peerSlots           chan struct{}
+	peerInferenceSlots  chan struct{}
+	peerPathSlots       chan struct{}
+	peerWake            chan struct{}
+	stop                chan struct{}
+	lifecycleMu         sync.Mutex
+	started             bool
+	stopped             bool
+	wg                  sync.WaitGroup
+	lastHash            [sha256.Size]byte
 	// lastReloadError is the last reload failure that was logged. Identical
 	// failures are suppressed so a broken config does not flood the logs;
 	// retries continue on every watch tick.
-	lastReloadError error
+	lastReloadError        error
+	lastPeerDiscoveryError string
 }
 
 type reloaderState struct {
@@ -76,6 +82,7 @@ type reloaderState struct {
 	peerClientCAs         *x509.CertPool
 	peerClientCRLs        []*x509.RevocationList
 	pairingStore          *federation.PairingStore
+	catalogGrantStore     *federation.CatalogGrantStore
 	auditStore            *auditlog.Store
 	management            *config.ManagementConfig
 	managementCertificate *tls.Certificate
@@ -111,6 +118,9 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		if !initialized && r.pairingStore != nil {
 			_ = r.pairingStore.Close()
 		}
+		if !initialized && r.catalogGrantStore != nil {
+			_ = r.catalogGrantStore.Close()
+		}
 		if !initialized && r.auditStore != nil {
 			_ = r.auditStore.Close()
 		}
@@ -132,6 +142,10 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		}
 		r.instanceID = hex.EncodeToString(id)
 		r.peerListen, r.peerNodeID = cfg.Peer.Listen, cfg.Peer.NodeID
+		if cfg.Peer.Discovery != nil {
+			discoveryConfig := *cfg.Peer.Discovery
+			r.peerDiscovery = &discoveryConfig
+		}
 		certificate, err = loadPeerCertificate(cfg.Peer)
 		if err != nil {
 			return nil, config.Config{}, err
@@ -142,6 +156,13 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 			r.pairingStore, err = federation.OpenPairingStore(cfg.Peer.MembershipDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
 			if err != nil {
 				return nil, config.Config{}, fmt.Errorf("open peer membership store: %w", err)
+			}
+		}
+		if cfg.Peer.Discovery != nil && cfg.Peer.Discovery.Enabled {
+			r.peerCatalogGrantDir = cfg.Peer.CatalogGrantDirectory
+			r.catalogGrantStore, err = federation.OpenCatalogGrantStore(cfg.Peer.CatalogGrantDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
+			if err != nil {
+				return nil, config.Config{}, fmt.Errorf("open peer catalog grant store: %w", err)
 			}
 		}
 		if cfg.Peer.AuditDirectory != "" {
@@ -169,11 +190,15 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		if r.pairingStore != nil {
 			_ = r.pairingStore.Close()
 		}
+		if r.catalogGrantStore != nil {
+			_ = r.catalogGrantStore.Close()
+		}
 		if r.auditStore != nil {
 			_ = r.auditStore.Close()
 		}
 		return nil, config.Config{}, err
 	}
+	state.catalogGrantStore = r.catalogGrantStore
 	r.state.Store(state)
 	digest, err := configDigest(path)
 	if err != nil {
@@ -181,6 +206,9 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		closePeerClients(state.peerClients)
 		if r.pairingStore != nil {
 			_ = r.pairingStore.Close()
+		}
+		if r.catalogGrantStore != nil {
+			_ = r.catalogGrantStore.Close()
 		}
 		if r.auditStore != nil {
 			_ = r.auditStore.Close()
@@ -194,6 +222,9 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		closePeerClients(state.peerClients)
 		if r.pairingStore != nil {
 			_ = r.pairingStore.Close()
+		}
+		if r.catalogGrantStore != nil {
+			_ = r.catalogGrantStore.Close()
 		}
 		if r.auditStore != nil {
 			_ = r.auditStore.Close()
@@ -217,6 +248,18 @@ func (r *Reloader) Start() {
 		return
 	}
 	r.started = true
+	if r.peerDiscovery != nil && r.peerDiscovery.Enabled {
+		advertiser, err := discovery.Start(discovery.Settings{
+			NodeID: r.peerNodeID, FederationID: r.peerFederationID,
+			Interface: r.peerDiscovery.Interface, AdvertiseURL: r.peerDiscovery.AdvertiseURL,
+		})
+		if err != nil {
+			r.logger.Warn("peer mDNS advertisement unavailable; continuing without discovery", "error", err)
+		} else {
+			r.mdnsAdvertiser = advertiser
+			r.logger.Info("peer mDNS candidate advertisement started", "node_id", r.peerNodeID, "interface", r.peerDiscovery.Interface)
+		}
+	}
 	r.wg.Add(2)
 	go r.watch()
 	go r.watchPeers()
@@ -224,12 +267,20 @@ func (r *Reloader) Start() {
 
 func (r *Reloader) Stop() {
 	r.lifecycleMu.Lock()
+	var advertiser *discovery.Advertiser
 	if !r.stopped {
 		r.stopped = true
 		close(r.stop)
 		r.state.Load().peerCancel()
+		advertiser = r.mdnsAdvertiser
+		r.mdnsAdvertiser = nil
 	}
 	r.lifecycleMu.Unlock()
+	if advertiser != nil {
+		if err := advertiser.Close(); err != nil {
+			r.logger.Warn("peer mDNS advertisement shutdown failed", "error", err)
+		}
+	}
 	if r.benchmark != nil {
 		r.benchmark.jobs.Stop()
 	}
@@ -248,6 +299,11 @@ func (r *Reloader) Stop() {
 	if r.auditStore != nil {
 		if err := r.auditStore.Close(); err != nil {
 			r.logger.Error("peer audit store shutdown failed", "error", err)
+		}
+	}
+	if r.catalogGrantStore != nil {
+		if err := r.catalogGrantStore.Close(); err != nil {
+			r.logger.Error("peer catalog grant store shutdown failed", "error", err)
 		}
 	}
 }
@@ -340,6 +396,20 @@ func (r *Reloader) reload() error {
 	if !reflect.DeepEqual(cfg.ManagementUI, r.managementUIConfig) {
 		return errors.New("changing management_ui authentication requires a restart")
 	}
+	var peerDiscovery *config.PeerDiscoveryConfig
+	if cfg.Peer != nil {
+		peerDiscovery = cfg.Peer.Discovery
+	}
+	if !reflect.DeepEqual(peerDiscovery, r.peerDiscovery) {
+		return errors.New("changing peer discovery configuration requires a restart")
+	}
+	var catalogGrantDirectory string
+	if cfg.Peer != nil {
+		catalogGrantDirectory = cfg.Peer.CatalogGrantDirectory
+	}
+	if catalogGrantDirectory != r.peerCatalogGrantDir {
+		return errors.New("changing peer catalog grant directory requires a restart")
+	}
 	var ingestionConfig *config.IngestionConfig
 	if cfg.Management != nil {
 		ingestionConfig = cfg.Management.Ingestion
@@ -362,7 +432,8 @@ func (r *Reloader) reload() error {
 		if r.peerListen == "" || cfg.Peer.Listen != r.peerListen || cfg.Peer.NodeID != r.peerNodeID {
 			return errors.New("enabling peer listener or changing its address or node ID requires a restart")
 		}
-		if cfg.Peer.FederationID != r.peerFederationID || cfg.Peer.MembershipDirectory != r.peerMembershipDir || cfg.Peer.AuditDirectory != r.peerAuditDir {
+		if cfg.Peer.FederationID != r.peerFederationID || cfg.Peer.MembershipDirectory != r.peerMembershipDir ||
+			cfg.Peer.AuditDirectory != r.peerAuditDir || cfg.Peer.CatalogGrantDirectory != r.peerCatalogGrantDir {
 			return errors.New("changing peer federation identity or protected state directories requires a restart")
 		}
 		certificate, err = loadPeerCertificate(cfg.Peer)
@@ -408,6 +479,7 @@ func (r *Reloader) reload() error {
 		r.lifecycleMu.Unlock()
 		return err
 	}
+	state.catalogGrantStore = r.catalogGrantStore
 	r.state.Store(state)
 	old.peerCancel()
 	closePeerClients(old.peerClients)

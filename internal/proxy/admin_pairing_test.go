@@ -99,6 +99,103 @@ func TestAdminPairingInvitationRequiresRoleAndCSRFAndNeverListsCode(t *testing.T
 	}
 }
 
+func TestAdminCatalogReadGrantRequiresRoleCSRFAndPairedFingerprint(t *testing.T) {
+	root := t.TempDir()
+	membershipDir, grantDir := filepath.Join(root, "membership"), filepath.Join(root, "catalog-grants")
+	for _, directory := range []string{membershipDir, grantDir} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	members, err := federation.OpenPairingStore(membershipDir, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer members.Close()
+	grants, err := federation.OpenCatalogGrantStore(grantDir, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grants.Close()
+	if _, err := members.AddMember("node-b", strings.Repeat("a", 64), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	audit := newTestAuditStore(t, "node-a")
+	defer audit.Close()
+	logger := discardLogger()
+	adminAuth, err := newAdminAuth(&config.ManagementUIConfig{
+		IssuerURL: "https://identity.example", ClientID: "catalog", ClientSecret: strings.Repeat("c", 32),
+		RedirectURL: "https://catalog.example/admin/auth/callback",
+		RoleGroups:  map[string][]string{"view": {"viewers"}, "administer_federation": {"federation-admins"}},
+	}, logger, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	adminAuth.sessions["viewer-session"] = adminSession{subject: "viewer", roles: []string{"view"}, csrf: "viewer-csrf", lastSeen: now, expiresAt: now.Add(time.Hour)}
+	adminAuth.sessions["admin-session"] = adminSession{subject: "operator", roles: []string{"administer_federation"}, csrf: "admin-csrf", lastSeen: now, expiresAt: now.Add(time.Hour)}
+	reloader := &Reloader{logger: logger, adminAuth: adminAuth, auditStore: audit}
+	reloader.state.Store(&reloaderState{
+		peer:         &config.PeerConfig{NodeID: "node-a", FederationID: "lab.example"},
+		pairingStore: members, catalogGrantStore: grants, auditStore: audit,
+	})
+
+	request := func(method, path, session, csrf, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "https://catalog.example"+path, strings.NewReader(body))
+		req.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: session})
+		if method != http.MethodGet {
+			req.Header.Set("Origin", "https://catalog.example")
+			req.Header.Set("Content-Type", "application/json")
+			if csrf != "" {
+				req.Header.Set(adminCSRFHeader, csrf)
+			}
+		}
+		response := httptest.NewRecorder()
+		reloader.ServeHTTP(response, req)
+		return response
+	}
+	base := adminPairingPath + "/catalog-grants"
+	if response := request(http.MethodPost, base, "viewer-session", "viewer-csrf", `{"node_id":"node-b"}`); response.Code != http.StatusForbidden {
+		t.Fatalf("viewer grant status = %d", response.Code)
+	}
+	if response := request(http.MethodPost, base, "admin-session", "", `{"node_id":"node-b"}`); response.Code != http.StatusForbidden {
+		t.Fatalf("missing CSRF grant status = %d", response.Code)
+	}
+	if response := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-c"}`); response.Code != http.StatusConflict {
+		t.Fatalf("unpaired grant status = %d %s", response.Code, response.Body.String())
+	}
+	created := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-b"}`)
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), strings.Repeat("a", 64)) {
+		t.Fatalf("catalog grant create = %d %s", created.Code, created.Body.String())
+	}
+	listed := request(http.MethodGet, base, "admin-session", "", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"active":true`) {
+		t.Fatalf("catalog grant list = %d %s", listed.Code, listed.Body.String())
+	}
+	revoked := request(http.MethodDelete, base+"/node-b", "admin-session", "admin-csrf", "")
+	if revoked.Code != http.StatusNoContent {
+		t.Fatalf("catalog grant revoke = %d %s", revoked.Code, revoked.Body.String())
+	}
+	listed = request(http.MethodGet, base, "admin-session", "", "")
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"grants":[]`) {
+		t.Fatalf("revoked catalog grant list = %d %s", listed.Code, listed.Body.String())
+	}
+	events, err := audit.ListRecent(20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, event := range events {
+		if event.Action == "catalog_read_grant.create" && event.PrincipalType == "oidc" &&
+			event.VerifiedUserSubject == "operator" && event.TargetID == "node-b" && event.Outcome == "succeeded" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("verified local actor missing from catalog grant audit: %+v", events)
+	}
+}
+
 func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T) {
 	ca, caKey, roots := newPeerIdentityTestCA(t)
 	ownerCertificate, _ := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-a")
