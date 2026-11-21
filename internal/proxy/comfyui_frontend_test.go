@@ -19,6 +19,10 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
 
+func comfyUIWebSocketTestKey() string {
+	return base64.StdEncoding.EncodeToString(make([]byte, 16))
+}
+
 func TestComfyUIFrontendAllowlist(t *testing.T) {
 	for _, endpoint := range []string{"/api/global_subgraphs/not-a-hash", "/api/global_subgraphs/" + strings.Repeat("g", 64), "/api/global_subgraphs/" + strings.Repeat("a", 64) + "?path=other"} {
 		if matched, status, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, "/comfyui"+endpoint, nil)); !matched || status != http.StatusBadRequest {
@@ -48,7 +52,7 @@ func TestComfyUIFrontendAllowlist(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/comfyui/ws?clientId=frontend", nil)
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "websocket")
-	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	request.Header.Set("Sec-WebSocket-Key", comfyUIWebSocketTestKey())
 	request.Header.Set("Sec-WebSocket-Version", "13")
 	if matched, status, _ := validateComfyUIFrontendRequest(request); !matched || status != 0 {
 		t.Fatalf("valid websocket denied: %v %d", matched, status)
@@ -212,7 +216,7 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
-		_, _ = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=frontend HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nCookie: caller=secret\r\n\r\n", strings.TrimPrefix(server.URL, "http://"))
+		_, _ = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=frontend HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nCookie: caller=secret\r\n\r\n", strings.TrimPrefix(server.URL, "http://"), comfyUIWebSocketTestKey())
 		reader := bufio.NewReader(connection)
 		response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
 		if err != nil {
@@ -337,7 +341,7 @@ func TestComfyUIWebSocketsDoNotConsumeResultReadSlots(t *testing.T) {
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "websocket")
 	request.Header.Set("Sec-WebSocket-Version", "13")
-	request.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	request.Header.Set("Sec-WebSocket-Key", comfyUIWebSocketTestKey())
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
