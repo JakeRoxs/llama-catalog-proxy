@@ -400,11 +400,11 @@ func withPeerCLIAudit(configPath, action, targetID, modelID, correlationID strin
 	var output bytes.Buffer
 	target, model, correlation, operationErr := operation(&output)
 	outcome := "succeeded"
-		if operationErr != nil {
-			outcome = "failed"
-			if errors.Is(operationErr, federation.ErrPairingStore) || errors.Is(operationErr, federation.ErrInvitation) ||
-				errors.Is(operationErr, federation.ErrCatalogGrantStore) || errors.Is(operationErr, modelconfig.ErrOwnerGrantStore) ||
-				errors.Is(operationErr, auditlog.ErrUnavailable) || errors.Is(operationErr, proxy.ErrComfyUIReleaseUnknown) {
+	if operationErr != nil {
+		outcome = "failed"
+		if errors.Is(operationErr, federation.ErrPairingStore) || errors.Is(operationErr, federation.ErrInvitation) ||
+			errors.Is(operationErr, federation.ErrCatalogGrantStore) || errors.Is(operationErr, modelconfig.ErrOwnerGrantStore) ||
+			errors.Is(operationErr, auditlog.ErrUnavailable) || errors.Is(operationErr, proxy.ErrComfyUIReleaseUnknown) {
 			outcome = "unknown"
 		}
 	}
