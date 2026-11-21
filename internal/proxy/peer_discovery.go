@@ -14,9 +14,10 @@ import (
 )
 
 type discoveredPeerClients struct {
-	clients       map[string]*peerClient
-	authorizedIDs map[string]struct{}
-	unavailable   map[string]string
+	clients        map[string]*peerClient
+	authorizedIDs  map[string]struct{}
+	unavailable    map[string]string
+	routeInference map[string]bool
 }
 
 func (r *Reloader) buildDiscoveredPeerClients(state *reloaderState) (discoveredPeerClients, error) {
@@ -27,7 +28,7 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 	browse func(context.Context, discovery.Settings, time.Duration) (discovery.CandidateResult, error)) (discoveredPeerClients, error) {
 	result := discoveredPeerClients{
 		clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}),
-		unavailable: make(map[string]string),
+		unavailable: make(map[string]string), routeInference: make(map[string]bool),
 	}
 	if state == nil || state.peer == nil || state.peer.Discovery == nil || !state.peer.Discovery.Enabled ||
 		state.pairingStore == nil || state.catalogGrantStore == nil {
@@ -37,16 +38,34 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 	if err != nil {
 		return result, err
 	}
+	inferenceGrants, err := state.catalogGrantStore.ListInferenceGrants()
+	if err != nil {
+		return result, err
+	}
+	routeInference := make(map[string]string)
+	for _, grant := range inferenceGrants {
+		if !grant.RouteOutgoing {
+			continue
+		}
+		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
+		if err != nil {
+			return discoveredPeerClients{clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}), unavailable: make(map[string]string), routeInference: make(map[string]bool)}, err
+		}
+		if paired && member.Fingerprint == grant.Fingerprint {
+			routeInference[grant.NodeID] = grant.Fingerprint
+		}
+	}
 	pairedGrants := make([]federation.CatalogReadGrant, 0, len(grants))
 	for _, grant := range grants {
 		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
 		if err != nil {
-			return discoveredPeerClients{clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}), unavailable: make(map[string]string)}, err
+			return discoveredPeerClients{clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}), unavailable: make(map[string]string), routeInference: make(map[string]bool)}, err
 		}
 		if !paired || member.Fingerprint != grant.Fingerprint {
 			continue
 		}
 		result.authorizedIDs[grant.NodeID] = struct{}{}
+		result.routeInference[grant.NodeID] = routeInference[grant.NodeID] == grant.Fingerprint
 		pairedGrants = append(pairedGrants, grant)
 	}
 	if len(pairedGrants) == 0 {
@@ -96,7 +115,8 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 			result.unavailable[grant.NodeID] = "not_discovered"
 			continue
 		}
-		client, err := newDiscoveredPeerClient(state, grant, endpoint)
+		client, err := newDiscoveredPeerClient(state, grant, endpoint,
+			routeInference[grant.NodeID] == grant.Fingerprint)
 		if err != nil {
 			result.unavailable[grant.NodeID] = "client_unavailable"
 			continue
@@ -106,14 +126,33 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 	return result, nil
 }
 
-func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadGrant, endpoint string) (*peerClient, error) {
+func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadGrant, endpoint string, routeInference bool) (*peerClient, error) {
 	if !identity.ValidNodeID(grant.NodeID) || state.peerClientCAs == nil || state.certificate == nil || len(state.certificate.Certificate) == 0 {
 		return nil, errors.New("discovered peer client identity unavailable")
 	}
-	if _, ok := state.pairingStore.GetMember(grant.NodeID); !ok {
+	member, ok, err := state.pairingStore.LookupMember(grant.NodeID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok || member.Fingerprint != grant.Fingerprint {
 		return nil, federation.ErrMemberNotFound
 	}
-	transport := &http.Transport{
+	reportTransport := newDiscoveredPeerTransport(state, grant.NodeID, false)
+	inferenceTransport := newDiscoveredPeerTransport(state, grant.NodeID, true)
+	return &peerClient{
+		id: grant.NodeID, endpoint: strings.TrimSuffix(endpoint, "/") + "/peer/v1/report",
+		origin: strings.TrimSuffix(endpoint, "/"), client: &http.Client{
+			Transport: reportTransport, Timeout: peerReportTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		serverCRLs: state.peerClientCRLs, crlMaxAge: state.peer.RevocationMaxAge(),
+		inferenceTransport: inferenceTransport, dynamic: true, catalogRead: true,
+		routeInference: routeInference,
+	}, nil
+}
+
+func newDiscoveredPeerTransport(state *reloaderState, nodeID string, inference bool) *http.Transport {
+	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12, RootCAs: state.peerClientCAs,
 			Certificates: []tls.Certificate{*state.certificate},
@@ -127,16 +166,24 @@ func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadG
 				}
 				serverCertificate := connection.PeerCertificates[0]
 				serverNodeID, err := federation.PeerIdentityNodeID(serverCertificate, state.peer.FederationID)
-				if err != nil || serverNodeID != grant.NodeID {
+				if err != nil || serverNodeID != nodeID {
 					return errors.New("peer server identity mismatch")
 				}
 				member, paired, err := state.pairingStore.LookupMember(serverNodeID)
 				if err != nil || !paired || member.Fingerprint != federation.CertificateFingerprint(serverCertificate) {
 					return errors.New("peer is not paired with this certificate")
 				}
-				allowed, err := state.catalogGrantStore.AllowsCatalogRead(serverNodeID, member.Fingerprint)
+				var allowed bool
+				if inference {
+					allowed, err = state.catalogGrantStore.AllowsOutgoingInference(serverNodeID, member.Fingerprint)
+				} else {
+					allowed, err = state.catalogGrantStore.AllowsCatalogRead(serverNodeID, member.Fingerprint)
+				}
 				if err != nil || !allowed {
-					return errors.New("peer has no active catalog read grant")
+					if inference {
+						return errors.New("peer has no active route_inference grant")
+					}
+					return errors.New("peer has no active catalog_read grant")
 				}
 				return nil
 			},
@@ -145,13 +192,4 @@ func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadG
 		MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
 		TLSHandshakeTimeout: peerReportTimeout,
 	}
-	return &peerClient{
-		id: grant.NodeID, endpoint: strings.TrimSuffix(endpoint, "/") + "/peer/v1/report",
-		origin: strings.TrimSuffix(endpoint, "/"), client: &http.Client{
-			Transport: transport, Timeout: peerReportTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		},
-		serverCRLs: state.peerClientCRLs, crlMaxAge: state.peer.RevocationMaxAge(),
-		inferenceTransport: transport.Clone(), dynamic: true,
-	}, nil
 }

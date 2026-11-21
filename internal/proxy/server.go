@@ -98,24 +98,30 @@ func isGenerationPath(request *http.Request) bool {
 }
 
 type Handler struct {
-	catalog            *catalog.Service
-	proxies            map[string]*httputil.ReverseProxy
-	defaultBackend     string
-	modelRoutes        []route
-	pathRoutes         []route
-	logger             *slog.Logger
-	healthTimeout      time.Duration
-	catalogTimeout     time.Duration
-	comfyUIWaitTimeout time.Duration
-	comfyUIBackendID   string
-	comfyUIEndpoint    string
-	backendEndpoints   map[string]string
-	comfyUIJobs        *comfyUIJobTracker
-	maxJSONBody        int64
-	diagnostics        *diagnostics.Service
-	modelDiagnostics   *modeldiagnostics.Service
-	provenance         *provenance.Service
-	history            *correlation.Correlator
+	catalog                    *catalog.Service
+	proxies                    map[string]*httputil.ReverseProxy
+	backendAdmission           func(*http.Request, string) (release func(), allowed bool)
+	defaultBackend             string
+	modelRoutes                []route
+	pathRoutes                 []route
+	logger                     *slog.Logger
+	healthTimeout              time.Duration
+	catalogTimeout             time.Duration
+	comfyUIWaitTimeout         time.Duration
+	comfyUIBackendID           string
+	comfyUIEndpoint            string
+	backendEndpoints           map[string]string
+	comfyUIJobs                *comfyUIJobTracker
+	comfyUIResultReadProxy     *httputil.ReverseProxy
+	comfyUIResultSlots         chan struct{}
+	comfyUIWebSocketSlots      chan struct{}
+	comfyUIFrontendSlots       chan struct{}
+	comfyUIImageUploadMaxBytes int64
+	maxJSONBody                int64
+	diagnostics                *diagnostics.Service
+	modelDiagnostics           *modeldiagnostics.Service
+	provenance                 *provenance.Service
+	history                    *correlation.Correlator
 	// requestObservation enables per-request inference timing observation.
 	requestObservation bool
 	// Diagnostics API auth boundary. A nonempty diagnosticsAPIKey protects
@@ -151,12 +157,14 @@ type route struct {
 }
 
 type handlerDependencies struct {
-	catalog          *catalog.Service
-	proxies          map[string]*httputil.ReverseProxy
-	modelRoutes      []route
-	pathRoutes       []route
-	backendEndpoints map[string]string
-	comfyUIJobs      *comfyUIJobTracker
+	catalog                *catalog.Service
+	proxies                map[string]*httputil.ReverseProxy
+	modelRoutes            []route
+	pathRoutes             []route
+	backendEndpoints       map[string]string
+	comfyUIJobs            *comfyUIJobTracker
+	comfyUIResultReadProxy *httputil.ReverseProxy
+	backendAdmission       func(*http.Request, string) (func(), bool)
 }
 
 func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (http.Handler, error) {
@@ -187,9 +195,45 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 	}
 	pathRoutes := buildPathRoutes(cfg.PathRoutes)
 	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
+	var resultReadProxy *httputil.ReverseProxy
+	if cfg.Peer != nil && cfg.Peer.ComfyUIResultRead != nil {
+		resultReadProxy, err = newComfyUIResultReadProxy(cfg.Peer.ComfyUIResultRead, logger)
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+	}
+	var backendAdmission func(*http.Request, string) (func(), bool)
+	if cfg.Peer != nil && cfg.Peer.ComfyUILease != nil && len(cfg.Peer.ComfyUILease.AdmissionBackends) > 0 {
+		releaseClient := &http.Client{
+			Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+			Timeout:   5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		target := cfg.Peer.ComfyUIResultRead
+		headers := make(http.Header, len(target.Headers)+2)
+		for name, value := range target.Headers {
+			headers.Set(name, value)
+		}
+		if target.APIKey != "" && headers.Get("Authorization") == "" && headers.Get("X-Api-Key") == "" {
+			headers.Set("Authorization", "Bearer "+target.APIKey)
+			headers.Set("X-Api-Key", target.APIKey)
+		}
+		coordinator := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
+			return VerifyComfyUIRelease(ctx, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
+		})
+		backendAdmission, err = newComfyUIDomainAdmission(coordinator,
+			cfg.Peer.ComfyUILease.AdmissionBackends, cfg.PathRoutes[comfyUIPathPrefix],
+			cfg.Peer.ComfyUILease.ReleaseTimeoutDuration())
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+	}
 	return handlerDependencies{
 		catalog: catalogService, proxies: proxies, modelRoutes: routes, pathRoutes: pathRoutes,
-		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs,
+		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs, comfyUIResultReadProxy: resultReadProxy,
+		backendAdmission: backendAdmission,
 	}, nil
 }
 
@@ -289,6 +333,11 @@ func preservePeerForwardedAddress(out, in http.Header) {
 func modifyProxiedResponse(response *http.Response, backendID, comfyBackendID string, comfyJobs *comfyUIJobTracker) {
 	if response.Request != nil {
 		setRequestIDHeader(response.Header, requestIDFromContext(response.Request.Context()))
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			if activation, ok := response.Request.Context().Value(comfyUILeaseActivationContextKey{}).(comfyUILeaseActivation); ok {
+				_ = activation.coordinator.activate(activation.leaseID)
+			}
+		}
 		observer := observerFromContext(response.Request.Context())
 		if observer != nil && response.StatusCode != http.StatusSwitchingProtocols {
 			observer.ObserveUpstream(response.StatusCode, response.Header)
@@ -301,28 +350,36 @@ func modifyProxiedResponse(response *http.Response, backendID, comfyBackendID st
 
 func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, dependencies handlerDependencies) *Handler {
 	h := &Handler{
-		catalog:            dependencies.catalog,
-		proxies:            dependencies.proxies,
-		defaultBackend:     cfg.DefaultBackend,
-		modelRoutes:        dependencies.modelRoutes,
-		pathRoutes:         dependencies.pathRoutes,
-		logger:             logger,
-		healthTimeout:      cfg.HealthTimeout,
-		catalogTimeout:     cfg.CatalogTimeout,
-		comfyUIWaitTimeout: cfg.ComfyUIWaitTimeout,
-		comfyUIBackendID:   cfg.PathRoutes[comfyUIPathPrefix],
-		comfyUIEndpoint:    dependencies.backendEndpoints[cfg.PathRoutes[comfyUIPathPrefix]],
-		backendEndpoints:   dependencies.backendEndpoints,
-		comfyUIJobs:        dependencies.comfyUIJobs,
-		maxJSONBody:        cfg.MaxJSONBody,
-		diagnostics:        diagnostics,
-		modelDiagnostics:   modelDiagnostics,
-		provenance:         provenance,
+		catalog:                dependencies.catalog,
+		proxies:                dependencies.proxies,
+		backendAdmission:       dependencies.backendAdmission,
+		defaultBackend:         cfg.DefaultBackend,
+		modelRoutes:            dependencies.modelRoutes,
+		pathRoutes:             dependencies.pathRoutes,
+		logger:                 logger,
+		healthTimeout:          cfg.HealthTimeout,
+		catalogTimeout:         cfg.CatalogTimeout,
+		comfyUIWaitTimeout:     cfg.ComfyUIWaitTimeout,
+		comfyUIBackendID:       cfg.PathRoutes[comfyUIPathPrefix],
+		comfyUIEndpoint:        dependencies.backendEndpoints[cfg.PathRoutes[comfyUIPathPrefix]],
+		backendEndpoints:       dependencies.backendEndpoints,
+		comfyUIJobs:            dependencies.comfyUIJobs,
+		comfyUIResultReadProxy: dependencies.comfyUIResultReadProxy,
+		maxJSONBody:            cfg.MaxJSONBody,
+		diagnostics:            diagnostics,
+		modelDiagnostics:       modelDiagnostics,
+		provenance:             provenance,
 		// The legacy timing prototype argument is accepted for signature
 		// compatibility but is ignored: per-request observers are created in
 		// ServeHTTP only when request_observation is enabled.
 		history:            historyStore(cfg),
 		requestObservation: cfg.RequestObservation,
+	}
+	if h.comfyUIResultReadProxy != nil {
+		h.comfyUIResultSlots = make(chan struct{}, 4)
+		h.comfyUIWebSocketSlots = make(chan struct{}, 8)
+		h.comfyUIFrontendSlots = make(chan struct{}, 16)
+		h.comfyUIImageUploadMaxBytes = cfg.Peer.ComfyUIResultRead.ImageUploadLimit()
 	}
 	if cfg.Peer != nil {
 		h.peerRouteAliases = make(map[string]struct{}, len(cfg.Peer.RouteAliases))
@@ -529,6 +586,9 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 	if h.servePeerPathRoute(writer, request, info) {
 		return
 	}
+	if h.serveComfyUIResultRead(writer, request, info, true) {
+		return
+	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
 		h.servePathRoute(writer, request, info, backendID)
 		return
@@ -569,7 +629,7 @@ func (h *Handler) servePathRoute(writer http.ResponseWriter, request *http.Reque
 	if cleanup != nil {
 		defer cleanup()
 	}
-	h.proxies[backendID].ServeHTTP(writer, request)
+	h.dispatchBackend(writer, request, backendID)
 }
 
 func (h *Handler) waitForPathRequest(writer http.ResponseWriter, request *http.Request, backendID string) (func(), bool) {
@@ -608,7 +668,22 @@ func (h *Handler) serveModelRoute(writer http.ResponseWriter, request *http.Requ
 	if isInferenceRequest(request) && h.comfyUIWaitTimeout > 0 && h.comfyUIJobs != nil && h.sharesComfyUIBackend(backendID) {
 		defer h.comfyUIJobs.endInference()
 	}
-	h.proxies[backendID].ServeHTTP(writer, request)
+	h.dispatchBackend(writer, request, backendID)
+}
+
+// dispatchBackend is the common owner-side forwarding and optional admission boundary.
+func (h *Handler) dispatchBackend(w http.ResponseWriter, req *http.Request, backendID string) {
+	if h.backendAdmission != nil {
+		release, allowed := h.backendAdmission(req, backendID)
+		if release != nil {
+			defer release()
+		}
+		if !allowed {
+			writeJSONError(h.logger, w, http.StatusServiceUnavailable, "backend admission blocked")
+			return
+		}
+	}
+	h.proxies[backendID].ServeHTTP(w, req)
 }
 
 func (h *Handler) writeRouteRequestError(writer http.ResponseWriter, request *http.Request, info *routeInfo, err error) {

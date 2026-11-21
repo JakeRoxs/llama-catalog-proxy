@@ -391,7 +391,9 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 			if accept := req.In.Header.Get("Accept"); accept != "" {
 				req.Out.Header.Set("Accept", accept)
 			}
-			req.Out.Header.Set("Authorization", "Bearer "+client.token)
+			if client.token != "" {
+				req.Out.Header.Set("Authorization", "Bearer "+client.token)
+			}
 			req.Out.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte(id.BackendID)))
 			req.Out.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte(id.LocalID)))
 			req.Out.Header.Set(peerPathHeader, req.In.URL.Path)

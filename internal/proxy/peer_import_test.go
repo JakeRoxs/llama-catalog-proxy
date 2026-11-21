@@ -73,9 +73,9 @@ func TestPeerCatalogRefreshKeepsOwnerEvidenceWithinConfiguredTTL(t *testing.T) {
 func TestPeerCacheDropsRevokedDynamicCatalogButRetainsStaticAndGrantedPeers(t *testing.T) {
 	now := time.Now().UTC()
 	cache := &peerCache{entries: make(map[string]peerCacheEntry)}
-	cache.updateSource("static-peer", nil, "", now, false)
-	cache.updateSource("granted-peer", nil, "", now, true)
-	cache.updateSource("revoked-peer", nil, "", now, true)
+	cache.updateSource("static-peer", nil, "", now, false, false)
+	cache.updateSource("granted-peer", nil, "", now, true, false)
+	cache.updateSource("revoked-peer", nil, "", now, true, false)
 	cache.retainDynamic(map[string]struct{}{"granted-peer": {}})
 	if _, ok := cache.entries["static-peer"]; !ok {
 		t.Fatal("static peer cache was removed with dynamic grant cleanup")
@@ -86,7 +86,7 @@ func TestPeerCacheDropsRevokedDynamicCatalogButRetainsStaticAndGrantedPeers(t *t
 	if _, ok := cache.entries["revoked-peer"]; ok {
 		t.Fatal("revoked dynamic catalog cache remained available")
 	}
-	cache.markDynamicUnavailable("granted-peer", "not_discovered", now.Add(time.Second))
+	cache.markDynamicUnavailable("granted-peer", "not_discovered", false, now.Add(time.Second))
 	if entry := cache.entries["granted-peer"]; entry.lastError != "not_discovered" {
 		t.Fatalf("unavailable dynamic peer cache error = %q", entry.lastError)
 	}
@@ -96,15 +96,23 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	ca, caKey, roots := newPeerIdentityTestCA(t)
 	localCertificate, _ := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-a")
 	serverCertificate, serverLeaf := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
-	var requests atomic.Int32
+	var reportRequests, inferenceRequests atomic.Int32
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		requests.Add(1)
-		if request.Method != http.MethodGet || request.URL.Path != "/peer/v1/report" {
-			t.Errorf("unexpected discovered peer request %s %s", request.Method, request.URL.Path)
-		}
 		if request.Header.Get("Authorization") != "" {
-			t.Errorf("mTLS-only catalog request carried Authorization: %q", request.Header.Get("Authorization"))
+			t.Errorf("mTLS-only dynamic peer request carried Authorization: %q", request.Header.Get("Authorization"))
 		}
+		if request.Method != http.MethodGet {
+			t.Errorf("unexpected discovered peer method %s", request.Method)
+		}
+		if request.URL.Path == "/peer/v1/inference" {
+			inferenceRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if request.URL.Path != "/peer/v1/report" {
+			t.Errorf("unexpected discovered peer path %s", request.URL.Path)
+		}
+		reportRequests.Add(1)
 		now := time.Now().UTC()
 		expires := now.Add(time.Minute)
 		report := nodecontract.Report{
@@ -154,6 +162,9 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	if _, err := grants.GrantCatalogRead(member, now); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := grants.GrantInference(member, false, true, now); err != nil {
+		t.Fatal(err)
+	}
 	state := &reloaderState{
 		peer: &config.PeerConfig{NodeID: "node-a", FederationID: "lab.example", Discovery: &config.PeerDiscoveryConfig{
 			Enabled: true, Interface: "lan0", AdvertiseURL: "https://node-a.local:9293",
@@ -174,7 +185,7 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 		t.Fatal(err)
 	}
 	client := discovered.clients["node-b"]
-	if client == nil || !client.dynamic || client.token != "" || len(discovered.authorizedIDs) != 1 {
+	if client == nil || !client.dynamic || client.token != "" || !client.routeInference || len(discovered.authorizedIDs) != 1 {
 		t.Fatalf("dynamic peer client set = %+v / %+v", client, discovered)
 	}
 	defer closePeerClients(map[string]*peerClient{"node-b": client})
@@ -182,14 +193,28 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	if reason != "" || receipt == nil || receipt.AuthenticatedNodeID != "node-b" || len(receipt.Report.Observations) != 1 {
 		t.Fatalf("mTLS catalog fetch = %#v, reason %q", receipt, reason)
 	}
+	inferenceResponse, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(server.URL + "/peer/v1/inference")
+	if err != nil {
+		t.Fatalf("separately granted mTLS inference request failed: %v", err)
+	}
+	_ = inferenceResponse.Body.Close()
+	if inferenceResponse.StatusCode != http.StatusOK {
+		t.Fatalf("dynamic inference status = %d", inferenceResponse.StatusCode)
+	}
 	if err := grants.RevokeCatalogRead("node-b"); err != nil {
 		t.Fatal(err)
 	}
 	if receipt, reason := client.fetch(context.Background()); receipt != nil || reason != "unavailable" {
 		t.Fatalf("revoked mTLS catalog fetch = %#v, reason %q", receipt, reason)
 	}
-	if got := requests.Load(); got != 1 {
+	if _, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(server.URL + "/peer/v1/inference"); err == nil {
+		t.Fatal("outbound inference remained enabled after catalog grant revocation cascade")
+	}
+	if got := reportRequests.Load(); got != 1 {
 		t.Fatalf("report requests after grant revocation = %d, want 1", got)
+	}
+	if got := inferenceRequests.Load(); got != 1 {
+		t.Fatalf("inference requests after grant revocation = %d, want 1", got)
 	}
 }
 

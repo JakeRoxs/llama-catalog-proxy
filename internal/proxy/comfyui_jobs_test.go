@@ -65,6 +65,54 @@ func TestComfyUIJobTrackerDoesNotProbeWhenNoTrackedJob(t *testing.T) {
 	}
 }
 
+func TestComfyUIAPIPromptAliasTracksAcceptedJobsBeforeCompetingInference(t *testing.T) {
+	var promptCalls, inferenceCalls, queueCalls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/comfyui/api/prompt":
+			promptCalls.Add(1)
+			_, _ = w.Write([]byte(`{"prompt_id":"job-1"}`))
+		case "/comfyui/queue":
+			queueCalls.Add(1)
+			_, _ = w.Write([]byte(`{"queue_running":[["job-1"]],"queue_pending":[]}`))
+		default:
+			inferenceCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.ComfyUIWaitTimeout = 100 * time.Millisecond
+	handler := newHandler(t, cfg)
+	promptResponse := httptest.NewRecorder()
+	handler.ServeHTTP(promptResponse, httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", strings.NewReader(`{"prompt":{}}`)))
+	if promptResponse.Code != http.StatusOK || promptCalls.Load() != 1 {
+		t.Fatalf("API prompt status=%d calls=%d", promptResponse.Code, promptCalls.Load())
+	}
+	inferenceResponse := httptest.NewRecorder()
+	handler.ServeHTTP(inferenceResponse, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"local"}`)))
+	if inferenceCalls.Load() != 0 || queueCalls.Load() == 0 || inferenceResponse.Code < 400 {
+		t.Fatalf("accepted API prompt was not tracked: status=%d inference=%d queue=%d",
+			inferenceResponse.Code, inferenceCalls.Load(), queueCalls.Load())
+	}
+}
+
+func TestComfyPromptRequestClassification(t *testing.T) {
+	for _, endpoint := range []string{"/comfyui/prompt", "/comfyui/api/prompt"} {
+		if !isComfyPromptRequest(httptest.NewRequest(http.MethodPost, endpoint, nil)) {
+			t.Fatalf("prompt endpoint not classified: %s", endpoint)
+		}
+		if isComfyPromptRequest(httptest.NewRequest(http.MethodGet, endpoint, nil)) {
+			t.Fatalf("status read classified as submission: %s", endpoint)
+		}
+	}
+	if isComfyPromptRequest(nil) || isComfyPromptRequest(&http.Request{Method: http.MethodPost}) ||
+		isComfyPromptRequest(httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt/extra", nil)) {
+		t.Fatal("invalid or non-prompt request classified as submission")
+	}
+}
+
 func TestComfyUIJobTrackerHonorsContextDeadline(t *testing.T) {
 	queue := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		_, _ = writer.Write([]byte(`{"queue_running":[["job"]],"queue_pending":[]}`))

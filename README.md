@@ -133,10 +133,32 @@ settings, and path-service access are not implied. When a matching static outbou
 present it remains the polling source; remove that static URL to use the dynamically discovered mDNS
 endpoint. Static token/scope grants remain available for other peer operations.
 
-mDNS is link-local. Default Docker bridge networks generally do not forward multicast between hosts,
-and a container's bridge address may not be reachable from another host. Cross-host discovery in the
-current Docker deployment therefore remains unverified; a host-networked listener or suitable
-multicast-capable network/sidecar is required. No deployment or host networking changes are included.
+Dynamic inference requires two additional, independent approvals. On the caller, catalog read must
+already be granted, then explicitly allow routing to that node:
+
+```sh
+llama-catalog-proxy peer inference-grants create --node-id node-b --route-outgoing --acknowledge
+```
+
+On the receiver, explicitly allow that caller to invoke local inference:
+
+```sh
+llama-catalog-proxy peer inference-grants create --node-id node-a --allow-incoming --acknowledge
+```
+
+The inbound and outbound inference flags are independent and bind to the current paired certificate.
+Catalog read never grants inference; revoking catalog read also disables outbound dynamic inference
+because the caller needs fresh model identities, but does not revoke an independent inbound inference
+grant. A configured static outbound peer URL takes precedence for its node. Diagnostics, settings,
+and path-service operations remain separately authorized.
+
+mDNS is link-local. A temporary non-secret host-LAN advertisement was discovered cross-host, but the
+same test inside the proxy network namespace was visible only within that host and produced no
+candidate from the other host. The separate Docker bridges therefore isolate the current proxy
+containers' mDNS traffic. A host-networked listener/sidecar or another multicast-capable deployment
+network is required for this topology. No production config or host networking was changed.
+In bridge-only deployments without that path, leave discovery disabled and continue using the existing
+static `PeerGrant` configuration.
 
 #### Optional operator-CA mutual TLS identity
 
@@ -182,13 +204,12 @@ as the client identity (include required intermediate certificates after the lea
 certificate file). Both sides check the exact federation/node URI and the paired certificate
 fingerprint. Outbound mTLS peer transports do not reuse connections, so a membership removal or CA
 rotation is checked on the next request. Static `PeerGrant` requests still require their bearer token
-and independently configured scope. For dynamic catalog polling only, the receiver accepts a
-bearer-free `/peer/v1/report` request when the mTLS identity is currently paired and an explicit
-`catalog_read` grant matches that certificate fingerprint in the separate protected catalog grant
-store. This grant cannot authorize diagnostics, inference, settings, or path services; pairing alone
-still grants nothing. Remove a static outbound URL for a node when using its dynamically discovered
-catalog endpoint. Existing peers must be provisioned with certificates before enabling mTLS on either
-side.
+and independently configured scope. Dynamic catalog polling accepts bearer-free `/peer/v1/report`
+requests only when the mTLS identity is currently paired and an explicit `catalog_read` grant matches
+that certificate fingerprint. Dynamic inference similarly requires separate caller `route_outgoing`
+and receiver `allow_incoming` grants; neither scope is implied by the other or by pairing. Remove a
+static outbound URL for a node when using its dynamically discovered endpoint. Existing peers must be
+provisioned with certificates before enabling mTLS on either side.
 
 Use short-lived certificates (maximum 30 days) and current CA-signed CRL bundles. Every issuing CA in
 the chain must have a signed CRL in the configured bundle; missing, untrusted, revoked, future-dated,
@@ -298,7 +319,27 @@ multiple endpoints for one node ID are rejected. This avoids manually supplying 
 but it does not itself grant catalog access. With `catalog_grant_directory` configured, report clients
 are created automatically for currently paired identities that have an active, separate catalog-read
 grant; endpoints are resolved from mDNS during refresh. A static outbound `PeerGrant` takes precedence
-for its node. Inference and other operation routes remain separately configured.
+for its node. Dynamic inference uses separate per-peer caller and receiver grants, as documented below;
+catalog access never implies inference permission.
+
+For dynamic inference, grant caller routing only after catalog read is approved on that caller:
+
+```sh
+llama-catalog-proxy peer catalog-grants create --node-id node-b --acknowledge
+llama-catalog-proxy peer inference-grants create --node-id node-b --route-outgoing --acknowledge
+```
+
+On `node-b`, separately approve inbound inference from `node-a`:
+
+```sh
+llama-catalog-proxy peer inference-grants create --node-id node-a --allow-incoming --acknowledge
+```
+
+`route_outgoing` and `allow_incoming` are distinct permissions bound to the paired certificate
+fingerprint. Both sides must grant their direction; catalog-read access is still separate. Revoking
+catalog read also disables outbound dynamic inference because model discovery depends on its reports;
+it does not revoke inbound inference. Diagnostics, settings, and path-service operations require their
+own grants.
 
 The `invite create` JSON output includes the one-time secret code. Transfer it out of band and keep
 any temporary file owner-only (for example, create it under `umask 077`). `peer join` accepts either
@@ -1239,6 +1280,163 @@ When the GPU backend is llama-swap, the `/comfyui` example forwards the path unc
 query strings, encoded path segments, backend credentials, and WebSocket upgrades. That optional
 llama-swap configuration can define the reserved local model ID `comfyui_auto`; llama-swap then owns
 the redirect, cold-start restrictions, path stripping, and ComfyUI compatibility settings.
+
+An owner may optionally configure `peer.comfyui_result_read` with the persistent ComfyUI service
+origin, separate from the llama-swap backend used by `path_routes: /comfyui`:
+
+```yaml
+peer:
+  comfyui_result_read:
+    url: http://comfyui:8188
+    image_upload_max_bytes: 16777216 # optional; default 16 MiB, maximum 64 MiB
+    # api_key: keep-owner-credential-in-protected-config
+  exposed_path_routes:
+    comfyui: /comfyui
+```
+
+When enabled, local and authorized peer bodyless `GET` requests for `/comfyui/history`,
+`/comfyui/history/<prompt_id>`, and `/comfyui/view` with an output `filename` are served directly by
+that owner-configured persistent service. Status reads for `/comfyui/prompt`, `/comfyui/queue`, and
+`/comfyui/system_stats` also bypass llama-swap, with no query parameters allowed. Their core `/api`
+aliases (for example `/comfyui/api/queue` and `/comfyui/api/history`) are supported, as are
+`/comfyui/api/jobs` and `/comfyui/api/jobs/<id>` with bounded, validated listing filters. These handlers
+were verified against installed ComfyUI source; there is no core `/health` handler in that snapshot.
+System stats indicate server responsiveness and device metrics, not GPU-lease readiness.
+
+The same target serves the UI root (`/comfyui/`, with a redirect from `/comfyui`), `index.html`,
+`favicon.ico`, `user.css`, `materialdesignicons.min.css`, and supported static file types under
+`assets/`, `scripts/`, `extensions/`, `locales/`, `fonts/`, and `templates/` directly. Named GET metadata
+routes (`features`, `extensions`, `embeddings`, `models`, `models/<folder>`, `object_info`,
+`object_info/<node>`, `users`, `settings`, `settings/<id>`, `workflow_templates`) and core `/api` aliases bypass
+llama-swap too. Asset queries accept only bounded `v`/`t` cache keys; metadata queries are disallowed.
+The installed `object_info` handler invokes plugin metadata methods, so custom nodes must be trusted;
+this is not a guarantee that arbitrary plugin code cannot touch a GPU.
+
+Saved-workflow reads use named GET `userdata`/`v2/userdata` listing routes and `userdata/<file>` for
+canonical relative JSON/CSS filenames. Listing queries accept only validated directories and the
+installed boolean listing options. Single-encoded nested workflow filenames are preserved for the
+upstream router; traversal and double-encoded paths are rejected. These requests use the configured
+owner-side backend identity, not an authenticated per-browser identity: incoming `Comfy-User`, cookies,
+and authorization are not passed through. Configure any owner `Comfy-User` header in protected backend
+headers. This does not implement ComfyUI multi-user account switching or end-user isolation.
+
+Settings saves (`POST /comfyui/settings` and `/settings/<id>`) and their `/api` aliases also route
+directly with a 1 MiB JSON-body limit. Whole-settings saves require a JSON object; one-setting saves
+accept any valid JSON value. Workflow saves use `POST /comfyui/userdata/<file>` (or its `/api` alias)
+with a 4 MiB JSON-body limit, restricted to `workflows/*.json` (including nested folders),
+`comfy.templates.json`, and `comfy.keybindings.json`. Nested filenames must be URL-encoded as one route
+parameter, such as `workflows%2Fexample.json`; unencoded move paths and traversal are rejected.
+Only boolean `overwrite`/`full_info` query options are accepted for file saves. JSON, plain-text JSON,
+and missing content types are supported to match the installed frontend; UTF-8 JSON is validated and
+forwarded with the correct content type. Saves retain owner identity and peer path authorization,
+never fall back to llama-swap, and are not automatically retried after errors. After a timeout,
+read back the setting/file to determine its state before retrying; a write may already have completed.
+
+GET `/comfyui/ws` (and `/comfyui/api/ws`) supports a validated WebSocket upgrade and optional bounded
+`clientId`. The installed handler negotiates feature flags and reports progress, not generation.
+Upgrades retain handshake headers but not caller credentials. Owner-side frontend requests, result
+reads, and WebSockets have separate bounded concurrency pools; peer path-service limits still apply.
+Unavailable UI requests do not fall back to llama-swap. This is an explicit core-route allowlist,
+not a catch-all for custom-node APIs, account changes, arbitrary file writes, deletes, or moves;
+full browser compatibility with installed plugins still requires deployment verification.
+
+Input-image `POST /comfyui/upload/image` and `/comfyui/api/upload/image` also bypass llama-swap
+automatically when this target is configured; no separate upload enable flag is required. Multipart
+bodies are fully size-bounded and validated before forwarding, with no temporary files. They must
+contain exactly one image file with a supported image extension/signature and may include `type=input`,
+a canonical relative `subfolder`, and `overwrite=true|false|1|0`. Output/temp destinations, unknown or
+duplicate fields, traversal filenames, encoded separators, and query parameters are rejected. The
+size limit includes multipart overhead. Actual image decoding remains ComfyUI's responsibility.
+
+The proxy rejects unsupported queries and non-output result-file types; caller `Authorization`/cookies
+are not forwarded, while only owner-configured backend credentials may be applied. Peer reads and
+uploads still require the existing `comfyui` `path_access`
+grant. Generation `POST /prompt` (including its `/api` alias), queue mutations, and other
+non-allowlisted paths continue through the configured
+`/comfyui` llama-swap path route, so result reads neither acquire a GPU lease nor bypass scheduling
+for GPU-using operations. Peer requests using ComfyUI `blake3:` filenames are denied until their
+multi-user identity behavior is verified; owner-local requests may use them. This setting does not
+keep the ComfyUI process/container alive, unload its models, release GPU memory, or verify `/free`.
+History remains in-memory and is lost on a real ComfyUI restart; interrupted jobs are not represented
+as successfully completed. This setting only provides result routing when the configured persistent
+service is already running.
+
+An owner may configure the code-only release verifier with explicit free-VRAM evidence thresholds:
+
+```yaml
+peer:
+  comfyui_lease:
+    release_timeout: 2m
+    poll_interval: 500ms
+    queue_idle_samples: 2
+    minimum_free_vram_bytes:
+      "cuda:0": 2147483648
+    # Optional: opt these exact local backend IDs into proxy-only admission.
+    # Include the backend selected by path_routes: /comfyui.
+    admission_backends: [comfyui_scheduler, other_gpu_backend]
+```
+
+With `admission_backends` omitted, this remains a code-only release verifier and must only be invoked
+after an external scheduler has closed admission. With it configured, eligible requests forwarded
+through catalog-proxy use the in-process coordinator: initial `unknown` state is reconciled on the
+first eligible request; an accepted ComfyUI prompt activates its lease; and a competing request waits
+for queue drain, one `/free` request, and repeated configured VRAM observations before forwarding.
+The verifier retries observations, not `/free`. Non-2xx or ambiguous first-prompt outcomes leave the
+state unknown. A competing backend load failure is returned normally and does not automatically retry
+the request or release operation.
+
+The managed domain admits only ComfyUI prompt POSTs to the `/comfyui` path backend plus the currently
+classified competing routes `GET /props` and `POST /v1/chat/completions`. Other requests to a listed
+backend fail closed; update route classification only after verifying their scheduler behavior. This
+is a best-effort gate for requests that pass through this proxy. It cannot stop direct llama-swap
+clients, operator/management actions, startup preloads, autonomous scheduler activity, or GPU work on
+other paths. It does not establish host-wide exclusivity or preserve ComfyUI's process/container.
+
+`admission_backends` is opt-in and requires the `/comfyui` path backend to be listed. Use backend IDs
+that actually represent the conflicting workloads in this deployment; configuration cannot prove
+that they cover all GPU users. A release failure leaves the coordinator blocked; automatic `/free`
+retry is deliberately disabled, and recovery currently requires restarting the proxy and obtaining
+fresh evidence. No llama-swap or ComfyUI changes are required or made by this proxy-only mode.
+
+Without runtime admission configured, the verifier may still be invoked explicitly, for example from
+a separately approved scheduler stop hook:
+
+```sh
+llama-catalog-proxy comfyui-lease release --config /config/config.yaml --acknowledge
+```
+
+The verifier requires repeated empty `/queue` samples before `/free`, then repeated empty queue and
+per-device `vram_free` threshold samples afterward. HTTP 200 alone never confirms release. Missing or
+unsupported device evidence and timeouts return `state: unknown` and a non-zero exit. The standalone
+command does not stop ComfyUI or wire itself into llama-swap.
+
+When `admission_backends` is configured, the coordinator is wired into common owner-side backend
+dispatch, including authorized peer inference/path forwarding. It starts in `unknown`, verifies release
+before admission, assigns opaque lease IDs, and drains submitted HTTP requests before invoking the
+queue/VRAM verifier. A successful first ComfyUI prompt response activates its lease; ambiguous starts
+leave admission unknown. Competing requests reserve the released domain while being forwarded. This
+process-local state is reset to unknown on proxy restart or config reload; it is not durable recovery.
+
+The separate Linux private Unix-socket transport is implemented and tested but is not started by the application
+and has no configuration/CLI binding. It requires an existing owner-only directory, creates a
+mode-`0600` socket, rejects symlink directories and existing paths, and never binds TCP or peer routes.
+The version-1 protocol has GET `/v1/lease/status` and POST `acquire`, `activate`, `release`, and
+`invalidate` under `/v1/lease/`. POSTs require `application/json` with `version: 1` and, except for
+acquisition, a `lease_id`. Bodies are capped at 2 KiB, mutations at eight concurrent requests, and
+operations at a caller-configured bounded timeout. The successful operation's `operation_lease_id`
+binds its result/receipt; the separate `lease_id` reports the current snapshot, which may have advanced.
+
+Transport startup and shutdown force `unknown`, discard receipts/lease IDs, preserve outstanding
+in-process reservations, and cancel active verification. No startup `/free` or automatic recovery
+occurs. POST `/v1/lease/reconcile` returns `501` until the owner binding can establish exclusive
+admission; a client-supplied assertion is not sufficient. Unexpected existing sockets are not assumed
+stale or removed. Cleanup removes only the same socket inode created by this transport.
+
+This is not a deployment-level lock: it has no durable restart recovery, deployed helper endpoint,
+or enforcement over direct llama-swap clients and autonomous loads. Do not treat these tests or the
+standalone release CLI as proof of a safe shared-GPU handoff. `admission_backends` enables only the
+documented best-effort gate over requests mediated by catalog-proxy; persistent-container lifecycle
+management is not implemented.
 
 `comfyui_wait_timeout` optionally prevents recognized inference requests routed to the same backend
 endpoint as `/comfyui` from reaching that backend while ComfyUI has queued or running jobs. Requests

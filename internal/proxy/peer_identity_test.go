@@ -281,7 +281,13 @@ func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) 
 		t.Fatalf("explicit mTLS catalog grant denied: %q %v", nodeID, ok)
 	}
 	if _, ok := authenticatedPeer(request, state, peerInference); ok {
-		t.Fatal("catalog grant authorized inference")
+		t.Fatal("catalog grant authorized inference without its separate grant")
+	}
+	if _, err := grants.GrantInference(member, true, false, now); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
+		t.Fatalf("explicit inbound inference grant denied: %q %v", nodeID, ok)
 	}
 	request.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
 	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
@@ -295,6 +301,9 @@ func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) 
 	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
 		t.Fatal("certificate rotation inherited the previous catalog grant")
 	}
+	if _, ok := authenticatedPeer(request, state, peerInference); ok {
+		t.Fatal("certificate rotation inherited the previous inference grant")
+	}
 	rotatedMember, ok, err := members.LookupMember("node-b")
 	if err != nil || !ok {
 		t.Fatalf("rotated membership lookup = %+v, %v, %v", rotatedMember, ok, err)
@@ -305,11 +314,26 @@ func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) 
 	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
 		t.Fatalf("re-granted rotated identity denied: %q %v", nodeID, ok)
 	}
+	if _, err := grants.GrantInference(rotatedMember, true, false, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
+		t.Fatalf("re-granted rotated inference identity denied: %q %v", nodeID, ok)
+	}
 	if err := grants.RevokeCatalogRead("node-b"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
 		t.Fatal("revoked catalog grant remained authorized")
+	}
+	if _, ok := authenticatedPeer(request, state, peerInference); !ok {
+		t.Fatal("catalog-read revocation incorrectly revoked independent inbound inference grant")
+	}
+	if err := grants.RevokeInference("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := authenticatedPeer(request, state, peerInference); ok {
+		t.Fatal("revoked inbound inference grant remained authorized")
 	}
 }
 

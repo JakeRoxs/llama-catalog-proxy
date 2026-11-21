@@ -115,3 +115,64 @@ func TestCatalogGrantStoreRejectsInvalidAndDuplicateCertificateGrants(t *testing
 		t.Fatal("same certificate fingerprint granted to multiple nodes")
 	}
 }
+
+func TestInferenceGrantDirectionsRemainSeparateFromCatalogRead(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenCatalogGrantStore(directory, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	fingerprint := strings.Repeat("d", 64)
+	member := Membership{NodeID: "node-b", Fingerprint: fingerprint, PairedAt: now}
+	if _, err := store.GrantInference(member, false, true, now); err != ErrInferenceNeedsCatalog {
+		t.Fatalf("route inference without catalog discovery grant = %v", err)
+	}
+	if _, err := store.GrantCatalogRead(member, now); err != nil {
+		t.Fatal(err)
+	}
+	grant, err := store.GrantInference(member, true, false, now)
+	if err != nil || !grant.AllowIncoming || grant.RouteOutgoing {
+		t.Fatalf("incoming-only inference grant = %+v, %v", grant, err)
+	}
+	if allowed, err := store.AllowsCatalogRead("node-b", fingerprint); err != nil || !allowed {
+		t.Fatalf("inference grant changed catalog-read scope: %v, %v", allowed, err)
+	}
+	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || !allowed {
+		t.Fatalf("incoming inference grant = %v, %v", allowed, err)
+	}
+	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
+		t.Fatalf("incoming grant enabled outbound routing: %v, %v", allowed, err)
+	}
+	if _, err := store.GrantInference(member, true, true, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || !allowed {
+		t.Fatalf("explicit outgoing inference grant = %v, %v", allowed, err)
+	}
+	if err := store.RevokeCatalogRead("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := store.AllowsCatalogRead("node-b", fingerprint); err != nil || allowed {
+		t.Fatalf("catalog read remained after its separate revoke: %v, %v", allowed, err)
+	}
+	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
+		t.Fatalf("catalog revoke left outbound inference active: %v, %v", allowed, err)
+	}
+	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || !allowed {
+		t.Fatalf("catalog revoke changed the separate inbound inference grant: %v, %v", allowed, err)
+	}
+	if err := store.RevokeInference("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || allowed {
+		t.Fatalf("inference revoke left incoming grant active: %v, %v", allowed, err)
+	}
+	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
+		t.Fatalf("inference revoke left route grant active: %v, %v", allowed, err)
+	}
+}

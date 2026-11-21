@@ -39,6 +39,7 @@ type peerClient struct {
 	serverCRLs         []*x509.RevocationList
 	crlMaxAge          time.Duration
 	dynamic            bool
+	catalogRead        bool
 	routeInference     bool
 	routeManagement    bool
 	routePaths         map[string]string
@@ -211,14 +212,25 @@ func (c *peerClient) fetch(ctx context.Context) (*nodecontract.Receipt, string) 
 }
 
 func (c *peerCache) update(id string, receipt *nodecontract.Receipt, reason string, now time.Time) {
-	c.updateSource(id, receipt, reason, now, false)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry := c.entries[id]
+	entry.dynamic = false
+	entry.lastAttempt, entry.lastError = now, reason
+	if receipt != nil {
+		entry.receipt = receipt
+	} else if entry.receipt != nil && now.Sub(entry.receipt.ReceivedAt) > peerRetention {
+		entry.receipt = nil
+	}
+	c.entries[id] = entry
 }
 
-func (c *peerCache) updateSource(id string, receipt *nodecontract.Receipt, reason string, now time.Time, dynamic bool) {
+func (c *peerCache) updateSource(id string, receipt *nodecontract.Receipt, reason string, now time.Time, dynamic, routeInference bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry := c.entries[id]
 	entry.dynamic = dynamic
+	entry.routeInference = routeInference
 	entry.lastAttempt, entry.lastError = now, reason
 	if receipt != nil {
 		entry.receipt = receipt
@@ -241,11 +253,12 @@ func (c *peerCache) retainDynamic(authorized map[string]struct{}) {
 	}
 }
 
-func (c *peerCache) markDynamicUnavailable(nodeID, reason string, now time.Time) {
+func (c *peerCache) markDynamicUnavailable(nodeID, reason string, routeInference bool, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry := c.entries[nodeID]
 	entry.dynamic = true
+	entry.routeInference = routeInference
 	entry.lastAttempt, entry.lastError = now, reason
 	if entry.receipt != nil && now.Sub(entry.receipt.ReceivedAt) > peerRetention {
 		entry.receipt = nil
@@ -304,11 +317,15 @@ func (r *Reloader) refreshPeerClients(state *reloaderState, clients map[string]*
 		go func() {
 			defer workers.Done()
 			for client := range jobs {
+				if client.dynamic && !client.catalogRead {
+					state.peerCache.markDynamicUnavailable(client.id, "catalog_read_not_granted", client.routeInference, time.Now())
+					continue
+				}
 				receipt, reason := client.fetch(state.peerContext)
 				if state.peerContext.Err() != nil {
 					continue
 				}
-				state.peerCache.updateSource(client.id, receipt, reason, time.Now(), client.dynamic)
+				state.peerCache.updateSource(client.id, receipt, reason, time.Now(), client.dynamic, client.routeInference)
 				if reason != "" {
 					r.logger.Warn("peer report refresh failed", "node_id", client.id, "reason", reason)
 				}
@@ -351,7 +368,7 @@ func (r *Reloader) watchPeers() {
 				if reason == "" {
 					reason = "not_discovered"
 				}
-				state.peerCache.markDynamicUnavailable(nodeID, reason, now)
+				state.peerCache.markDynamicUnavailable(nodeID, reason, discovered.routeInference[nodeID], now)
 			}
 			if err != nil && state.peerContext.Err() == nil {
 				if r.lastPeerDiscoveryError != err.Error() {

@@ -144,7 +144,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	if handler.comfyUIWaitTimeout > 0 && handler.comfyUIJobs != nil && handler.sharesComfyUIBackend(id.BackendID) {
 		defer handler.comfyUIJobs.endInference()
 	}
-	handler.proxies[id.BackendID].ServeHTTP(w, req)
+	handler.dispatchBackend(w, req, id.BackendID)
 }
 
 func (h *Handler) modelAliases(backendID, localID string) []string {

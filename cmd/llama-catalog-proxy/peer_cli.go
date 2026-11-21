@@ -21,13 +21,14 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/discovery"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/proxy"
 )
 
 const defaultPeerConfigPath = "/config/config.yaml"
 
 func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: llama-catalog-proxy peer {catalog-grants|config|discover|invite|join|members|grants} ...")
+		return errors.New("usage: llama-catalog-proxy peer {catalog-grants|config|discover|inference-grants|invite|join|members|grants} ...")
 	}
 	switch args[0] {
 	case "invite":
@@ -92,6 +93,20 @@ func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 			return finishPeerCommand(runPeerCatalogGrantRevoke(args[2:], stdout, stderr))
 		default:
 			return errors.New("unknown peer catalog-grants action")
+		}
+	case "inference-grants":
+		if len(args) < 2 {
+			return errors.New("usage: llama-catalog-proxy peer inference-grants {create|list|revoke} ...")
+		}
+		switch args[1] {
+		case "create":
+			return finishPeerCommand(runPeerInferenceGrantCreate(args[2:], stdout, stderr))
+		case "list":
+			return finishPeerCommand(runPeerInferenceGrantList(args[2:], stdout, stderr))
+		case "revoke":
+			return finishPeerCommand(runPeerInferenceGrantRevoke(args[2:], stdout, stderr))
+		default:
+			return errors.New("unknown peer inference-grants action")
 		}
 	default:
 		return errors.New("unknown peer action")
@@ -385,11 +400,11 @@ func withPeerCLIAudit(configPath, action, targetID, modelID, correlationID strin
 	var output bytes.Buffer
 	target, model, correlation, operationErr := operation(&output)
 	outcome := "succeeded"
-	if operationErr != nil {
-		outcome = "failed"
-		if errors.Is(operationErr, federation.ErrPairingStore) || errors.Is(operationErr, federation.ErrInvitation) ||
-			errors.Is(operationErr, federation.ErrCatalogGrantStore) || errors.Is(operationErr, modelconfig.ErrOwnerGrantStore) ||
-			errors.Is(operationErr, auditlog.ErrUnavailable) {
+		if operationErr != nil {
+			outcome = "failed"
+			if errors.Is(operationErr, federation.ErrPairingStore) || errors.Is(operationErr, federation.ErrInvitation) ||
+				errors.Is(operationErr, federation.ErrCatalogGrantStore) || errors.Is(operationErr, modelconfig.ErrOwnerGrantStore) ||
+				errors.Is(operationErr, auditlog.ErrUnavailable) || errors.Is(operationErr, proxy.ErrComfyUIReleaseUnknown) {
 			outcome = "unknown"
 		}
 	}

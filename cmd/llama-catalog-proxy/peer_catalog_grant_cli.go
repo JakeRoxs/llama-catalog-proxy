@@ -12,7 +12,7 @@ import (
 
 type peerCatalogGrantView struct {
 	federation.CatalogReadGrant
-	Active bool `json:"active"`
+	CurrentFingerprint bool `json:"current_fingerprint"`
 }
 
 func runPeerCatalogGrantCreate(args []string, stdout, stderr io.Writer) error {
@@ -72,8 +72,8 @@ func runPeerCatalogGrantList(args []string, stdout, stderr io.Writer) error {
 				return "", "", "", lookupErr
 			}
 			result = append(result, peerCatalogGrantView{
-				CatalogReadGrant: grant,
-				Active:           paired && member.Fingerprint == grant.Fingerprint,
+				CatalogReadGrant:   grant,
+				CurrentFingerprint: paired && member.Fingerprint == grant.Fingerprint,
 			})
 		}
 		return "", "", "", json.NewEncoder(out).Encode(result)
@@ -101,7 +101,7 @@ func runPeerCatalogGrantRevoke(args []string, stdout, stderr io.Writer) error {
 		if err := grants.RevokeCatalogRead(*nodeID); err != nil {
 			return *nodeID, "", "", err
 		}
-		_, err = io.WriteString(out, "catalog_read grant revoked\n")
+		_, err = io.WriteString(out, "catalog_read grant revoked; outbound dynamic inference routing disabled\n")
 		return *nodeID, "", "", err
 	})
 }

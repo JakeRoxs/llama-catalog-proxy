@@ -66,7 +66,8 @@ test("admin dashboard uses OIDC session and renders only the safe overview field
     "/admin/api/v1/federation/members": { state: "available", members: [{ node_id: "peer-b", certificate_sha256: "a".repeat(64), paired_at: "2026-11-16T00:00:00Z" }] },
     "/admin/api/v1/federation/invitations": { state: "available", invitations: [{ node_id: "peer-c", expires_at: "2026-11-16T00:10:00Z" }] },
     "/admin/api/v1/federation/grants": { state: "available", grants: [{ id: "0123456789abcdef0123456789abcdef", requester_node_id: "peer-b", backend_id: "backend-a", target_id: "target-a", model_ids: ["model-a"], expires_at: "2026-11-17T00:00:00Z" }] },
-    "/admin/api/v1/federation/catalog-grants": { state: "available", grants: [{ node_id: "peer-b", certificate_sha256: "a".repeat(64), active: true }] },
+    "/admin/api/v1/federation/catalog-grants": { state: "available", grants: [{ node_id: "peer-b", certificate_sha256: "a".repeat(64), current_fingerprint: true }] },
+    "/admin/api/v1/federation/inference-grants": { state: "available", grants: [{ node_id: "peer-b", certificate_sha256: "a".repeat(64), allow_incoming_inference: true, route_outgoing_inference: false, current_fingerprint: true }] },
     "/admin/api/v1/audit/events?limit=50": { state: "available", retention_days: 30, events: [] },
   };
   const fetchImpl = async (url, options) => {
@@ -75,7 +76,7 @@ test("admin dashboard uses OIDC session and renders only the safe overview field
   };
   const { elements } = createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.deepEqual(calls.map((call) => call.url), ["/admin/api/v1/session", "/admin/api/v1/overview", "/admin/api/v1/activity", "/admin/api/v1/federation/members", "/admin/api/v1/federation/invitations", "/admin/api/v1/federation/grants", "/admin/api/v1/federation/catalog-grants", "/admin/api/v1/audit/events?limit=50"]);
+  assert.deepEqual(calls.map((call) => call.url), ["/admin/api/v1/session", "/admin/api/v1/overview", "/admin/api/v1/activity", "/admin/api/v1/federation/members", "/admin/api/v1/federation/invitations", "/admin/api/v1/federation/grants", "/admin/api/v1/federation/catalog-grants", "/admin/api/v1/federation/inference-grants", "/admin/api/v1/audit/events?limit=50"]);
   assert.ok(calls.every((call) => call.options.credentials === "same-origin"));
   assert.ok(calls.every((call) => call.options.headers === undefined || call.options.headers.Authorization === undefined));
   assert.equal(elements.get("dashboard").hidden, false);
@@ -95,9 +96,10 @@ test("admin dashboard uses OIDC session and renders only the safe overview field
   assert.match(textOf(elements.get("paired-members")), /peer-b/);
   assert.match(textOf(elements.get("pending-invitations")), /peer-c/);
   assert.match(textOf(elements.get("owner-grants")), /peer-b.*backend-a.*model-a/);
-  assert.match(textOf(elements.get("catalog-read-grants")), /peer-b.*Active for paired certificate/);
+  assert.match(textOf(elements.get("catalog-read-grants")), /peer-b.*Fingerprint matches current paired identity/);
+  assert.match(textOf(elements.get("inference-grants")), /peer-b.*Allowed.*Off/);
   await elements.get("refresh").listeners.click();
-  assert.equal(calls.length, 16, "manual refresh reloads overview, activity, pairing, catalog grants, owner grants and audit events");
+  assert.equal(calls.length, 18, "manual refresh reloads overview, activity, pairing, catalog and inference grants, owner grants and audit events");
 });
 
 test("admin dashboard does not query sensitive endpoints", async () => {
@@ -154,6 +156,48 @@ test("catalog-read grant UI requires explicit confirmation and uses CSRF-protect
   assert.deepEqual(JSON.parse(mutation.options.body), { node_id: "node-b" });
   assert.equal(mutation.options.headers.Authorization, undefined);
   assert.match(elements.get("pairing-notice").textContent, /approved for the current paired certificate/);
+});
+
+test("inference grant UI submits independent directions with CSRF protection", async () => {
+  const calls = [];
+  const fetchImpl = async (url, options = {}) => {
+    calls.push({ url, options });
+    const response = url === "/admin/api/v1/session"
+      ? { subject: "operator", roles: ["view", "administer_federation"], csrf_token: "csrf" }
+      : url === "/admin/api/v1/overview"
+        ? { node_id: "node-a", updated_at: "2026-11-16T00:00:00Z", models: [], peers: [], request_summary_state: "not_configured" }
+        : url === "/admin/api/v1/federation/members"
+          ? { state: "available", members: [{ node_id: "node-b" }] }
+          : url === "/admin/api/v1/federation/invitations"
+            ? { state: "available", invitations: [] }
+            : url === "/admin/api/v1/federation/catalog-grants"
+              ? { state: "available", grants: [] }
+              : url === "/admin/api/v1/federation/inference-grants"
+                ? { state: "available", grants: [] }
+                : url === "/admin/api/v1/federation/grants"
+                  ? { state: "not_configured", grants: [] }
+                  : url === "/admin/api/v1/audit/events?limit=50"
+                    ? { state: "available", events: [] }
+                    : { grant: { node_id: "node-b" } };
+    return { ok: true, status: 200, json: async () => response };
+  };
+  const { elements } = createDashboard(fetchImpl);
+  await new Promise((resolve) => setImmediate(resolve));
+  elements.set("inference-grant-node", new Element("input"));
+  elements.set("inference-grant-incoming", new Element("input"));
+  elements.set("inference-grant-outgoing", new Element("input"));
+  elements.set("inference-grant-confirm", new Element("input"));
+  elements.get("inference-grant-node").value = "node-b";
+  elements.get("inference-grant-incoming").checked = true;
+  elements.get("inference-grant-outgoing").checked = false;
+  elements.get("inference-grant-confirm").checked = true;
+  await elements.get("inference-grant-form").listeners.submit({ preventDefault() {} });
+  const mutation = calls.find((call) => call.url === "/admin/api/v1/federation/inference-grants" && call.options.method === "POST");
+  assert.ok(mutation);
+  assert.equal(mutation.options.headers["X-Llama-Catalog-CSRF"], "csrf");
+  assert.deepEqual(JSON.parse(mutation.options.body), {
+    node_id: "node-b", allow_incoming_inference: true, route_outgoing_inference: false,
+  });
 });
 
 test("federation administrator creates a one-time invitation through the protected API", async () => {

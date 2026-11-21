@@ -78,6 +78,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "comfyui-lease" {
+		if err := runComfyUILeaseCommand(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintln(os.Stderr, "comfyui lease command failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	configPath := flag.String("config", "/config/config.yaml", "path to YAML configuration")
 	healthcheckURL := flag.String("healthcheck", "", "check an HTTP health endpoint and exit")
 	checkConfig := flag.Bool("check-config", false, "validate configuration and exit")

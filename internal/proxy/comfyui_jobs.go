@@ -237,5 +237,6 @@ func (t *comfyUIJobTracker) queueBusy(ctx context.Context) (bool, error) {
 }
 
 func isComfyPromptRequest(request *http.Request) bool {
-	return request != nil && request.Method == http.MethodPost && request.URL.Path == "/comfyui/prompt"
+	return request != nil && request.URL != nil && request.Method == http.MethodPost &&
+		(request.URL.Path == "/comfyui/prompt" || request.URL.Path == "/comfyui/api/prompt")
 }

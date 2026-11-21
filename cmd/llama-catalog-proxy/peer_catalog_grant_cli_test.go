@@ -49,6 +49,11 @@ func TestPeerCatalogGrantCLIRequiresPairingAndFingerprintRegrant(t *testing.T) {
 	}
 
 	var output bytes.Buffer
+	if err := runPeerCommand([]string{"inference-grants", "create", "--config", configPath, "--node-id", "node-b",
+		"--route-outgoing", "--acknowledge"}, &output, &bytes.Buffer{}); err == nil {
+		t.Fatal("outgoing inference grant without catalog read was accepted")
+	}
+	output.Reset()
 	if err := runPeerCommand([]string{"catalog-grants", "create", "--config", configPath,
 		"--node-id", "node-b", "--acknowledge"}, &output, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
@@ -65,8 +70,21 @@ func TestPeerCatalogGrantCLIRequiresPairingAndFingerprintRegrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	var listed []peerCatalogGrantView
-	if err := json.Unmarshal(output.Bytes(), &listed); err != nil || len(listed) != 1 || !listed[0].Active {
+	if err := json.Unmarshal(output.Bytes(), &listed); err != nil || len(listed) != 1 || !listed[0].CurrentFingerprint {
 		t.Fatalf("active catalog grant list = %s, %v", output.String(), err)
+	}
+	if err := runPeerCommand([]string{"inference-grants", "create", "--config", configPath, "--node-id", "node-b",
+		"--route-outgoing", "--acknowledge"}, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	output.Reset()
+	if err := runPeerCommand([]string{"inference-grants", "list", "--config", configPath}, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	var inferenceListed []peerInferenceGrantView
+	if err := json.Unmarshal(output.Bytes(), &inferenceListed); err != nil || len(inferenceListed) != 1 ||
+		!inferenceListed[0].CurrentFingerprint || !inferenceListed[0].RouteOutgoing || inferenceListed[0].AllowIncoming {
+		t.Fatalf("independent route-inference grant = %s, %v", output.String(), err)
 	}
 
 	store, err = federation.OpenPairingStore(membershipDir, "lab.example", "node-a")
@@ -83,12 +101,23 @@ func TestPeerCatalogGrantCLIRequiresPairingAndFingerprintRegrant(t *testing.T) {
 	if err := runPeerCommand([]string{"catalog-grants", "list", "--config", configPath}, &output, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(output.Bytes(), &listed); err != nil || len(listed) != 1 || listed[0].Active {
+	if err := json.Unmarshal(output.Bytes(), &listed); err != nil || len(listed) != 1 || listed[0].CurrentFingerprint {
 		t.Fatalf("rotated certificate inherited catalog grant: %s, %v", output.String(), err)
+	}
+	output.Reset()
+	if err := runPeerCommand([]string{"inference-grants", "list", "--config", configPath}, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(output.Bytes(), &inferenceListed); err != nil || len(inferenceListed) != 1 || inferenceListed[0].CurrentFingerprint {
+		t.Fatalf("rotated certificate inherited inference grant: %s, %v", output.String(), err)
 	}
 
 	if err := runPeerCommand([]string{"catalog-grants", "create", "--config", configPath,
 		"--node-id", "node-b", "--acknowledge"}, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := runPeerCommand([]string{"inference-grants", "create", "--config", configPath, "--node-id", "node-b",
+		"--route-outgoing", "--acknowledge"}, &output, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := runPeerCommand([]string{"catalog-grants", "revoke", "--config", configPath,
@@ -101,5 +130,12 @@ func TestPeerCatalogGrantCLIRequiresPairingAndFingerprintRegrant(t *testing.T) {
 	}
 	if strings.TrimSpace(output.String()) != "[]" {
 		t.Fatalf("revoked catalog grant remains listed: %s", output.String())
+	}
+	output.Reset()
+	if err := runPeerCommand([]string{"inference-grants", "list", "--config", configPath}, &output, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(output.String()) != "[]" {
+		t.Fatalf("catalog revoke left outbound inference grant active: %s", output.String())
 	}
 }

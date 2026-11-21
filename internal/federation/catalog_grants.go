@@ -25,8 +25,10 @@ const (
 )
 
 var (
-	ErrCatalogGrantStore   = errors.New("catalog grant store unavailable")
-	ErrCatalogGrantMissing = errors.New("catalog read grant not found")
+	ErrCatalogGrantStore     = errors.New("catalog grant store unavailable")
+	ErrCatalogGrantMissing   = errors.New("catalog read grant not found")
+	ErrInferenceGrantMissing = errors.New("inference grant not found")
+	ErrInferenceNeedsCatalog = errors.New("outbound inference grant requires a current catalog read grant")
 )
 
 type CatalogReadGrant struct {
@@ -35,11 +37,20 @@ type CatalogReadGrant struct {
 	GrantedAt   time.Time `json:"granted_at"`
 }
 
+type InferenceGrant struct {
+	NodeID        string    `json:"node_id"`
+	Fingerprint   string    `json:"certificate_sha256"`
+	AllowIncoming bool      `json:"allow_incoming_inference"`
+	RouteOutgoing bool      `json:"route_outgoing_inference"`
+	GrantedAt     time.Time `json:"granted_at"`
+}
+
 type catalogGrantData struct {
 	Version      int                         `json:"version"`
 	FederationID string                      `json:"federation_id"`
 	LocalNodeID  string                      `json:"local_node_id"`
 	Grants       map[string]CatalogReadGrant `json:"catalog_read_grants"`
+	Inference    map[string]InferenceGrant   `json:"inference_grants,omitempty"`
 }
 
 type CatalogGrantStore struct {
@@ -72,7 +83,10 @@ func OpenCatalogGrantStore(directory, federationID, localNodeID string) (*Catalo
 	}
 	store := &CatalogGrantStore{
 		root: root, directory: directory, federationID: federationID, localNodeID: localNodeID,
-		data: catalogGrantData{Version: 1, FederationID: federationID, LocalNodeID: localNodeID, Grants: make(map[string]CatalogReadGrant)},
+		data: catalogGrantData{
+			Version: 1, FederationID: federationID, LocalNodeID: localNodeID,
+			Grants: make(map[string]CatalogReadGrant), Inference: make(map[string]InferenceGrant),
+		},
 	}
 	if err := store.openLock(); err != nil {
 		_ = root.Close()
@@ -115,6 +129,11 @@ func (s *CatalogGrantStore) GrantCatalogRead(member Membership, now time.Time) (
 			return CatalogReadGrant{}, ErrCatalogGrantStore
 		}
 	}
+	for nodeID, existing := range s.data.Inference {
+		if nodeID != member.NodeID && strings.EqualFold(existing.Fingerprint, member.Fingerprint) {
+			return CatalogReadGrant{}, ErrCatalogGrantStore
+		}
+	}
 	if _, ok := s.data.Grants[member.NodeID]; !ok && len(s.data.Grants) >= maxCatalogGrants {
 		return CatalogReadGrant{}, ErrCatalogGrantStore
 	}
@@ -144,6 +163,14 @@ func (s *CatalogGrantStore) RevokeCatalogRead(nodeID string) error {
 		return ErrCatalogGrantMissing
 	}
 	delete(s.data.Grants, nodeID)
+	if inference, ok := s.data.Inference[nodeID]; ok {
+		inference.RouteOutgoing = false
+		if inference.AllowIncoming {
+			s.data.Inference[nodeID] = inference
+		} else {
+			delete(s.data.Inference, nodeID)
+		}
+	}
 	return s.persist()
 }
 
@@ -178,6 +205,128 @@ func (s *CatalogGrantStore) ListCatalogReadGrants() ([]CatalogReadGrant, error) 
 	defer unlock()
 	grants := make([]CatalogReadGrant, 0, len(s.data.Grants))
 	for _, grant := range s.data.Grants {
+		grants = append(grants, grant)
+	}
+	sort.Slice(grants, func(i, j int) bool { return grants[i].NodeID < grants[j].NodeID })
+	return grants, nil
+}
+
+func (s *CatalogGrantStore) GrantInference(member Membership, allowIncoming, routeOutgoing bool, now time.Time) (InferenceGrant, error) {
+	if !identity.ValidNodeID(member.NodeID) || member.NodeID == s.localNodeID || !validFingerprint(member.Fingerprint) ||
+		member.PairedAt.IsZero() || now.IsZero() || (!allowIncoming && !routeOutgoing) {
+		return InferenceGrant{}, ErrCatalogGrantStore
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.failed {
+		return InferenceGrant{}, ErrCatalogGrantStore
+	}
+	unlock, err := s.lockAndRead()
+	if err != nil {
+		return InferenceGrant{}, err
+	}
+	defer unlock()
+	if routeOutgoing {
+		catalogGrant, ok := s.data.Grants[member.NodeID]
+		if !ok || !strings.EqualFold(catalogGrant.Fingerprint, member.Fingerprint) {
+			return InferenceGrant{}, ErrInferenceNeedsCatalog
+		}
+	}
+	if existing, ok := s.data.Inference[member.NodeID]; ok && strings.EqualFold(existing.Fingerprint, member.Fingerprint) &&
+		existing.AllowIncoming == allowIncoming && existing.RouteOutgoing == routeOutgoing {
+		return existing, nil
+	}
+	for nodeID, existing := range s.data.Grants {
+		if nodeID != member.NodeID && strings.EqualFold(existing.Fingerprint, member.Fingerprint) {
+			return InferenceGrant{}, ErrCatalogGrantStore
+		}
+	}
+	for nodeID, existing := range s.data.Inference {
+		if nodeID != member.NodeID && strings.EqualFold(existing.Fingerprint, member.Fingerprint) {
+			return InferenceGrant{}, ErrCatalogGrantStore
+		}
+	}
+	if _, ok := s.data.Inference[member.NodeID]; !ok && len(s.data.Inference) >= maxCatalogGrants {
+		return InferenceGrant{}, ErrCatalogGrantStore
+	}
+	grant := InferenceGrant{
+		NodeID: member.NodeID, Fingerprint: strings.ToLower(member.Fingerprint),
+		AllowIncoming: allowIncoming, RouteOutgoing: routeOutgoing, GrantedAt: now.UTC(),
+	}
+	s.data.Inference[member.NodeID] = grant
+	if err := s.persist(); err != nil {
+		return InferenceGrant{}, err
+	}
+	return grant, nil
+}
+
+func (s *CatalogGrantStore) RevokeInference(nodeID string) error {
+	if !identity.ValidNodeID(nodeID) || nodeID == s.localNodeID {
+		return ErrInferenceGrantMissing
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.failed {
+		return ErrCatalogGrantStore
+	}
+	unlock, err := s.lockAndRead()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if _, ok := s.data.Inference[nodeID]; !ok {
+		return ErrInferenceGrantMissing
+	}
+	delete(s.data.Inference, nodeID)
+	return s.persist()
+}
+
+func (s *CatalogGrantStore) AllowsIncomingInference(nodeID, fingerprint string) (bool, error) {
+	return s.allowsInference(nodeID, fingerprint, false)
+}
+
+func (s *CatalogGrantStore) AllowsOutgoingInference(nodeID, fingerprint string) (bool, error) {
+	return s.allowsInference(nodeID, fingerprint, true)
+}
+
+func (s *CatalogGrantStore) allowsInference(nodeID, fingerprint string, outgoing bool) (bool, error) {
+	if !identity.ValidNodeID(nodeID) || !validFingerprint(fingerprint) {
+		return false, ErrCatalogGrantStore
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.failed {
+		return false, ErrCatalogGrantStore
+	}
+	unlock, err := s.lockAndRead()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	grant, ok := s.data.Inference[nodeID]
+	if !ok || !strings.EqualFold(grant.Fingerprint, fingerprint) {
+		return false, nil
+	}
+	if outgoing {
+		catalogGrant, catalogOK := s.data.Grants[nodeID]
+		return grant.RouteOutgoing && catalogOK && strings.EqualFold(catalogGrant.Fingerprint, fingerprint), nil
+	}
+	return grant.AllowIncoming, nil
+}
+
+func (s *CatalogGrantStore) ListInferenceGrants() ([]InferenceGrant, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.failed {
+		return nil, ErrCatalogGrantStore
+	}
+	unlock, err := s.lockAndRead()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	grants := make([]InferenceGrant, 0, len(s.data.Inference))
+	for _, grant := range s.data.Inference {
 		grants = append(grants, grant)
 	}
 	sort.Slice(grants, func(i, j int) bool { return grants[i].NodeID < grants[j].NodeID })
@@ -235,7 +384,7 @@ func (s *CatalogGrantStore) lockAndRead() (func() error, error) {
 func (s *CatalogGrantStore) read() error {
 	s.data = catalogGrantData{
 		Version: 1, FederationID: s.federationID, LocalNodeID: s.localNodeID,
-		Grants: make(map[string]CatalogReadGrant),
+		Grants: make(map[string]CatalogReadGrant), Inference: make(map[string]InferenceGrant),
 	}
 	pathInfo, err := s.root.Lstat(catalogGrantFilename)
 	if errors.Is(err, os.ErrNotExist) {
@@ -265,6 +414,9 @@ func (s *CatalogGrantStore) read() error {
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) || validateCatalogGrantData(stored, s.federationID, s.localNodeID) != nil {
 		return ErrCatalogGrantStore
+	}
+	if stored.Inference == nil {
+		stored.Inference = make(map[string]InferenceGrant)
 	}
 	s.data = stored
 	return nil
@@ -319,10 +471,11 @@ func (s *CatalogGrantStore) persist() error {
 
 func validateCatalogGrantData(data catalogGrantData, federationID, localNodeID string) error {
 	if data.Version != 1 || data.FederationID != federationID || data.LocalNodeID != localNodeID ||
-		data.Grants == nil || len(data.Grants) > maxCatalogGrants {
+		data.Grants == nil || len(data.Grants) > maxCatalogGrants || len(data.Inference) > maxCatalogGrants {
 		return ErrCatalogGrantStore
 	}
 	fingerprints := make(map[string]struct{}, len(data.Grants))
+	fingerprintNode := make(map[string]string, len(data.Grants)+len(data.Inference))
 	for nodeID, grant := range data.Grants {
 		fingerprint := strings.ToLower(grant.Fingerprint)
 		if !identity.ValidNodeID(nodeID) || nodeID == localNodeID || grant.NodeID != nodeID ||
@@ -333,6 +486,18 @@ func validateCatalogGrantData(data catalogGrantData, federationID, localNodeID s
 			return ErrCatalogGrantStore
 		}
 		fingerprints[fingerprint] = struct{}{}
+		fingerprintNode[fingerprint] = nodeID
+	}
+	for nodeID, grant := range data.Inference {
+		fingerprint := strings.ToLower(grant.Fingerprint)
+		if !identity.ValidNodeID(nodeID) || nodeID == localNodeID || grant.NodeID != nodeID ||
+			!validFingerprint(fingerprint) || grant.GrantedAt.IsZero() || (!grant.AllowIncoming && !grant.RouteOutgoing) {
+			return ErrCatalogGrantStore
+		}
+		if owner, duplicate := fingerprintNode[fingerprint]; duplicate && owner != nodeID {
+			return ErrCatalogGrantStore
+		}
+		fingerprintNode[fingerprint] = nodeID
 	}
 	return nil
 }

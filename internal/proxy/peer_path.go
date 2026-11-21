@@ -156,7 +156,8 @@ func (r *Reloader) servePeerPath(w http.ResponseWriter, req *http.Request) {
 	}
 	escapedPath := string(escapedPathBytes)
 	requestPath, err := url.PathUnescape(escapedPath)
-	if err != nil || requestPath == "" || requestPath[0] != '/' || path.Clean(requestPath) != requestPath ||
+	frontendRoot := service == "comfyui" && localPrefix == "/comfyui" && requestPath == "/comfyui/" && req.Method == http.MethodGet
+	if err != nil || requestPath == "" || requestPath[0] != '/' || (!frontendRoot && path.Clean(requestPath) != requestPath) ||
 		strings.ContainsAny(requestPath, "?#\\") || !pathHasPrefix(requestPath, localPrefix) {
 		http.Error(w, "invalid path service request", http.StatusBadRequest)
 		return
@@ -166,16 +167,19 @@ func (r *Reloader) servePeerPath(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	backendID, matchedPrefix, matched := handler.routePathMatch(requestPath)
-	if !matched || matchedPrefix != localPrefix {
-		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
-		return
-	}
 	forwarded := req.Clone(req.Context())
 	forwarded.URL.Path = requestPath
 	forwarded.URL.RawPath = escapedPath
 	forwarded.Header = peerPathBackendHeaders(req.Header)
 	forwarded.Host = ""
+	if service == "comfyui" && handler.serveComfyUIResultRead(w, forwarded, &routeInfo{}, false) {
+		return
+	}
+	backendID, matchedPrefix, matched := handler.routePathMatch(requestPath)
+	if !matched || matchedPrefix != localPrefix {
+		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	handler.servePathRoute(w, forwarded, &routeInfo{}, backendID)
 }
 

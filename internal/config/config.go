@@ -132,23 +132,73 @@ type ManagementTarget struct {
 
 // PeerConfig describes the opt-in HTTPS listener and explicitly configured peers.
 type PeerConfig struct {
-	NodeID                string               `yaml:"node_id"`
-	Listen                string               `yaml:"listen"`
-	TLSCertFile           string               `yaml:"tls_cert_file"`
-	TLSKeyFile            string               `yaml:"tls_key_file"`
-	FederationID          string               `yaml:"federation_id,omitempty"`
-	ClientCAFile          string               `yaml:"client_ca_file,omitempty"`
-	ClientCRLFile         string               `yaml:"client_crl_file,omitempty"`
-	CRLMaxAge             string               `yaml:"crl_max_age,omitempty"`
-	MembershipDirectory   string               `yaml:"membership_directory,omitempty"`
-	AuditDirectory        string               `yaml:"audit_directory,omitempty"`
-	CatalogGrantDirectory string               `yaml:"catalog_grant_directory,omitempty"`
-	LocalBackends         []string             `yaml:"local_backends"`
-	ManagementTargets     map[string]string    `yaml:"management_targets,omitempty"`
-	RouteAliases          []string             `yaml:"route_aliases,omitempty"`
-	ExposedPathRoutes     map[string]string    `yaml:"exposed_path_routes,omitempty"`
-	Discovery             *PeerDiscoveryConfig `yaml:"discovery,omitempty"`
-	Peers                 map[string]PeerGrant `yaml:"peers"`
+	NodeID                string                   `yaml:"node_id"`
+	Listen                string                   `yaml:"listen"`
+	TLSCertFile           string                   `yaml:"tls_cert_file"`
+	TLSKeyFile            string                   `yaml:"tls_key_file"`
+	FederationID          string                   `yaml:"federation_id,omitempty"`
+	ClientCAFile          string                   `yaml:"client_ca_file,omitempty"`
+	ClientCRLFile         string                   `yaml:"client_crl_file,omitempty"`
+	CRLMaxAge             string                   `yaml:"crl_max_age,omitempty"`
+	MembershipDirectory   string                   `yaml:"membership_directory,omitempty"`
+	AuditDirectory        string                   `yaml:"audit_directory,omitempty"`
+	CatalogGrantDirectory string                   `yaml:"catalog_grant_directory,omitempty"`
+	LocalBackends         []string                 `yaml:"local_backends"`
+	ManagementTargets     map[string]string        `yaml:"management_targets,omitempty"`
+	RouteAliases          []string                 `yaml:"route_aliases,omitempty"`
+	ExposedPathRoutes     map[string]string        `yaml:"exposed_path_routes,omitempty"`
+	ComfyUIResultRead     *ComfyUIResultReadConfig `yaml:"comfyui_result_read,omitempty"`
+	ComfyUILease          *ComfyUILeaseConfig      `yaml:"comfyui_lease,omitempty"`
+	Discovery             *PeerDiscoveryConfig     `yaml:"discovery,omitempty"`
+	Peers                 map[string]PeerGrant     `yaml:"peers"`
+}
+
+type ComfyUIResultReadConfig struct {
+	URL                 string            `yaml:"url"`
+	APIKey              string            `yaml:"api_key,omitempty"`
+	Headers             map[string]string `yaml:"headers,omitempty"`
+	ImageUploadMaxBytes int64             `yaml:"image_upload_max_bytes,omitempty"`
+}
+
+func (c *ComfyUIResultReadConfig) ImageUploadLimit() int64 {
+	if c.ImageUploadMaxBytes == 0 {
+		return 16 << 20
+	}
+	return c.ImageUploadMaxBytes
+}
+
+type ComfyUILeaseConfig struct {
+	ReleaseTimeout       string           `yaml:"release_timeout,omitempty"`
+	PollInterval         string           `yaml:"poll_interval,omitempty"`
+	QueueIdleSamples     int              `yaml:"queue_idle_samples,omitempty"`
+	MinimumFreeVRAMBytes map[string]int64 `yaml:"minimum_free_vram_bytes"`
+	// AdmissionBackends opts proxy-mediated requests for these backends into
+	// best-effort ComfyUI release coordination. Empty leaves the verifier CLI
+	// available without enabling runtime admission.
+	AdmissionBackends []string `yaml:"admission_backends,omitempty"`
+}
+
+func (c *ComfyUILeaseConfig) ReleaseTimeoutDuration() time.Duration {
+	if c == nil || c.ReleaseTimeout == "" {
+		return 2 * time.Minute
+	}
+	duration, _ := time.ParseDuration(c.ReleaseTimeout)
+	return duration
+}
+
+func (c *ComfyUILeaseConfig) PollIntervalDuration() time.Duration {
+	if c == nil || c.PollInterval == "" {
+		return 500 * time.Millisecond
+	}
+	duration, _ := time.ParseDuration(c.PollInterval)
+	return duration
+}
+
+func (c *ComfyUILeaseConfig) StableQueueSamples() int {
+	if c == nil || c.QueueIdleSamples == 0 {
+		return 2
+	}
+	return c.QueueIdleSamples
 }
 
 type PeerDiscoveryConfig struct {
@@ -900,6 +950,85 @@ func validatePeer(c Config) error {
 	if strings.TrimSpace(p.TLSCertFile) == "" || strings.TrimSpace(p.TLSKeyFile) == "" {
 		return errors.New("peer TLS certificate and key files are required")
 	}
+	if p.ComfyUIResultRead != nil {
+		if p.ComfyUIResultRead.ImageUploadMaxBytes < 0 || p.ComfyUIResultRead.ImageUploadMaxBytes > 64<<20 {
+			return errors.New("peer comfyui_result_read image_upload_max_bytes must be between 0 (16 MiB default) and 67108864")
+		}
+		pathBackendID, pathRouteExists := c.PathRoutes["/comfyui"]
+		pathBackend, backendExists := c.Backends[pathBackendID]
+		if !pathRouteExists || !backendExists {
+			return errors.New("peer comfyui_result_read requires path_routes /comfyui to a configured scheduler backend")
+		}
+		if err := validateHTTPURL("peer.comfyui_result_read", p.ComfyUIResultRead.URL); err != nil {
+			return err
+		}
+		target, err := url.Parse(p.ComfyUIResultRead.URL)
+		if err != nil || target == nil || target.User != nil || target.Opaque != "" ||
+			(target.Path != "" && target.Path != "/") || target.RawPath != "" || target.Fragment != "" || target.RawFragment != "" {
+			return errors.New("peer comfyui_result_read URL must be an origin without credentials or a path")
+		}
+		schedulerURL, err := url.Parse(pathBackend.URL)
+		if err == nil && sameHTTPOrigin(target, schedulerURL) {
+			return errors.New("peer comfyui_result_read must target a separate persistent ComfyUI service, not the scheduler backend")
+		}
+		if len(p.ComfyUIResultRead.Headers) > 64 ||
+			(p.ComfyUIResultRead.APIKey != "" && !validHeaderValue(p.ComfyUIResultRead.APIKey)) {
+			return errors.New("peer comfyui_result_read headers or API key are invalid")
+		}
+		for name, value := range p.ComfyUIResultRead.Headers {
+			if !validHeaderName(name) || !validHeaderValue(value) {
+				return errors.New("peer comfyui_result_read headers or API key are invalid")
+			}
+		}
+		if exposedPrefix := p.ExposedPathRoutes["comfyui"]; exposedPrefix != "" && exposedPrefix != "/comfyui" {
+			return errors.New("peer comfyui_result_read can only be exposed through the /comfyui service prefix")
+		}
+	}
+	if p.ComfyUILease != nil {
+		if p.ComfyUIResultRead == nil {
+			return errors.New("peer comfyui_lease requires comfyui_result_read")
+		}
+		releaseTimeout := p.ComfyUILease.ReleaseTimeoutDuration()
+		pollInterval := p.ComfyUILease.PollIntervalDuration()
+		if releaseTimeout < 5*time.Second || releaseTimeout > 30*time.Minute ||
+			pollInterval < 100*time.Millisecond || pollInterval > 10*time.Second {
+			return errors.New("peer comfyui_lease release_timeout or poll_interval is outside its supported range")
+		}
+		if p.ComfyUILease.QueueIdleSamples != 0 && (p.ComfyUILease.QueueIdleSamples < 2 || p.ComfyUILease.QueueIdleSamples > 10) {
+			return errors.New("peer comfyui_lease queue_idle_samples must be between 2 and 10")
+		}
+		if len(p.ComfyUILease.MinimumFreeVRAMBytes) == 0 || len(p.ComfyUILease.MinimumFreeVRAMBytes) > 16 {
+			return errors.New("peer comfyui_lease requires a minimum free-VRAM threshold for each GPU device")
+		}
+		for device, threshold := range p.ComfyUILease.MinimumFreeVRAMBytes {
+			deviceType, indexText, ok := strings.Cut(device, ":")
+			index, err := strconv.Atoi(indexText)
+			if !ok || deviceType == "" || deviceType == "cpu" || strings.ToLower(deviceType) != deviceType || len(deviceType) > 32 ||
+				strings.ContainsAny(deviceType, " :/\\\t\r\n") || err != nil || index < 0 || index > 63 ||
+				strconv.Itoa(index) != indexText || threshold <= 0 {
+				return errors.New("peer comfyui_lease minimum_free_vram_bytes keys must be device_type:index with positive byte thresholds")
+			}
+		}
+		if len(p.ComfyUILease.AdmissionBackends) > 0 {
+			promptBackend, ok := c.PathRoutes["/comfyui"]
+			if !ok || promptBackend == "" {
+				return errors.New("peer comfyui_lease admission_backends requires path_routes /comfyui")
+			}
+			managed := make(map[string]bool, len(p.ComfyUILease.AdmissionBackends))
+			for _, id := range p.ComfyUILease.AdmissionBackends {
+				if id == "" || managed[id] {
+					return errors.New("peer comfyui_lease admission_backends must contain unique configured backend IDs")
+				}
+				if _, exists := c.Backends[id]; !exists {
+					return fmt.Errorf("peer comfyui_lease admission backend %q is not configured", id)
+				}
+				managed[id] = true
+			}
+			if !managed[promptBackend] {
+				return errors.New("peer comfyui_lease admission_backends must include the /comfyui prompt backend")
+			}
+		}
+	}
 	if p.AuditDirectory != "" && (!filepath.IsAbs(p.AuditDirectory) || filepath.Clean(p.AuditDirectory) != p.AuditDirectory) {
 		return errors.New("peer audit_directory must be an absolute clean path")
 	}
@@ -1082,6 +1211,23 @@ func validatePeer(c Config) error {
 		}
 	}
 	return nil
+}
+
+func sameHTTPOrigin(left, right *url.URL) bool {
+	if left == nil || right == nil || !strings.EqualFold(left.Scheme, right.Scheme) ||
+		!strings.EqualFold(left.Hostname(), right.Hostname()) {
+		return false
+	}
+	port := func(target *url.URL) string {
+		if target.Port() != "" {
+			return target.Port()
+		}
+		if strings.EqualFold(target.Scheme, "https") {
+			return "443"
+		}
+		return "80"
+	}
+	return port(left) == port(right)
 }
 
 func validFederationID(value string) bool {

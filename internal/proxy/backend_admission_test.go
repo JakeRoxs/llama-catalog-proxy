@@ -1,0 +1,173 @@
+package proxy
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+)
+
+func TestOwnerBackendDispatchSharesAdmissionBoundary(t *testing.T) {
+	var forwarded atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			_, _ = io.WriteString(w, `{"data":[{"id":"example"}]}`)
+			return
+		}
+		forwarded.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	h := newHandler(t, cfg).(*Handler)
+	h.catalog.RefreshBackendModels(t.Context(), []string{"default"}, time.Minute)
+	h.modelRoutes = []route{{prefix: "alias/", backendID: "default"}}
+	owner := &Reloader{logger: h.logger, instanceID: strings.Repeat("a", 32),
+		peerPathSlots: make(chan struct{}, 1), peerInferenceSlots: make(chan struct{}, 1)}
+	token := strings.Repeat("b", 32)
+	owner.state.Store(&reloaderState{handler: h, peerContext: context.Background(), cacheTTL: time.Minute, generation: 1,
+		peer: &config.PeerConfig{NodeID: "owner", LocalBackends: []string{"default"},
+			ExposedPathRoutes: map[string]string{"comfyui": "/comfyui"},
+			Peers:             map[string]config.PeerGrant{"caller": {Token: token, Inference: true, PathAccess: []string{"comfyui"}}}}})
+
+	for _, test := range []struct {
+		name, method, path, body, target string
+	}{
+		{"default GET", "GET", "/props", "", "/props"},
+		{"model POST", "POST", "/v1/chat/completions", `{"model":"alias/example"}`, "/v1/chat/completions"},
+		{"local path", "POST", "/comfyui/api/prompt", `{}`, "/comfyui/api/prompt"},
+		{"peer path", "POST", peerPathEndpoint, `{}`, "/comfyui/prompt"},
+		{"peer inference", "POST", "/peer/v1/inference", `{"model":"example"}`, "/v1/chat/completions"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, allowed := range []bool{false, true} {
+				checks, releases := 0, 0
+				h.backendAdmission = func(req *http.Request, backendID string) (func(), bool) {
+					checks++
+					if backendID != "default" || req.URL.Path != test.target || req.Method != test.method {
+						t.Errorf("incorrect admission target: %s %s %s", backendID, req.Method, req.URL.Path)
+					}
+					if !allowed {
+						return nil, false
+					}
+					return func() { releases++ }, true
+				}
+				req := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer "+token)
+				req.TLS = &tls.ConnectionState{}
+				w := httptest.NewRecorder()
+				before := forwarded.Load()
+				switch test.name {
+				case "peer path":
+					req.Header.Set(peerPathServiceHeader, "comfyui")
+					req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(test.target)))
+					owner.PeerHandler().ServeHTTP(w, req)
+				case "peer inference":
+					req.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte("default")))
+					req.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte("example")))
+					req.Header.Set(peerPathHeader, test.target)
+					req.Header.Set(peerInstanceHeader, owner.instanceID)
+					req.Header.Set(peerGenerationHeader, "1")
+					owner.PeerHandler().ServeHTTP(w, req)
+				default:
+					h.ServeHTTP(w, req)
+				}
+				wantStatus, wantSends := http.StatusServiceUnavailable, 0
+				if allowed {
+					wantStatus, wantSends = http.StatusAccepted, 1
+				}
+				if w.Code != wantStatus || checks != 1 || releases != wantSends || forwarded.Load()-before != int32(wantSends) {
+					t.Fatalf("allowed=%v status=%d checks=%d releases=%d sends=%d body=%q", allowed, w.Code, checks, releases, forwarded.Load()-before, w.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestConfiguredComfyUIAdmissionWaitsForReleaseAndAllowsRetryAfterLoadFailure(t *testing.T) {
+	var freeRequests, statsRequests, competingRequests, promptRequests atomic.Int32
+	comfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/queue":
+			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/free":
+			freeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/system_stats":
+			count := statsRequests.Add(1)
+			freeVRAM := int64(600)
+			if count >= 3 {
+				freeVRAM = 900
+			}
+			_, _ = fmt.Fprintf(w, `{"devices":[{"name":"GPU","type":"cuda","index":0,"vram_total":1000,"vram_free":%d}]}`, freeVRAM)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer comfy.Close()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props":
+			if competingRequests.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case "/comfyui/api/prompt":
+			promptRequests.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.Peer = &config.PeerConfig{
+		NodeID: "owner", Listen: "127.0.0.1:9294", TLSCertFile: "cert.pem", TLSKeyFile: "key.pem",
+		ComfyUIResultRead: &config.ComfyUIResultReadConfig{URL: comfy.URL},
+		ComfyUILease: &config.ComfyUILeaseConfig{
+			ReleaseTimeout: "5s", PollInterval: "100ms", QueueIdleSamples: 2,
+			MinimumFreeVRAMBytes: map[string]int64{"cuda:0": 800},
+			AdmissionBackends:    []string{"default"},
+		},
+	}
+	h := newHandler(t, cfg).(*Handler)
+	request := func(method, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(method, path, nil))
+		return w
+	}
+
+	// The initial mediated competing request reconciles an unknown coordinator.
+	// It waits for free VRAM evidence, polling after one /free request.
+	failedLoad := request(http.MethodGet, "/props")
+	if failedLoad.Code != http.StatusBadGateway || freeRequests.Load() != 1 || statsRequests.Load() < 3 || competingRequests.Load() != 1 {
+		t.Fatalf("initial release/load status=%d frees=%d stats=%d competing=%d", failedLoad.Code, freeRequests.Load(), statsRequests.Load(), competingRequests.Load())
+	}
+	// A backend load failure is not treated as proof of a new ComfyUI release,
+	// but it also does not poison the explicit lease transition: the scheduler
+	// remains responsible for its own ordinary model routing on the next prompt.
+	accepted := request(http.MethodPost, "/comfyui/api/prompt")
+	if accepted.Code != http.StatusAccepted || promptRequests.Load() != 1 || freeRequests.Load() != 1 {
+		t.Fatalf("prompt retry status=%d prompts=%d frees=%d", accepted.Code, promptRequests.Load(), freeRequests.Load())
+	}
+	secondCompeting := request(http.MethodGet, "/props")
+	if secondCompeting.Code != http.StatusAccepted || freeRequests.Load() != 2 || competingRequests.Load() != 2 {
+		t.Fatalf("active lease handoff status=%d frees=%d competing=%d", secondCompeting.Code, freeRequests.Load(), competingRequests.Load())
+	}
+}

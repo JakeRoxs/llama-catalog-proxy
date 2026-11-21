@@ -203,14 +203,15 @@ async function loadPairing(roles) {
   panel.hidden = !allowed;
   if (!allowed) return;
   try {
-    const [members, invitations, grants, catalogGrants, audit] = await Promise.all([
+    const [members, invitations, grants, catalogGrants, inferenceGrants, audit] = await Promise.all([
       pairingRequest("/admin/api/v1/federation/members"),
       pairingRequest("/admin/api/v1/federation/invitations"),
       pairingRequest("/admin/api/v1/federation/grants").catch(() => null),
       pairingRequest("/admin/api/v1/federation/catalog-grants").catch(() => null),
+      pairingRequest("/admin/api/v1/federation/inference-grants").catch(() => null),
       pairingRequest("/admin/api/v1/audit/events?limit=50").catch(() => null),
     ]);
-    renderPairing(members, invitations, grants, catalogGrants, audit);
+    renderPairing(members, invitations, grants, catalogGrants, inferenceGrants, audit);
   } catch {
     pairingNotice("Pairing state is unavailable on this node.", true);
   }
@@ -500,7 +501,7 @@ function enableRemoteSettingsAfterTerminal() {
   for (const element of byId("remote-settings-form").querySelectorAll("input,select,button")) element.disabled = false;
 }
 
-function renderPairing(memberData, invitationData, grantData, catalogGrantData, auditData) {
+function renderPairing(memberData, invitationData, grantData, catalogGrantData, inferenceGrantData, auditData) {
   const members = byId("paired-members");
   members.replaceChildren();
   const list = memberData.members || [];
@@ -595,7 +596,7 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     const revoke = document.createElement("button");
     node.textContent = grant.node_id;
     fingerprint.textContent = grant.certificate_sha256;
-    state.textContent = grant.active ? "Active for paired certificate" : "Inactive; re-grant after pairing certificate rotation";
+    state.textContent = grant.current_fingerprint ? "Fingerprint matches current paired identity" : "Fingerprint is no longer paired; re-grant explicitly";
     revoke.type = "button";
     revoke.className = "button quiet";
     revoke.textContent = "Revoke catalog read";
@@ -607,6 +608,40 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     action.append(revoke);
     row.append(node, fingerprint, state, action);
     catalogTable.append(row);
+  }
+
+  const inferenceTable = byId("inference-grants");
+  inferenceTable.replaceChildren();
+  const inferenceGrants = inferenceGrantData?.grants || [];
+  const inferenceGrantsReady = inferenceGrantData?.state === "available";
+  byId("inference-grant-form").hidden = !inferenceGrantsReady;
+  byId("inference-grants-unavailable").hidden = inferenceGrantsReady;
+  byId("inference-grants-empty").hidden = !inferenceGrantsReady || inferenceGrants.length !== 0;
+  for (const grant of inferenceGrants) {
+    const row = document.createElement("tr");
+    const node = document.createElement("td");
+    const fingerprint = document.createElement("td");
+    const incoming = document.createElement("td");
+    const outgoing = document.createElement("td");
+    const state = document.createElement("td");
+    const action = document.createElement("td");
+    const revoke = document.createElement("button");
+    node.textContent = grant.node_id;
+    fingerprint.textContent = grant.certificate_sha256;
+    incoming.textContent = grant.allow_incoming_inference ? "Allowed" : "Off";
+    outgoing.textContent = grant.route_outgoing_inference ? "Allowed" : "Off";
+    state.textContent = grant.current_fingerprint ? "Fingerprint matches current paired identity" : "Fingerprint is no longer paired; re-grant explicitly";
+    revoke.type = "button";
+    revoke.className = "button quiet";
+    revoke.textContent = "Revoke inference";
+    revoke.addEventListener("click", () => {
+      if (window.confirm(`Revoke all inference permissions for ${grant.node_id}? Catalog read remains separate.`)) {
+        void removeInferenceGrant(grant.node_id);
+      }
+    });
+    action.append(revoke);
+    row.append(node, fingerprint, incoming, outgoing, state, action);
+    inferenceTable.append(row);
   }
 
   const auditTable = byId("audit-events");
@@ -639,7 +674,7 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
 async function removeCatalogGrant(nodeID) {
   try {
     await pairingRequest(`/admin/api/v1/federation/catalog-grants/${encodeURIComponent(nodeID)}`, "DELETE");
-    pairingNotice("Catalog-read grant revoked; identity membership remains.");
+    pairingNotice("Catalog-read grant revoked; outbound dynamic inference routing was also disabled. Identity membership remains.");
     await refreshDashboard();
   } catch {
     pairingNotice("Catalog grant revocation outcome may be unknown. Refresh the grant list before retrying.", true);
@@ -661,6 +696,44 @@ async function createCatalogGrant(event) {
     await refreshDashboard();
   } catch {
     pairingNotice("Catalog grant outcome may be unknown. Refresh the grant list before retrying.", true);
+  }
+}
+
+async function removeInferenceGrant(nodeID) {
+  try {
+    await pairingRequest(`/admin/api/v1/federation/inference-grants/${encodeURIComponent(nodeID)}`, "DELETE");
+    pairingNotice("Inference permissions revoked; catalog-read and identity membership remain separate.");
+    await refreshDashboard();
+  } catch {
+    pairingNotice("Inference grant revocation outcome may be unknown. Refresh the grant list before retrying.", true);
+  }
+}
+
+async function createInferenceGrant(event) {
+  event.preventDefault();
+  if (!byId("inference-grant-confirm").checked) {
+    pairingNotice("Explicit inference grant confirmation is required.", true);
+    return;
+  }
+  const allowIncoming = byId("inference-grant-incoming").checked;
+  const routeOutgoing = byId("inference-grant-outgoing").checked;
+  if (!allowIncoming && !routeOutgoing) {
+    pairingNotice("Select at least one inference direction.", true);
+    return;
+  }
+  const nodeID = byId("inference-grant-node").value.trim();
+  try {
+    await pairingRequest("/admin/api/v1/federation/inference-grants", "POST", {
+      node_id: nodeID, allow_incoming_inference: allowIncoming, route_outgoing_inference: routeOutgoing,
+    });
+    byId("inference-grant-node").value = "";
+    byId("inference-grant-incoming").checked = false;
+    byId("inference-grant-outgoing").checked = false;
+    byId("inference-grant-confirm").checked = false;
+    pairingNotice("Explicit inference permissions saved. They remain separate from catalog read.");
+    await refreshDashboard();
+  } catch {
+    pairingNotice("Inference grant outcome may be unknown. A route_inference grant requires catalog read; refresh the grant lists before retrying.", true);
   }
 }
 
@@ -776,6 +849,7 @@ byId("join-form").addEventListener("submit", joinWithInvitation);
 byId("copy-invitation").addEventListener("click", copyInvitation);
 byId("owner-grant-form").addEventListener("submit", createOwnerGrant);
 byId("catalog-read-form").addEventListener("submit", createCatalogGrant);
+byId("inference-grant-form").addEventListener("submit", createInferenceGrant);
 byId("remote-grant-load").addEventListener("submit", loadRemoteGrants);
 byId("remote-grant-select").addEventListener("change", populateRemoteModels);
 byId("remote-load-snapshot").addEventListener("click", loadRemoteSnapshot);

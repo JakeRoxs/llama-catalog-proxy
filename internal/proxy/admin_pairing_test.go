@@ -164,13 +164,32 @@ func TestAdminCatalogReadGrantRequiresRoleCSRFAndPairedFingerprint(t *testing.T)
 	if response := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-c"}`); response.Code != http.StatusConflict {
 		t.Fatalf("unpaired grant status = %d %s", response.Code, response.Body.String())
 	}
+	inferenceBase := adminPairingPath + "/inference-grants"
+	if response := request(http.MethodPost, inferenceBase, "admin-session", "admin-csrf",
+		`{"node_id":"node-b","allow_incoming_inference":false,"route_outgoing_inference":true}`); response.Code != http.StatusConflict {
+		t.Fatalf("route inference without catalog-read grant = %d %s", response.Code, response.Body.String())
+	}
 	created := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-b"}`)
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), strings.Repeat("a", 64)) {
 		t.Fatalf("catalog grant create = %d %s", created.Code, created.Body.String())
 	}
 	listed := request(http.MethodGet, base, "admin-session", "", "")
-	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"active":true`) {
+	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"current_fingerprint":true`) {
 		t.Fatalf("catalog grant list = %d %s", listed.Code, listed.Body.String())
+	}
+	created = request(http.MethodPost, inferenceBase, "admin-session", "admin-csrf",
+		`{"node_id":"node-b","allow_incoming_inference":true,"route_outgoing_inference":true}`)
+	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"allow_incoming_inference":true`) ||
+		!strings.Contains(created.Body.String(), `"route_outgoing_inference":true`) {
+		t.Fatalf("inference grant create = %d %s", created.Code, created.Body.String())
+	}
+	inferenceList := request(http.MethodGet, inferenceBase, "admin-session", "", "")
+	if inferenceList.Code != http.StatusOK || !strings.Contains(inferenceList.Body.String(), `"current_fingerprint":true`) {
+		t.Fatalf("inference grant list = %d %s", inferenceList.Code, inferenceList.Body.String())
+	}
+	inferenceRevoke := request(http.MethodDelete, inferenceBase+"/node-b", "admin-session", "admin-csrf", "")
+	if inferenceRevoke.Code != http.StatusNoContent {
+		t.Fatalf("inference grant revoke = %d %s", inferenceRevoke.Code, inferenceRevoke.Body.String())
 	}
 	revoked := request(http.MethodDelete, base+"/node-b", "admin-session", "admin-csrf", "")
 	if revoked.Code != http.StatusNoContent {
@@ -184,14 +203,18 @@ func TestAdminCatalogReadGrantRequiresRoleCSRFAndPairedFingerprint(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	foundCatalog, foundInference := false, false
 	for _, event := range events {
-		if event.Action == "catalog_read_grant.create" && event.PrincipalType == "oidc" &&
+		if (event.Action == "catalog_read_grant.create" || event.Action == "inference_grant.create") && event.PrincipalType == "oidc" &&
 			event.VerifiedUserSubject == "operator" && event.TargetID == "node-b" && event.Outcome == "succeeded" {
-			found = true
+			if event.Action == "catalog_read_grant.create" {
+				foundCatalog = true
+			} else {
+				foundInference = true
+			}
 		}
 	}
-	if !found {
+	if !foundCatalog || !foundInference {
 		t.Fatalf("verified local actor missing from catalog grant audit: %+v", events)
 	}
 }

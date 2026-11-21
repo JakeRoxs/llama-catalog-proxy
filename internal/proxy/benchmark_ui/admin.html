@@ -132,6 +132,26 @@
         </div>
         <div class="pairing-columns grant-section">
           <div>
+            <h3>Independent inference grants</h3>
+            <p class="small-note">Allowing inbound inference and routing outbound inference are separate per-peer approvals. Outbound routing also requires a current catalog-read grant to discover model IDs. Neither permission is implied by pairing or catalog access.</p>
+            <form id="inference-grant-form" class="grant-form">
+              <label for="inference-grant-node">Currently paired node ID</label>
+              <input id="inference-grant-node" required autocomplete="off">
+              <label class="confirm-row"><input id="inference-grant-incoming" type="checkbox"> Allow this node to invoke local inference.</label>
+              <label class="confirm-row"><input id="inference-grant-outgoing" type="checkbox"> Allow this node's models for outbound inference routing.</label>
+              <label class="confirm-row"><input id="inference-grant-confirm" type="checkbox" required> I approve these inference permissions.</label>
+              <button class="button primary" type="submit">Save inference grants</button>
+            </form>
+          </div>
+          <div>
+            <h3>Current inference grants</h3>
+            <p id="inference-grants-unavailable" class="small-note" hidden>Inference grant store is not configured.</p>
+            <div class="table-wrap"><table><thead><tr><th>Node ID</th><th>Certificate SHA-256</th><th>Incoming</th><th>Outgoing</th><th>State</th><th></th></tr></thead><tbody id="inference-grants"></tbody></table></div>
+            <p id="inference-grants-empty" class="empty" hidden>No inference grants.</p>
+          </div>
+        </div>
+        <div class="pairing-columns grant-section">
+          <div>
             <h3>Owner-approved settings grants</h3>
             <p class="small-note">The static `ManageSettings` peer flag is a hard ceiling. Grants below narrow it to named target/model pairs and never authorize inference.</p>
             <form id="owner-grant-form" class="grant-form">

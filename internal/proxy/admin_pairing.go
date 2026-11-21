@@ -53,6 +53,12 @@ func (r *Reloader) serveAdminPairing(w http.ResponseWriter, req *http.Request) {
 		r.createAdminCatalogGrant(w, req)
 	case strings.HasPrefix(req.URL.Path, adminPairingPath+"/catalog-grants/") && req.Method == http.MethodDelete:
 		r.revokeAdminCatalogGrant(w, req, strings.TrimPrefix(req.URL.Path, adminPairingPath+"/catalog-grants/"))
+	case req.URL.Path == adminPairingPath+"/inference-grants" && req.Method == http.MethodGet:
+		r.listAdminInferenceGrants(w, req)
+	case req.URL.Path == adminPairingPath+"/inference-grants" && req.Method == http.MethodPost:
+		r.createAdminInferenceGrant(w, req)
+	case strings.HasPrefix(req.URL.Path, adminPairingPath+"/inference-grants/") && req.Method == http.MethodDelete:
+		r.revokeAdminInferenceGrant(w, req, strings.TrimPrefix(req.URL.Path, adminPairingPath+"/inference-grants/"))
 	case req.URL.Path == adminPairingPath+"/grants" && req.Method == http.MethodGet:
 		r.listAdminOwnerGrants(w, req)
 	case req.URL.Path == adminPairingPath+"/grants" && req.Method == http.MethodPost:
@@ -71,7 +77,12 @@ func (r *Reloader) serveAdminPairing(w http.ResponseWriter, req *http.Request) {
 
 type adminCatalogGrantView struct {
 	federation.CatalogReadGrant
-	Active bool `json:"active"`
+	CurrentFingerprint bool `json:"current_fingerprint"`
+}
+
+type adminInferenceGrantView struct {
+	federation.InferenceGrant
+	CurrentFingerprint bool `json:"current_fingerprint"`
 }
 
 func (r *Reloader) listAdminCatalogGrants(w http.ResponseWriter, _ *http.Request) {
@@ -92,7 +103,9 @@ func (r *Reloader) listAdminCatalogGrants(w http.ResponseWriter, _ *http.Request
 			http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		result = append(result, adminCatalogGrantView{CatalogReadGrant: grant, Active: paired && member.Fingerprint == grant.Fingerprint})
+		result = append(result, adminCatalogGrantView{
+			CatalogReadGrant: grant, CurrentFingerprint: paired && member.Fingerprint == grant.Fingerprint,
+		})
 	}
 	writeJSON(r.logger, w, http.StatusOK, map[string]any{"state": "available", "grants": result})
 }
@@ -187,6 +200,121 @@ func (r *Reloader) adminCatalogGrantStores() (*reloaderState, int) {
 		return nil, http.StatusServiceUnavailable
 	}
 	return state, 0
+}
+
+func (r *Reloader) listAdminInferenceGrants(w http.ResponseWriter, _ *http.Request) {
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "inference grant store unavailable", status)
+		return
+	}
+	grants, err := state.catalogGrantStore.ListInferenceGrants()
+	if err != nil {
+		http.Error(w, "inference grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	result := make([]adminInferenceGrantView, 0, len(grants))
+	for _, grant := range grants {
+		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
+		if err != nil {
+			http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		result = append(result, adminInferenceGrantView{
+			InferenceGrant: grant, CurrentFingerprint: paired && member.Fingerprint == grant.Fingerprint,
+		})
+	}
+	writeJSON(r.logger, w, http.StatusOK, map[string]any{"state": "available", "grants": result})
+}
+
+func (r *Reloader) createAdminInferenceGrant(w http.ResponseWriter, req *http.Request) {
+	var input struct {
+		NodeID        string `json:"node_id"`
+		AllowIncoming bool   `json:"allow_incoming_inference"`
+		RouteOutgoing bool   `json:"route_outgoing_inference"`
+	}
+	if err := decodeAdminPairingJSON(w, req, &input); err != nil || input.NodeID == "" || (!input.AllowIncoming && !input.RouteOutgoing) {
+		http.Error(w, "invalid inference grant request", http.StatusBadRequest)
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped {
+		http.Error(w, "inference grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "inference grant store unavailable", status)
+		return
+	}
+	member, paired, err := state.pairingStore.LookupMember(input.NodeID)
+	if err != nil {
+		http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !paired {
+		http.Error(w, "inference access can only be granted to a paired identity", http.StatusConflict)
+		return
+	}
+	transaction, err := r.beginAdminAudit(req, "inference_grant.create", input.NodeID, "", "")
+	if err != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	grant, err := state.catalogGrantStore.GrantInference(member, input.AllowIncoming, input.RouteOutgoing, time.Now())
+	if !r.finishAdminMutation(w, transaction, err, input.NodeID, "", "") {
+		return
+	}
+	if err != nil {
+		if errors.Is(err, federation.ErrInferenceNeedsCatalog) {
+			http.Error(w, "route_inference requires a separate current catalog_read grant", http.StatusConflict)
+		} else {
+			http.Error(w, "inference grant store unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	r.wakePeerRefresh()
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]any{"grant": grant})
+}
+
+func (r *Reloader) revokeAdminInferenceGrant(w http.ResponseWriter, req *http.Request, nodeID string) {
+	if strings.Contains(nodeID, "/") || !identity.ValidNodeID(nodeID) {
+		http.Error(w, "invalid node ID", http.StatusBadRequest)
+		return
+	}
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	if r.stopped {
+		http.Error(w, "inference grant store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, status := r.adminCatalogGrantStores()
+	if status != 0 {
+		http.Error(w, "inference grant store unavailable", status)
+		return
+	}
+	transaction, err := r.beginAdminAudit(req, "inference_grant.revoke", nodeID, "", "")
+	if err != nil {
+		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	err = state.catalogGrantStore.RevokeInference(nodeID)
+	if !r.finishAdminMutation(w, transaction, err, nodeID, "", "") {
+		return
+	}
+	if err != nil {
+		if errors.Is(err, federation.ErrInferenceGrantMissing) {
+			http.NotFound(w, req)
+		} else {
+			http.Error(w, "inference grant store unavailable", http.StatusServiceUnavailable)
+		}
+		return
+	}
+	r.wakePeerRefresh()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (r *Reloader) wakePeerRefresh() {

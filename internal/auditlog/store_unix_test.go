@@ -168,6 +168,17 @@ func TestAuditStoreFailsClosedAtDailyCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
+	next := Event{
+		ID: strings.Repeat("f", 32), At: now,
+		LocalNodeID: "node-a", PrincipalType: "local_cli", UserIdentityState: "local_process", LocalAccount: "uid:1",
+		Action: "settings.audit", Outcome: "succeeded", Phase: "event",
+	}
+	nextLine, err := json.Marshal(next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Leave exactly one serialized event of space, independent of timestamp precision.
+	targetSize := MaxDayFileBytes - len(nextLine) - 1
 	var data bytes.Buffer
 	for index := 1; index < MaxEvents; index++ {
 		event := Event{
@@ -179,12 +190,20 @@ func TestAuditStoreFailsClosedAtDailyCapacity(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if data.Len()+len(line)+1 > MaxDayFileBytes-100 {
+		if data.Len()+len(line)+1 > targetSize {
 			break
 		}
 		data.Write(line)
 		data.WriteByte('\n')
 	}
+	padding := targetSize - data.Len()
+	if padding < 0 || padding >= MaxEventBytes || data.Len() == 0 {
+		t.Fatalf("invalid capacity fixture: bytes=%d padding=%d", data.Len(), padding)
+	}
+	// JSON permits trailing whitespace; pad the last record without adding another event.
+	data.Truncate(data.Len() - 1)
+	data.WriteString(strings.Repeat(" ", padding))
+	data.WriteByte('\n')
 	if err := os.WriteFile(filepath.Join(directory, auditFilename(now)), data.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +212,20 @@ func TestAuditStoreFailsClosedAtDailyCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	err = store.Record(Event{
-		LocalNodeID: "node-a", PrincipalType: "local_cli", UserIdentityState: "local_process", LocalAccount: "uid:1",
-		Action: "settings.audit", Outcome: "succeeded", Phase: "event",
-	})
+	if err := store.Record(next); err != nil {
+		t.Fatalf("event exactly filling daily capacity rejected: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(directory, auditFilename(now)))
+	if err != nil || len(before) != MaxDayFileBytes {
+		t.Fatalf("daily file size = %d, want %d, error=%v", len(before), MaxDayFileBytes, err)
+	}
+	next.ID = strings.Repeat("e", 32)
+	err = store.Record(next)
 	if err == nil || !errors.Is(err, ErrCapacity) {
 		t.Fatalf("audit append at daily capacity error = %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(directory, auditFilename(now)))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rejected append changed daily file: %v", err)
 	}
 }
