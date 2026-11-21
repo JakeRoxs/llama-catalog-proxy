@@ -59,6 +59,33 @@ func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
 	}
 }
 
+func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {
+	var sends atomic.Int32
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIServiceUnavailable
+	})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sends.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+	h := newHandler(t, baseConfig(backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/props", nil))
+	if state := c.snapshot(); w.Code != http.StatusAccepted || sends.Load() != 1 || state.State != "released" {
+		t.Fatalf("stopped-service bootstrap status=%d sends=%d state=%+v", w.Code, sends.Load(), state)
+	}
+	if receipt := c.receipt; receipt.State != "stopped" || receipt.FreeRequested {
+		t.Fatalf("stopped-service bootstrap claimed a free operation: %+v", receipt)
+	}
+}
+
 func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 	for _, verifyOK := range []bool{true, false} {
 		name := "confirmed"

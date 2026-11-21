@@ -53,6 +53,9 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 			ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
 			_, err := coordinator.reconcileInitial(ctx)
 			cancel()
+			if errors.Is(err, errComfyUIServiceUnavailable) {
+				err = coordinator.assumeInitialStopped()
+			}
 			if err != nil {
 				return nil, false
 			}

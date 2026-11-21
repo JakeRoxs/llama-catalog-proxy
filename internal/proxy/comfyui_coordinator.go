@@ -93,6 +93,22 @@ func (c *comfyUICoordinator) reconcileInitial(ctx context.Context) (ComfyUIRelea
 	return c.reconcile(ctx)
 }
 
+// assumeInitialStopped records the narrow best-effort case where the first
+// queue probe got ECONNREFUSED before any /free request. Scheduler dispatch can
+// then start ComfyUI normally; other reconciliation failures remain unknown.
+func (c *comfyUICoordinator) assumeInitialStopped() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.initialReconcile || c.status.State != "unknown" || c.verifying ||
+		c.status.Submissions != 0 || c.status.Competing != 0 {
+		return errComfyUIAdmissionBlocked
+	}
+	c.status.State = "released"
+	c.receipt = ComfyUIReleaseResult{State: "stopped"}
+	c.signalLocked()
+	return nil
+}
+
 func (c *comfyUICoordinator) beginLease() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

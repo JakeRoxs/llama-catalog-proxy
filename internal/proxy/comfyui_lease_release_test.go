@@ -16,6 +16,20 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
 
+func TestVerifyComfyUIReleaseDistinguishesStoppedServiceBeforeFree(t *testing.T) {
+	server := httptest.NewServer(http.NotFoundHandler())
+	url := server.URL
+	server.Close()
+
+	result, err := VerifyComfyUIRelease(context.Background(), url, nil, &config.ComfyUILeaseConfig{
+		ReleaseTimeout: "5s", PollInterval: "100ms", QueueIdleSamples: 2,
+		MinimumFreeVRAMBytes: map[string]int64{"cuda:0": 800},
+	}, &http.Client{Timeout: time.Second})
+	if !errors.Is(err, errComfyUIServiceUnavailable) || result.FreeRequested {
+		t.Fatalf("stopped service result=%+v err=%v", result, err)
+	}
+}
+
 func TestVerifyComfyUIReleaseRequiresStableQueueFreeAndPerDeviceVRAM(t *testing.T) {
 	var mu sync.Mutex
 	var paths []string

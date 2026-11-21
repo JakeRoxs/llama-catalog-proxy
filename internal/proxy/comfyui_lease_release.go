@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
@@ -24,6 +25,8 @@ const (
 )
 
 var ErrComfyUIReleaseUnknown = errors.New("ComfyUI release state is unknown")
+
+var errComfyUIServiceUnavailable = errors.New("ComfyUI service is unavailable")
 
 type ComfyUIDeviceReleaseEvidence struct {
 	DeviceKey            string `json:"device"`
@@ -82,6 +85,9 @@ func VerifyComfyUIRelease(ctx context.Context, targetURL string, targetHeaders h
 	queueURL := endpointURL(base, "/queue")
 	queueTracker := &comfyUIJobTracker{url: queueURL.String(), headers: cloneComfyUILeaseHeaders(targetHeaders), client: client}
 	if err := waitForEmptyComfyUIQueue(ctx, queueTracker, idleSamples, pollInterval); err != nil {
+		if errors.Is(err, syscall.ECONNREFUSED) {
+			return result, errors.Join(errComfyUIServiceUnavailable, err)
+		}
 		return result, fmt.Errorf("%w: queue did not reach a stable empty state", ErrComfyUIReleaseUnknown)
 	}
 	freeURL := endpointURL(base, "/free")
