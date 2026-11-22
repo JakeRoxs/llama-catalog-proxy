@@ -12,8 +12,12 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
 
-func TestLlamaSwapReadOnlyUIRequestsBypassLeaseTransitions(t *testing.T) {
+func TestLlamaSwapUIAndControlPassThroughModelRoutesUseLease(t *testing.T) {
 	var backendCalls, verifications atomic.Int32
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		verifications.Add(1)
+		return confirmedCoordinatorEvidence(), nil
+	})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		backendCalls.Add(1)
 		switch r.URL.Path {
@@ -27,6 +31,11 @@ func TestLlamaSwapReadOnlyUIRequestsBypassLeaseTransitions(t *testing.T) {
 			_, _ = w.Write([]byte(`{"version":"test"}`))
 		case "/api/models/unload":
 			w.WriteHeader(http.StatusNoContent)
+		case "/v1/chat/completions":
+			if state := coordinator.snapshot(); state.State != "released" || state.Competing != 1 {
+				t.Errorf("model dispatch forwarded without released lease: %+v", state)
+			}
+			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
 		}
@@ -34,10 +43,6 @@ func TestLlamaSwapReadOnlyUIRequestsBypassLeaseTransitions(t *testing.T) {
 	defer backend.Close()
 	cfg := baseConfig(backend.URL)
 	h := newHandler(t, cfg).(*Handler)
-	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
-		verifications.Add(1)
-		return confirmedCoordinatorEvidence(), nil
-	})
 	admit, err := newComfyUIDomainAdmission(coordinator, []string{"default"}, "default", time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -63,10 +68,15 @@ func TestLlamaSwapReadOnlyUIRequestsBypassLeaseTransitions(t *testing.T) {
 	if backendCalls.Load() != 5 || verifications.Load() != 0 || coordinator.snapshot().State != "unknown" {
 		t.Fatalf("read-only UI touched lease state: backend=%d verify=%d state=%+v", backendCalls.Load(), verifications.Load(), coordinator.snapshot())
 	}
-	blocked := httptest.NewRecorder()
-	h.ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/models/unload", nil))
-	if blocked.Code != http.StatusServiceUnavailable || backendCalls.Load() != 5 {
-		t.Fatalf("management mutation escaped gate: status=%d backend=%d", blocked.Code, backendCalls.Load())
+	management := httptest.NewRecorder()
+	h.ServeHTTP(management, httptest.NewRequest(http.MethodPost, "/api/models/unload", nil))
+	if management.Code != http.StatusNoContent || backendCalls.Load() != 6 || verifications.Load() != 0 {
+		t.Fatalf("management request was unnecessarily lease-gated: status=%d backend=%d verify=%d", management.Code, backendCalls.Load(), verifications.Load())
+	}
+	model := httptest.NewRecorder()
+	h.ServeHTTP(model, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil))
+	if model.Code != http.StatusNoContent || backendCalls.Load() != 7 || verifications.Load() != 1 {
+		t.Fatalf("model request did not hand off through the lease: status=%d backend=%d verify=%d", model.Code, backendCalls.Load(), verifications.Load())
 	}
 }
 
@@ -231,10 +241,16 @@ func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 			if _, err := c.reconcile(ctx); err != nil {
 				t.Fatal(err)
 			}
-			for _, path := range []string{"/upstream/example/", "/v1/realtime", "/%70rops"} {
-				if got := status(http.MethodGet, path); got != http.StatusServiceUnavailable {
-					t.Fatalf("unclassified or noncanonical route %s: status=%d", path, got)
+			for _, path := range []string{"/upstream/example/", "/v1/realtime"} {
+				if got := status(http.MethodGet, path); got != http.StatusAccepted {
+					t.Fatalf("model dispatch route %s did not use lease handoff: status=%d", path, got)
 				}
+			}
+			if got := status(http.MethodGet, "/%70rops"); got != http.StatusServiceUnavailable {
+				t.Fatalf("noncanonical model path was admitted: status=%d", got)
+			}
+			if sends.Load() != 2 {
+				t.Fatalf("recognized model dispatch routes were not forwarded: %d", sends.Load())
 			}
 			prompt := httptest.NewRequestWithContext(ctx, http.MethodPost, "/comfyui/api/prompt", nil)
 			if _, allowed := admit(prompt, "alternate"); allowed {
@@ -255,7 +271,7 @@ func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 			result := make(chan int, 1)
 			go func() { result <- status(http.MethodGet, "/props?model=example") }()
 			waitCoordinatorState(t, c, "draining")
-			if sends.Load() != 0 || checks.Load() != 1 {
+			if sends.Load() != 2 || checks.Load() != 1 {
 				t.Fatal("forwarding or verification started before the prompt drained")
 			}
 			if _, allowed := admit(prompt, "default"); allowed {
@@ -267,13 +283,13 @@ func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatal("release verification did not start")
 			}
-			if sends.Load() != 0 {
+			if sends.Load() != 2 {
 				t.Fatal("competing GET reached the backend before verification")
 			}
 			close(unblock)
-			wantStatus, wantSends := http.StatusServiceUnavailable, int32(0)
+			wantStatus, wantSends := http.StatusServiceUnavailable, int32(2)
 			if verifyOK {
-				wantStatus, wantSends = http.StatusAccepted, 1
+				wantStatus, wantSends = http.StatusAccepted, 3
 			}
 			if got := <-result; got != wantStatus || sends.Load() != wantSends || c.snapshot().Competing != 0 {
 				t.Fatalf("handoff status=%d sends=%d state=%+v", got, sends.Load(), c.snapshot())
@@ -284,7 +300,7 @@ func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 				}
 			} else if _, err := c.reserveCompeting(); !errors.Is(err, errComfyUIAdmissionBlocked) {
 				t.Fatal("unconfirmed release opened admission")
-			} else if got := status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || checks.Load() != 2 || sends.Load() != 0 {
+			} else if got := status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || checks.Load() != 2 || sends.Load() != 2 {
 				t.Fatal("competing POST retried an unconfirmed release or forwarded")
 			}
 		})

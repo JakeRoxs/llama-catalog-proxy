@@ -1385,10 +1385,14 @@ The verifier retries observations, not `/free`. Non-2xx or ambiguous first-promp
 state unknown. A competing backend load failure is returned normally and does not automatically retry
 the request or release operation.
 
-The managed domain admits only ComfyUI prompt POSTs to the `/comfyui` path backend plus the currently
-classified competing routes `GET /props` and `POST /v1/chat/completions`. Other requests to a listed
-backend fail closed; update route classification only after verifying their scheduler behavior. This
-is a best-effort gate for requests that pass through this proxy. It cannot stop direct llama-swap
+The coordinator applies to requests under the `/comfyui` scheduler path and recognized llama-swap
+model-dispatch routes, including model inference endpoints, model-specific GET endpoints such as
+`GET /props`, and `/upstream/{model}/...`. ComfyUI prompts and its scheduler-routed UI root acquire or
+reuse the ComfyUI lease; recognized model-dispatch requests release it before forwarding. Other
+traffic, including the llama-swap UI/static files, read-only status APIs, and management/control
+endpoints, passes through without lease transitions. Keep the classifier aligned with the deployed
+llama-swap model route table: newly added or custom model-loading routes are not automatically gated.
+This is a best-effort gate for requests that pass through this proxy. It cannot stop direct llama-swap
 clients, operator/management actions, startup preloads, autonomous scheduler activity, or GPU work on
 other paths. It does not establish host-wide exclusivity or preserve ComfyUI's process/container.
 
