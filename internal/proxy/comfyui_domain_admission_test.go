@@ -12,6 +12,64 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
 
+func TestLlamaSwapReadOnlyUIRequestsBypassLeaseTransitions(t *testing.T) {
+	var backendCalls, verifications atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalls.Add(1)
+		switch r.URL.Path {
+		case "/":
+			http.Redirect(w, r, "/ui/", http.StatusFound)
+		case "/ui/":
+			_, _ = w.Write([]byte("llama-swap-ui"))
+		case "/ui/assets/app.js":
+			_, _ = w.Write([]byte("app"))
+		case "/api/version":
+			_, _ = w.Write([]byte(`{"version":"test"}`))
+		case "/api/models/unload":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	h := newHandler(t, cfg).(*Handler)
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		verifications.Add(1)
+		return confirmedCoordinatorEvidence(), nil
+	})
+	admit, err := newComfyUIDomainAdmission(coordinator, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+
+	for _, test := range []struct {
+		path string
+		want int
+	}{
+		{"/", http.StatusFound},
+		{"/ui/", http.StatusOK},
+		{"/ui/assets/app.js", http.StatusOK},
+		{"/api/version", http.StatusOK},
+		{"/api/profiles", http.StatusNotFound},
+	} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, test.path, nil))
+		if w.Code != test.want {
+			t.Errorf("GET %s status=%d want=%d body=%q", test.path, w.Code, test.want, w.Body.String())
+		}
+	}
+	if backendCalls.Load() != 5 || verifications.Load() != 0 || coordinator.snapshot().State != "unknown" {
+		t.Fatalf("read-only UI touched lease state: backend=%d verify=%d state=%+v", backendCalls.Load(), verifications.Load(), coordinator.snapshot())
+	}
+	blocked := httptest.NewRecorder()
+	h.ServeHTTP(blocked, httptest.NewRequest(http.MethodPost, "/api/models/unload", nil))
+	if blocked.Code != http.StatusServiceUnavailable || backendCalls.Load() != 5 {
+		t.Fatalf("management mutation escaped gate: status=%d backend=%d", blocked.Code, backendCalls.Load())
+	}
+}
+
 func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
 	for _, test := range []struct {
 		name       string

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -34,6 +36,9 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 		}
 		if req == nil || req.URL == nil || req.URL.RawPath != "" || req.Context().Err() != nil {
 			return nil, false
+		}
+		if isLlamaSwapReadOnlyUIRequest(req) {
+			return nil, true
 		}
 		prompt := isComfyPromptRequest(req)
 		startComfyUI := prompt || (isComfyUIFrontendRoot(req) && req.ContentLength <= 0 &&
@@ -97,4 +102,31 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 		done, err := coordinator.reserveCompeting()
 		return done, err == nil
 	}, nil
+}
+
+// isLlamaSwapReadOnlyUIRequest admits only the shell and non-model UI reads.
+// Model-dispatched paths and management mutations remain behind the lease gate.
+func isLlamaSwapReadOnlyUIRequest(req *http.Request) bool {
+	if req == nil || req.URL == nil || req.Method != http.MethodGet ||
+		(req.Body != nil && req.Body != http.NoBody) || req.ContentLength > 0 || len(req.TransferEncoding) != 0 ||
+		len(req.URL.RawQuery) > 4096 || strings.ContainsAny(req.URL.Path, "\\\x00") {
+		return false
+	}
+	cleanPath := path.Clean(req.URL.Path)
+	if cleanPath != req.URL.Path && !(strings.HasSuffix(req.URL.Path, "/") && cleanPath+"/" == req.URL.Path) {
+		return false
+	}
+	switch req.URL.Path {
+	case "/", "/ui", "/favicon.ico", "/health", "/wol-health", "/v1/models", "/models",
+		"/logs", "/logs/stream", "/running", "/metrics", "/api/profiles", "/api/events",
+		"/api/events/logs", "/api/metrics/activity", "/api/metrics/stats", "/api/performance",
+		"/api/version", "/api/hardware", "/api/tailcat":
+		return true
+	}
+	for _, prefix := range []string{"/ui/", "/logs/stream/", "/api/captures/"} {
+		if strings.HasPrefix(req.URL.Path, prefix) {
+			return true
+		}
+	}
+	return false
 }
