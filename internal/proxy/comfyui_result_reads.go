@@ -105,6 +105,11 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 		writeJSONError(h.logger, writer, status, message)
 		return true
 	}
+	if frontend && isComfyUIFrontendRoot(request) {
+		// Bootstrap the persistent service through llama-swap. Once started, the
+		// rest of the allowlisted frontend and result reads use the direct target.
+		return false
+	}
 	if request.URL.Path == "/comfyui" {
 		location := "/comfyui/"
 		if request.URL.RawQuery != "" {

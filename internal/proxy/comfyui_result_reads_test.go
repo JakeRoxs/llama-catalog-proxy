@@ -142,6 +142,30 @@ func TestComfyUIStatusPollingBypassesSchedulerLocallyAndOverPeer(t *testing.T) {
 	if directReads.Load() != 18 || schedulerCalls.Load() != 0 {
 		t.Fatalf("polling requests: direct=%d scheduler=%d", directReads.Load(), schedulerCalls.Load())
 	}
+	for _, viaPeer := range []bool{false, true} {
+		request := httptest.NewRequest(http.MethodGet, "/comfyui/", nil)
+		if viaPeer {
+			request = httptest.NewRequest(http.MethodGet, peerPathEndpoint, nil)
+			request.TLS = &tls.ConnectionState{}
+			request.Header.Set("Authorization", "Bearer "+token)
+			request.Header.Set(peerPathServiceHeader, "comfyui")
+			request.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte("/comfyui/")))
+			response := httptest.NewRecorder()
+			owner.PeerHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusOK || response.Body.String() != "scheduled GET /comfyui/" {
+				t.Fatalf("peer UI root was not scheduled: status=%d body=%q", response.Code, response.Body.String())
+			}
+			continue
+		}
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusOK || response.Body.String() != "scheduled GET /comfyui/" {
+			t.Fatalf("local UI root was not scheduled: status=%d body=%q", response.Code, response.Body.String())
+		}
+	}
+	if schedulerCalls.Load() != 2 || directReads.Load() != 18 {
+		t.Fatalf("UI root routing: direct=%d scheduler=%d", directReads.Load(), schedulerCalls.Load())
+	}
 	for _, endpoint := range []string{"/prompt", "/api/prompt", "/queue", "/api/queue"} {
 		request := httptest.NewRequest(http.MethodPost, "/comfyui"+endpoint, strings.NewReader(`{}`))
 		response := httptest.NewRecorder()
@@ -150,7 +174,7 @@ func TestComfyUIStatusPollingBypassesSchedulerLocallyAndOverPeer(t *testing.T) {
 			t.Fatalf("mutation %s was not scheduled: status=%d body=%q", endpoint, response.Code, response.Body.String())
 		}
 	}
-	if schedulerCalls.Load() != 4 || directReads.Load() != 18 {
+	if schedulerCalls.Load() != 6 || directReads.Load() != 18 {
 		t.Fatalf("mutation routing: direct=%d scheduler=%d", directReads.Load(), schedulerCalls.Load())
 	}
 }

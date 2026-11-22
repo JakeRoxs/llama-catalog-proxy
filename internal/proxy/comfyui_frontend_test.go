@@ -170,7 +170,7 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 				handler.ServeHTTP(w, req)
 			}
 		}))
-		for _, endpoint := range []string{"/", "/assets/app.js?v=1", "/extensions/custom/ui.js", "/api/features", "/object_info",
+		for _, endpoint := range []string{"/assets/app.js?v=1", "/extensions/custom/ui.js", "/api/features", "/object_info",
 			"/api/i18n", "/api/global_subgraphs", "/api/node_replacements",
 			"/api/global_subgraphs/" + strings.Repeat("a", 64),
 			"/api/jobs?status=completed,failed,cancelled&limit=64&offset=0",
@@ -193,6 +193,15 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 				t.Fatalf("peer=%v endpoint=%s status=%d body=%q", viaPeer, endpoint, response.StatusCode, body)
 			}
 		}
+		beforeRoot := schedulerCalls.Load()
+		root, err := server.Client().Get(server.URL + "/comfyui/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = root.Body.Close()
+		if root.StatusCode != http.StatusAccepted || schedulerCalls.Load() != beforeRoot+1 {
+			t.Fatalf("peer=%v UI root did not start through scheduler: status=%d calls=%d", viaPeer, root.StatusCode, schedulerCalls.Load())
+		}
 		noRedirectClient := *server.Client()
 		noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 		rootResponse, err := noRedirectClient.Get(server.URL + "/comfyui")
@@ -203,12 +212,13 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 		if rootResponse.StatusCode != http.StatusTemporaryRedirect || rootResponse.Header.Get("Location") != "/comfyui/" {
 			t.Fatalf("root redirect peer=%v: status=%d location=%s", viaPeer, rootResponse.StatusCode, rootResponse.Header.Get("Location"))
 		}
+		beforeAsset := schedulerCalls.Load()
 		unavailable, err := server.Client().Get(server.URL + "/comfyui/assets/missing.js")
 		if err != nil {
 			t.Fatal(err)
 		}
 		_ = unavailable.Body.Close()
-		if unavailable.StatusCode != http.StatusServiceUnavailable || schedulerCalls.Load() != 0 {
+		if unavailable.StatusCode != http.StatusServiceUnavailable || schedulerCalls.Load() != beforeAsset {
 			t.Fatalf("unavailable asset fell back to scheduler: status=%d calls=%d", unavailable.StatusCode, schedulerCalls.Load())
 		}
 		connection, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
@@ -236,17 +246,17 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 		}
 		server.Close()
 	}
-	if schedulerCalls.Load() != 0 {
-		t.Fatalf("frontend triggered %d scheduler requests", schedulerCalls.Load())
+	if schedulerCalls.Load() != 2 {
+		t.Fatalf("UI root triggered %d scheduler requests; want one per route", schedulerCalls.Load())
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", strings.NewReader(`{}`)))
-	if response.Code != http.StatusAccepted || schedulerCalls.Load() != 1 {
+	if response.Code != http.StatusAccepted || schedulerCalls.Load() != 3 {
 		t.Fatal("generation no longer uses scheduler")
 	}
 }
 
-func TestComfyUIPageAndResultsNeverFallBackWhenBackendStops(t *testing.T) {
+func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 	const page = `<script src="assets/app.js"></script>`
 	responses := map[string]string{
 		"/": page, "/assets/app.js": "// frontend fixture",
@@ -263,6 +273,10 @@ func TestComfyUIPageAndResultsNeverFallBackWhenBackendStops(t *testing.T) {
 	var schedulerCalls atomic.Int32
 	scheduler := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		schedulerCalls.Add(1)
+		if r.Method == http.MethodGet && r.URL.Path == "/comfyui/" {
+			_, _ = io.WriteString(w, page)
+			return
+		}
 		if r.Method != http.MethodPost || r.URL.Path != "/comfyui/api/prompt" {
 			t.Errorf("unexpected scheduler request: %s %s", r.Method, r.URL.Path)
 		}
@@ -294,6 +308,9 @@ func TestComfyUIPageAndResultsNeverFallBackWhenBackendStops(t *testing.T) {
 	if pageURL.Path != "/comfyui/" || body != page {
 		t.Fatalf("unexpected page or redirect: %s %q", pageURL.Path, body)
 	}
+	if schedulerCalls.Load() != 1 {
+		t.Fatalf("initial UI page did not go through scheduler: %d", schedulerCalls.Load())
+	}
 	for _, target := range []string{"assets/app.js", "api/history/job-1", "view?filename=output.png"} {
 		ref, err := url.Parse(target)
 		if err != nil {
@@ -306,18 +323,21 @@ func TestComfyUIPageAndResultsNeverFallBackWhenBackendStops(t *testing.T) {
 	}
 
 	backend.Close()
-	for _, target := range []string{"/comfyui", "/comfyui/assets/app.js", "/comfyui/api/history/job-1", "/comfyui/view?filename=output.png"} {
+	if _, body := get(proxyServer.URL+"/comfyui/", http.StatusOK); body != page {
+		t.Fatalf("scheduler UI root after result backend stopped: %q", body)
+	}
+	for _, target := range []string{"/comfyui/assets/app.js", "/comfyui/api/history/job-1", "/comfyui/view?filename=output.png"} {
 		get(proxyServer.URL+target, http.StatusBadGateway)
 	}
-	if schedulerCalls.Load() != 0 {
-		t.Fatalf("direct requests reached scheduler: %d", schedulerCalls.Load())
+	if schedulerCalls.Load() != 2 {
+		t.Fatalf("expected only UI root startup requests through scheduler: %d", schedulerCalls.Load())
 	}
 	res, err := client.Post(proxyServer.URL+"/comfyui/api/prompt", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusAccepted || schedulerCalls.Load() != 1 {
+	if res.StatusCode != http.StatusAccepted || schedulerCalls.Load() != 3 {
 		t.Fatalf("generation status=%d scheduler calls=%d", res.StatusCode, schedulerCalls.Load())
 	}
 }
@@ -332,8 +352,9 @@ func TestComfyUIWebSocketsDoNotConsumeResultReadSlots(t *testing.T) {
 	handler := &Handler{logger: discardLogger(), comfyUIResultReadProxy: resultProxy,
 		comfyUIResultSlots: make(chan struct{}, 1), comfyUIWebSocketSlots: make(chan struct{}, 1)}
 	handler.comfyUIWebSocketSlots <- struct{}{}
+	handler.comfyUIFrontendSlots = make(chan struct{}, 1)
 	page := httptest.NewRecorder()
-	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/comfyui/", nil))
+	handler.ServeHTTP(page, httptest.NewRequest(http.MethodGet, "/comfyui/assets/app.js", nil))
 	if page.Code != http.StatusOK {
 		t.Fatalf("WebSocket slots starved page read: %d", page.Code)
 	}

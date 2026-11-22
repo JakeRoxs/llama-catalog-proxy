@@ -36,13 +36,16 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 			return nil, false
 		}
 		prompt := isComfyPromptRequest(req)
+		startComfyUI := prompt || (isComfyUIFrontendRoot(req) && req.ContentLength <= 0 &&
+			(req.Body == nil || req.Body == http.NoBody) && len(req.TransferEncoding) == 0)
 		competing := (req.Method == http.MethodGet && req.URL.Path == "/props") ||
 			(req.Method == http.MethodPost && req.URL.Path == "/v1/chat/completions")
-		if !prompt && !competing {
+		if !startComfyUI && !competing {
 			return nil, false
 		}
-		if prompt {
-			if backendID != promptBackend || req.URL.RawQuery != "" || req.URL.ForceQuery {
+		if startComfyUI {
+			if backendID != promptBackend ||
+				prompt && (req.URL.RawQuery != "" || req.URL.ForceQuery) {
 				return nil, false
 			}
 		} else if req.URL.RawPath != "" {
@@ -61,7 +64,7 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 			}
 			state = coordinator.snapshot()
 		}
-		if prompt {
+		if startComfyUI {
 			firstPrompt := state.State == "released"
 			leaseID, done, err := coordinator.admitPrompt()
 			if err == nil && firstPrompt {

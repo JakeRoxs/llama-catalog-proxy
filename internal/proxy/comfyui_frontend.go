@@ -161,6 +161,11 @@ func validateComfyUIFrontendRequest(request *http.Request) (bool, int, string) {
 	return true, 0, ""
 }
 
+func isComfyUIFrontendRoot(request *http.Request) bool {
+	return request != nil && request.URL != nil && request.Method == http.MethodGet &&
+		(request.URL.Path == "/comfyui/" || request.URL.Path == "/comfyui/index.html")
+}
+
 func validComfyUIUserDataPath(value string) bool {
 	if value == "" || len(value) > 2048 || strings.HasPrefix(value, "/") || path.Clean(value) != value ||
 		strings.ContainsAny(value, "\\%:\x00\r\n") {

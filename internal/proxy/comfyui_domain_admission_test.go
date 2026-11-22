@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
 
 func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
@@ -83,6 +85,37 @@ func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {
 	}
 	if receipt := c.receipt; receipt.State != "stopped" || receipt.FreeRequested {
 		t.Fatalf("stopped-service bootstrap claimed a free operation: %+v", receipt)
+	}
+}
+
+func TestComfyUIRootBootstrapsThroughSchedulerWhenPersistentServiceIsStopped(t *testing.T) {
+	var schedulerCalls atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		schedulerCalls.Add(1)
+		if req.Method != http.MethodGet || req.URL.Path != "/comfyui/" {
+			t.Errorf("unexpected scheduler request: %s %s", req.Method, req.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("comfy-ui"))
+	}))
+	defer backend.Close()
+
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	cfg.Peer = &config.PeerConfig{
+		NodeID: "owner", Listen: "127.0.0.1:9294", TLSCertFile: "cert.pem", TLSKeyFile: "key.pem",
+		ComfyUIResultRead: &config.ComfyUIResultReadConfig{URL: "http://127.0.0.1:1"},
+		ComfyUILease: &config.ComfyUILeaseConfig{
+			ReleaseTimeout: "5s", PollInterval: "100ms", QueueIdleSamples: 2,
+			MinimumFreeVRAMBytes: map[string]int64{"cuda:0": 1},
+			AdmissionBackends:    []string{"default"},
+		},
+	}
+	h := newHandler(t, cfg).(*Handler)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/comfyui/", nil))
+	if w.Code != http.StatusOK || w.Body.String() != "comfy-ui" || schedulerCalls.Load() != 1 {
+		t.Fatalf("ComfyUI root bootstrap: status=%d body=%q scheduler=%d", w.Code, w.Body.String(), schedulerCalls.Load())
 	}
 }
 
