@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -85,7 +86,7 @@ func VerifyComfyUIRelease(ctx context.Context, targetURL string, targetHeaders h
 	queueURL := endpointURL(base, "/queue")
 	queueTracker := &comfyUIJobTracker{url: queueURL.String(), headers: cloneComfyUILeaseHeaders(targetHeaders), client: client}
 	if err := waitForEmptyComfyUIQueue(ctx, queueTracker, idleSamples, pollInterval); err != nil {
-		if errors.Is(err, syscall.ECONNREFUSED) {
+		if isComfyUIUnavailableBeforeFree(err) {
 			return result, errors.Join(errComfyUIServiceUnavailable, err)
 		}
 		return result, fmt.Errorf("%w: queue did not reach a stable empty state", ErrComfyUIReleaseUnknown)
@@ -145,6 +146,14 @@ func VerifyComfyUIRelease(ctx context.Context, targetURL string, targetHeaders h
 			return result, fmt.Errorf("%w: release did not meet the configured queue and VRAM criteria before timeout", ErrComfyUIReleaseUnknown)
 		}
 	}
+}
+
+func isComfyUIUnavailableBeforeFree(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var dnsError *net.DNSError
+	return errors.As(err, &dnsError) && dnsError.IsNotFound
 }
 
 func waitForEmptyComfyUIQueue(ctx context.Context, tracker *comfyUIJobTracker, samples int, interval time.Duration) error {

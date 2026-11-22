@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +29,23 @@ func TestVerifyComfyUIReleaseDistinguishesStoppedServiceBeforeFree(t *testing.T)
 	if !errors.Is(err, errComfyUIServiceUnavailable) || result.FreeRequested {
 		t.Fatalf("stopped service result=%+v err=%v", result, err)
 	}
+
+	client := &http.Client{Transport: comfyUIReleaseRoundTripper(func(*http.Request) (*http.Response, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "comfyui", IsNotFound: true}
+	})}
+	result, err = VerifyComfyUIRelease(context.Background(), "http://comfyui:8188", nil, &config.ComfyUILeaseConfig{
+		ReleaseTimeout: "5s", PollInterval: "100ms", QueueIdleSamples: 2,
+		MinimumFreeVRAMBytes: map[string]int64{"cuda:0": 800},
+	}, client)
+	if !errors.Is(err, errComfyUIServiceUnavailable) || result.FreeRequested {
+		t.Fatalf("unregistered stopped service result=%+v err=%v", result, err)
+	}
+}
+
+type comfyUIReleaseRoundTripper func(*http.Request) (*http.Response, error)
+
+func (roundTrip comfyUIReleaseRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	return roundTrip(request)
 }
 
 func TestVerifyComfyUIReleaseRequiresStableQueueFreeAndPerDeviceVRAM(t *testing.T) {
