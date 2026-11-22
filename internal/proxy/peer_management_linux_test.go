@@ -68,22 +68,50 @@ func TestCreateDelegatedSettingsProposal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertDelegatedProposalOwnership(t, proposal)
+	assertDelegatedProposalPersisted(t, store, proposal.Proposal.ID, input.Owner, proposal.Proposal.CreatedAt)
+	assertDelegatedProposalNoLeak(t, proposal, token)
+	assertTargetUnchanged(t, targetPath, source)
+	assertAllDelegatedProposalRejections(t, state, r, request, input, store, proposal, token, targetDir, targetAlias, storeAlias)
+	r.state.Store(&reloaderState{})
+	if _, err := r.createDelegatedSettingsProposal(request, state, input, 15*time.Minute); !errors.Is(err, errDelegationChanged) {
+		t.Fatalf("stale configuration accepted: %v", err)
+	}
+	r.state.Store(state)
+	r.stopped = true
+	if _, err := r.createDelegatedSettingsProposal(request, state, input, 15*time.Minute); !errors.Is(err, errDelegationChanged) {
+		t.Fatalf("stopped owner accepted proposal: %v", err)
+	}
+}
+
+func assertDelegatedProposalOwnership(t *testing.T, proposal modelconfig.DelegatedProposal) {
 	if proposal.RequesterNode != "requester" || proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != "model" {
 		t.Fatalf("unexpected owner binding: %#v", proposal)
 	}
-	stored, err := modelconfig.LoadDelegatedProposal(store, proposal.Proposal.ID)
-	if err != nil || modelconfig.ValidateDelegatedProposal(stored, input.Owner, "requester", "backend", "swap", proposal.Proposal.CreatedAt) != nil {
+}
+
+func assertDelegatedProposalPersisted(t *testing.T, store string, id string, owner modelconfig.DelegatedOwner, createdAt time.Time) {
+	stored, err := modelconfig.LoadDelegatedProposal(store, id)
+	if err != nil || modelconfig.ValidateDelegatedProposal(stored, owner, "requester", "backend", "swap", createdAt) != nil {
 		t.Fatalf("owner review was not persisted correctly: %v", err)
 	}
+}
+
+func assertDelegatedProposalNoLeak(t *testing.T, proposal modelconfig.DelegatedProposal, token string) {
 	data, err := json.Marshal(proposal)
 	if err != nil || strings.Contains(string(data), "confidential") || strings.Contains(string(data), "/private/") || strings.Contains(string(data), token) {
 		t.Fatalf("proposal leaked source or credential: %v", err)
 	}
-	got, err := os.ReadFile(targetPath)
+}
+
+func assertTargetUnchanged(t *testing.T, path, source string) {
+	got, err := os.ReadFile(path)
 	if err != nil || string(got) != source {
 		t.Fatalf("creating review changed the target: %v", err)
 	}
+}
 
+func assertAllDelegatedProposalRejections(t *testing.T, state *reloaderState, r *Reloader, request *http.Request, input delegatedSettingsRequest, store string, proposal modelconfig.DelegatedProposal, token, targetDir, targetAlias, storeAlias string) {
 	for _, tt := range []struct {
 		name   string
 		change func(*reloaderState, *http.Request, *delegatedSettingsRequest) string
@@ -164,14 +192,5 @@ func TestCreateDelegatedSettingsProposal(t *testing.T) {
 				t.Fatalf("rejected action modified store: %v, %v", ids, err)
 			}
 		})
-	}
-	r.state.Store(&reloaderState{})
-	if _, err := r.createDelegatedSettingsProposal(request, state, input, 15*time.Minute); !errors.Is(err, errDelegationChanged) {
-		t.Fatalf("stale configuration accepted: %v", err)
-	}
-	r.state.Store(state)
-	r.stopped = true
-	if _, err := r.createDelegatedSettingsProposal(request, state, input, 15*time.Minute); !errors.Is(err, errDelegationChanged) {
-		t.Fatalf("stopped owner accepted proposal: %v", err)
 	}
 }

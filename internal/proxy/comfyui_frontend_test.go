@@ -23,32 +23,95 @@ func comfyUIWebSocketTestKey() string {
 	return base64.StdEncoding.EncodeToString(make([]byte, 16))
 }
 
+// comfyUIFrontendEndpoints is the exact set of ComfyUI frontend asset and API
+// endpoints exercised by the HTTP and WebSocket bypass scheduler test. The
+// result backend echoes each request URI verbatim, so the response body must
+// equal the endpoint entry itself.
+var comfyUIFrontendEndpoints = []string{
+	"/assets/app.js?v=1", "/extensions/custom/ui.js", "/api/features", "/object_info",
+	"/api/i18n", "/api/global_subgraphs", "/api/node_replacements",
+	"/api/global_subgraphs/" + strings.Repeat("a", 64),
+	"/api/jobs?status=completed,failed,cancelled&limit=64&offset=0",
+	"/user.css", "/materialdesignicons.min.css", "/fonts/materialdesignicons-webfont.woff2?v=7.4.47",
+	"/api/users", "/api/settings", "/api/userdata/user.css", "/api/userdata/workflows%2Fexample.json",
+	"/api/userdata?dir=workflows&recurse=true&full_info=true", "/api/v2/userdata?path=workflows%2Fproject",
+	"/templates/index.json", "/workflow_templates",
+}
+
 func TestComfyUIFrontendAllowlist(t *testing.T) {
-	for _, endpoint := range []string{"/api/global_subgraphs/not-a-hash", "/api/global_subgraphs/" + strings.Repeat("g", 64), "/api/global_subgraphs/" + strings.Repeat("a", 64) + "?path=other"} {
-		if matched, status, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, "/comfyui"+endpoint, nil)); !matched || status != http.StatusBadRequest {
+	assertSubgraphRequestsRejected(t, []string{
+		"/api/global_subgraphs/not-a-hash",
+		"/api/global_subgraphs/" + strings.Repeat("g", 64),
+		"/api/global_subgraphs/" + strings.Repeat("a", 64) + "?path=other",
+	})
+	assertFrontendRoutesAllowed(t, []string{
+		"/comfyui", "/comfyui/", "/comfyui/index.html", "/comfyui/assets/app.js?v=1",
+		"/comfyui/scripts/app.js", "/comfyui/extensions/custom/ui.js", "/comfyui/assets/style.css",
+		"/comfyui/assets/font.woff2", "/comfyui/favicon.ico", "/comfyui/features",
+		"/comfyui/api/features", "/comfyui/extensions", "/comfyui/embeddings",
+		"/comfyui/models/checkpoints", "/comfyui/object_info", "/comfyui/api/object_info/LoadImage",
+	})
+	assertUnsafeFrontendRoutesRejected(t, []string{
+		"/comfyui/assets/../secret.js", "/comfyui/assets/.secret.js", "/comfyui/assets/file.py",
+		"/comfyui/models/folder/extra", "/comfyui/features?user_id=other", "/comfyui/assets%2fapp.js",
+	})
+	assertNonFrontendRoutesRejected(t, []string{
+		"/comfyui/prompt", "/comfyui/custom/load_model", "/comfyui/health", "/comfyui/free",
+		"/settings", "/api/settings", "/userdata/workflows%2Fexample.json",
+	})
+	assertGenerationBypassRejected(t)
+	assertWebSocketAllowed(t)
+	assertWebSocketDuplicateClientIDsRejected(t)
+}
+
+func assertSubgraphRequestsRejected(t *testing.T, endpoints []string) {
+	t.Helper()
+	for _, endpoint := range endpoints {
+		matched, status, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, "/comfyui"+endpoint, nil))
+		if !matched || status != http.StatusBadRequest {
 			t.Fatalf("subgraph request %s: matched=%v status=%d", endpoint, matched, status)
 		}
 	}
-	for _, endpoint := range []string{"/comfyui", "/comfyui/", "/comfyui/index.html", "/comfyui/assets/app.js?v=1", "/comfyui/scripts/app.js", "/comfyui/extensions/custom/ui.js", "/comfyui/assets/style.css", "/comfyui/assets/font.woff2", "/comfyui/favicon.ico", "/comfyui/features", "/comfyui/api/features", "/comfyui/extensions", "/comfyui/embeddings", "/comfyui/models/checkpoints", "/comfyui/object_info", "/comfyui/api/object_info/LoadImage"} {
+}
+
+func assertFrontendRoutesAllowed(t *testing.T, endpoints []string) {
+	t.Helper()
+	for _, endpoint := range endpoints {
 		matched, status, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, endpoint, nil))
 		if !matched || status != 0 {
 			t.Fatalf("frontend route %s: matched=%v status=%d", endpoint, matched, status)
 		}
 	}
-	for _, endpoint := range []string{"/comfyui/assets/../secret.js", "/comfyui/assets/.secret.js", "/comfyui/assets/file.py", "/comfyui/models/folder/extra", "/comfyui/features?user_id=other", "/comfyui/assets%2fapp.js"} {
+}
+
+func assertUnsafeFrontendRoutesRejected(t *testing.T, endpoints []string) {
+	t.Helper()
+	for _, endpoint := range endpoints {
 		matched, status, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, endpoint, nil))
 		if !matched || status < 400 {
 			t.Fatalf("unsafe frontend route %s: matched=%v status=%d", endpoint, matched, status)
 		}
 	}
-	for _, endpoint := range []string{"/comfyui/prompt", "/comfyui/custom/load_model", "/comfyui/health", "/comfyui/free", "/settings", "/api/settings", "/userdata/workflows%2Fexample.json"} {
+}
+
+func assertNonFrontendRoutesRejected(t *testing.T, endpoints []string) {
+	t.Helper()
+	for _, endpoint := range endpoints {
 		if matched, _, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodGet, endpoint, nil)); matched {
 			t.Fatalf("non-frontend route classified: %s", endpoint)
 		}
 	}
+}
+
+func assertGenerationBypassRejected(t *testing.T) {
+	t.Helper()
 	if matched, _, _ := validateComfyUIFrontendRequest(httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", strings.NewReader(`{}`))); matched {
 		t.Fatal("generation matched frontend bypass")
 	}
+}
+
+func assertWebSocketAllowed(t *testing.T) {
+	t.Helper()
 	request := httptest.NewRequest(http.MethodGet, "/comfyui/ws?clientId=frontend", nil)
 	request.Header.Set("Connection", "Upgrade")
 	request.Header.Set("Upgrade", "websocket")
@@ -57,6 +120,15 @@ func TestComfyUIFrontendAllowlist(t *testing.T) {
 	if matched, status, _ := validateComfyUIFrontendRequest(request); !matched || status != 0 {
 		t.Fatalf("valid websocket denied: %v %d", matched, status)
 	}
+}
+
+func assertWebSocketDuplicateClientIDsRejected(t *testing.T) {
+	t.Helper()
+	request := httptest.NewRequest(http.MethodGet, "/comfyui/ws?clientId=frontend", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Sec-WebSocket-Key", comfyUIWebSocketTestKey())
+	request.Header.Set("Sec-WebSocket-Version", "13")
 	request.URL.RawQuery = "clientId=a&clientId=b"
 	if _, status, _ := validateComfyUIFrontendRequest(request); status != http.StatusBadRequest {
 		t.Fatalf("duplicate WebSocket client IDs accepted: %d", status)
@@ -158,92 +230,11 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 		Peers:             map[string]config.PeerGrant{"caller": {Token: token, PathAccess: []string{"comfyui"}}},
 	}})
 	for _, viaPeer := range []bool{false, true} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if viaPeer {
-				req.TLS = &tls.ConnectionState{}
-				req.Header.Set(peerPathServiceHeader, "comfyui")
-				req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(req.URL.EscapedPath())))
-				req.Header.Set("Authorization", "Bearer "+token)
-				req.URL.Path = peerPathEndpoint
-				owner.PeerHandler().ServeHTTP(w, req)
-			} else {
-				handler.ServeHTTP(w, req)
-			}
-		}))
-		for _, endpoint := range []string{"/assets/app.js?v=1", "/extensions/custom/ui.js", "/api/features", "/object_info",
-			"/api/i18n", "/api/global_subgraphs", "/api/node_replacements",
-			"/api/global_subgraphs/" + strings.Repeat("a", 64),
-			"/api/jobs?status=completed,failed,cancelled&limit=64&offset=0",
-			"/user.css", "/materialdesignicons.min.css", "/fonts/materialdesignicons-webfont.woff2?v=7.4.47",
-			"/api/users", "/api/settings", "/api/userdata/user.css", "/api/userdata/workflows%2Fexample.json",
-			"/api/userdata?dir=workflows&recurse=true&full_info=true", "/api/v2/userdata?path=workflows%2Fproject",
-			"/templates/index.json", "/workflow_templates"} {
-			request, err := http.NewRequest(http.MethodGet, server.URL+"/comfyui"+endpoint, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			request.Header.Set("Comfy-User", "forged-caller")
-			response, err := server.Client().Do(request)
-			if err != nil {
-				t.Fatal(err)
-			}
-			body, _ := io.ReadAll(response.Body)
-			_ = response.Body.Close()
-			if response.StatusCode != http.StatusOK || string(body) != endpoint {
-				t.Fatalf("peer=%v endpoint=%s status=%d body=%q", viaPeer, endpoint, response.StatusCode, body)
-			}
-		}
-		beforeRoot := schedulerCalls.Load()
-		root, err := server.Client().Get(server.URL + "/comfyui/")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = root.Body.Close()
-		if root.StatusCode != http.StatusOK || schedulerCalls.Load() != beforeRoot {
-			t.Fatalf("peer=%v running UI root should use persistent origin: status=%d calls=%d", viaPeer, root.StatusCode, schedulerCalls.Load())
-		}
-		noRedirectClient := *server.Client()
-		noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		rootResponse, err := noRedirectClient.Get(server.URL + "/comfyui")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = rootResponse.Body.Close()
-		if rootResponse.StatusCode != http.StatusTemporaryRedirect || rootResponse.Header.Get("Location") != "/comfyui/" {
-			t.Fatalf("root redirect peer=%v: status=%d location=%s", viaPeer, rootResponse.StatusCode, rootResponse.Header.Get("Location"))
-		}
-		beforeAsset := schedulerCalls.Load()
-		unavailable, err := server.Client().Get(server.URL + "/comfyui/assets/missing.js")
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = unavailable.Body.Close()
-		if unavailable.StatusCode != http.StatusServiceUnavailable || schedulerCalls.Load() != beforeAsset {
-			t.Fatalf("unavailable asset fell back to scheduler: status=%d calls=%d", unavailable.StatusCode, schedulerCalls.Load())
-		}
-		connection, err := net.DialTimeout("tcp", strings.TrimPrefix(server.URL, "http://"), time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
-		_, _ = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=frontend HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nCookie: caller=secret\r\n\r\n", strings.TrimPrefix(server.URL, "http://"), comfyUIWebSocketTestKey())
-		reader := bufio.NewReader(connection)
-		response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
-		if err != nil {
-			_ = connection.Close()
-			t.Fatal(err)
-		}
-		if response.StatusCode != http.StatusSwitchingProtocols {
-			_ = connection.Close()
-			t.Fatalf("peer=%v WebSocket status=%d", viaPeer, response.StatusCode)
-		}
-		_, _ = connection.Write([]byte("\x81\x82\x00\x00\x00\x00hi"))
-		frame := make([]byte, 4)
-		_, err = io.ReadFull(reader, frame)
-		_ = connection.Close()
-		if err != nil || string(frame) != "\x81\x02ok" {
-			t.Fatalf("peer=%v WebSocket reply=%q error=%v", viaPeer, frame, err)
-		}
+		server := serveComfyUIFrontendMode(t, handler, owner, viaPeer, token)
+		assertComfyUIFrontendEndpoints(t, server, comfyUIFrontendEndpoints, viaPeer)
+		assertComfyUIFrontendRoot(t, server, &schedulerCalls, viaPeer)
+		assertComfyUIFrontendAssetUnavailable(t, server, &schedulerCalls)
+		assertComfyUIFrontendWebSocket(t, server, viaPeer)
 		server.Close()
 	}
 	if schedulerCalls.Load() != 0 {
@@ -253,6 +244,123 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", strings.NewReader(`{}`)))
 	if response.Code != http.StatusAccepted || schedulerCalls.Load() != 1 {
 		t.Fatal("generation no longer uses scheduler")
+	}
+}
+
+// serveComfyUIFrontendMode returns an httptest server that serves the ComfyUI
+// frontend either directly (local mode) or through the owner peer (peer mode).
+// In peer mode the request carries the peer TLS marker, service/path headers and
+// bearer token, and the owner peer path endpoint is invoked.
+func serveComfyUIFrontendMode(t *testing.T, handler *Handler, owner *Reloader, viaPeer bool, token string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if viaPeer {
+			req.TLS = &tls.ConnectionState{}
+			req.Header.Set(peerPathServiceHeader, "comfyui")
+			req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(req.URL.EscapedPath())))
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.URL.Path = peerPathEndpoint
+			owner.PeerHandler().ServeHTTP(w, req)
+		} else {
+			handler.ServeHTTP(w, req)
+		}
+	}))
+}
+
+// assertComfyUIFrontendEndpoints verifies every frontend endpoint is served by
+// the result backend with a 200 and a body that echoes the endpoint, in both
+// local and peer modes. The forged Comfy-User header must not leak as a cookie
+// to the result backend.
+func assertComfyUIFrontendEndpoints(t *testing.T, server *httptest.Server, endpoints []string, viaPeer bool) {
+	t.Helper()
+	for _, endpoint := range endpoints {
+		request, err := http.NewRequest(http.MethodGet, server.URL+"/comfyui"+endpoint, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Comfy-User", "forged-caller")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(response.Body)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || string(body) != endpoint {
+			t.Fatalf("peer=%v endpoint=%s status=%d body=%q", viaPeer, endpoint, response.StatusCode, body)
+		}
+	}
+}
+
+// assertComfyUIFrontendRoot verifies the UI root is served persistently by the
+// result backend (scheduler untouched) and that the non-root path redirects to
+// the root with a temporary redirect, in both local and peer modes.
+func assertComfyUIFrontendRoot(t *testing.T, server *httptest.Server, schedulerCalls *atomic.Int32, viaPeer bool) {
+	t.Helper()
+	beforeRoot := schedulerCalls.Load()
+	root, err := server.Client().Get(server.URL + "/comfyui/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = root.Body.Close()
+	if root.StatusCode != http.StatusOK || schedulerCalls.Load() != beforeRoot {
+		t.Fatalf("peer=%v running UI root should use persistent origin: status=%d calls=%d", viaPeer, root.StatusCode, schedulerCalls.Load())
+	}
+	noRedirectClient := *server.Client()
+	noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	rootResponse, err := noRedirectClient.Get(server.URL + "/comfyui")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rootResponse.Body.Close()
+	if rootResponse.StatusCode != http.StatusTemporaryRedirect || rootResponse.Header.Get("Location") != "/comfyui/" {
+		t.Fatalf("root redirect peer=%v: status=%d location=%s", viaPeer, rootResponse.StatusCode, rootResponse.Header.Get("Location"))
+	}
+}
+
+// assertComfyUIFrontendAssetUnavailable verifies an unavailable asset returns
+// 503 from the result backend and does not fall back to the scheduler, in both
+// local and peer modes.
+func assertComfyUIFrontendAssetUnavailable(t *testing.T, server *httptest.Server, schedulerCalls *atomic.Int32) {
+	t.Helper()
+	beforeAsset := schedulerCalls.Load()
+	unavailable, err := server.Client().Get(server.URL + "/comfyui/assets/missing.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unavailable.Body.Close()
+	if unavailable.StatusCode != http.StatusServiceUnavailable || schedulerCalls.Load() != beforeAsset {
+		t.Fatalf("unavailable asset fell back to scheduler: status=%d calls=%d", unavailable.StatusCode, schedulerCalls.Load())
+	}
+}
+
+// assertComfyUIFrontendWebSocket performs a raw TCP WebSocket handshake against
+// the server, echoes a masked frame, and verifies the reply. The connection is
+// closed on every path, including failure paths.
+func assertComfyUIFrontendWebSocket(t *testing.T, server *httptest.Server, viaPeer bool) {
+	t.Helper()
+	host := strings.TrimPrefix(server.URL, "http://")
+	connection, err := net.DialTimeout("tcp", host, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetDeadline(time.Now().Add(5 * time.Second))
+	_, _ = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=frontend HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nCookie: caller=secret\r\n\r\n", host, comfyUIWebSocketTestKey())
+	reader := bufio.NewReader(connection)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+	if err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusSwitchingProtocols {
+		_ = connection.Close()
+		t.Fatalf("peer=%v WebSocket status=%d", viaPeer, response.StatusCode)
+	}
+	_, _ = connection.Write([]byte("\x81\x82\x00\x00\x00\x00hi"))
+	frame := make([]byte, 4)
+	_, err = io.ReadFull(reader, frame)
+	_ = connection.Close()
+	if err != nil || string(frame) != "\x81\x02ok" {
+		t.Fatalf("peer=%v WebSocket reply=%q error=%v", viaPeer, frame, err)
 	}
 }
 

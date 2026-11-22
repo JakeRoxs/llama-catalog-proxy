@@ -48,25 +48,16 @@ func TestDownloadArtifactFollowsTrustedRedirectsWithoutForwardingCredentials(t *
 		calls++
 		switch calls {
 		case 1:
-			if r.Host != "huggingface.co" || r.URL.EscapedPath() != "/owner/repo/resolve/main/model.gguf" ||
-				r.Header.Get("Authorization") != "Bearer fixture-token" || r.Header.Get("Accept-Encoding") != "identity" {
-				t.Errorf("unexpected initial request: host=%q path=%q auth=%q", r.Host, r.URL.Path, r.Header.Get("Authorization"))
-			}
+			assertInitialRequest(t, r)
 			http.Redirect(w, r, "/owner/repo/resolve/commit/model.gguf", http.StatusFound)
 		case 2:
-			if r.Header.Get("Authorization") != "Bearer fixture-token" {
-				t.Error("same-origin redirect lost authorization")
-			}
+			assertSameOriginKeepsAuth(t, r)
 			http.Redirect(w, r, "https://cas-bridge.xethub.hf.co/file?signature=fixture-secret", http.StatusFound)
 		case 3:
-			if r.Host != "cas-bridge.xethub.hf.co" || r.Header.Get("Authorization") != "" {
-				t.Error("cross-origin redirect forwarded authorization")
-			}
+			assertCrossOriginDropsAuth(t, r)
 			http.Redirect(w, r, "https://huggingface.co/final", http.StatusFound)
 		case 4:
-			if r.Header.Get("Authorization") != "" {
-				t.Error("authorization was restored after leaving the Hub")
-			}
+			assertAuthRestored(t, r)
 			w.Header().Set("Content-Length", fmt.Sprint(len(data)))
 			_, _ = w.Write(data)
 		default:
@@ -78,6 +69,35 @@ func TestDownloadArtifactFollowsTrustedRedirectsWithoutForwardingCredentials(t *
 	result, err := downloadArtifact(context.Background(), options, time.Minute, "fixture-token", client)
 	if err != nil || result.Publication != PublicationPublished || result.Bytes != int64(len(data)) || calls != 4 {
 		t.Fatalf("result = %+v, error = %v, calls = %d", result, err, calls)
+	}
+}
+
+// assertInitialRequest verifies the first request targets the Hub with the credential and no compression.
+func assertInitialRequest(t *testing.T, r *http.Request) {
+	if r.Host != "huggingface.co" || r.URL.EscapedPath() != "/owner/repo/resolve/main/model.gguf" ||
+		r.Header.Get("Authorization") != "Bearer fixture-token" || r.Header.Get("Accept-Encoding") != "identity" {
+		t.Errorf("unexpected initial request: host=%q path=%q auth=%q", r.Host, r.URL.Path, r.Header.Get("Authorization"))
+	}
+}
+
+// assertSameOriginKeepsAuth verifies a same-origin redirect forwards the credential.
+func assertSameOriginKeepsAuth(t *testing.T, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer fixture-token" {
+		t.Error("same-origin redirect lost authorization")
+	}
+}
+
+// assertCrossOriginDropsAuth verifies a cross-origin redirect strips the credential.
+func assertCrossOriginDropsAuth(t *testing.T, r *http.Request) {
+	if r.Host != "cas-bridge.xethub.hf.co" || r.Header.Get("Authorization") != "" {
+		t.Error("cross-origin redirect forwarded authorization")
+	}
+}
+
+// assertAuthRestored verifies the credential is not re-added after leaving the Hub.
+func assertAuthRestored(t *testing.T, r *http.Request) {
+	if r.Header.Get("Authorization") != "" {
+		t.Error("authorization was restored after leaving the Hub")
 	}
 }
 
@@ -153,55 +173,66 @@ func TestDownloadArtifactCancellationAndStagingPreflight(t *testing.T) {
 		{"deadline while reading", true, context.DeadlineExceeded},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			started := make(chan struct{})
-			client := fixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Length", "100")
-				w.WriteHeader(http.StatusOK)
-				w.(http.Flusher).Flush()
-				close(started)
-				<-r.Context().Done()
-			})
-			options := stageOptions(t.TempDir())
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			done := make(chan error, 1)
-			go func() {
-				duration := time.Minute
-				if tt.timeout {
-					duration = 250 * time.Millisecond
-				}
-				result, err := downloadArtifact(ctx, options, duration, "", client)
-				if result.Publication != PublicationNotPublished {
-					done <- fmt.Errorf("unexpected publication: %s", result.Publication)
-					return
-				}
-				done <- err
-			}()
-			<-started
-			if !tt.timeout {
-				cancel()
-			}
-			if err := <-done; !errors.Is(err, tt.want) {
-				t.Fatalf("error = %v", err)
-			}
-			if _, err := os.Stat(filepath.Join(options.Directory, options.Source.Filename)); !errors.Is(err, os.ErrNotExist) {
-				t.Fatalf("destination exists or could not be inspected: %v", err)
-			}
+			testDownloadCancellation(t, tt.timeout, tt.want)
 		})
 	}
 	t.Run("existing destination", func(t *testing.T) {
-		client := fixtureClient(t, func(http.ResponseWriter, *http.Request) {
-			t.Error("network request sent despite existing destination")
-		})
-		options := stageOptions(t.TempDir())
-		if err := os.WriteFile(filepath.Join(options.Directory, options.Source.Filename), []byte("existing"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		result, err := downloadArtifact(context.Background(), options, time.Minute, "", client)
-		if !errors.Is(err, ErrStageExists) || result.Publication != PublicationNotPublished {
-			t.Fatalf("result = %+v, error = %v", result, err)
-		}
+		testExistingDestination(t)
 	})
+}
+
+// testDownloadCancellation exercises download cancellation and deadline expiry, asserting
+// that no partial artifact is left in the staging directory.
+func testDownloadCancellation(t *testing.T, timeout bool, want error) {
+	started := make(chan struct{})
+	client := fixtureClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+	})
+	options := stageOptions(t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		duration := time.Minute
+		if timeout {
+			duration = 250 * time.Millisecond
+		}
+		result, err := downloadArtifact(ctx, options, duration, "", client)
+		if result.Publication != PublicationNotPublished {
+			done <- fmt.Errorf("unexpected publication: %s", result.Publication)
+			return
+		}
+		done <- err
+	}()
+	<-started
+	if !timeout {
+		cancel()
+	}
+	if err := <-done; !errors.Is(err, want) {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(options.Directory, options.Source.Filename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("destination exists or could not be inspected: %v", err)
+	}
+}
+
+// testExistingDestination asserts a download is skipped when the destination already exists.
+func testExistingDestination(t *testing.T) {
+	client := fixtureClient(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("network request sent despite existing destination")
+	})
+	options := stageOptions(t.TempDir())
+	if err := os.WriteFile(filepath.Join(options.Directory, options.Source.Filename), []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := downloadArtifact(context.Background(), options, time.Minute, "", client)
+	if !errors.Is(err, ErrStageExists) || result.Publication != PublicationNotPublished {
+		t.Fatalf("result = %+v, error = %v", result, err)
+	}
 }
 
 func TestDownloadJobWithLocalTLSFixture(t *testing.T) {

@@ -20,6 +20,12 @@ import (
 
 const operationClockFilename = "operation-clock.json"
 
+// delegatedOperationTempPrefix is the filename prefix for temporary operation
+// replacement files created by replaceOperationRecord. Centralizing the
+// ".operation-" literal here addresses go:S1192 (duplicated string literal x4)
+// without changing temp filename or recovery semantics.
+const delegatedOperationTempPrefix = ".operation-"
+
 type operationClock struct {
 	Since time.Time `json:"since"`
 }
@@ -54,8 +60,8 @@ func operationInventory(root *os.Root, dir *os.File) ([]string, time.Time, error
 				return nil, time.Time{}, ErrProposalStore
 			}
 			ids = append(ids, id)
-		case strings.HasPrefix(name, ".operation-") && strings.HasSuffix(name, ".tmp"):
-			id := strings.TrimSuffix(strings.TrimPrefix(name, ".operation-"), ".tmp")
+		case strings.HasPrefix(name, delegatedOperationTempPrefix) && strings.HasSuffix(name, ".tmp"):
+			id := strings.TrimSuffix(strings.TrimPrefix(name, delegatedOperationTempPrefix), ".tmp")
 			if temporary != "" || !validProposalID(id) {
 				return nil, time.Time{}, ErrProposalStore
 			}
@@ -117,7 +123,7 @@ func delegatedOperationProposalIDsReadOnly(root *os.Root, dir *os.File) (map[str
 				return nil, err
 			}
 			ids[id] = true
-		case strings.HasPrefix(name, ".operation-") && strings.HasSuffix(name, ".tmp"):
+		case strings.HasPrefix(name, delegatedOperationTempPrefix) && strings.HasSuffix(name, ".tmp"):
 			// A temporary replacement may be evidence of an interrupted write.
 			// Do not let proposal cleanup trigger the operation store's recovery.
 			return nil, ErrProposalStore
@@ -147,7 +153,7 @@ func replaceOperationRecord(root *os.Root, dir *os.File, name string, data []byt
 	if _, err := rand.Read(id[:]); err != nil {
 		return ErrProposalStore
 	}
-	temp := ".operation-" + hex.EncodeToString(id[:]) + ".tmp"
+	temp := delegatedOperationTempPrefix + hex.EncodeToString(id[:]) + ".tmp"
 	file, err := root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return ErrProposalStore

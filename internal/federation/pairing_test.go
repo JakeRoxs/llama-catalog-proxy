@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -212,5 +213,78 @@ func TestLostMembershipStateFailsClosedAsEmpty(t *testing.T) {
 	members, err := recovered.ListMembers()
 	if err != nil || len(members) != 0 || recovered.IsMember("node-b") {
 		t.Fatalf("lost state restored trust unexpectedly: %+v, %v", members, err)
+	}
+}
+
+func TestPairingConsumeInvitationReuseRotatesFingerprint(t *testing.T) {
+	_, store := pairingStoreFixture(t)
+	now := time.Now().UTC()
+	invite, err := store.CreateInvitation("node-b", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fingerprintA := strings.Repeat("a", 64)
+	fingerprintB := strings.Repeat("b", 64)
+	if _, err := store.ConsumeInvitation(invite.Code, "node-b", fingerprintA, now); err != nil {
+		t.Fatal(err)
+	}
+	// The consumed record is fresh, so re-consuming the same invitation routes to
+	// the reuse path and rotates the paired member fingerprint.
+	if _, err := store.ConsumeInvitation(invite.Code, "node-b", fingerprintB, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	member, ok := store.GetMember("node-b")
+	if !ok || member.Fingerprint != strings.ToLower(fingerprintB) {
+		t.Fatalf("fingerprint was not rotated: %+v", member)
+	}
+	revoked, err := store.IsCertificateRevoked("node-b", fingerprintA)
+	if err != nil || !revoked {
+		t.Fatalf("rotated-away fingerprint was not revoked: %v, %v", revoked, err)
+	}
+}
+
+func TestPairingValidatePairingDataRejectsMalformedStores(t *testing.T) {
+	directory := t.TempDir()
+	if err := os.Chmod(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeMalformedStore := func(t *testing.T, data pairingData) {
+		t.Helper()
+		raw, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(directory, storeFilename), raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Duplicate member fingerprint must be rejected.
+	writeMalformedStore(t, pairingData{
+		Version: 1, FederationID: "lab.example", LocalNodeID: "node-a",
+		Members: map[string]Membership{
+			"node-b": {NodeID: "node-b", Fingerprint: strings.Repeat("a", 64), PairedAt: time.Now().UTC()},
+			"node-c": {NodeID: "node-c", Fingerprint: strings.Repeat("a", 64), PairedAt: time.Now().UTC()},
+		},
+		Invites:  make(map[string]inviteRecord),
+		Consumed: make(map[string]consumedRecord),
+		Revoked:  make(map[string][]string),
+	})
+	if _, err := OpenPairingStore(directory, "lab.example", "node-a"); err == nil {
+		t.Fatal("store with duplicate member fingerprint was accepted")
+	}
+	// Consumed record that collides with an active invite hash must be rejected.
+	writeMalformedStore(t, pairingData{
+		Version: 1, FederationID: "lab.example", LocalNodeID: "node-a",
+		Members: make(map[string]Membership),
+		Invites: map[string]inviteRecord{
+			"deadbeef": {NodeID: "node-b", CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour)},
+		},
+		Consumed: map[string]consumedRecord{
+			"deadbeef": {NodeID: "node-b", ExpiresAt: time.Now().Add(time.Hour)},
+		},
+		Revoked: make(map[string][]string),
+	})
+	if _, err := OpenPairingStore(directory, "lab.example", "node-a"); err == nil {
+		t.Fatal("store with consumed-invite hash collision was accepted")
 	}
 }

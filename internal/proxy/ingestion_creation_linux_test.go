@@ -70,7 +70,16 @@ func TestPreviewRecordedCreationBindsRecordAndConfiguredPath(t *testing.T) {
 	defer manager.Stop()
 	ctx := int32(4096)
 	input := modelconfig.CreationCommandInput{Executable: "llama-server", Settings: modelconfig.CommandSettings{ContextSize: &ctx}}
-	got, err := previewRecordedCreation(manager, models, target, "local", "new", "", record.Job.ID, input)
+	got, err := previewRecordedCreation(recordedCreationPreviewRequest{
+		jobs:           manager,
+		modelDirectory: models,
+		target:         target,
+		targetID:       "local",
+		modelID:        "new",
+		templateID:     "",
+		recordID:       record.Job.ID,
+		input:          input,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,12 +100,40 @@ func TestPreviewRecordedCreationBindsRecordAndConfiguredPath(t *testing.T) {
 	if err != nil || string(unchanged) != source {
 		t.Fatalf("preview modified target: %v", err)
 	}
-	if _, err := storeRecordedCreation(manager, models, proposals, target, "local", "new", "", record.Job.ID,
-		strings.Repeat("a", 64), got.Artifact.Revision, got.ReviewRevision, input); !errors.Is(err, modelconfig.ErrProposalStale) {
+	if _, err := storeRecordedCreation(storeRecordedCreationRequest{
+		previewRequest: recordedCreationPreviewRequest{
+			jobs:           manager,
+			modelDirectory: models,
+			target:         target,
+			targetID:       "local",
+			modelID:        "new",
+			templateID:     "",
+			recordID:       record.Job.ID,
+			input:          input,
+		},
+		store:                    proposals,
+		expectedRevision:         strings.Repeat("a", 64),
+		expectedArtifactRevision: got.Artifact.Revision,
+		expectedReviewRevision:   got.ReviewRevision,
+	}); !errors.Is(err, modelconfig.ErrProposalStale) {
 		t.Fatalf("stale review accepted: %v", err)
 	}
-	proposal, err := storeRecordedCreation(manager, models, proposals, target, "local", "new", "", record.Job.ID,
-		got.Preview.Revision, got.Artifact.Revision, got.ReviewRevision, input)
+	proposal, err := storeRecordedCreation(storeRecordedCreationRequest{
+		previewRequest: recordedCreationPreviewRequest{
+			jobs:           manager,
+			modelDirectory: models,
+			target:         target,
+			targetID:       "local",
+			modelID:        "new",
+			templateID:     "",
+			recordID:       record.Job.ID,
+			input:          input,
+		},
+		store:                    proposals,
+		expectedRevision:         got.Preview.Revision,
+		expectedArtifactRevision: got.Artifact.Revision,
+		expectedReviewRevision:   got.ReviewRevision,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,14 +451,32 @@ func TestPreviewRecordedCreationBindsRecordAndConfiguredPath(t *testing.T) {
 		t.Fatalf("changed artifact modified target: %v", err)
 	}
 	input.ModelPath = "/different/path.gguf"
-	if _, err := previewRecordedCreation(manager, models, target, "local", "new", "", record.Job.ID, input); err == nil {
+	if _, err := previewRecordedCreation(recordedCreationPreviewRequest{
+		jobs:           manager,
+		modelDirectory: models,
+		target:         target,
+		targetID:       "local",
+		modelID:        "new",
+		templateID:     "",
+		recordID:       record.Job.ID,
+		input:          input,
+	}); err == nil {
 		t.Fatal("accepted a caller-selected model path")
 	}
 	input.ModelPath = ""
 	if err := os.Remove(filepath.Join(models, "model.gguf")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := previewRecordedCreation(manager, models, target, "local", "new", "", record.Job.ID, input); !errors.Is(err, ingestion.ErrArtifactUnavailable) {
+	if _, err := previewRecordedCreation(recordedCreationPreviewRequest{
+		jobs:           manager,
+		modelDirectory: models,
+		target:         target,
+		targetID:       "local",
+		modelID:        "new",
+		templateID:     "",
+		recordID:       record.Job.ID,
+		input:          input,
+	}); !errors.Is(err, ingestion.ErrArtifactUnavailable) {
 		t.Fatalf("missing artifact accepted: %v", err)
 	}
 }

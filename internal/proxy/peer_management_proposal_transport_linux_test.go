@@ -22,7 +22,31 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
-func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
+type tlsProposalHarness struct {
+	owner     delegatedApplyFixture
+	mode      *atomic.Int32
+	calls     *atomic.Int32
+	redirects *atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+	server    *httptest.Server
+	caPath    string
+	peerToken string
+	caller    string
+	clients   map[string]*peerClient
+	state     *reloaderState
+	receiver  *Reloader
+	request   *http.Request
+	wrong     *http.Request
+	plaintext *http.Request
+	canceled  context.Context
+	input     delegatedSettingsRequest
+	redirect  *httptest.Server
+	cleanup   func()
+}
+
+func newTLSProposalHarness(t *testing.T) (tlsProposalHarness, func()) {
+	t.Helper()
 	owner := newDelegatedApplyFixture(t)
 	existing, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
 	if err != nil {
@@ -39,7 +63,6 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	redirect := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		redirects.Add(1)
 	}))
-	defer redirect.Close()
 	peerToken, caller := strings.Repeat("p", 32), strings.Repeat("c", 32)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.URL.Path == peerSettingsApplyPath {
@@ -116,7 +139,6 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 			_, _ = w.Write(response.Body.Bytes())
 		}
 	}))
-	defer server.Close()
 	caPath := filepath.Join(t.TempDir(), "peer-ca.pem")
 	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
 		t.Fatal(err)
@@ -128,7 +150,6 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer closePeerClients(clients)
 	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
 	receiver := &Reloader{managementSlots: make(chan struct{}, 2)}
 	receiver.state.Store(state)
@@ -142,146 +163,201 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	plaintext.TLS = nil
 	canceled, cancel := context.WithCancel(request.Context())
 	cancel()
+	h := tlsProposalHarness{
+		owner:     owner,
+		mode:      &mode,
+		calls:     &calls,
+		redirects: &redirects,
+		entered:   entered,
+		release:   release,
+		server:    server,
+		caPath:    caPath,
+		peerToken: peerToken,
+		caller:    caller,
+		clients:   clients,
+		state:     state,
+		receiver:  receiver,
+		request:   request,
+		wrong:     wrong,
+		plaintext: plaintext,
+		canceled:  canceled,
+		input:     input,
+		redirect:  redirect,
+	}
+	cleanup := func() {
+		server.Close()
+		redirect.Close()
+		closePeerClients(clients)
+	}
+	return h, cleanup
+}
+
+func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
+	h, cleanup := newTLSProposalHarness(t)
+	defer cleanup()
+
 	for _, tt := range []struct {
 		name  string
 		req   *http.Request
 		state *reloaderState
 		want  error
 	}{
-		{"wrong caller", wrong, state, errDelegationUnauthorized},
-		{"plaintext", plaintext, state, errDelegationUnauthorized},
-		{"canceled", request.WithContext(canceled), state, context.Canceled},
-		{"stale state", request, &reloaderState{}, errDelegationChanged},
+		{"wrong caller", h.wrong, h.state, errDelegationUnauthorized},
+		{"plaintext", h.plaintext, h.state, errDelegationUnauthorized},
+		{"canceled", h.request.WithContext(h.canceled), h.state, context.Canceled},
+		{"stale state", h.request, &reloaderState{}, errDelegationChanged},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := receiver.forwardDelegatedSettingsProposal(tt.req, tt.state, input); !errors.Is(err, tt.want) {
-				t.Fatalf("got %v, want %v", err, tt.want)
-			}
+			assertProposalRejected(t, h, tt.req, tt.state, h.input, tt.want)
 		})
 	}
-	clients["owner"].routeManagement = false
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationPeerUnavailable) {
-		t.Fatalf("disabled route accepted: %v", err)
-	}
-	clients["owner"].routeManagement = true
-	rotated := *state
-	rotated.management = copyManagementConfig(state.management)
+
+	h.clients["owner"].routeManagement = false
+	assertProposalRejected(t, h, h.request, h.state, h.input, errDelegationPeerUnavailable)
+	h.clients["owner"].routeManagement = true
+
+	rotated := *h.state
+	rotated.management = copyManagementConfig(h.state.management)
 	rotated.management.DelegationToken = strings.Repeat("n", 32)
-	receiver.lifecycleMu.Lock()
-	receiver.state.Store(&rotated)
-	receiver.lifecycleMu.Unlock()
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, &rotated, input); !errors.Is(err, errDelegationUnauthorized) {
-		t.Fatalf("revoked receiving credential accepted: %v", err)
-	}
-	receiver.lifecycleMu.Lock()
-	receiver.state.Store(state)
-	receiver.lifecycleMu.Unlock()
-	oversized := input
+	h.receiver.lifecycleMu.Lock()
+	h.receiver.state.Store(&rotated)
+	h.receiver.lifecycleMu.Unlock()
+	assertProposalRejected(t, h, h.request, &rotated, h.input, errDelegationUnauthorized)
+	h.receiver.lifecycleMu.Lock()
+	h.receiver.state.Store(h.state)
+	h.receiver.lifecycleMu.Unlock()
+
+	oversized := h.input
 	oversized.Model = strings.Repeat("a", maxBenchmarkJSONBytes)
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, oversized); !errors.Is(err, modelconfig.ErrDelegatedProposalInvalid) {
-		t.Fatalf("oversized request accepted: %v", err)
-	}
-	if calls.Load() != 0 {
+	assertProposalRejected(t, h, h.request, h.state, oversized, modelconfig.ErrDelegatedProposalInvalid)
+
+	if h.calls.Load() != 0 {
 		t.Fatal("rejected request reached owner")
 	}
-	revoked := *owner.state
-	revoked.peer = copyPeerConfig(owner.state.peer)
-	revoked.peer.Peers["requester"] = config.PeerGrant{Token: peerToken, CatalogRead: true}
-	owner.r.lifecycleMu.Lock()
-	owner.r.state.Store(&revoked)
-	owner.r.lifecycleMu.Unlock()
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationProposalUnknown) {
-		t.Fatalf("revoked owner grant: %v", err)
-	}
-	owner.r.lifecycleMu.Lock()
-	owner.r.state.Store(owner.state)
-	owner.r.lifecycleMu.Unlock()
-	staleOwner := input
+
+	revoked := *h.owner.state
+	revoked.peer = copyPeerConfig(h.owner.state.peer)
+	revoked.peer.Peers["requester"] = config.PeerGrant{Token: h.peerToken, CatalogRead: true}
+	h.owner.r.lifecycleMu.Lock()
+	h.owner.r.state.Store(&revoked)
+	h.owner.r.lifecycleMu.Unlock()
+	assertProposalRejected(t, h, h.request, h.state, h.input, errDelegationProposalUnknown)
+	h.owner.r.lifecycleMu.Lock()
+	h.owner.r.state.Store(h.owner.state)
+	h.owner.r.lifecycleMu.Unlock()
+
+	staleOwner := h.input
 	staleOwner.Owner.ConfigGeneration++
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, staleOwner); !errors.Is(err, errDelegationProposalUnknown) {
-		t.Fatalf("stale owner incarnation: %v", err)
-	}
-	staleSource := input
+	assertProposalRejected(t, h, h.request, h.state, staleOwner, errDelegationProposalUnknown)
+
+	staleSource := h.input
 	staleSource.Revision = strings.Repeat("b", 64)
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, staleSource); !errors.Is(err, errDelegationProposalUnknown) {
-		t.Fatalf("stale source revision: %v", err)
-	}
-	ids, err := modelconfig.ListDelegatedProposals(owner.proposals)
+	assertProposalRejected(t, h, h.request, h.state, staleSource, errDelegationProposalUnknown)
+
+	ids, err := modelconfig.ListDelegatedProposals(h.owner.proposals)
 	if err != nil || len(ids) != 1 {
 		t.Fatalf("rejected owner request persisted a review: %v, %v", ids, err)
 	}
-	mode.Store(1)
-	before := calls.Load()
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationProposalUnknown) {
-		t.Fatalf("lost response was not unknown: %v", err)
+
+	h.mode.Store(1)
+	before := h.calls.Load()
+	assertProposalRejected(t, h, h.request, h.state, h.input, errDelegationProposalUnknown)
+	if h.calls.Load() != before+1 {
+		t.Fatalf("proposal request automatically retried: %d additional calls", h.calls.Load()-before)
 	}
-	if calls.Load() != before+1 {
-		t.Fatalf("proposal request automatically retried: %d additional calls", calls.Load()-before)
-	}
-	ids, err = modelconfig.ListDelegatedProposals(owner.proposals)
+	ids, err = modelconfig.ListDelegatedProposals(h.owner.proposals)
 	if err != nil || len(ids) != 2 {
 		t.Fatalf("lost response did not leave exactly one stored review: %v, %v", ids, err)
 	}
+
 	for _, m := range []int32{2, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
-		mode.Store(m)
-		if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationProposalUnknown) {
-			t.Fatalf("untrusted response mode %d: %v", m, err)
-		}
+		h.mode.Store(m)
+		assertProposalRejected(t, h, h.request, h.state, h.input, errDelegationProposalUnknown)
 	}
-	if redirects.Load() != 0 {
+
+	if h.redirects.Load() != 0 {
 		t.Fatal("proposal request followed a redirect")
 	}
-	mode.Store(12)
+
+	h.mode.Store(12)
 	done := make(chan error, 1)
 	go func() {
-		_, err := receiver.forwardDelegatedSettingsProposal(request, state, input)
+		_, err := h.receiver.forwardDelegatedSettingsProposal(h.request, h.state, h.input)
 		done <- err
 	}()
-	<-entered
-	if receiver.lifecycleMu.TryLock() {
-		receiver.lifecycleMu.Unlock()
-		close(release)
+	<-h.entered
+	if h.receiver.lifecycleMu.TryLock() {
+		h.receiver.lifecycleMu.Unlock()
+		close(h.release)
 		<-done
 		t.Fatal("receiving configuration changed during proposal forwarding")
 	}
-	close(release)
+	close(h.release)
 	if err := <-done; err != nil {
 		t.Fatalf("in-flight proposal: %v", err)
 	}
-	mode.Store(0)
-	proposal, err := receiver.forwardDelegatedSettingsProposal(request, state, input)
-	if err != nil || proposal.Owner != input.Owner || proposal.RequesterNode != "requester" ||
-		proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != input.Model || proposal.Proposal.Revision != input.Revision ||
+
+	h.mode.Store(0)
+	proposal, err := h.receiver.forwardDelegatedSettingsProposal(h.request, h.state, h.input)
+	if err != nil || proposal.Owner != h.input.Owner || proposal.RequesterNode != "requester" ||
+		proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != h.input.Model || proposal.Proposal.Revision != h.input.Revision ||
 		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) != delegatedProposalLifetime {
 		t.Fatalf("proposal = %+v, %v", proposal, err)
 	}
-	stored, err := modelconfig.LoadDelegatedProposal(owner.proposals, proposal.Proposal.ID)
+	assertProposalValidated(t, h, &proposal)
+
+	operation, err := h.receiver.forwardDelegatedSettingsApply(h.request, h.state, proposal, strings.Repeat("f", 32), true, true, true)
+	if err != nil || operation.Outcome != "written" || operation.ProposalID != proposal.Proposal.ID {
+		t.Fatalf("created review could not be applied: %+v, %v", operation, err)
+	}
+
+	unregistered := httptest.NewRequest(http.MethodPost, "https://owner.example"+peerSettingsProposalPath, nil)
+	unregistered.Header.Set("Authorization", "Bearer "+h.peerToken)
+	recorder := httptest.NewRecorder()
+	h.owner.r.PeerHandler().ServeHTTP(recorder, unregistered)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("proposal route did not reject an empty request: %d", recorder.Code)
+	}
+
+	h.server.Close()
+	if _, err := h.receiver.forwardDelegatedSettingsProposal(h.request, h.state, h.input); !errors.Is(err, errDelegationProposalUnknown) {
+		t.Fatalf("owner outage was not unknown: %v", err)
+	}
+}
+
+// assertProposalRejected asserts that forwarding the proposal returns exactly
+// the expected error. It is used for every rejection mode: unauthorized callers,
+// plaintext, canceled contexts, stale state, peer unavailable, revoked tokens,
+// oversized input, lost responses, and untrusted mode mutations.
+func assertProposalRejected(t *testing.T, h tlsProposalHarness, req *http.Request, state *reloaderState, input delegatedSettingsRequest, want error) {
+	t.Helper()
+	if _, err := h.receiver.forwardDelegatedSettingsProposal(req, state, input); !errors.Is(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+}
+
+// assertProposalValidated validates a successfully returned proposal: it matches
+// the request identity, is persisted by the owner with the same review revision,
+// exposes no confidential or private data, and leaves the target file unchanged.
+func assertProposalValidated(t *testing.T, h tlsProposalHarness, proposal *modelconfig.DelegatedProposal) {
+	t.Helper()
+	if proposal.Owner != h.input.Owner || proposal.RequesterNode != "requester" ||
+		proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != h.input.Model || proposal.Proposal.Revision != h.input.Revision ||
+		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) != delegatedProposalLifetime {
+		t.Fatalf("proposal = %+v", proposal)
+	}
+	stored, err := modelconfig.LoadDelegatedProposal(h.owner.proposals, proposal.Proposal.ID)
 	if err != nil || stored.ReviewRevision != proposal.ReviewRevision {
 		t.Fatalf("owner did not persist returned proposal: %v", err)
 	}
 	data, err := json.Marshal(proposal)
-	if err != nil || bytes.Contains(data, []byte(caller)) || bytes.Contains(data, []byte(peerToken)) ||
-		bytes.Contains(data, []byte("confidential")) || bytes.Contains(data, []byte("/private/")) || bytes.Contains(data, []byte(owner.target)) {
+	if err != nil || bytes.Contains(data, []byte(h.caller)) || bytes.Contains(data, []byte(h.peerToken)) ||
+		bytes.Contains(data, []byte("confidential")) || bytes.Contains(data, []byte("/private/")) || bytes.Contains(data, []byte(h.owner.target)) {
 		t.Fatalf("proposal exposed confidential data: %v", err)
 	}
-	current, err := os.ReadFile(filepath.Join(owner.target, "config.yaml"))
-	if err != nil || !bytes.Equal(current, owner.source) {
+	current, err := os.ReadFile(filepath.Join(h.owner.target, "config.yaml"))
+	if err != nil || !bytes.Equal(current, h.owner.source) {
 		t.Fatalf("proposal creation changed target: %v", err)
-	}
-	operation, err := receiver.forwardDelegatedSettingsApply(request, state, proposal, strings.Repeat("f", 32), true, true, true)
-	if err != nil || operation.Outcome != "written" || operation.ProposalID != proposal.Proposal.ID {
-		t.Fatalf("created review could not be applied: %+v, %v", operation, err)
-	}
-	unregistered := httptest.NewRequest(http.MethodPost, "https://owner.example"+peerSettingsProposalPath, nil)
-	unregistered.Header.Set("Authorization", "Bearer "+peerToken)
-	recorder := httptest.NewRecorder()
-	owner.r.PeerHandler().ServeHTTP(recorder, unregistered)
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("proposal route did not reject an empty request: %d", recorder.Code)
-	}
-	server.Close()
-	if _, err := receiver.forwardDelegatedSettingsProposal(request, state, input); !errors.Is(err, errDelegationProposalUnknown) {
-		t.Fatalf("owner outage was not unknown: %v", err)
 	}
 }
 
@@ -430,55 +506,63 @@ func TestPeerDelegatedProposalRejectsInvalidRequests(t *testing.T) {
 func TestPeerDelegatedProposalRechecksAfterBodyRead(t *testing.T) {
 	for _, change := range []string{"revocation", "cancellation"} {
 		t.Run(change, func(t *testing.T) {
-			f := newDelegatedApplyFixture(t)
-			f.r.logger = discardLogger()
-			f.r.peerSlots = make(chan struct{}, 1)
-			proposal, err := modelconfig.LoadDelegatedProposal(f.proposals, f.input.ProposalID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			input := delegatedSettingsRequest{
-				Owner: proposal.Owner, Backend: proposal.BackendID, Model: proposal.Proposal.ModelID,
-				Revision: proposal.Proposal.Revision, Settings: proposal.Proposal.Settings,
-			}
-			data, err := json.Marshal(input)
-			if err != nil {
-				t.Fatal(err)
-			}
-			body := &delayedReviewBody{
-				reader: strings.NewReader(string(data)), started: make(chan struct{}), release: make(chan struct{}),
-			}
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			req := httptest.NewRequest(http.MethodPost, "https://owner.example"+peerSettingsProposalPath, body).WithContext(ctx)
-			req.Header.Set("Authorization", "Bearer "+strings.Repeat("p", 32))
-			req.Header.Set("Content-Type", "application/json")
-			recorder := httptest.NewRecorder()
-			done := make(chan struct{})
-			go func() {
-				f.r.servePeerDelegatedSettingsProposal(recorder, req)
-				close(done)
-			}()
-			<-body.started
-			if change == "cancellation" {
-				cancel()
-			} else {
-				revoked := *f.state
-				revoked.peer = copyPeerConfig(f.state.peer)
-				revoked.peer.Peers["requester"] = config.PeerGrant{Token: strings.Repeat("p", 32), CatalogRead: true}
-				f.r.lifecycleMu.Lock()
-				f.r.state.Store(&revoked)
-				f.r.lifecycleMu.Unlock()
-			}
-			close(body.release)
-			<-done
-			if recorder.Code != http.StatusServiceUnavailable {
-				t.Fatalf("%s during request returned %d", change, recorder.Code)
-			}
-			ids, err := modelconfig.ListDelegatedProposals(f.proposals)
-			if err != nil || len(ids) != 1 || ids[0] != f.input.ProposalID {
-				t.Fatalf("%s persisted a proposal: %v, %v", change, ids, err)
-			}
+			verifyPeerDelegatedProposalRechecksAfterBodyRead(t, change)
 		})
+	}
+}
+
+// verifyPeerDelegatedProposalRechecksAfterBodyRead exercises one revocation or cancellation change
+// and asserts the owner rejects the request after the body read without persisting a proposal.
+// Delayed body synchronization, cancel/revoke sequence, lifecycle locking, the release channel,
+// the response status, and the persisted-proposal assertion are preserved exactly.
+func verifyPeerDelegatedProposalRechecksAfterBodyRead(t *testing.T, change string) {
+	f := newDelegatedApplyFixture(t)
+	f.r.logger = discardLogger()
+	f.r.peerSlots = make(chan struct{}, 1)
+	proposal, err := modelconfig.LoadDelegatedProposal(f.proposals, f.input.ProposalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := delegatedSettingsRequest{
+		Owner: proposal.Owner, Backend: proposal.BackendID, Model: proposal.Proposal.ModelID,
+		Revision: proposal.Proposal.Revision, Settings: proposal.Proposal.Settings,
+	}
+	data, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := &delayedReviewBody{
+		reader: strings.NewReader(string(data)), started: make(chan struct{}), release: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "https://owner.example"+peerSettingsProposalPath, body).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+strings.Repeat("p", 32))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		f.r.servePeerDelegatedSettingsProposal(recorder, req)
+		close(done)
+	}()
+	<-body.started
+	if change == "cancellation" {
+		cancel()
+	} else {
+		revoked := *f.state
+		revoked.peer = copyPeerConfig(f.state.peer)
+		revoked.peer.Peers["requester"] = config.PeerGrant{Token: strings.Repeat("p", 32), CatalogRead: true}
+		f.r.lifecycleMu.Lock()
+		f.r.state.Store(&revoked)
+		f.r.lifecycleMu.Unlock()
+	}
+	close(body.release)
+	<-done
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("%s during request returned %d", change, recorder.Code)
+	}
+	ids, err := modelconfig.ListDelegatedProposals(f.proposals)
+	if err != nil || len(ids) != 1 || ids[0] != f.input.ProposalID {
+		t.Fatalf("%s persisted a proposal: %v, %v", change, ids, err)
 	}
 }

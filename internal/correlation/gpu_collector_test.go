@@ -102,6 +102,128 @@ func gpuPageBodyRaw(t *testing.T, body string) string {
 	return body
 }
 
+// genGPUStats returns `count` stats spaced one millisecond apart starting at
+// the fixture time, all on device 0 with identical utilization/memory.
+func genGPUStats(count int) []GpuStat {
+	stats := make([]GpuStat, 0, count)
+	for i := 0; i < count; i++ {
+		stats = append(stats, GpuStat{
+			Timestamp:  gpuFixtureTime.Add(time.Duration(i) * time.Millisecond),
+			ID:         0,
+			GpuUtilPct: 50.0,
+			MemUtilPct: 50.0,
+			MemUsedMB:  1024,
+			MemTotalMB: 4096,
+		})
+	}
+	return stats
+}
+
+// collectGPUReportOrFatal collects from c with epoch 1 and fails the test on error.
+func collectGPUReportOrFatal(t *testing.T, c *GPUCollector) GPUReport {
+	report, err := c.Collect(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return report
+}
+
+// assertGlobalCapVisible checks the global truncation contract for two backends
+// each contributing `perBackend` samples below their own record cap.
+func assertGlobalCapVisible(t *testing.T, report GPUReport, perBackend int) {
+	if len(report.Samples) != gpuMaxSamplesGlobal {
+		t.Fatalf("total samples = %d, want %d (global cap)", len(report.Samples), gpuMaxSamplesGlobal)
+	}
+	if !report.Truncated {
+		t.Fatal("global truncated should be true")
+	}
+	if report.Coverage != "truncated" {
+		t.Fatalf("coverage = %q, want truncated", report.Coverage)
+	}
+	// Per-backend states truthful: neither backend hit its own record cap.
+	for id, st := range report.BackendStates {
+		if st.Truncated {
+			t.Fatalf("backend %s should not be truncated (under its record cap)", id)
+		}
+		if st.Samples != perBackend {
+			t.Fatalf("backend %s samples = %d, want %d", id, st.Samples, perBackend)
+		}
+	}
+}
+
+// assertDeterministicRetainedSubset checks that backend0 samples are retained
+// first, followed by backend1 samples, with exactly `perBackend` of each.
+func assertDeterministicRetainedSubset(t *testing.T, report GPUReport, backend0, backend1 string, perBackend int) {
+	seenBackend0 := 0
+	for _, s := range report.Samples {
+		if s.BackendID == backend0 {
+			seenBackend0++
+		} else if s.BackendID == backend1 && seenBackend0 < perBackend {
+			t.Fatal("backend-1 samples appear before all backend-0 samples")
+		}
+	}
+	if seenBackend0 != perBackend {
+		t.Fatalf("backend-0 samples = %d, want %d", seenBackend0, perBackend)
+	}
+}
+
+// collectGPUReportTwiceOrFatal collects from c twice with epoch 1 and fails the
+// test on error.
+func collectGPUReportTwiceOrFatal(t *testing.T, c *GPUCollector) (GPUReport, GPUReport) {
+	report1, err := c.Collect(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report2, err := c.Collect(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return report1, report2
+}
+
+// assertReportsEqual checks two reports contain the same samples in the same order.
+func assertReportsEqual(t *testing.T, report1, report2 GPUReport) {
+	if len(report1.Samples) != len(report2.Samples) {
+		t.Fatalf("sample counts differ: %d vs %d", len(report1.Samples), len(report2.Samples))
+	}
+	for i := range report1.Samples {
+		if report1.Samples[i].BackendID != report2.Samples[i].BackendID {
+			t.Fatalf("sample %d backend differs: %q vs %q", i, report1.Samples[i].BackendID, report2.Samples[i].BackendID)
+		}
+		if report1.Samples[i].Timestamp != report2.Samples[i].Timestamp {
+			t.Fatalf("sample %d timestamp differs", i)
+		}
+		if report1.Samples[i].DeviceID != report2.Samples[i].DeviceID {
+			t.Fatalf("sample %d device differs", i)
+		}
+	}
+}
+
+// assertBackendIDOrder checks that samples of firstBackend come before samples
+// of secondBackend (sorted backend-ID order).
+func assertBackendIDOrder(t *testing.T, report GPUReport, firstBackend, secondBackend string) {
+	firstIdx := -1
+	for i, s := range report.Samples {
+		if s.BackendID == firstBackend && firstIdx == -1 {
+			firstIdx = i
+		}
+	}
+	if firstIdx != 0 {
+		t.Fatalf("%s samples must come first (sorted backend ID order)", firstBackend)
+	}
+}
+
+// assertSortedByTimestampWithinBackend checks samples within each backend are
+// sorted by timestamp.
+func assertSortedByTimestampWithinBackend(t *testing.T, report GPUReport) {
+	for i := 1; i < len(report.Samples); i++ {
+		if report.Samples[i].BackendID == report.Samples[i-1].BackendID &&
+			report.Samples[i].Timestamp.Before(report.Samples[i-1].Timestamp) {
+			t.Fatal("samples within a backend not sorted by timestamp")
+		}
+	}
+}
+
 func TestGpuConstructionMakesNoRequestsAndSkipsDisabledBackends(t *testing.T) {
 	var count atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1044,27 +1166,13 @@ func TestGlobalCapVisible(t *testing.T) {
 	// Two backends each with 2500 records (one device, many time points).
 	// Per backend: 2500 < 4096 record cap, not truncated. Global: 5000 > 4096
 	// => global truncated, 4096 samples retained deterministically.
-	gen := func(count int) []GpuStat {
-		stats := make([]GpuStat, 0, count)
-		for i := 0; i < count; i++ {
-			stats = append(stats, GpuStat{
-				Timestamp:  gpuFixtureTime.Add(time.Duration(i) * time.Millisecond),
-				ID:         0,
-				GpuUtilPct: 50.0,
-				MemUtilPct: 50.0,
-				MemUsedMB:  1024,
-				MemTotalMB: 4096,
-			})
-		}
-		return stats
-	}
 	server0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, gpuPageBody(t, true, gen(2500)...))
+		fmt.Fprint(w, gpuPageBody(t, true, genGPUStats(2500)...))
 	}))
 	server1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, gpuPageBody(t, true, gen(2500)...))
+		fmt.Fprint(w, gpuPageBody(t, true, genGPUStats(2500)...))
 	}))
 	defer server0.Close()
 	defer server1.Close()
@@ -1074,49 +1182,18 @@ func TestGlobalCapVisible(t *testing.T) {
 		"backend-1": {URL: server1.URL, Diagnostics: "llama_swap"},
 	}
 	c := newTestGPUCollector(t, backends)
-	report, err := c.Collect(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(report.Samples) != gpuMaxSamplesGlobal {
-		t.Fatalf("total samples = %d, want %d (global cap)", len(report.Samples), gpuMaxSamplesGlobal)
-	}
-	if !report.Truncated {
-		t.Fatal("global truncated should be true")
-	}
-	if report.Coverage != "truncated" {
-		t.Fatalf("coverage = %q, want truncated", report.Coverage)
-	}
-	// Per-backend states truthful: neither backend hit its own record cap.
-	for id, st := range report.BackendStates {
-		if st.Truncated {
-			t.Fatalf("backend %s should not be truncated (under its record cap)", id)
-		}
-		if st.Samples != 2500 {
-			t.Fatalf("backend %s samples = %d, want 2500", id, st.Samples)
-		}
-	}
-	// Deterministic retained subset: backend-0 samples first (sorted ID order).
-	seenBackend0 := 0
-	for _, s := range report.Samples {
-		if s.BackendID == "backend-0" {
-			seenBackend0++
-		} else if s.BackendID == "backend-1" && seenBackend0 < 2500 {
-			t.Fatal("backend-1 samples appear before all backend-0 samples")
-		}
-	}
-	if seenBackend0 != 2500 {
-		t.Fatalf("backend-0 samples = %d, want 2500", seenBackend0)
-	}
+	report := collectGPUReportOrFatal(t, c)
+	assertGlobalCapVisible(t, report, 2500)
+	assertDeterministicRetainedSubset(t, report, "backend-0", "backend-1", 2500)
 }
 
 func TestConcurrencyMax4Workers(t *testing.T) {
-	var active, max atomic.Int32
+	var active, maxActive atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := active.Add(1)
 		defer active.Add(-1)
-		for old := max.Load(); n > old; old = max.Load() {
-			if max.CompareAndSwap(old, n) {
+		for old := maxActive.Load(); n > old; old = maxActive.Load() {
+			if maxActive.CompareAndSwap(old, n) {
 				break
 			}
 		}
@@ -1134,8 +1211,8 @@ func TestConcurrencyMax4Workers(t *testing.T) {
 	if _, err := c.Collect(context.Background(), 1); err != nil {
 		t.Fatal(err)
 	}
-	if max.Load() > 4 {
-		t.Fatalf("max concurrent HTTP = %d, want <= 4", max.Load())
+	if maxActive.Load() > 4 {
+		t.Fatalf("maxActive concurrent HTTP = %d, want <= 4", maxActive.Load())
 	}
 }
 
@@ -1288,45 +1365,9 @@ func TestDeterministicMergeOrder(t *testing.T) {
 		"backend-b": {URL: server1.URL, Diagnostics: "llama_swap"},
 		"backend-a": {URL: server2.URL, Diagnostics: "llama_swap"},
 	})
-	report1, err := c.Collect(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	report2, err := c.Collect(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(report1.Samples) != len(report2.Samples) {
-		t.Fatalf("sample counts differ: %d vs %d", len(report1.Samples), len(report2.Samples))
-	}
-	for i := range report1.Samples {
-		if report1.Samples[i].BackendID != report2.Samples[i].BackendID {
-			t.Fatalf("sample %d backend differs: %q vs %q", i, report1.Samples[i].BackendID, report2.Samples[i].BackendID)
-		}
-		if report1.Samples[i].Timestamp != report2.Samples[i].Timestamp {
-			t.Fatalf("sample %d timestamp differs", i)
-		}
-		if report1.Samples[i].DeviceID != report2.Samples[i].DeviceID {
-			t.Fatalf("sample %d device differs", i)
-		}
-	}
-	// backend-a sorts before backend-b.
-	firstA := -1
-	for i, s := range report1.Samples {
-		if s.BackendID == "backend-a" && firstA == -1 {
-			firstA = i
-		}
-	}
-	if firstA != 0 {
-		t.Fatal("backend-a samples must come first (sorted backend ID order)")
-	}
-	// Within each backend, samples sorted by timestamp.
-	for _, rep := range []GPUReport{report1, report2} {
-		for i := 1; i < len(rep.Samples); i++ {
-			if rep.Samples[i].BackendID == rep.Samples[i-1].BackendID &&
-				rep.Samples[i].Timestamp.Before(rep.Samples[i-1].Timestamp) {
-				t.Fatal("samples within a backend not sorted by timestamp")
-			}
-		}
-	}
+	report1, report2 := collectGPUReportTwiceOrFatal(t, c)
+	assertReportsEqual(t, report1, report2)
+	assertBackendIDOrder(t, report1, "backend-a", "backend-b")
+	assertSortedByTimestampWithinBackend(t, report1)
+	assertSortedByTimestampWithinBackend(t, report2)
 }

@@ -154,6 +154,72 @@ func TestPeerIdentityCertificateMustMatchFederationAndNode(t *testing.T) {
 	}
 }
 
+// assertPeerAuthenticated verifies that authenticatedPeer returns the expected outcome for the
+// given request and reloader state, failing the test with msg when it does not. When expectOk is
+// true, the result must be successful and the node ID must match expectedNodeID. The failure
+// message for a successful-but-wrong result includes the actual node ID and ok value.
+func assertPeerAuthenticated(t *testing.T, request *http.Request, state *reloaderState, expectedNodeID string, expectOk bool, msg string) {
+	t.Helper()
+	nodeID, ok := authenticatedPeer(request, state, peerCatalog)
+	if expectOk {
+		if !ok || nodeID != expectedNodeID {
+			t.Fatalf("%s: %q %v", msg, nodeID, ok)
+		}
+	} else if ok {
+		t.Fatal(msg)
+	}
+}
+
+// assertPeerGrantResult verifies that authenticatedPeer returns the expected outcome for the
+// given request, state, and scope, failing the test with msg when it does not. When expectOk is
+// true, the result must be successful and the node ID must match expectedNodeID. The failure
+// message for a successful-but-wrong result includes the actual node ID and ok value.
+func assertPeerGrantResult(t *testing.T, request *http.Request, state *reloaderState, scope peerScope, expectedNodeID string, expectOk bool, msg string) {
+	t.Helper()
+	nodeID, ok := authenticatedPeer(request, state, scope)
+	if expectOk {
+		if !ok || nodeID != expectedNodeID {
+			t.Fatalf("%s: %q %v", msg, nodeID, ok)
+		}
+	} else if ok {
+		t.Fatal(msg)
+	}
+}
+
+// rotateAndRegrant replaces the node-b membership fingerprint with the rotated certificate's
+// fingerprint, updates the request TLS state to the rotated certificate, asserts that rotation
+// invalidates prior grants, then grants catalog read and inference to the rotated member and
+// asserts the re-grant outcomes.
+func rotateAndRegrant(t *testing.T, request *http.Request, state *reloaderState, members *federation.PairingStore, grants *federation.CatalogGrantStore, rotated *x509.Certificate, ca *x509.Certificate, now time.Time) {
+	t.Helper()
+	if _, err := members.AddMember("node-b", peerCertificateFingerprint(rotated), now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotated}, VerifiedChains: [][]*x509.Certificate{{rotated, ca}}}
+	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+		t.Fatal("certificate rotation inherited the previous catalog grant")
+	}
+	if _, ok := authenticatedPeer(request, state, peerInference); ok {
+		t.Fatal("certificate rotation inherited the previous inference grant")
+	}
+	rotatedMember, ok, err := members.LookupMember("node-b")
+	if err != nil || !ok {
+		t.Fatalf("rotated membership lookup = %+v, %v, %v", rotatedMember, ok, err)
+	}
+	if _, err := grants.GrantCatalogRead(rotatedMember, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
+		t.Fatalf("re-granted rotated identity denied: %q %v", nodeID, ok)
+	}
+	if _, err := grants.GrantInference(rotatedMember, true, false, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
+		t.Fatalf("re-granted rotated inference identity denied: %q %v", nodeID, ok)
+	}
+}
+
 func TestAuthenticatedPeerRequiresVerifiedMatchingClientIdentity(t *testing.T) {
 	ca, caKey, roots := newPeerIdentityTestCA(t)
 	_, valid := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
@@ -179,24 +245,16 @@ func TestAuthenticatedPeerRequiresVerifiedMatchingClientIdentity(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "https://peer.example/peer/v1/report", nil)
 	request.Header.Set("Authorization", "Bearer "+strings.Repeat("b", 32))
 	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{valid}, VerifiedChains: [][]*x509.Certificate{{valid, ca}}}
-	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
-		t.Fatalf("verified matching identity rejected: %q %v", nodeID, ok)
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", true, "verified matching identity rejected")
 	state.peerClientCRLs = []*x509.RevocationList{newPeerIdentityTestCRL(t, ca, caKey, valid.SerialNumber)}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("CA-revoked certificate remained authorized")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "CA-revoked certificate remained authorized")
 	state.peerClientCRLs = []*x509.RevocationList{currentCRL}
 	request.TLS.PeerCertificates[0] = wrong
 	request.TLS.VerifiedChains[0][0] = wrong
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("certificate for a different node was accepted with node-b's bearer token")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "certificate for a different node was accepted with node-b's bearer token")
 	_, rotated := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
 	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotated}, VerifiedChains: [][]*x509.Certificate{{rotated, ca}}}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("unpaired replacement certificate bypassed membership fingerprint")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "unpaired replacement certificate bypassed membership fingerprint")
 	invite, err := members.CreateInvitation("node-b", time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -204,28 +262,20 @@ func TestAuthenticatedPeerRequiresVerifiedMatchingClientIdentity(t *testing.T) {
 	if _, err := members.ConsumeInvitation(invite.Code, "node-b", peerCertificateFingerprint(rotated), time.Now()); err != nil {
 		t.Fatalf("explicit certificate rotation was rejected: %v", err)
 	}
-	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
-		t.Fatalf("explicitly paired replacement identity rejected: %q %v", nodeID, ok)
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", true, "explicitly paired replacement identity rejected")
 	request.TLS.PeerCertificates[0] = valid
 	request.TLS.VerifiedChains[0][0] = valid
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("old identity certificate remained valid after replacement")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "old identity certificate remained valid after replacement")
 	request.TLS.PeerCertificates[0] = rotated
 	request.TLS.VerifiedChains[0][0] = rotated
 	_, _, rotatedRoots := newPeerIdentityTestCA(t)
 	state.peerClientCAs = rotatedRoots
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("certificate from a removed CA remained authorized on an existing connection")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "certificate from a removed CA remained authorized on an existing connection")
 	state.peerClientCAs = roots
 	if err := members.RemoveMember("node-b", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("revoked identity remained authorized")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "revoked identity remained authorized")
 	newInvite, err := members.CreateInvitation("node-b", time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -234,9 +284,7 @@ func TestAuthenticatedPeerRequiresVerifiedMatchingClientIdentity(t *testing.T) {
 		t.Fatal("previously revoked certificate was accepted during re-pairing")
 	}
 	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{valid}}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("unverified client certificate was accepted")
-	}
+	assertPeerAuthenticated(t, request, state, "node-b", false, "unverified client certificate was accepted")
 }
 
 func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) {
@@ -271,70 +319,45 @@ func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) 
 	}
 	request := httptest.NewRequest(http.MethodGet, "https://peer.example/peer/v1/report", nil)
 	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{valid}, VerifiedChains: [][]*x509.Certificate{{valid, ca}}}
+
+	// No catalog grant initially: paired membership alone must not authorize report access.
 	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
 		t.Fatal("paired membership without a catalog grant authorized report access")
 	}
+
+	// Explicit mTLS catalog grant allows only catalog.
 	if _, err := grants.GrantCatalogRead(member, now); err != nil {
 		t.Fatal(err)
 	}
-	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
-		t.Fatalf("explicit mTLS catalog grant denied: %q %v", nodeID, ok)
-	}
-	if _, ok := authenticatedPeer(request, state, peerInference); ok {
-		t.Fatal("catalog grant authorized inference without its separate grant")
-	}
+	assertPeerGrantResult(t, request, state, peerCatalog, "node-b", true, "explicit mTLS catalog grant denied")
+	assertPeerGrantResult(t, request, state, peerInference, "", false, "catalog grant authorized inference without its separate grant")
+
+	// Inference requires its distinct grant.
 	if _, err := grants.GrantInference(member, true, false, now); err != nil {
 		t.Fatal(err)
 	}
-	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
-		t.Fatalf("explicit inbound inference grant denied: %q %v", nodeID, ok)
-	}
+	assertPeerGrantResult(t, request, state, peerInference, "node-b", true, "explicit inbound inference grant denied")
+
+	// Invalid bearer never falls back to mTLS-only authorization.
 	request.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("invalid bearer token fell back to mTLS-only authorization")
-	}
+	assertPeerGrantResult(t, request, state, peerCatalog, "", false, "invalid bearer token fell back to mTLS-only authorization")
 	request.Header.Del("Authorization")
-	if _, err := members.AddMember("node-b", peerCertificateFingerprint(rotated), now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotated}, VerifiedChains: [][]*x509.Certificate{{rotated, ca}}}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("certificate rotation inherited the previous catalog grant")
-	}
-	if _, ok := authenticatedPeer(request, state, peerInference); ok {
-		t.Fatal("certificate rotation inherited the previous inference grant")
-	}
-	rotatedMember, ok, err := members.LookupMember("node-b")
-	if err != nil || !ok {
-		t.Fatalf("rotated membership lookup = %+v, %v, %v", rotatedMember, ok, err)
-	}
-	if _, err := grants.GrantCatalogRead(rotatedMember, now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
-		t.Fatalf("re-granted rotated identity denied: %q %v", nodeID, ok)
-	}
-	if _, err := grants.GrantInference(rotatedMember, true, false, now.Add(time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
-		t.Fatalf("re-granted rotated inference identity denied: %q %v", nodeID, ok)
-	}
+
+	// Certificate rotation invalidates old grants; explicit grants restore scopes.
+	rotateAndRegrant(t, request, state, members, grants, rotated, ca, now)
+
+	// Catalog revoke does not revoke independent inference.
 	if err := grants.RevokeCatalogRead("node-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
-		t.Fatal("revoked catalog grant remained authorized")
-	}
-	if _, ok := authenticatedPeer(request, state, peerInference); !ok {
-		t.Fatal("catalog-read revocation incorrectly revoked independent inbound inference grant")
-	}
+	assertPeerGrantResult(t, request, state, peerCatalog, "", false, "revoked catalog grant remained authorized")
+	assertPeerGrantResult(t, request, state, peerInference, "node-b", true, "catalog-read revocation incorrectly revoked independent inbound inference grant")
+
+	// Inference revoke denies.
 	if err := grants.RevokeInference("node-b"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := authenticatedPeer(request, state, peerInference); ok {
-		t.Fatal("revoked inbound inference grant remained authorized")
-	}
+	assertPeerGrantResult(t, request, state, peerInference, "", false, "revoked inbound inference grant remained authorized")
 }
 
 func TestCurrentCRLBlocksIdentityFromRestoredOldMembershipSnapshot(t *testing.T) {

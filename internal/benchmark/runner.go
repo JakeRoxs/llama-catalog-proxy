@@ -62,36 +62,8 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 		},
 	}
 
-	partial := false
-	stop := false
-	for _, workload := range syntheticWorkloads {
-		if stop || runCtx.Err() != nil {
-			break
-		}
-		workloadResult := WorkloadResult{
-			Name:            workload.Name,
-			Category:        workload.Category,
-			Version:         workload.Version,
-			ReasoningEffort: workload.ReasoningEffort,
-			Samples:         make([]SampleResult, 0, config.Repetitions),
-		}
-		for iteration := 1; iteration <= config.Repetitions; iteration++ {
-			if runCtx.Err() != nil {
-				break
-			}
-			sample, budgetExhausted := runSample(runCtx, options.Client, workload, config, iteration, &record)
-			workloadResult.Samples = append(workloadResult.Samples, sample)
-			if sample.Status != SampleCompleted {
-				partial = true
-			}
-			if budgetExhausted {
-				partial = true
-				stop = true
-				break
-			}
-		}
-		record.Workloads = append(record.Workloads, workloadResult)
-	}
+	workloads, partial := runWorkloads(runCtx, options.Client, config, &record)
+	record.Workloads = workloads
 
 	if runCtx.Err() != nil {
 		record.Status = RunCanceled
@@ -173,20 +145,25 @@ func runSample(ctx context.Context, client *APIClient, workload syntheticWorkloa
 	}
 	messages = append(messages, chatMessage{Role: "user", Content: workload.UserPrompt})
 
-	first, failed, exhausted := sendRequest(ctx, client, workload, config, messages, workload.ToolRoundTrip, record, &sample)
+	runner := &sampleRequestRunner{
+		client:   client,
+		workload: workload,
+		config:   config,
+		record:   record,
+		sample:   &sample,
+	}
+	first, failed, exhausted := sendRequest(ctx, runner, messages, workload.ToolRoundTrip)
 	if failed || exhausted {
 		setSampleFailure(&sample, ctx)
 	} else if workload.ToolRoundTrip {
-		if len(first.ToolCalls) != 1 {
-			sample.Correctness = CorrectnessFailed
-			sample.ErrorClass = "invalid_tool_call"
-		} else if toolOutput, ok := toolMessage(first.ToolCalls[0], "TOOL_ROUND_TRIP_OK"); !ok {
+		toolOutput, ok := toolRoundTripOutput(first.ToolCalls, "TOOL_ROUND_TRIP_OK")
+		if !ok {
 			sample.Correctness = CorrectnessFailed
 			sample.ErrorClass = "invalid_tool_call"
 		} else {
 			messages = append(messages, chatMessage{Role: "assistant", ToolCalls: first.ToolCalls})
 			messages = append(messages, chatMessage{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Content: toolOutput})
-			second, secondFailed, secondExhausted := sendRequest(ctx, client, workload, config, messages, false, record, &sample)
+			second, secondFailed, secondExhausted := sendRequest(ctx, runner, messages, false)
 			if secondFailed || secondExhausted {
 				exhausted = secondExhausted
 				setSampleFailure(&sample, ctx)
@@ -210,23 +187,88 @@ func runSample(ctx context.Context, client *APIClient, workload syntheticWorkloa
 	return sample, exhausted
 }
 
-func sendRequest(ctx context.Context, client *APIClient, workload syntheticWorkload, config RequestedConfiguration, messages []chatMessage, allowTools bool, record *RunRecord, sample *SampleResult) (chatResult, bool, bool) {
-	remaining := config.TokenBudget - record.OutputTokensReserved
+// toolRoundTripOutput validates that exactly one tool call was made and that its
+// benchmark_echo payload matches the expected tool message. It returns the echoed
+// message and whether the round trip is valid. A non-single tool call or a
+// malformed/incorrect payload is treated as one invalid round trip; toolMessage is
+// only invoked when exactly one call is present, matching the prior short-circuit.
+func toolRoundTripOutput(toolCalls []toolCall, expectedToolMessage string) (string, bool) {
+	if len(toolCalls) != 1 {
+		return "", false
+	}
+	return toolMessage(toolCalls[0], expectedToolMessage)
+}
+
+// runWorkloads executes every synthetic workload in order, repeating each per
+// the configured repetitions. It preserves workload/iteration order and stops at
+// the first budget exhaustion (the current workload is still appended) or on
+// context cancellation. It returns the workload results and whether any sample
+// failed or the budget exhausted.
+func runWorkloads(runCtx context.Context, client *APIClient, config RequestedConfiguration, record *RunRecord) ([]WorkloadResult, bool) {
+	partial := false
+	workloads := make([]WorkloadResult, 0, len(syntheticWorkloads))
+	for _, workload := range syntheticWorkloads {
+		if runCtx.Err() != nil {
+			break
+		}
+		workloadResult := WorkloadResult{
+			Name:            workload.Name,
+			Category:        workload.Category,
+			Version:         workload.Version,
+			ReasoningEffort: workload.ReasoningEffort,
+			Samples:         make([]SampleResult, 0, config.Repetitions),
+		}
+		budgetExhausted := false
+		for iteration := 1; iteration <= config.Repetitions; iteration++ {
+			if runCtx.Err() != nil {
+				break
+			}
+			sample, exhausted := runSample(runCtx, client, workload, config, iteration, record)
+			workloadResult.Samples = append(workloadResult.Samples, sample)
+			if sample.Status != SampleCompleted {
+				partial = true
+			}
+			if exhausted {
+				partial = true
+				budgetExhausted = true
+				break
+			}
+		}
+		workloads = append(workloads, workloadResult)
+		if budgetExhausted {
+			break
+		}
+	}
+	return workloads, partial
+}
+
+// sampleRequestRunner holds the request-scoped state shared by sendRequest and
+// runSample: the client, workload, configuration, run record, and sample result.
+type sampleRequestRunner struct {
+	client   *APIClient
+	workload syntheticWorkload
+	config   RequestedConfiguration
+	record   *RunRecord
+	sample   *SampleResult
+}
+
+func sendRequest(ctx context.Context, runner *sampleRequestRunner, messages []chatMessage, allowTools bool) (chatResult, bool, bool) {
+	remaining := runner.config.TokenBudget - runner.record.OutputTokensReserved
 	if remaining < 1 {
-		sample.ErrorClass = "request_budget_exhausted"
+		runner.sample.ErrorClass = "request_budget_exhausted"
 		return chatResult{}, true, true
 	}
-	maxTokens := config.MaxOutput
+	maxTokens := runner.config.MaxOutput
 	if maxTokens > remaining {
 		maxTokens = remaining
 	}
-	record.OutputTokensReserved += maxTokens
-	result, errorClass := client.Complete(ctx, config.Model, messages, workload, config, maxTokens, allowTools)
-	sample.Requests = append(sample.Requests, result.Measure)
-	sample.InputBytes += result.Measure.PromptBytes
-	sample.OutputBytes += result.Measure.OutputBytes
+	runner.record.OutputTokensReserved += maxTokens
+	result, errorClass := runner.client.Complete(ctx, runner.config.Model, messages, runner.workload, runner.config, maxTokens, allowTools)
+	runner.sample.Requests = append(runner.sample.Requests, result.Measure)
+	runner.sample.InputBytes += result.Measure.PromptBytes
+	runner.sample.OutputBytes += result.Measure.OutputBytes
 	if errorClass != "" {
-		sample.ErrorClass = errorClass
+		runner.sample.ErrorClass = errorClass
 		return result, true, false
 	}
 	return result, false, false

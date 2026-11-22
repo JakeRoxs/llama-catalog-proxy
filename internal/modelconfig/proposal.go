@@ -116,20 +116,10 @@ func validProposal(p Proposal) bool {
 		return false
 	}
 	requested := make(map[string]string)
-	addNumber := func(name string, value *int32, minimum int32) bool {
-		if value == nil {
-			return true
-		}
-		if *value < minimum {
-			return false
-		}
-		requested[name] = strconv.FormatInt(int64(*value), 10)
-		return true
-	}
-	if !addNumber("context", p.Settings.ContextSize, 0) ||
-		!addNumber("fit_context", p.Settings.FitContext, 0) ||
-		!addNumber("fit_target", p.Settings.FitTarget, 0) ||
-		!addNumber("cache_ram", p.Settings.CacheRAM, -1) {
+	if !addRequestedNumber(requested, "context", p.Settings.ContextSize, 0) ||
+		!addRequestedNumber(requested, "fit_context", p.Settings.FitContext, 0) ||
+		!addRequestedNumber(requested, "fit_target", p.Settings.FitTarget, 0) ||
+		!addRequestedNumber(requested, "cache_ram", p.Settings.CacheRAM, -1) {
 		return false
 	}
 	if p.Settings.Fit != nil {
@@ -149,6 +139,21 @@ func validProposal(p Proposal) bool {
 		delete(requested, change.Setting)
 	}
 	return len(requested) == 0
+}
+
+// addRequestedNumber records the requested numeric setting value when it is
+// present and at least the minimum, returning false for values below minimum.
+// A nil value is accepted and not recorded. The requested map key holds the
+// decimal value produced by FormatInt.
+func addRequestedNumber(requested map[string]string, name string, value *int32, minimum int32) bool {
+	if value == nil {
+		return true
+	}
+	if *value < minimum {
+		return false
+	}
+	requested[name] = strconv.FormatInt(int64(*value), 10)
+	return true
 }
 
 func validDigest(value string) bool {

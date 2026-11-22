@@ -70,18 +70,8 @@ func TestManagementWritesHTTPS(t *testing.T) {
 	path := configPath(t)
 	writeConfig := func() {
 		t.Helper()
-		content := fmt.Sprintf(`default_backend: local
-backends: {local: {url: http://localhost:9292}}
-management:
-  listen: "127.0.0.1:9294"
-  tls_cert_file: %q
-  tls_key_file: %q
-  preview_token: %q
-  proposal_store: {directory: %q, token: %q}
-  backup_store: {directory: %q, token: %q, max_backups: 1}
-  targets:
-    local: {directory: %q, filename: config.yaml}
-`, certPath, keyPath, previewToken, proposalDir, proposalToken, currentBackupDir, backupToken, currentTargetDir)
+		content := backupConfigTemplate(certPath, keyPath, previewToken, proposalDir, proposalToken, currentTargetDir)
+		content += fmt.Sprintf("  backup_store: {directory: %q, token: %q, max_backups: 1}\n", currentBackupDir, backupToken)
 		if enabled {
 			content += fmt.Sprintf("  write_token: %q\n", currentToken)
 		}

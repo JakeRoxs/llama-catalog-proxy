@@ -68,53 +68,62 @@ func TestAdoptExistingArtifactPersistsLocalEvidence(t *testing.T) {
 func TestAdoptRejectsUnsafeOrInvalidFiles(t *testing.T) {
 	for _, kind := range []string{"missing", "symlink", "hardlink", "writable", "invalid", "too_large", "unauthorized"} {
 		t.Run(kind, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "model.gguf")
-			data := ggufHeader(3, 0, 0)
-			if kind == "invalid" {
-				data = []byte("not GGUF")
-			}
-			if kind != "missing" {
-				if err := os.WriteFile(path, data, 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			switch kind {
-			case "symlink":
-				other := filepath.Join(dir, "other")
-				if err := os.Rename(path, other); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(other, path); err != nil {
-					t.Fatal(err)
-				}
-			case "hardlink":
-				if err := os.Link(path, filepath.Join(dir, "other")); err != nil {
-					t.Fatal(err)
-				}
-			case "writable":
-				if err := os.Chmod(path, 0o660); err != nil {
-					t.Fatal(err)
-				}
-			}
-			source, _ := LocalSource("model.gguf")
-			options := StageOptions{Directory: dir, Source: source, MaxBytes: 1024,
-				MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AdoptExisting: true, AllowAdoption: true}
-			if kind == "too_large" {
-				options.MaxBytes = int64(len(data) - 1)
-			}
-			if kind == "unauthorized" {
-				options.AllowAdoption = false
-			}
-			result, err := adoptArtifact(context.Background(), options, time.Minute)
-			if err == nil || result.Publication != PublicationNotPublished {
-				t.Fatalf("unsafe adoption accepted: %+v %v", result, err)
-			}
+			adoptRejectsCase(t, kind)
 		})
 	}
 	for _, name := range []string{"../model.gguf", "model-00001-of-00002.gguf", "/model.gguf"} {
 		if _, err := LocalSource(name); err == nil {
 			t.Fatalf("invalid local filename accepted: %q", name)
+		}
+	}
+}
+
+func adoptRejectsCase(t *testing.T, kind string) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.gguf")
+	data := ggufHeader(3, 0, 0)
+	if kind == "invalid" {
+		data = []byte("not GGUF")
+	}
+	prepareAdoptFile(t, dir, kind, path, data)
+	source, _ := LocalSource("model.gguf")
+	options := StageOptions{Directory: dir, Source: source, MaxBytes: 1024,
+		MaxDirectoryBytes: 1024, MinFreeBytes: 1, FileMode: 0o600, AdoptExisting: true, AllowAdoption: true}
+	if kind == "too_large" {
+		options.MaxBytes = int64(len(data) - 1)
+	}
+	if kind == "unauthorized" {
+		options.AllowAdoption = false
+	}
+	result, err := adoptArtifact(context.Background(), options, time.Minute)
+	if err == nil || result.Publication != PublicationNotPublished {
+		t.Fatalf("unsafe adoption accepted: %+v %v", result, err)
+	}
+}
+
+func prepareAdoptFile(t *testing.T, dir, kind, path string, data []byte) {
+	if kind == "missing" {
+		return
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	switch kind {
+	case "symlink":
+		other := filepath.Join(dir, "other")
+		if err := os.Rename(path, other); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, path); err != nil {
+			t.Fatal(err)
+		}
+	case "hardlink":
+		if err := os.Link(path, filepath.Join(dir, "other")); err != nil {
+			t.Fatal(err)
+		}
+	case "writable":
+		if err := os.Chmod(path, 0o660); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -203,52 +212,61 @@ func TestReplacementJobPersistsPublication(t *testing.T) {
 func TestReplacementDoesNotPublishOnCancellationOrUnsafeDestination(t *testing.T) {
 	for _, kind := range []string{"missing", "symlink", "hardlink", "canceled", "canceled_during_copy"} {
 		t.Run(kind, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "model.gguf")
-			if kind != "missing" {
-				if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			switch kind {
-			case "symlink":
-				other := filepath.Join(dir, "other")
-				if err := os.Rename(path, other); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(other, path); err != nil {
-					t.Fatal(err)
-				}
-			case "hardlink":
-				if err := os.Link(path, filepath.Join(dir, "other")); err != nil {
-					t.Fatal(err)
-				}
-			}
-			options := stageOptions(dir)
-			options.ReplaceExisting, options.AllowReplacement, options.AcknowledgeExclusiveWindow = true, true, true
-			ctx := context.Background()
-			var reader io.Reader = bytes.NewReader(ggufHeader(3, 0, 0))
-			if kind == "canceled" || kind == "canceled_during_copy" {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithCancel(ctx)
-				defer cancel()
-				if kind == "canceled" {
-					cancel()
-				} else {
-					reader = &cancelingReader{data: ggufHeader(3, 0, 0), cancel: cancel}
-				}
-			}
-			result, err := StageNewArtifact(ctx, options, reader)
-			if err == nil || result.Publication != PublicationNotPublished {
-				t.Fatalf("unsafe replacement accepted: %+v %v", result, err)
-			}
-			if kind != "missing" {
-				data, err := os.ReadFile(path)
-				if err != nil || string(data) != "old" {
-					t.Fatalf("existing file modified: %q %v", data, err)
-				}
-			}
+			replacementDoesNotPublishCase(t, kind)
 		})
+	}
+}
+
+func replacementDoesNotPublishCase(t *testing.T, kind string) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model.gguf")
+	prepareReplacementFile(t, dir, kind, path)
+	options := stageOptions(dir)
+	options.ReplaceExisting, options.AllowReplacement, options.AcknowledgeExclusiveWindow = true, true, true
+	ctx := context.Background()
+	var reader io.Reader = bytes.NewReader(ggufHeader(3, 0, 0))
+	if kind == "canceled" || kind == "canceled_during_copy" {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		if kind == "canceled" {
+			cancel()
+		} else {
+			reader = &cancelingReader{data: ggufHeader(3, 0, 0), cancel: cancel}
+		}
+	}
+	result, err := StageNewArtifact(ctx, options, reader)
+	if err == nil || result.Publication != PublicationNotPublished {
+		t.Fatalf("unsafe replacement accepted: %+v %v", result, err)
+	}
+	if kind != "missing" {
+		data, err := os.ReadFile(path)
+		if err != nil || string(data) != "old" {
+			t.Fatalf("existing file modified: %q %v", data, err)
+		}
+	}
+}
+
+func prepareReplacementFile(t *testing.T, dir, kind, path string) {
+	if kind == "missing" {
+		return
+	}
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	switch kind {
+	case "symlink":
+		other := filepath.Join(dir, "other")
+		if err := os.Rename(path, other); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(other, path); err != nil {
+			t.Fatal(err)
+		}
+	case "hardlink":
+		if err := os.Link(path, filepath.Join(dir, "other")); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

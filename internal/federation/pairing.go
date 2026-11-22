@@ -191,30 +191,43 @@ func (s *PairingStore) ConsumeInvitation(code, nodeID, fingerprint string, now t
 	defer unlock()
 	s.prune(now)
 	if consumed, ok := s.data.Consumed[key]; ok {
-		member, paired := s.data.Members[consumed.NodeID]
-		if paired && consumed.NodeID == nodeID && now.Before(consumed.ExpiresAt) {
-			fingerprint = strings.ToLower(fingerprint)
-			if member.Fingerprint != fingerprint {
-				if fingerprintRevoked(s.data.Revoked[nodeID], fingerprint) || fingerprintInUse(s.data.Members, fingerprint) {
-					return Membership{}, ErrInvitation
-				}
-				if err := recordRevokedFingerprint(s.data.Revoked, nodeID, member.Fingerprint); err != nil {
-					return Membership{}, err
-				}
-				member.Fingerprint = fingerprint
-				s.data.Members[nodeID] = member
-				if err := s.persist(); err != nil {
-					return Membership{}, err
-				}
-			}
-			return member, nil
-		}
-		return Membership{}, ErrInvitation
+		return s.consumeInvitationReuse(consumed, nodeID, fingerprint, now)
 	}
 	invite, ok := s.data.Invites[key]
 	if !ok || invite.NodeID != nodeID || !now.Before(invite.ExpiresAt) {
 		return Membership{}, ErrInvitation
 	}
+	return s.consumeInvitationFresh(invite, nodeID, fingerprint, now, key)
+}
+
+// consumeInvitationReuse handles a previously consumed invitation whose consumed
+// record is still fresh. It rotates the paired member fingerprint when the
+// presented fingerprint differs from the stored one.
+func (s *PairingStore) consumeInvitationReuse(consumed consumedRecord, nodeID, fingerprint string, now time.Time) (Membership, error) {
+	member, paired := s.data.Members[consumed.NodeID]
+	if paired && consumed.NodeID == nodeID && now.Before(consumed.ExpiresAt) {
+		fingerprint = strings.ToLower(fingerprint)
+		if member.Fingerprint != fingerprint {
+			if fingerprintRevoked(s.data.Revoked[nodeID], fingerprint) || fingerprintInUse(s.data.Members, fingerprint) {
+				return Membership{}, ErrInvitation
+			}
+			if err := recordRevokedFingerprint(s.data.Revoked, nodeID, member.Fingerprint); err != nil {
+				return Membership{}, err
+			}
+			member.Fingerprint = fingerprint
+			s.data.Members[nodeID] = member
+			if err := s.persist(); err != nil {
+				return Membership{}, err
+			}
+		}
+		return member, nil
+	}
+	return Membership{}, ErrInvitation
+}
+
+// consumeInvitationFresh handles a first-time invitation consume. It validates the
+// fingerprint, registers the member, and persists the consumed record.
+func (s *PairingStore) consumeInvitationFresh(invite inviteRecord, nodeID, fingerprint string, now time.Time, key string) (Membership, error) {
 	if fingerprintRevoked(s.data.Revoked[nodeID], fingerprint) {
 		return Membership{}, ErrInvitation
 	}
@@ -434,94 +447,75 @@ func (s *PairingStore) RemoveInvitation(nodeID string) error {
 	return s.persist()
 }
 
-func (s *PairingStore) Join(ctx context.Context, endpoint, code string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (Membership, error) {
-	return s.JoinExpected(ctx, endpoint, "", code, certificate, roots, crls, maxCRLAge)
+// JoinExpectedOptions groups the enrollment parameters of PairingStore.JoinExpected
+// into a single options value so call sites use named fields instead of a positional
+// argument list.
+type JoinExpectedOptions struct {
+	// ExpectedNodeID is the node ID the peer TLS certificate must identify. When empty,
+	// any valid peer identity is accepted.
+	ExpectedNodeID string
+	// Code is the one-time invitation code presented in the enroll request.
+	Code string
+	// Certificate is the local peer identity certificate presented to the peer.
+	Certificate tls.Certificate
+	// Roots are the federation trust roots used to verify the peer.
+	Roots *x509.CertPool
+	// CRLs are the federation revocation lists used to verify the peer.
+	CRLs []*x509.RevocationList
+	// MaxCRLAge is the maximum allowed age of a CRL.
+	MaxCRLAge time.Duration
 }
 
-func (s *PairingStore) JoinExpected(ctx context.Context, endpoint, expectedNodeID, code string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (Membership, error) {
-	if !validInvitationCode(code) || roots == nil || len(crls) == 0 || len(certificate.Certificate) == 0 {
+func (s *PairingStore) Join(ctx context.Context, endpoint, code string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (Membership, error) {
+	return s.JoinExpected(ctx, endpoint, JoinExpectedOptions{
+		Code:        code,
+		Certificate: certificate,
+		Roots:       roots,
+		CRLs:        crls,
+		MaxCRLAge:   maxCRLAge,
+	})
+}
+
+func (s *PairingStore) JoinExpected(ctx context.Context, endpoint string, options JoinExpectedOptions) (Membership, error) {
+	if err := validateJoinOptions(options); err != nil {
 		return Membership{}, ErrInvitation
 	}
-	if expectedNodeID != "" && !identity.ValidNodeID(expectedNodeID) {
+	if options.ExpectedNodeID != "" && !identity.ValidNodeID(options.ExpectedNodeID) {
 		return Membership{}, ErrInvitation
 	}
 	origin, err := validEndpoint(endpoint)
 	if err != nil {
 		return Membership{}, ErrInvitation
 	}
-	leaf := certificate.Leaf
-	if leaf == nil {
-		leaf, err = x509.ParseCertificate(certificate.Certificate[0])
-		if err != nil {
-			return Membership{}, ErrInvitation
-		}
-	}
-	if ValidateIdentityCertificate(leaf, s.federationID, s.localNodeID) != nil {
+	leaf, err := localLeafCertificate(options.Certificate)
+	if err != nil {
 		return Membership{}, ErrInvitation
 	}
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: []tls.Certificate{certificate},
-			VerifyConnection: func(state tls.ConnectionState) error {
-				if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
-					return ErrInvitation
-				}
-				if VerifyCertificateRevocation(state.VerifiedChains, crls, maxCRLAge, time.Now()) != nil {
-					return ErrInvitation
-				}
-				remoteID, err := PeerIdentityNodeID(state.PeerCertificates[0], s.federationID)
-				if err != nil || (expectedNodeID != "" && remoteID != expectedNodeID) {
-					return ErrInvitation
-				}
-				revoked, err := s.IsCertificateRevoked(remoteID, CertificateFingerprint(state.PeerCertificates[0]))
-				if err != nil || revoked {
-					return ErrInvitation
-				}
-				return nil
-			},
-		},
-		DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
-		TLSHandshakeTimeout: 5 * time.Second, IdleConnTimeout: 10 * time.Second,
+	if err := ValidateIdentityCertificate(leaf, s.federationID, s.localNodeID); err != nil {
+		return Membership{}, ErrInvitation
 	}
+	transport := newJoinTransport(s, options)
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+"/peer/v1/enroll", nil)
+	client := newJoinClient(transport)
+	response, err := sendEnrollRequest(ctx, client, origin, options.Code)
 	if err != nil {
 		return Membership{}, ErrInvitation
 	}
-	request.Header.Set("X-Llama-Catalog-Invite", code)
-	response, err := client.Do(request)
+	if err := validateEnrollResponse(response); err != nil {
+		return Membership{}, ErrInvitation
+	}
+	result, err := readAndDecodeEnrollResponse(response)
 	if err != nil {
 		return Membership{}, ErrInvitation
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.VerifiedChains) == 0 || len(response.TLS.PeerCertificates) == 0 {
+	if err := validateEnrollResult(result, s, options.ExpectedNodeID); err != nil {
 		return Membership{}, ErrInvitation
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, 4097))
-	if err != nil || len(body) > 4096 {
+	remoteNodeID, err := verifyServerIdentity(response, result, s.federationID)
+	if err != nil {
 		return Membership{}, ErrInvitation
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	var result struct {
-		State        string    `json:"state"`
-		FederationID string    `json:"federation_id"`
-		LocalNodeID  string    `json:"local_node_id"`
-		NodeID       string    `json:"node_id"`
-		PairedAt     time.Time `json:"paired_at"`
-	}
-	if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF || result.State != "paired" ||
-		result.FederationID != s.federationID || result.NodeID != s.localNodeID || !identity.ValidNodeID(result.LocalNodeID) ||
-		(expectedNodeID != "" && result.LocalNodeID != expectedNodeID) {
-		return Membership{}, ErrInvitation
-	}
-	serverCert := response.TLS.PeerCertificates[0]
-	remoteNodeID, err := PeerIdentityNodeID(serverCert, s.federationID)
-	if err != nil || remoteNodeID != result.LocalNodeID {
-		return Membership{}, ErrInvitation
-	}
-	return s.AddMember(remoteNodeID, CertificateFingerprint(serverCert), time.Now().UTC())
+	return s.AddMember(remoteNodeID, CertificateFingerprint(response.TLS.PeerCertificates[0]), time.Now().UTC())
 }
 
 func (s *PairingStore) Close() error {
@@ -671,14 +665,39 @@ func (s *PairingStore) prune(now time.Time) {
 }
 
 func validatePairingData(data pairingData, federationID, localNodeID string) error {
+	if err := validatePairingDataRoot(data, federationID, localNodeID); err != nil {
+		return ErrPairingStore
+	}
+	if err := validatePairingDataMembers(data.Members, localNodeID); err != nil {
+		return ErrPairingStore
+	}
+	if err := validatePairingDataInvites(data.Invites, localNodeID); err != nil {
+		return ErrPairingStore
+	}
+	if err := validatePairingDataConsumed(data.Consumed, data.Invites, localNodeID); err != nil {
+		return ErrPairingStore
+	}
+	if err := validatePairingDataRevoked(data.Revoked, localNodeID); err != nil {
+		return ErrPairingStore
+	}
+	return nil
+}
+
+// validatePairingDataRoot enforces the global store header and size limits.
+func validatePairingDataRoot(data pairingData, federationID, localNodeID string) error {
 	if data.Version != 1 || data.FederationID != federationID || data.LocalNodeID != localNodeID ||
 		data.Members == nil || data.Invites == nil || data.Consumed == nil || data.Revoked == nil ||
 		len(data.Members) > maxPairingMembers || len(data.Invites) > maxPairingInvites || len(data.Consumed) > maxConsumedInvites ||
 		revokedFingerprintCount(data.Revoked) > maxRevocations {
 		return ErrPairingStore
 	}
-	fingerprints := make(map[string]bool, len(data.Members))
-	for id, member := range data.Members {
+	return nil
+}
+
+// validatePairingDataMembers validates each member row and duplicate fingerprints.
+func validatePairingDataMembers(members map[string]Membership, localNodeID string) error {
+	fingerprints := make(map[string]bool, len(members))
+	for id, member := range members {
 		fingerprint := strings.ToLower(member.Fingerprint)
 		if !identity.ValidNodeID(id) || id == localNodeID || member.NodeID != id || !validFingerprint(fingerprint) ||
 			member.PairedAt.IsZero() || fingerprints[fingerprint] {
@@ -686,23 +705,39 @@ func validatePairingData(data pairingData, federationID, localNodeID string) err
 		}
 		fingerprints[fingerprint] = true
 	}
-	inviteIDs := make(map[string]bool, len(data.Invites))
-	for hash, invite := range data.Invites {
+	return nil
+}
+
+// validatePairingDataInvites validates each invite row and duplicate node IDs.
+func validatePairingDataInvites(invites map[string]inviteRecord, localNodeID string) error {
+	inviteIDs := make(map[string]bool, len(invites))
+	for hash, invite := range invites {
 		if !validHash(hash) || !identity.ValidNodeID(invite.NodeID) || invite.NodeID == localNodeID ||
 			inviteIDs[invite.NodeID] || invite.CreatedAt.IsZero() || !invite.ExpiresAt.After(invite.CreatedAt) || invite.ExpiresAt.Sub(invite.CreatedAt) > invitationLifetime {
 			return ErrPairingStore
 		}
 		inviteIDs[invite.NodeID] = true
 	}
-	for hash, consumed := range data.Consumed {
+	return nil
+}
+
+// validatePairingDataConsumed validates each consumed row and its exclusion from
+// the active invite set.
+func validatePairingDataConsumed(consumed map[string]consumedRecord, invites map[string]inviteRecord, localNodeID string) error {
+	for hash, consumed := range consumed {
 		if !validHash(hash) || !identity.ValidNodeID(consumed.NodeID) || consumed.NodeID == localNodeID || consumed.ExpiresAt.IsZero() {
 			return ErrPairingStore
 		}
-		if _, duplicate := data.Invites[hash]; duplicate {
+		if _, duplicate := invites[hash]; duplicate {
 			return ErrPairingStore
 		}
 	}
-	for nodeID, revoked := range data.Revoked {
+	return nil
+}
+
+// validatePairingDataRevoked validates each revoked fingerprint list.
+func validatePairingDataRevoked(revoked map[string][]string, localNodeID string) error {
+	for nodeID, revoked := range revoked {
 		if !identity.ValidNodeID(nodeID) || nodeID == localNodeID || len(revoked) == 0 || len(revoked) > maxRevocationsPerID {
 			return ErrPairingStore
 		}
@@ -795,4 +830,130 @@ func recordRevokedFingerprint(revoked map[string][]string, nodeID, fingerprint s
 	}
 	revoked[nodeID] = append(revoked[nodeID], strings.ToLower(fingerprint))
 	return nil
+}
+
+// validateJoinOptions checks the invitation code, trust roots, CRLs and client
+// certificate supplied to JoinExpected. It returns ErrInvitation for any unsafe input.
+func validateJoinOptions(options JoinExpectedOptions) error {
+	if !validInvitationCode(options.Code) || options.Roots == nil || len(options.CRLs) == 0 || len(options.Certificate.Certificate) == 0 {
+		return ErrInvitation
+	}
+	return nil
+}
+
+// localLeafCertificate returns the leaf certificate of the local peer identity,
+// parsing the first certificate of the chain when the transport has not pre-parsed it.
+func localLeafCertificate(certificate tls.Certificate) (*x509.Certificate, error) {
+	if certificate.Leaf != nil {
+		return certificate.Leaf, nil
+	}
+	return x509.ParseCertificate(certificate.Certificate[0])
+}
+
+// newJoinTransport builds the HTTP transport used by JoinExpected, including the
+// TLS VerifyConnection callback that validates the peer certificate, revocation
+// state and expected node identity before any request is sent.
+func newJoinTransport(s *PairingStore, options JoinExpectedOptions) *http.Transport {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12, RootCAs: options.Roots, Certificates: []tls.Certificate{options.Certificate},
+			VerifyConnection: func(state tls.ConnectionState) error {
+				return s.verifyPeerConnection(state, options)
+			},
+		},
+		DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
+		TLSHandshakeTimeout: 5 * time.Second, IdleConnTimeout: 10 * time.Second,
+	}
+}
+
+// verifyPeerConnection validates the peer TLS connection presented during enrollment.
+// It is invoked by the transport's VerifyConnection callback.
+func (s *PairingStore) verifyPeerConnection(state tls.ConnectionState, options JoinExpectedOptions) error {
+	if len(state.VerifiedChains) == 0 || len(state.PeerCertificates) == 0 {
+		return ErrInvitation
+	}
+	if err := VerifyCertificateRevocation(state.VerifiedChains, options.CRLs, options.MaxCRLAge, time.Now()); err != nil {
+		return ErrInvitation
+	}
+	remoteID, err := PeerIdentityNodeID(state.PeerCertificates[0], s.federationID)
+	if err != nil || (options.ExpectedNodeID != "" && remoteID != options.ExpectedNodeID) {
+		return ErrInvitation
+	}
+	revoked, err := s.IsCertificateRevoked(remoteID, CertificateFingerprint(state.PeerCertificates[0]))
+	if err != nil || revoked {
+		return ErrInvitation
+	}
+	return nil
+}
+
+// newJoinClient builds the HTTP client used by JoinExpected. It rejects redirects and
+// bounds the request lifetime.
+func newJoinClient(transport *http.Transport) *http.Client {
+	return &http.Client{Transport: transport, Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+}
+
+// sendEnrollRequest builds and executes the enroll request, presenting the invitation
+// code as a request header.
+func sendEnrollRequest(ctx context.Context, client *http.Client, origin, code string) (*http.Response, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+"/peer/v1/enroll", nil)
+	if err != nil {
+		return nil, ErrInvitation
+	}
+	request.Header.Set("X-Llama-Catalog-Invite", code)
+	return client.Do(request)
+}
+
+// validateEnrollResponse checks the enroll response status and TLS peer evidence.
+func validateEnrollResponse(response *http.Response) error {
+	if response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.VerifiedChains) == 0 || len(response.TLS.PeerCertificates) == 0 {
+		return ErrInvitation
+	}
+	return nil
+}
+
+// enrollResult is the decoded payload of the peer enroll endpoint.
+type enrollResult struct {
+	State        string    `json:"state"`
+	FederationID string    `json:"federation_id"`
+	LocalNodeID  string    `json:"local_node_id"`
+	NodeID       string    `json:"node_id"`
+	PairedAt     time.Time `json:"paired_at"`
+}
+
+// readAndDecodeEnrollResponse reads the enroll response body within the 4096 byte
+// limit and decodes it, rejecting unknown and trailing fields.
+func readAndDecodeEnrollResponse(response *http.Response) (enrollResult, error) {
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4097))
+	if err != nil || len(body) > 4096 {
+		return enrollResult{}, ErrInvitation
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	var result enrollResult
+	if decoder.Decode(&result) != nil || decoder.Decode(new(any)) != io.EOF {
+		return enrollResult{}, ErrInvitation
+	}
+	return result, nil
+}
+
+// validateEnrollResult checks the decoded enroll result against the local federation
+// identity and the expected node ID.
+func validateEnrollResult(result enrollResult, s *PairingStore, expectedNodeID string) error {
+	if result.State != "paired" || result.FederationID != s.federationID || result.NodeID != s.localNodeID ||
+		!identity.ValidNodeID(result.LocalNodeID) || (expectedNodeID != "" && result.LocalNodeID != expectedNodeID) {
+		return ErrInvitation
+	}
+	return nil
+}
+
+// verifyServerIdentity checks that the peer TLS certificate identifies the same node
+// the enroll response declared as the local node.
+func verifyServerIdentity(response *http.Response, result enrollResult, federationID string) (string, error) {
+	serverCert := response.TLS.PeerCertificates[0]
+	remoteNodeID, err := PeerIdentityNodeID(serverCert, federationID)
+	if err != nil || remoteNodeID != result.LocalNodeID {
+		return "", ErrInvitation
+	}
+	return remoteNodeID, nil
 }

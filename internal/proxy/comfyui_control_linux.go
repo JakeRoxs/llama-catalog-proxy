@@ -141,7 +141,7 @@ func (c *comfyUIControl) Close() error {
 
 func (c *comfyUIControl) respond(w http.ResponseWriter, status int, receipt *ComfyUIReleaseResult, code, operationID string) {
 	state := c.coordinator.snapshot()
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(contentTypeHeader, "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(comfyUIControlResponse{
@@ -170,8 +170,8 @@ func (c *comfyUIControl) serve(w http.ResponseWriter, req *http.Request, timeout
 		c.respond(w, http.StatusNotFound, nil, "unknown_operation", "")
 		return
 	}
-	if req.Method != http.MethodPost || len(req.Header.Values("Content-Type")) != 1 ||
-		req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Content-Encoding") != "" {
+	if req.Method != http.MethodPost || len(req.Header.Values(contentTypeHeader)) != 1 ||
+		req.Header.Get(contentTypeHeader) != "application/json" || req.Header.Get("Content-Encoding") != "" {
 		c.respond(w, http.StatusBadRequest, nil, "invalid_operation_request", "")
 		return
 	}

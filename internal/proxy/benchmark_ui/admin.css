@@ -52,7 +52,7 @@ td:first-child { overflow-wrap:anywhere; font-family:ui-monospace,monospace; }
 .empty { padding:14px 0 0; }
 .small-note { margin:16px 0 0; }
 footer { padding-top:22px; text-align:center; }
-.notice { margin-top:16px; color:var(--warn); font-size:13px; }
+.notice { display: block; margin-top:16px; color:var(--warn); font-size:13px; }
 .notice-error { color:#ff9a8f; }
 .pairing-forms,.pairing-columns { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
 .pairing-forms form,.grant-form { display:grid; align-content:start; gap:10px; padding:16px; border:1px solid var(--line); border-radius:10px; }

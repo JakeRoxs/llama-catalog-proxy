@@ -22,6 +22,7 @@ import (
 const (
 	serviceName       = "_llama-catalog-peer._tcp"
 	serviceDomain     = "local."
+	localDomain       = ".local"
 	protocolVersion   = "1"
 	maxCandidates     = 64
 	maxCandidateBatch = 128
@@ -70,11 +71,11 @@ func Start(settings Settings) (*Advertiser, error) {
 	serviceHost := host
 	instance := instanceLabel(settings.NodeID)
 	if net.ParseIP(host) != nil {
-		serviceHost = instance + ".local"
+		serviceHost = instance + localDomain
 		if !hasAdvertisedAddress(addresses, host) {
 			return nil, errors.New("peer discovery advertise_url address is not assigned to the selected interface")
 		}
-	} else if !strings.HasSuffix(host, ".local") {
+	} else if !strings.HasSuffix(host, localDomain) {
 		return nil, errors.New("peer discovery hostname must use the .local domain")
 	}
 	service, err := mdns.NewMDNSService(instance, serviceName, serviceDomain, serviceHost+".", port, addresses, advertisementTXT(settings))
@@ -221,7 +222,7 @@ func entryMatchesURL(entry *mdns.ServiceEntry, host string) bool {
 			entry.AddrV6IPAddr != nil && ip.Equal(entry.AddrV6IPAddr.IP))
 	}
 	serviceHost := strings.TrimSuffix(strings.ToLower(entry.Host), ".")
-	if serviceHost != strings.ToLower(host) || !strings.HasSuffix(serviceHost, ".local") {
+	if serviceHost != strings.ToLower(host) || !strings.HasSuffix(serviceHost, localDomain) {
 		return false
 	}
 	return usableAddress(entry.AddrV4) || usableAddress(entry.AddrV6) ||

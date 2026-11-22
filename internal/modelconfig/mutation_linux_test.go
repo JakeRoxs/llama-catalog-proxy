@@ -36,6 +36,15 @@ func mutationFixture(t *testing.T) (string, string, []byte, Proposal) {
 func TestReviewedMutationAndReversibleRollback(t *testing.T) {
 	targetDir, backupDir, source, proposal := mutationFixture(t)
 	path := filepath.Join(targetDir, "config.yaml")
+	applied, current := verifyMutationApplied(t, targetDir, path, source, backupDir, proposal)
+	verifyRollbackAndReverse(t, targetDir, path, source, backupDir, proposal, applied, current)
+}
+
+// verifyMutationApplied applies the reviewed proposal and verifies the applied
+// result, the on-disk content, and the backup contents. It returns the applied
+// result and the post-apply content for later reverse-rollback comparisons.
+func verifyMutationApplied(t *testing.T, targetDir, path string, source []byte, backupDir string, proposal Proposal) (MutationResult, []byte) {
+	t.Helper()
 	applied, err := applyReviewedProposal(targetDir, "config.yaml", "local", backupDir, 1, proposal)
 	if err != nil || !applied.Written || !applied.Durable || applied.BackupID == "" {
 		t.Fatalf("apply = %+v, %v", applied, err)
@@ -48,6 +57,15 @@ func TestReviewedMutationAndReversibleRollback(t *testing.T) {
 	if err != nil || !bytes.Equal(backup.Source, source) {
 		t.Fatalf("apply backup: %v", err)
 	}
+	return applied, current
+}
+
+// verifyRollbackAndReverse verifies the stale replay rejection, the rollback,
+// backup retention, the reverse backup, the reverse rollback, and the target
+// permissions. Source bytes, revisions, backup retention, rollback order, and
+// mode checks are preserved verbatim.
+func verifyRollbackAndReverse(t *testing.T, targetDir, path string, source []byte, backupDir string, proposal Proposal, applied MutationResult, current []byte) {
+	t.Helper()
 	if _, err := applyReviewedProposal(targetDir, "config.yaml", "local", backupDir, 1, proposal); !errors.Is(err, ErrProposalStale) {
 		t.Fatalf("replayed proposal: %v", err)
 	}
@@ -279,58 +297,72 @@ func TestBackupRotationFailureReportsDurableWrite(t *testing.T) {
 	}
 }
 
+// backupMutationCase is a single row of the TestBackupMutationFailureAndUncertainCommit
+// matrix. Every field and table value is preserved verbatim from the original.
+type backupMutationCase struct {
+	name        string
+	written     bool
+	replaceErr  error
+	wantOld     bool
+	wantNew     bool
+	wantDurable bool
+	wantUnknown bool
+}
+
 func TestBackupMutationFailureAndUncertainCommit(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		written     bool
-		replaceErr  error
-		wantOld     bool
-		wantNew     bool
-		wantDurable bool
-		wantUnknown bool
-	}{
+	for _, tc := range []backupMutationCase{
 		{name: "before rename", replaceErr: errTargetChanged, wantOld: true},
 		{name: "uncertain durability", written: true, replaceErr: errTargetCommitUncertain, wantOld: true, wantNew: true},
 		{name: "uncertain rename", replaceErr: ErrTargetRenameUncertain, wantOld: true, wantNew: true, wantUnknown: true},
 		{name: "durable commit", written: true, wantNew: true, wantDurable: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			if err := os.Chmod(dir, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			source := []byte("models: {m: {cmd: 'llama-server -c 1024'}}")
-			proposal, old := backupFixture(t, source)
-			_, next := backupFixture(t, source)
-			if err := saveBackup(dir, old, 1); err != nil {
-				t.Fatal(err)
-			}
-			preview, err := PreviewDocument("local", "m", source, proposal.Settings)
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := commitWithBackup(dir, 1, func(*os.Root) (backupRecord, []byte, error) {
-				return next, preview.candidate, nil
-			}, func([]byte) (bool, error) {
-				return tc.written, tc.replaceErr
-			})
-			if !errors.Is(err, tc.replaceErr) || result.Written != tc.written || result.Durable != tc.wantDurable ||
-				result.OutcomeUnknown != tc.wantUnknown {
-				t.Fatalf("mutation = %+v, %v", result, err)
-			}
-			_, oldErr := loadBackup(dir, old.Info.ID)
-			_, newErr := loadBackup(dir, next.Info.ID)
-			if (oldErr == nil) != tc.wantOld || (newErr == nil) != tc.wantNew {
-				t.Fatalf("backup retention: old=%v new=%v", oldErr, newErr)
-			}
-			if tc.wantNew && result.BackupID != next.Info.ID || !tc.wantNew && result.BackupID != "" {
-				t.Fatalf("wrong backup ID: %+v", result)
-			}
-			if tc.written && tc.replaceErr != nil {
-				if err := saveBackup(dir, old, 1); !errors.Is(err, errBackupStore) {
-					t.Fatalf("over-limit store did not fail closed: %v", err)
-				}
-			}
+			runBackupMutationCase(t, tc)
 		})
+	}
+}
+
+// runBackupMutationCase executes one matrix case of
+// TestBackupMutationFailureAndUncertainCommit. The fixture setup,
+// commitWithBackup invocation, result-field assertions, backup-retention
+// decisions, backup-ID check, and over-limit fail-closed check are preserved
+// verbatim.
+func runBackupMutationCase(t *testing.T, tc backupMutationCase) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := []byte("models: {m: {cmd: 'llama-server -c 1024'}}")
+	proposal, old := backupFixture(t, source)
+	_, next := backupFixture(t, source)
+	if err := saveBackup(dir, old, 1); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := PreviewDocument("local", "m", source, proposal.Settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := commitWithBackup(dir, 1, func(*os.Root) (backupRecord, []byte, error) {
+		return next, preview.candidate, nil
+	}, func([]byte) (bool, error) {
+		return tc.written, tc.replaceErr
+	})
+	if !errors.Is(err, tc.replaceErr) || result.Written != tc.written || result.Durable != tc.wantDurable ||
+		result.OutcomeUnknown != tc.wantUnknown {
+		t.Fatalf("mutation = %+v, %v", result, err)
+	}
+	_, oldErr := loadBackup(dir, old.Info.ID)
+	_, newErr := loadBackup(dir, next.Info.ID)
+	if (oldErr == nil) != tc.wantOld || (newErr == nil) != tc.wantNew {
+		t.Fatalf("backup retention: old=%v new=%v", oldErr, newErr)
+	}
+	if tc.wantNew && result.BackupID != next.Info.ID || !tc.wantNew && result.BackupID != "" {
+		t.Fatalf("wrong backup ID: %+v", result)
+	}
+	if tc.written && tc.replaceErr != nil {
+		if err := saveBackup(dir, old, 1); !errors.Is(err, errBackupStore) {
+			t.Fatalf("over-limit store did not fail closed: %v", err)
+		}
 	}
 }

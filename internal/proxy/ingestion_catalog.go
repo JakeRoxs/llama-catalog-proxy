@@ -12,6 +12,8 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
+const catalogUnavailableMsg = "catalog unavailable"
+
 func (r *Reloader) serveCreationCatalog(w http.ResponseWriter, req *http.Request, state *reloaderState, directory, id string) {
 	if req.URL.RawQuery != "" || req.URL.ForceQuery || !sameIngestionOrigin(req) {
 		http.Error(w, "invalid request origin or query", http.StatusForbidden)
@@ -61,7 +63,7 @@ func (r *Reloader) serveCreationCatalog(w http.ResponseWriter, req *http.Request
 	}
 	handler, ok := state.handler.(*Handler)
 	if !ok || handler.catalog == nil {
-		http.Error(w, "catalog unavailable", http.StatusServiceUnavailable)
+		http.Error(w, catalogUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	prefix, ok := handler.catalog.BackendPrefix(input.BackendID)
@@ -80,7 +82,7 @@ func (r *Reloader) serveCreationCatalog(w http.ResponseWriter, req *http.Request
 	defer cancel()
 	response, _, err := handler.modelCatalog(ctx, nil)
 	if err != nil {
-		http.Error(w, "catalog unavailable", http.StatusBadGateway)
+		http.Error(w, catalogUnavailableMsg, http.StatusBadGateway)
 		return
 	}
 	if ctx.Err() != nil {
@@ -93,7 +95,7 @@ func (r *Reloader) serveCreationCatalog(w http.ResponseWriter, req *http.Request
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(response.Body, &catalog); err != nil {
-		http.Error(w, "catalog unavailable", http.StatusBadGateway)
+		http.Error(w, catalogUnavailableMsg, http.StatusBadGateway)
 		return
 	}
 	publicID := prefix + proposal.ModelID

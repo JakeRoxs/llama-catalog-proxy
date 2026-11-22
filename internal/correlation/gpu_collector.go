@@ -250,6 +250,12 @@ func NewGPUCollector(backends map[string]config.Backend) *GPUCollector {
 // positive; it is a collector-local collection scope, not proof of an upstream
 // restart. Calls are serialized by a gate: a waiting caller honors context
 // cancellation and returns ctx.Err() rather than blocking forever.
+//
+// Collect is gate/context orchestration plus post-drain cancellation: it
+// validates the epoch and context, serializes callers through the refresh
+// gate, snapshots the sorted backend jobs, runs the bounded worker pool, and
+// drains results to EOF through mergeResults. After the drain it honors parent
+// cancellation and never returns a partial report on cancel.
 func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, error) {
 	if epoch <= 0 {
 		return GPUReport{}, errors.New("epoch must be positive")
@@ -268,8 +274,34 @@ func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, err
 		return GPUReport{}, err
 	}
 
-	// Snapshot the backend jobs under the lock, then release it so collection
-	// can proceed without holding the lock across HTTP.
+	// Snapshot the enabled backend jobs under the lock, then release it so
+	// collection can proceed without holding the lock across HTTP.
+	jobs := c.snapshotJobs()
+
+	// Run the bounded worker pool and drain results to EOF. The feeder respects
+	// context cancellation and stops feeding; workers drain the job channel to
+	// completion; the result channel closes only after all workers have drained,
+	// so there is no goroutine leak even when the parent context is canceled
+	// mid-collection.
+	resultChan := c.runWorkers(ctx, epoch, jobs)
+
+	// Merge bounded batches into the global top-K window, re-sorting by
+	// (BackendID, Timestamp, DeviceID) and truncating to the global max after
+	// every result. The states map is a defensive copy of the initial states.
+	samples, states, globalTruncated := mergeResults(c.backendStates, resultChan)
+
+	// After draining workers, honor parent cancellation: never return partial
+	// success on cancel.
+	if err := ctx.Err(); err != nil {
+		return GPUReport{}, err
+	}
+
+	return finalizeReport(states, samples, globalTruncated), nil
+}
+
+// snapshotJobs copies all enabled backend jobs under the collector lock and
+// returns them sorted by backend ID. The caller must not hold c.mu.
+func (c *GPUCollector) snapshotJobs() []gpuBackendJob {
 	c.mu.Lock()
 	jobs := make([]gpuBackendJob, 0, len(c.backends))
 	for id, b := range c.backends {
@@ -277,10 +309,14 @@ func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, err
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
 	c.mu.Unlock()
+	return jobs
+}
 
-	// Run the bounded worker pool: at most 4 goroutines reading from a bounded
-	// job channel and sending to a bounded result channel. No goroutine is
-	// dedicated to a backend.
+// runWorkers starts at most four workers that fetch each job and send results
+// to the returned channel. The feeder respects ctx cancellation and stops
+// feeding; workers drain the job channel to completion. The result channel is
+// closed only after all workers have drained, so the caller ranges it to EOF.
+func (c *GPUCollector) runWorkers(ctx context.Context, epoch int64, jobs []gpuBackendJob) <-chan gpuBackendResult {
 	n := 4
 	if n > len(jobs) {
 		n = len(jobs)
@@ -311,11 +347,17 @@ func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, err
 		close(jobChan)
 		wg.Wait()
 	}()
+	return resultChan
+}
 
-	// Keep the deterministic first global window while draining bounded batches.
-	// Do not stage a full sample slice for every configured backend.
-	states := make(map[string]GPUBackendState, len(c.backendStates))
-	for id, state := range c.backendStates {
+// mergeResults merges backend results into a bounded sample slice and a copy
+// of the backend state map. For each result it updates the state, appends
+// samples, re-sorts by (BackendID, Timestamp, DeviceID), and truncates to the
+// global max after every result. It ranges the result channel to EOF (the
+// caller of runWorkers guarantees the channel closes only after workers drain).
+func mergeResults(initialStates map[string]GPUBackendState, resultChan <-chan gpuBackendResult) ([]GPUSample, map[string]GPUBackendState, bool) {
+	states := make(map[string]GPUBackendState, len(initialStates))
+	for id, state := range initialStates {
 		states[id] = state
 	}
 	samples := make([]GPUSample, 0, gpuMaxSamplesGlobal)
@@ -338,12 +380,13 @@ func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, err
 			globalTruncated = true
 		}
 	}
-	// After draining workers, honor parent cancellation: never return partial
-	// success on cancel.
-	if err := ctx.Err(); err != nil {
-		return GPUReport{}, err
-	}
+	return samples, states, globalTruncated
+}
 
+// finalizeReport assembles the GPUReport from merged states and samples,
+// computing coverage and truncation flags from per-backend states and global
+// truncation.
+func finalizeReport(states map[string]GPUBackendState, samples []GPUSample, globalTruncated bool) GPUReport {
 	report := GPUReport{
 		BackendStates:               states,
 		Samples:                     samples,
@@ -386,7 +429,48 @@ func (c *GPUCollector) Collect(ctx context.Context, epoch int64) (GPUReport, err
 	report.Coverage = coverage
 	report.Truncated = truncated
 	report.TotalSamples = len(report.Samples)
-	return report, nil
+	return report
+}
+
+// buildRequest creates the authenticated GET request for /api/performance.
+// It sets Accept, copies configured headers (only when absent), and adds
+// API-key authentication when no Authorization/X-Api-Key header is present.
+func (c *GPUCollector) buildRequest(ctx context.Context, b *gpuBackendInfo) (*http.Request, error) {
+	u := b.url.JoinPath("api/performance")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	for key, value := range b.config.Headers {
+		if req.Header.Get(key) == "" {
+			req.Header.Set(key, value)
+		}
+	}
+	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
+		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
+		req.Header.Set("X-Api-Key", b.config.APIKey)
+	}
+	return req, nil
+}
+
+// classifyStatus maps an HTTP status code to a GPU backend state and reason.
+// Returns continueProcessing=true for 200 and 503 (continue reading the body).
+// For all other non-success statuses it returns the state/reason and
+// continueProcessing=false so the caller can return early without parsing.
+func classifyStatus(statusCode int) (state string, reason string, continueProcessing bool) {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		return gpuUnauthorizedState, "authorization_required", false
+	case statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed:
+		return gpuUnsupportedState, "not_available", false
+	case statusCode >= 300 && statusCode < 400:
+		return gpuUnknownState, "redirect_refused", false
+	case statusCode != http.StatusOK && statusCode != http.StatusServiceUnavailable:
+		return gpuUnavailableState, "http_error", false
+	default:
+		return "", "", true
+	}
 }
 
 // collect fetches GPU stats from one backend and normalizes them. It never
@@ -402,21 +486,10 @@ func (c *GPUCollector) collect(ctx context.Context, id string, b *gpuBackendInfo
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	u := b.url.JoinPath("api/performance")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := c.buildRequest(ctx, b)
 	if err != nil {
 		state.State, state.Reason = gpuUnsupportedState, "invalid_request"
 		return nil, state
-	}
-	req.Header.Set("Accept", "application/json")
-	for key, value := range b.config.Headers {
-		if req.Header.Get(key) == "" {
-			req.Header.Set(key, value)
-		}
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
@@ -426,21 +499,9 @@ func (c *GPUCollector) collect(ctx context.Context, id string, b *gpuBackendInfo
 	}
 	defer response.Body.Close()
 	state.HTTPStatus = response.StatusCode
-
-	// Check HTTP status codes first. 401/403, 404/405, 3xx, and other
-	// non-200/503 statuses are returned without parsing the body.
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		state.State, state.Reason = gpuUnauthorizedState, "authorization_required"
-		return nil, state
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		state.State, state.Reason = gpuUnsupportedState, "not_available"
-		return nil, state
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		state.State, state.Reason = gpuUnknownState, "redirect_refused"
-		return nil, state
-	case response.StatusCode != http.StatusOK && response.StatusCode != http.StatusServiceUnavailable:
-		state.State, state.Reason = gpuUnavailableState, "http_error"
+	st, reason, cont := classifyStatus(response.StatusCode)
+	if !cont {
+		state.State, state.Reason = st, reason
 		return nil, state
 	}
 
@@ -499,6 +560,53 @@ func (c *GPUCollector) collect(ctx context.Context, id string, b *gpuBackendInfo
 	return samples, state
 }
 
+// appendNormalizedGPUStat normalizes one wire stat and appends it to samples
+// when valid, not a duplicate, and within device caps. It returns whether the
+// sample was appended, whether the row was invalid, and whether a new device
+// beyond the cap was encountered (truncation). The devices map is updated for
+// newly accepted devices. A new device beyond the cap sets truncated=true but
+// does not append, so already-accepted devices keep collecting time points.
+func (c *GPUCollector) appendNormalizedGPUStat(
+	samples *[]GPUSample,
+	devices map[string]bool,
+	seen map[string]bool,
+	w wireGpuStat,
+	backendID string,
+	epoch int64,
+) (appended bool, invalid bool, truncated bool) {
+	s := c.normalizeWireStat(backendID, w)
+	if s == nil {
+		return false, true, false
+	}
+	if !devices[s.DeviceID] {
+		if len(devices) >= gpuMaxDevicesPerBackend {
+			return false, false, true
+		}
+		devices[s.DeviceID] = true
+	}
+	key := fmt.Sprintf("%s:%v", s.DeviceID, s.Timestamp)
+	if seen[key] {
+		return false, false, false
+	}
+	seen[key] = true
+	sample := *s
+	sample.Epoch = epoch
+	*samples = append(*samples, sample)
+	return true, false, false
+}
+
+// coverageFor returns the coverage string from truncation and invalid flags.
+// Truncated takes precedence over invalid.
+func coverageFor(truncated bool, anyInvalid bool) string {
+	if truncated {
+		return "truncated"
+	}
+	if anyInvalid {
+		return "partial"
+	}
+	return "complete"
+}
+
 // normalizeGPUStats converts one backend's wire stats into normalized samples.
 // Distinct device indexes are capped at gpuMaxDevicesPerBackend; many time
 // points per device are allowed, up to gpuMaxRecordsPerBackend records.
@@ -516,29 +624,16 @@ func (c *GPUCollector) normalizeGPUStats(backendID string, stats []wireGpuStat, 
 			truncated = true
 			break
 		}
-		s := c.normalizeWireStat(backendID, w)
-		if s == nil {
+		appended, invalid, devTruncated := c.appendNormalizedGPUStat(&samples, devices, seen, w, backendID, epoch)
+		if invalid {
 			anyInvalid = true
-			continue
 		}
-		if !devices[s.DeviceID] {
-			if len(devices) >= gpuMaxDevicesPerBackend {
-				truncated = true
-				// New device beyond the cap: drop it but keep collecting
-				// time points for already-accepted devices.
-				continue
-			}
-			devices[s.DeviceID] = true
+		if devTruncated {
+			truncated = true
 		}
-		key := fmt.Sprintf("%s:%v", s.DeviceID, s.Timestamp)
-		if seen[key] {
-			continue
+		if appended {
+			collected++
 		}
-		seen[key] = true
-		collected++
-		sample := *s
-		sample.Epoch = epoch
-		samples = append(samples, sample)
 	}
 	sort.SliceStable(samples, func(i, j int) bool {
 		if samples[i].Timestamp.Equal(samples[j].Timestamp) {
@@ -546,13 +641,32 @@ func (c *GPUCollector) normalizeGPUStats(backendID string, stats []wireGpuStat, 
 		}
 		return samples[i].Timestamp.Before(samples[j].Timestamp)
 	})
-	coverage := "complete"
-	if truncated {
-		coverage = "truncated"
-	} else if anyInvalid {
-		coverage = "partial"
-	}
+	coverage := coverageFor(truncated, anyInvalid)
 	return samples, len(devices), truncated, coverage
+}
+
+// copyGPUPercent copies a utilization percentage into a non-nil pointer when it
+// is a finite value in [0, 100]; explicit zero is preserved as a non-nil zero.
+// NaN, Inf, negative, or > 100 values yield nil. The row is still retained;
+// only the field is dropped.
+func copyGPUPercent(v float64) *float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
+		return nil
+	}
+	p := new(float64)
+	*p = v
+	return p
+}
+
+// copyNonnegativeInt copies a nonnegative integer into a non-nil pointer;
+// explicit zero is preserved as a non-nil zero. Negative values yield nil.
+func copyNonnegativeInt(v int) *int {
+	if v < 0 {
+		return nil
+	}
+	p := new(int)
+	*p = v
+	return p
 }
 
 // normalizeWireStat converts one upstream wire stat into a normalized safe
@@ -561,7 +675,8 @@ func (c *GPUCollector) normalizeGPUStats(backendID string, stats []wireGpuStat, 
 // the bounded source device index. Utilization/memory values are reported as
 // optional pointers with units; explicit zero values are preserved as
 // non-nil pointers, absent/unknown values are nil, and out-of-range values
-// are nil while the row is retained.
+// are nil while the row is retained. Invalid measurements drop only their
+// field; the row is never rejected for an out-of-range value.
 func (c *GPUCollector) normalizeWireStat(backendID string, w wireGpuStat) *GPUSample {
 	if w.ID == nil || *w.ID < 0 {
 		return nil
@@ -575,49 +690,17 @@ func (c *GPUCollector) normalizeWireStat(backendID string, w wireGpuStat) *GPUSa
 		Timestamp:  w.Timestamp,
 		ObservedAt: c.now(),
 	}
-	// Utilization percentages: explicit 0 is a valid reading, always report.
-	// Negative, non-finite, or > 100 percent => nil; the row is retained.
 	if w.GpuUtilPct != nil {
-		v := *w.GpuUtilPct
-		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
-			// field stays nil
-		} else {
-			p := new(float64)
-			*p = v
-			sample.GpuUtilPct = p
-		}
+		sample.GpuUtilPct = copyGPUPercent(*w.GpuUtilPct)
 	}
 	if w.MemUtilPct != nil {
-		v := *w.MemUtilPct
-		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 100 {
-			// field stays nil
-		} else {
-			p := new(float64)
-			*p = v
-			sample.MemUtilPct = p
-		}
+		sample.MemUtilPct = copyGPUPercent(*w.MemUtilPct)
 	}
-	// Memory: explicit 0 is a valid reading (non-nil 0); absent => nil;
-	// negative => nil.
 	if w.MemUsedMB != nil {
-		v := *w.MemUsedMB
-		if v < 0 {
-			// field stays nil
-		} else {
-			p := new(int)
-			*p = v
-			sample.MemUsedMB = p
-		}
+		sample.MemUsedMB = copyNonnegativeInt(*w.MemUsedMB)
 	}
 	if w.MemTotalMB != nil {
-		v := *w.MemTotalMB
-		if v < 0 {
-			// field stays nil
-		} else {
-			p := new(int)
-			*p = v
-			sample.MemTotalMB = p
-		}
+		sample.MemTotalMB = copyNonnegativeInt(*w.MemTotalMB)
 	}
 	return sample
 }

@@ -19,6 +19,7 @@ import (
 )
 
 const (
+	backupPrefix   = "backup-"
 	maxBackupLimit = MaxBackups
 	maxBackupBytes = (maxConfigBytes+2)/3*4 + 16<<10
 )
@@ -103,7 +104,7 @@ func prepareRollback(directory, filename, targetID string, record backupRecord, 
 	return append([]byte(nil), record.Source...), nil
 }
 
-func backupFilename(id string) string { return "backup-" + id + ".json" }
+func backupFilename(id string) string { return backupPrefix + id + ".json" }
 
 func readBackup(root *os.Root, id string) (backupRecord, error) {
 	if !validProposalID(id) {
@@ -175,10 +176,10 @@ func backupInventory(root *os.Root, dir *os.File, limit int) ([]backupInfo, erro
 	backups := make([]backupInfo, 0, len(entries))
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, "backup-") || !strings.HasSuffix(name, ".json") {
+		if !strings.HasPrefix(name, backupPrefix) || !strings.HasSuffix(name, ".json") {
 			return nil, errBackupStore
 		}
-		id := strings.TrimSuffix(strings.TrimPrefix(name, "backup-"), ".json")
+		id := strings.TrimSuffix(strings.TrimPrefix(name, backupPrefix), ".json")
 		existing, err := readBackup(root, id)
 		if err != nil {
 			return nil, errBackupStore

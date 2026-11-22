@@ -16,7 +16,7 @@ type peerInferenceGrantView struct {
 
 func runPeerInferenceGrantCreate(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer inference-grants create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	nodeID := flags.String("node-id", "", "paired node identity for inference authorization")
 	allowIncoming := flags.Bool("allow-incoming", false, "allow this peer to invoke local inference")
 	routeOutgoing := flags.Bool("route-outgoing", false, "allow this node to route inference to the peer")
@@ -51,7 +51,7 @@ func runPeerInferenceGrantCreate(args []string, stdout, stderr io.Writer) error 
 
 func runPeerInferenceGrantList(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer inference-grants list", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -82,7 +82,7 @@ func runPeerInferenceGrantList(args []string, stdout, stderr io.Writer) error {
 
 func runPeerInferenceGrantRevoke(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer inference-grants revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	nodeID := flags.String("node-id", "", "paired node identity whose inference grants will be revoked")
 	acknowledge := flags.Bool("acknowledge", false, "confirm this inference authorization change")
 	if err := parsePeerFlags(flags, args); err != nil {

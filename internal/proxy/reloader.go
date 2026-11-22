@@ -185,7 +185,15 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 			return nil, config.Config{}, err
 		}
 	}
-	state, err := makeReloaderState(cfg, handler, 1, certificate, managementCertificate, r.peerListen != "", r.pairingStore, r.auditStore)
+	state, err := makeReloaderState(cfg, reloaderStateOptions{
+		handler:               handler,
+		generation:            1,
+		certificate:           certificate,
+		managementCertificate: managementCertificate,
+		reservePeer:           r.peerListen != "",
+		pairingStore:          r.pairingStore,
+		auditStore:            r.auditStore,
+	})
 	if err != nil {
 		if r.pairingStore != nil {
 			_ = r.pairingStore.Close()
@@ -248,21 +256,31 @@ func (r *Reloader) Start() {
 		return
 	}
 	r.started = true
-	if r.peerDiscovery != nil && r.peerDiscovery.Enabled {
-		advertiser, err := discovery.Start(discovery.Settings{
-			NodeID: r.peerNodeID, FederationID: r.peerFederationID,
-			Interface: r.peerDiscovery.Interface, AdvertiseURL: r.peerDiscovery.AdvertiseURL,
-		})
-		if err != nil {
-			r.logger.Warn("peer mDNS advertisement unavailable; continuing without discovery", "error", err)
-		} else {
-			r.mdnsAdvertiser = advertiser
-			r.logger.Info("peer mDNS candidate advertisement started", "node_id", r.peerNodeID, "interface", r.peerDiscovery.Interface)
-		}
-	}
+	r.startPeerDiscoveryAdvertisement()
 	r.wg.Add(2)
 	go r.watch()
 	go r.watchPeers()
+}
+
+// startPeerDiscoveryAdvertisement starts the mDNS peer discovery advertiser when
+// discovery is enabled. The caller holds lifecycleMu; the helper does not lock
+// it. It does nothing when peerDiscovery is nil or disabled. On
+// discovery.Start failure it logs a warning and continues without an
+// advertiser; on success it stores the advertiser and logs an info message.
+func (r *Reloader) startPeerDiscoveryAdvertisement() {
+	if r.peerDiscovery == nil || !r.peerDiscovery.Enabled {
+		return
+	}
+	advertiser, err := discovery.Start(discovery.Settings{
+		NodeID: r.peerNodeID, FederationID: r.peerFederationID,
+		Interface: r.peerDiscovery.Interface, AdvertiseURL: r.peerDiscovery.AdvertiseURL,
+	})
+	if err != nil {
+		r.logger.Warn("peer mDNS advertisement unavailable; continuing without discovery", "error", err)
+		return
+	}
+	r.mdnsAdvertiser = advertiser
+	r.logger.Info("peer mDNS candidate advertisement started", "node_id", r.peerNodeID, "interface", r.peerDiscovery.Interface)
 }
 
 func (r *Reloader) Stop() {
@@ -291,6 +309,13 @@ func (r *Reloader) Stop() {
 	}
 	r.wg.Wait()
 	closePeerClients(r.state.Load().peerClients)
+	r.closeManagedStores()
+}
+
+// closeManagedStores closes the pairing, audit, and catalog grant stores in
+// that order, logging each closure failure without halting the remaining
+// closures. It is invoked by Stop after peer clients are closed.
+func (r *Reloader) closeManagedStores() {
 	if r.pairingStore != nil {
 		if err := r.pairingStore.Close(); err != nil {
 			r.logger.Error("peer membership store shutdown failed", "error", err)
@@ -474,7 +499,15 @@ func (r *Reloader) reload() error {
 		r.lifecycleMu.Unlock()
 		return errors.New("configuration generation exhausted")
 	}
-	state, err := makeReloaderState(cfg, handler, old.generation+1, certificate, managementCertificate, r.peerListen != "", r.pairingStore, r.auditStore)
+	state, err := makeReloaderState(cfg, reloaderStateOptions{
+		handler:               handler,
+		generation:            old.generation + 1,
+		certificate:           certificate,
+		managementCertificate: managementCertificate,
+		reservePeer:           r.peerListen != "",
+		pairingStore:          r.pairingStore,
+		auditStore:            r.auditStore,
+	})
 	if err != nil {
 		r.lifecycleMu.Unlock()
 		return err
@@ -495,7 +528,21 @@ func (r *Reloader) reload() error {
 	return nil
 }
 
-func makeReloaderState(cfg config.Config, handler http.Handler, generation uint64, certificate, managementCertificate *tls.Certificate, reservePeer bool, pairingStore *federation.PairingStore, auditStore *auditlog.Store) (*reloaderState, error) {
+// reloaderStateOptions groups the non-configuration parameters of
+// makeReloaderState so the constructor takes two parameters: the config under
+// validation and the options bundle. cfg stays separate because it is the
+// configuration being validated/reloaded, not a bundle of opaque state.
+type reloaderStateOptions struct {
+	handler               http.Handler
+	generation            uint64
+	certificate           *tls.Certificate
+	managementCertificate *tls.Certificate
+	reservePeer           bool
+	pairingStore          *federation.PairingStore
+	auditStore            *auditlog.Store
+}
+
+func makeReloaderState(cfg config.Config, opts reloaderStateOptions) (*reloaderState, error) {
 	peerClientCAs, err := loadPeerClientCAs(cfg.Peer)
 	if err != nil {
 		return nil, err
@@ -509,29 +556,29 @@ func makeReloaderState(cfg config.Config, handler http.Handler, generation uint6
 			return nil, err
 		}
 	}
-	clients, cache, err := newPeerClientsWithMembership(cfg.Peer, pairingStore)
+	clients, cache, err := newPeerClientsWithMembership(cfg.Peer, opts.pairingStore)
 	if err != nil {
 		return nil, err
 	}
-	if reservePeer {
-		h, ok := handler.(*Handler)
+	if opts.reservePeer {
+		h, ok := opts.handler.(*Handler)
 		if !ok {
 			return nil, errors.New("unexpected handler type for peer configuration")
 		}
 		h.peerCache = cache
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	if reservePeer {
-		h := handler.(*Handler)
+	if opts.reservePeer {
+		h := opts.handler.(*Handler)
 		h.peerClients = clients
 		h.peerContext = ctx
 		h.peerInferenceSlots = make(chan struct{}, 8)
 	}
 	return &reloaderState{
-		handler: handler, peer: copyPeerConfig(cfg.Peer), cacheTTL: cfg.ModelsCacheTTL,
-		generation: generation, certificate: certificate, peerClientCAs: peerClientCAs, peerClientCRLs: peerClientCRLs,
-		pairingStore: pairingStore, auditStore: auditStore, peerClients: clients,
-		management: copyManagementConfig(cfg.Management), managementCertificate: managementCertificate,
+		handler: opts.handler, peer: copyPeerConfig(cfg.Peer), cacheTTL: cfg.ModelsCacheTTL,
+		generation: opts.generation, certificate: opts.certificate, peerClientCAs: peerClientCAs, peerClientCRLs: peerClientCRLs,
+		pairingStore: opts.pairingStore, auditStore: opts.auditStore, peerClients: clients,
+		management: copyManagementConfig(cfg.Management), managementCertificate: opts.managementCertificate,
 		peerCache: cache, peerContext: ctx, peerCancel: cancel,
 	}, nil
 }
@@ -548,28 +595,28 @@ func copyManagementConfig(management *config.ManagementConfig) *config.Managemen
 	if management == nil {
 		return nil
 	}
-	copy := *management
+	managementCopy := *management
 	if management.DelegatedStore != nil {
 		stores := *management.DelegatedStore
-		copy.DelegatedStore = &stores
+		managementCopy.DelegatedStore = &stores
 	}
 	if management.ProposalStore != nil {
 		store := *management.ProposalStore
-		copy.ProposalStore = &store
+		managementCopy.ProposalStore = &store
 	}
 	if management.BackupStore != nil {
 		store := *management.BackupStore
-		copy.BackupStore = &store
+		managementCopy.BackupStore = &store
 	}
 	if management.Ingestion != nil {
 		ingestion := *management.Ingestion
-		copy.Ingestion = &ingestion
+		managementCopy.Ingestion = &ingestion
 	}
-	copy.Targets = make(map[string]config.ManagementTarget, len(management.Targets))
+	managementCopy.Targets = make(map[string]config.ManagementTarget, len(management.Targets))
 	for id, target := range management.Targets {
-		copy.Targets[id] = target
+		managementCopy.Targets[id] = target
 	}
-	return &copy
+	return &managementCopy
 }
 
 func loadPeerCertificate(peer *config.PeerConfig) (*tls.Certificate, error) {
@@ -611,17 +658,17 @@ func copyPeerConfig(peer *config.PeerConfig) *config.PeerConfig {
 	if peer == nil {
 		return nil
 	}
-	copy := *peer
-	copy.LocalBackends = append([]string(nil), peer.LocalBackends...)
-	copy.ManagementTargets = make(map[string]string, len(peer.ManagementTargets))
+	peerCopy := *peer
+	peerCopy.LocalBackends = append([]string(nil), peer.LocalBackends...)
+	peerCopy.ManagementTargets = make(map[string]string, len(peer.ManagementTargets))
 	for backend, target := range peer.ManagementTargets {
-		copy.ManagementTargets[backend] = target
+		peerCopy.ManagementTargets[backend] = target
 	}
-	copy.Peers = make(map[string]config.PeerGrant, len(peer.Peers))
+	peerCopy.Peers = make(map[string]config.PeerGrant, len(peer.Peers))
 	for id, grant := range peer.Peers {
-		copy.Peers[id] = grant
+		peerCopy.Peers[id] = grant
 	}
-	return &copy
+	return &peerCopy
 }
 
 func configDigest(path string) ([sha256.Size]byte, error) {

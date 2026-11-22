@@ -128,7 +128,22 @@ func TestPeerCLIRequiresProtectedInvitationFile(t *testing.T) {
 
 func TestPeerCLIGrantsRespectStaticCeilingAndPersistOwnerGrant(t *testing.T) {
 	root := t.TempDir()
-	paths := map[string]string{}
+	configPath, paths, store := setupPeerCLIEnvironment(t, root)
+	defer store.Close()
+
+	grant := createOwnerGrantViaCLI(t, configPath, paths)
+	verifyGrantListed(t, configPath, grant)
+	revokeOwnerGrantViaCLI(t, configPath, paths, grant)
+	verifyGrantAudit(t, paths, grant)
+}
+
+// setupPeerCLIEnvironment creates the temporary directory structure, writes the peer
+// CLI configuration and target config, opens the pairing store and registers the
+// node-b member. It returns the config path, the directory paths and the store whose
+// lifecycle the caller owns (close via defer).
+func setupPeerCLIEnvironment(t *testing.T, root string) (configPath string, paths map[string]string, store *federation.PairingStore) {
+	t.Helper()
+	paths = map[string]string{}
 	for _, name := range []string{"membership", "audit", "grants", "proposals", "operations", "backups", "proposal-store", "target"} {
 		path := filepath.Join(root, name)
 		if err := os.Mkdir(path, 0o700); err != nil {
@@ -182,7 +197,7 @@ management:
 		strings.Repeat("p", 32), strings.Repeat("w", 32), strings.Repeat("d", 32),
 		paths["proposal-store"], strings.Repeat("q", 32), paths["backups"], strings.Repeat("r", 32),
 		paths["proposals"], paths["operations"], paths["grants"], paths["target"])
-	configPath := filepath.Join(root, "config.yaml")
+	configPath = filepath.Join(root, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContents), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +208,13 @@ management:
 	if _, err := store.AddMember("node-b", strings.Repeat("a", 64), time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	return
+}
+
+// createOwnerGrantViaCLI issues a grant create request and asserts the returned owner
+// grant and its immediate authorization.
+func createOwnerGrantViaCLI(t *testing.T, configPath string, paths map[string]string) modelconfig.OwnerGrant {
+	t.Helper()
 	createArgs := []string{"grants", "create", "--config", configPath, "--requester-node", "node-b", "--backend", "backend-a", "--models", "model", "--expires-in", "24h", "--acknowledge"}
 	var output bytes.Buffer
 	if err := runPeerCommand(createArgs, &output, &bytes.Buffer{}); err != nil {
@@ -206,16 +227,32 @@ management:
 	if allowed, err := modelconfig.OwnerGrantAuthorizes(paths["grants"], "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || !allowed {
 		t.Fatalf("CLI owner grant did not authorize its exact model: %v, %v", allowed, err)
 	}
+	return grant
+}
+
+// verifyGrantListed asserts the created grant appears in the grants list.
+func verifyGrantListed(t *testing.T, configPath string, grant modelconfig.OwnerGrant) {
+	t.Helper()
 	var grants bytes.Buffer
 	if err := runPeerCommand([]string{"grants", "list", "--config", configPath}, &grants, &bytes.Buffer{}); err != nil || !bytes.Contains(grants.Bytes(), []byte(grant.ID)) {
 		t.Fatalf("CLI grant list = %s, %v", grants.String(), err)
 	}
+}
+
+// revokeOwnerGrantViaCLI revokes the grant and asserts it is no longer authorized.
+func revokeOwnerGrantViaCLI(t *testing.T, configPath string, paths map[string]string, grant modelconfig.OwnerGrant) {
+	t.Helper()
 	if err := runPeerCommand([]string{"grants", "revoke", "--config", configPath, "--grant-id", grant.ID}, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	if allowed, err := modelconfig.OwnerGrantAuthorizes(paths["grants"], "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || allowed {
 		t.Fatalf("revoked CLI grant remained active: %v, %v", allowed, err)
 	}
+}
+
+// verifyGrantAudit asserts the owner grant create event is recorded with CLI attribution.
+func verifyGrantAudit(t *testing.T, paths map[string]string, grant modelconfig.OwnerGrant) {
+	t.Helper()
 	audit, err := auditlog.Open(paths["audit"], "owner")
 	if err != nil {
 		t.Fatal(err)

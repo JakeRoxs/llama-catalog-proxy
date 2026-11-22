@@ -349,11 +349,11 @@ func readJSONValue(decoder *json.Decoder, depth int) error {
 }
 
 func foldRune(r rune) rune {
-	min := r
+	minimum := r
 	for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
-		if next < min {
-			min = next
+		if next < minimum {
+			minimum = next
 		}
 	}
-	return min
+	return minimum
 }

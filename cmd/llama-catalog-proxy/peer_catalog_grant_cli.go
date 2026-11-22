@@ -10,6 +10,8 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 )
 
+const configPathHelpText = "path to YAML configuration"
+
 type peerCatalogGrantView struct {
 	federation.CatalogReadGrant
 	CurrentFingerprint bool `json:"current_fingerprint"`
@@ -17,7 +19,7 @@ type peerCatalogGrantView struct {
 
 func runPeerCatalogGrantCreate(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer catalog-grants create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, configPathHelpText)
 	nodeID := flags.String("node-id", "", "paired node identity to grant catalog read")
 	acknowledge := flags.Bool("acknowledge", false, "confirm this catalog authorization change")
 	if err := parsePeerFlags(flags, args); err != nil {
@@ -50,7 +52,7 @@ func runPeerCatalogGrantCreate(args []string, stdout, stderr io.Writer) error {
 
 func runPeerCatalogGrantList(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer catalog-grants list", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, configPathHelpText)
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -82,7 +84,7 @@ func runPeerCatalogGrantList(args []string, stdout, stderr io.Writer) error {
 
 func runPeerCatalogGrantRevoke(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer catalog-grants revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, configPathHelpText)
 	nodeID := flags.String("node-id", "", "paired node identity whose catalog grant will be revoked")
 	acknowledge := flags.Bool("acknowledge", false, "confirm this catalog authorization change")
 	if err := parsePeerFlags(flags, args); err != nil {

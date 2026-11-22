@@ -12,6 +12,19 @@ import (
 )
 
 func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
+	dir, owner, proposal, id := setupDelegatedProposalStore(t)
+	assertDelegatedRecordPrivate(t, dir, id)
+	assertDelegatedBindingAndExpiry(t, dir, id, owner, proposal)
+	assertDelegatedListAndDuplicate(t, dir, id, proposal)
+	assertDelegatedIsolationFromLocalAPIs(t, dir, id, proposal)
+	assertDelegatedDeleteAndInvalidID(t, dir, id)
+	assertDelegatedDirectoryMixingRejected(t, dir, id, proposal)
+}
+
+// setupDelegatedProposalStore creates a private store directory, saves a
+// delegated proposal, and returns the directory, owner, proposal, and id.
+func setupDelegatedProposalStore(t *testing.T) (string, DelegatedOwner, DelegatedProposal, string) {
+	t.Helper()
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -21,6 +34,13 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err := SaveDelegatedProposal(dir, proposal); err != nil {
 		t.Fatal(err)
 	}
+	return dir, owner, proposal, id
+}
+
+// assertDelegatedRecordPrivate checks the persisted record is private and does
+// not leak the target path or directory name.
+func assertDelegatedRecordPrivate(t *testing.T, dir, id string) {
+	t.Helper()
 	path := filepath.Join(dir, delegatedProposalFilename(id))
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0o600 {
@@ -30,6 +50,12 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err != nil || strings.Contains(string(data), "config.yaml") || strings.Contains(string(data), "directory") {
 		t.Fatalf("record includes target path or cannot be read: %v", err)
 	}
+}
+
+// assertDelegatedBindingAndExpiry checks the persisted proposal validates
+// against the original owner and is invalidated by owner restart or expiry.
+func assertDelegatedBindingAndExpiry(t *testing.T, dir, id string, owner DelegatedOwner, proposal DelegatedProposal) {
+	t.Helper()
 	restored, err := LoadDelegatedProposal(dir, id)
 	if err != nil {
 		t.Fatal(err)
@@ -45,6 +71,12 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err := ValidateDelegatedProposal(restored, owner, "requester", "backend", "target", proposal.ExpiresAt); !errors.Is(err, ErrDelegatedProposalExpired) {
 		t.Fatalf("expired persisted review accepted: %v", err)
 	}
+}
+
+// assertDelegatedListAndDuplicate checks listing returns the proposal and a
+// duplicate save is rejected.
+func assertDelegatedListAndDuplicate(t *testing.T, dir, id string, proposal DelegatedProposal) {
+	t.Helper()
 	ids, err := ListDelegatedProposals(dir)
 	if err != nil || len(ids) != 1 || ids[0] != id {
 		t.Fatalf("list = %v, %v", ids, err)
@@ -52,6 +84,12 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err := SaveDelegatedProposal(dir, proposal); !errors.Is(err, ErrProposalStore) {
 		t.Fatalf("duplicate record overwritten: %v", err)
 	}
+}
+
+// assertDelegatedIsolationFromLocalAPIs checks local proposal APIs cannot read,
+// apply, delete, or save into a delegated-only directory.
+func assertDelegatedIsolationFromLocalAPIs(t *testing.T, dir, id string, proposal DelegatedProposal) {
+	t.Helper()
 	if _, err := LoadStoredProposal(dir, id); !errors.Is(err, ErrProposalNotFound) {
 		t.Fatalf("delegated review exposed as a local proposal: %v", err)
 	}
@@ -64,6 +102,12 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err := SaveProposal(dir, proposal.Proposal); !errors.Is(err, ErrProposalStore) {
 		t.Fatalf("mixed local/delegated directory accepted: %v", err)
 	}
+}
+
+// assertDelegatedDeleteAndInvalidID checks deletion succeeds and invalid IDs
+// are rejected.
+func assertDelegatedDeleteAndInvalidID(t *testing.T, dir, id string) {
+	t.Helper()
 	if err := DeleteDelegatedProposal(dir, id); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +117,12 @@ func TestDelegatedProposalStorePersistenceAndIsolation(t *testing.T) {
 	if err := DeleteDelegatedProposal(dir, "../config.yaml"); !errors.Is(err, ErrProposalNotFound) {
 		t.Fatalf("invalid ID accepted: %v", err)
 	}
+}
+
+// assertDelegatedDirectoryMixingRejected checks a local proposal in the same
+// directory is not treated as a delegated review.
+func assertDelegatedDirectoryMixingRejected(t *testing.T, dir, id string, proposal DelegatedProposal) {
+	t.Helper()
 	if err := SaveProposal(dir, proposal.Proposal); err != nil {
 		t.Fatal(err)
 	}

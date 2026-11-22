@@ -40,6 +40,7 @@ const (
 	routeInfoKindLocal   = "local"
 	comfyUIPathPrefix    = "/comfyui"
 	requestIDHeader      = "X-Request-ID"
+	apiKeyHeader         = "X-Api-Key"
 )
 
 // routeInfo captures how a request was routed for logging and correlation.
@@ -223,9 +224,9 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 		for name, value := range target.Headers {
 			headers.Set(name, value)
 		}
-		if target.APIKey != "" && headers.Get("Authorization") == "" && headers.Get("X-Api-Key") == "" {
+		if target.APIKey != "" && headers.Get("Authorization") == "" && headers.Get(apiKeyHeader) == "" {
 			headers.Set("Authorization", "Bearer "+target.APIKey)
-			headers.Set("X-Api-Key", target.APIKey)
+			headers.Set(apiKeyHeader, target.APIKey)
 		}
 		coordinator := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
 			return VerifyComfyUIRelease(ctx, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
@@ -326,12 +327,12 @@ func preservePeerAddressHeaders(ctx context.Context) bool {
 
 func preservePeerForwardedAddress(out, in http.Header) {
 	var forwarded []string
-	for _, value := range in.Values("X-Forwarded-For") {
+	for _, value := range in.Values(xForwardedForHeader) {
 		forwarded = append(forwarded, value)
 	}
 	if len(forwarded) > 0 {
-		forwarded = append(forwarded, out.Values("X-Forwarded-For")...)
-		out.Set("X-Forwarded-For", strings.Join(forwarded, ", "))
+		forwarded = append(forwarded, out.Values(xForwardedForHeader)...)
+		out.Set(xForwardedForHeader, strings.Join(forwarded, ", "))
 	}
 	if realIP := in.Values("X-Real-IP"); len(realIP) > 0 {
 		out[http.CanonicalHeaderKey("X-Real-IP")] = append([]string(nil), realIP...)
@@ -482,11 +483,11 @@ func applyBackendHeaders(header http.Header, backend config.Backend) {
 }
 
 func setAPIKeyIfMissing(header http.Header, apiKey string) {
-	if apiKey == "" || header.Get("Authorization") != "" || header.Get("X-Api-Key") != "" {
+	if apiKey == "" || header.Get("Authorization") != "" || header.Get(apiKeyHeader) != "" {
 		return
 	}
 	header.Set("Authorization", "Bearer "+apiKey)
-	header.Set("X-Api-Key", apiKey)
+	header.Set(apiKeyHeader, apiKey)
 }
 
 type requestExecution struct {
@@ -862,7 +863,7 @@ func (h *Handler) logRequest(request *http.Request, response *responseWriter, st
 			"method", request.Method,
 			"path", request.URL.Path,
 			"client_addr", request.RemoteAddr,
-			"x_forwarded_for", request.Header.Get("X-Forwarded-For"),
+			"x_forwarded_for", request.Header.Get(xForwardedForHeader),
 			"user_agent", request.UserAgent(),
 			"route_kind", info.kind,
 			"backend_id", info.backendID,

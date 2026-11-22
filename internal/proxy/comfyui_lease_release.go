@@ -261,12 +261,12 @@ func validateVRAMThresholds(thresholds map[string]int64) error {
 }
 
 func endpointURL(base *url.URL, endpoint string) *url.URL {
-	copy := *base
-	copy.Path = endpoint
-	copy.RawPath = ""
-	copy.RawQuery = ""
-	copy.Fragment = ""
-	return &copy
+	endpointCopy := *base
+	endpointCopy.Path = endpoint
+	endpointCopy.RawPath = ""
+	endpointCopy.RawQuery = ""
+	endpointCopy.Fragment = ""
+	return &endpointCopy
 }
 
 func cloneComfyUILeaseHeaders(headers http.Header) http.Header {

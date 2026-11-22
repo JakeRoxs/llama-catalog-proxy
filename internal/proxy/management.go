@@ -22,6 +22,11 @@ import (
 
 const maxManagementRequest = 16 << 10
 
+const (
+	invalidRequestMsg = "invalid request"
+	previewPath       = "/management/v1/preview"
+)
+
 func (r *Reloader) ManagementTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -82,71 +87,115 @@ func (w *auditResponseWriter) Push(target string, options *http.PushOptions) err
 
 func (r *Reloader) serveManagementAudited(w http.ResponseWriter, req *http.Request) {
 	state := r.state.Load()
-	var tx *auditlog.Transaction
-	if state != nil && state.auditStore != nil {
-		var err error
-		tx, err = state.auditStore.Begin(r.managementAuditEvent(req, state))
-		if err != nil {
-			http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
-			return
-		}
-	} else if state != nil && state.peer != nil && state.peer.FederationID != "" {
+	tx, err := r.beginManagementAudit(req, state)
+	if err != nil {
 		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	tracked := &auditResponseWriter{ResponseWriter: w}
 	r.serveManagement(tracked, req)
-	if tx != nil {
-		outcome := "unknown"
-		if tracked.status >= 200 && tracked.status < 300 {
-			outcome = "succeeded"
-		} else if tracked.status == http.StatusUnauthorized || tracked.status == http.StatusForbidden {
-			outcome = "denied"
-		} else if tracked.status < 500 {
-			outcome = "failed"
+	r.finishManagementAudit(tx, tracked)
+}
+
+// beginManagementAudit returns the audit transaction for the request. A non-nil
+// error means the caller must fail closed with 503 "audit store unavailable".
+// It returns (nil, nil) when auditing is not applicable (no state, no store,
+// or a non-federated peer).
+func (r *Reloader) beginManagementAudit(req *http.Request, state *reloaderState) (*auditlog.Transaction, error) {
+	if state == nil || state.auditStore == nil {
+		if state != nil && state.peer != nil && state.peer.FederationID != "" {
+			return nil, errors.New("audit store unavailable")
 		}
-		if err := tx.Finish(outcome); err != nil {
-			r.logger.Error("management audit completion failed", "outcome", "unknown", "error", err)
-		}
+		return nil, nil
+	}
+	tx, err := state.auditStore.Begin(r.managementAuditEvent(req, state))
+	if err != nil {
+		return nil, err
+	}
+	return tx, nil
+}
+
+// managementAuditOutcome maps an HTTP response status to an audit outcome.
+func managementAuditOutcome(status int) string {
+	switch {
+	case status >= 200 && status < 300:
+		return "succeeded"
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return "denied"
+	case status < 500:
+		return "failed"
+	}
+	return "unknown"
+}
+
+// finishManagementAudit completes the transaction exactly once after the handler,
+// mapping the tracked response status to an audit outcome and logging any finish
+// failure using the same fields as before.
+func (r *Reloader) finishManagementAudit(tx *auditlog.Transaction, tracked *auditResponseWriter) {
+	if tx == nil {
+		return
+	}
+	if err := tx.Finish(managementAuditOutcome(tracked.status)); err != nil {
+		r.logger.Error("management audit completion failed", "outcome", "unknown", "error", err)
 	}
 }
 
 func (r *Reloader) managementAuditEvent(req *http.Request, state *reloaderState) auditlog.Event {
-	event := auditlog.Event{LocalNodeID: r.peerNodeID, PrincipalType: "unknown", UserIdentityState: "unknown", Action: managementAuditAction(req)}
+	event := auditlog.Event{
+		LocalNodeID:       r.peerNodeID,
+		PrincipalType:     "unknown",
+		UserIdentityState: "unknown",
+		Action:            managementAuditAction(req),
+	}
 	if state.peer != nil {
 		event.LocalNodeID = state.peer.NodeID
 	}
 	if req == nil || state.management == nil {
 		return event
 	}
-	if token := state.management.DelegationToken; managementBearerAuthorized(req, token) {
+	event = r.classifyManagementAuditPrincipal(req, state.management, event)
+	event = extractManagementAuditQueryIDs(req, event)
+	return event
+}
+
+// classifyManagementAuditPrincipal resolves the audit principal using the priority:
+// delegation token > machine principal > verified OIDC configure_models.
+func (r *Reloader) classifyManagementAuditPrincipal(req *http.Request, management *config.ManagementConfig, event auditlog.Event) auditlog.Event {
+	if token := management.DelegationToken; managementBearerAuthorized(req, token) {
 		event.PrincipalType = "delegation_token"
-	} else if managementMachinePrincipal(req, state.management) {
-		event.PrincipalType = "machine_token"
-	} else if r.adminAuth != nil {
-		if subject, ok := r.adminAuth.RequireRole(req, "configure_models"); ok {
-			event.PrincipalType = "oidc"
-			event.UserIdentityState = "verified_local"
-			event.IdentityIssuer = r.adminAuth.config.IssuerURL
-			event.VerifiedUserSubject = subject
-			event.Role = "configure_models"
-		}
+		return event
 	}
+	if managementMachinePrincipal(req, management) {
+		event.PrincipalType = "machine_token"
+		return event
+	}
+	if r.adminAuth == nil {
+		return event
+	}
+	if subject, ok := r.adminAuth.RequireRole(req, "configure_models"); ok {
+		event.PrincipalType = "oidc"
+		event.UserIdentityState = "verified_local"
+		event.IdentityIssuer = r.adminAuth.config.IssuerURL
+		event.VerifiedUserSubject = subject
+		event.Role = "configure_models"
+	}
+	return event
+}
+
+// extractManagementAuditQueryIDs safely extracts single-valued query IDs for target, model, and operation.
+func extractManagementAuditQueryIDs(req *http.Request, event auditlog.Event) auditlog.Event {
 	if len(req.URL.Query()["target_id"]) == 1 {
-		candidate := req.URL.Query().Get("target_id")
-		if identity.ValidNodeID(candidate) {
+		if candidate := req.URL.Query().Get("target_id"); identity.ValidNodeID(candidate) {
 			event.TargetID = candidate
 		}
 	}
 	if len(req.URL.Query()["model_id"]) == 1 {
-		candidate := req.URL.Query().Get("model_id")
-		if identity.ValidModelComponent(candidate) {
+		if candidate := req.URL.Query().Get("model_id"); identity.ValidModelComponent(candidate) {
 			event.ModelID = candidate
 		}
 	}
 	if len(req.URL.Query()["operation_id"]) == 1 {
-		candidate := req.URL.Query().Get("operation_id")
-		if modelconfig.ValidDelegatedOperationID(candidate) {
+		if candidate := req.URL.Query().Get("operation_id"); modelconfig.ValidDelegatedOperationID(candidate) {
 			event.CorrelationID = candidate
 		}
 	}
@@ -189,6 +238,223 @@ func managementAuditAction(req *http.Request) string {
 	}
 }
 
+// managementRoute classifies the exact management sub-resource a request targets,
+// preserving the precedence used by serveManagement: delegated routes first, then
+// write, proposal, backup, ingestion, creation preview, preview, settings, and
+// finally unknown.
+type managementRoute int
+
+const (
+	routeUnknown managementRoute = iota
+	routeDelegated
+	routeWrite
+	routeProposal
+	routeBackup
+	routeIngestion
+	routeCreationPreview
+	routePreview
+	routeSettings
+)
+
+// classifyManagementRoute returns the route matched by req with exact precedence.
+// Delegated routes take priority over all other management routes.
+func classifyManagementRoute(req *http.Request) managementRoute {
+	if strings.HasPrefix(req.URL.Path, receivedSettingsPathPrefix) ||
+		req.URL.Path == receivedOperationPath[:len(receivedOperationPath)-1] ||
+		strings.HasPrefix(req.URL.Path, receivedOperationPath) ||
+		req.URL.Path == ownerProposalsPath ||
+		strings.HasPrefix(req.URL.Path, ownerOperationPath) {
+		return routeDelegated
+	}
+	if isWriteRoute(req) {
+		return routeWrite
+	}
+	if isProposalRoute(req) {
+		return routeProposal
+	}
+	if isBackupRoute(req) {
+		return routeBackup
+	}
+	if isIngestionRoute(req) {
+		return routeIngestion
+	}
+	if req.URL.Path == "/management/v1/creation/preview" {
+		return routeCreationPreview
+	}
+	if req.URL.Path == previewPath {
+		return routePreview
+	}
+	if req.URL.Path == "/management/v1/settings" {
+		return routeSettings
+	}
+	return routeUnknown
+}
+
+func isWriteRoute(req *http.Request) bool {
+	return (strings.HasPrefix(req.URL.Path, "/management/v1/proposals/") && strings.HasSuffix(req.URL.Path, "/apply")) ||
+		(strings.HasPrefix(req.URL.Path, "/management/v1/backups/") && strings.HasSuffix(req.URL.Path, "/rollback"))
+}
+
+func isProposalRoute(req *http.Request) bool {
+	return req.URL.Path == "/management/v1/proposals" || strings.HasPrefix(req.URL.Path, "/management/v1/proposals/")
+}
+
+func isBackupRoute(req *http.Request) bool {
+	return req.URL.Path == "/management/v1/backups" || strings.HasPrefix(req.URL.Path, "/management/v1/backups/")
+}
+
+func isIngestionRoute(req *http.Request) bool {
+	return req.URL.Path == "/management/v1/ingestion" || strings.HasPrefix(req.URL.Path, "/management/v1/ingestion/")
+}
+
+// selectManagementToken returns the bearer token required for the classified route,
+// following the precedence: write token > proposal/backup/ingestion store token >
+// preview token. It returns an empty string when management is nil or no store token
+// applies, which causes the caller's authorization check to fail closed.
+func selectManagementToken(management *config.ManagementConfig, route managementRoute) string {
+	if management == nil {
+		return ""
+	}
+	switch route {
+	case routeWrite:
+		return management.WriteToken
+	case routeProposal:
+		if management.ProposalStore != nil {
+			return management.ProposalStore.Token
+		}
+		return ""
+	case routeBackup:
+		if management.BackupStore != nil {
+			return management.BackupStore.Token
+		}
+		return ""
+	case routeIngestion:
+		if management.Ingestion != nil {
+			return management.Ingestion.Token
+		}
+		return ""
+	}
+	return management.PreviewToken
+}
+
+// serveCreationPreview acquires the management slot and serves the creation preview.
+// It returns true when the request was handled, false when the slot was unavailable
+// (and a 503 was already written).
+func (r *Reloader) serveCreationPreview(w http.ResponseWriter, req *http.Request, state *reloaderState) bool {
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		http.Error(w, "management service busy", http.StatusServiceUnavailable)
+		return false
+	}
+	r.serveCreation(w, req, state, false)
+	return true
+}
+
+// managementTargetInput is the decoded target/model selection for preview and settings
+// requests. It is intentionally distinct from the preview payload, which adds a
+// settings object.
+type managementTargetInput struct {
+	TargetID string `json:"target_id"`
+	ModelID  string `json:"model_id"`
+}
+
+// servePreviewOrSettings handles the /management/v1/preview and /management/v1/settings
+// endpoints: method, content-type, slot, body, and JSON validation guards, then body
+// decode, target lookup, and the preview/settings operation. It returns true when the
+// request was handled, false when a guard already wrote a response.
+func (r *Reloader) servePreviewOrSettings(w http.ResponseWriter, req *http.Request, state *reloaderState, management *config.ManagementConfig) bool {
+	if (req.URL.Path != previewPath && req.URL.Path != "/management/v1/settings") || req.URL.RawQuery != "" {
+		http.NotFound(w, req)
+		return false
+	}
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	contentType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	if err != nil || contentType != "application/json" || req.Header.Get("Content-Encoding") != "" {
+		http.Error(w, "JSON request required", http.StatusUnsupportedMediaType)
+		return false
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		defer func() { <-r.managementSlots }()
+	default:
+		http.Error(w, "management service busy", http.StatusServiceUnavailable)
+		return false
+	}
+	if req.Body == nil {
+		http.Error(w, "request body required", http.StatusBadRequest)
+		return false
+	}
+	data, err := io.ReadAll(io.LimitReader(req.Body, maxManagementRequest+1))
+	if err != nil {
+		http.Error(w, "request could not be read", http.StatusBadRequest)
+		return false
+	}
+	if len(data) > maxManagementRequest {
+		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return false
+	}
+	if err := validateManagementJSON(data); err != nil {
+		http.Error(w, invalidRequestMsg, http.StatusBadRequest)
+		return false
+	}
+	return r.decodeAndExecutePreviewOrSettings(w, req, state, management, data)
+}
+
+// decodeAndExecutePreviewOrSettings decodes the preview/settings body, resolves the
+// target, runs the preview or settings operation, rechecks the snapshot, and writes
+// the JSON result. It returns true when the request was handled, false when a response
+// was already written.
+func (r *Reloader) decodeAndExecutePreviewOrSettings(w http.ResponseWriter, req *http.Request, state *reloaderState, management *config.ManagementConfig, data []byte) bool {
+	var input managementTargetInput
+	var settings modelconfig.CommandSettings
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if req.URL.Path == previewPath {
+		var previewInput struct {
+			managementTargetInput
+			Settings modelconfig.CommandSettings `json:"settings"`
+		}
+		if err := decoder.Decode(&previewInput); err != nil {
+			http.Error(w, invalidRequestMsg, http.StatusBadRequest)
+			return false
+		}
+		input, settings = previewInput.managementTargetInput, previewInput.Settings
+	} else {
+		if err := decoder.Decode(&input); err != nil {
+			http.Error(w, invalidRequestMsg, http.StatusBadRequest)
+			return false
+		}
+	}
+	target, ok := management.Targets[input.TargetID]
+	if !ok {
+		http.NotFound(w, req)
+		return false
+	}
+	var result any
+	var err error
+	if req.URL.Path == previewPath {
+		result, err = modelconfig.PreviewTarget(target.Directory, target.Filename, input.TargetID, input.ModelID, settings)
+	} else {
+		result, err = modelconfig.ReadSettingsTarget(target.Directory, target.Filename, input.TargetID, input.ModelID)
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return false
+	}
+	if r.state.Load() != state {
+		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+		return false
+	}
+	writeJSON(r.logger, w, http.StatusOK, result)
+	return true
+}
+
 func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if req.TLS == nil {
@@ -196,148 +462,44 @@ func (r *Reloader) serveManagement(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	state := r.state.Load()
-	switch {
-	case strings.HasPrefix(req.URL.Path, receivedSettingsPathPrefix),
-		req.URL.Path == receivedOperationPath[:len(receivedOperationPath)-1],
-		strings.HasPrefix(req.URL.Path, receivedOperationPath),
-		req.URL.Path == ownerProposalsPath,
-		strings.HasPrefix(req.URL.Path, ownerOperationPath):
+	route := classifyManagementRoute(req)
+	if route == routeDelegated {
 		r.serveDelegatedManagement(w, req, state)
 		return
 	}
 	management := state.management
-	isProposal := req.URL.Path == "/management/v1/proposals" || strings.HasPrefix(req.URL.Path, "/management/v1/proposals/")
-	isBackup := req.URL.Path == "/management/v1/backups" || strings.HasPrefix(req.URL.Path, "/management/v1/backups/")
-	isIngestion := req.URL.Path == "/management/v1/ingestion" || strings.HasPrefix(req.URL.Path, "/management/v1/ingestion/")
-	isWrite := strings.HasPrefix(req.URL.Path, "/management/v1/proposals/") && strings.HasSuffix(req.URL.Path, "/apply") ||
-		strings.HasPrefix(req.URL.Path, "/management/v1/backups/") && strings.HasSuffix(req.URL.Path, "/rollback")
-	token := ""
-	if management != nil {
-		if isWrite {
-			token = management.WriteToken
-		} else if isProposal && management.ProposalStore != nil {
-			token = management.ProposalStore.Token
-		} else if isBackup && management.BackupStore != nil {
-			token = management.BackupStore.Token
-		} else if isIngestion && management.Ingestion != nil {
-			token = management.Ingestion.Token
-		} else if !isProposal && !isBackup && !isIngestion {
-			token = management.PreviewToken
-		}
-	}
+	token := selectManagementToken(management, route)
 	if management == nil || !managementBearerAuthorized(req, token) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	if isWrite {
+	switch route {
+	case routeWrite:
 		r.serveMutation(w, req, state)
 		return
-	}
-	if isIngestion {
+	case routeIngestion:
 		r.serveIngestion(w, req, state)
 		return
-	}
-	if isProposal {
+	case routeProposal:
 		r.serveProposals(w, req, state)
 		return
-	}
-	if isBackup {
+	case routeBackup:
 		r.serveBackups(w, req, state)
 		return
-	}
-	if req.URL.Path == "/management/v1/creation/preview" {
-		select {
-		case r.managementSlots <- struct{}{}:
-			defer func() { <-r.managementSlots }()
-		default:
-			http.Error(w, "management service busy", http.StatusServiceUnavailable)
+	case routeCreationPreview:
+		if !r.serveCreationPreview(w, req, state) {
 			return
 		}
-		r.serveCreation(w, req, state, false)
 		return
-	}
-	if (req.URL.Path != "/management/v1/preview" && req.URL.Path != "/management/v1/settings") || req.URL.RawQuery != "" {
-		http.NotFound(w, req)
+	case routePreview, routeSettings:
+		if !r.servePreviewOrSettings(w, req, state, management) {
+			return
+		}
 		return
-	}
-	if req.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	contentType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
-	if err != nil || contentType != "application/json" || req.Header.Get("Content-Encoding") != "" {
-		http.Error(w, "JSON request required", http.StatusUnsupportedMediaType)
-		return
-	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
 	default:
-		http.Error(w, "management service busy", http.StatusServiceUnavailable)
-		return
-	}
-	if req.Body == nil {
-		http.Error(w, "request body required", http.StatusBadRequest)
-		return
-	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, maxManagementRequest+1))
-	if err != nil {
-		http.Error(w, "request could not be read", http.StatusBadRequest)
-		return
-	}
-	if len(data) > maxManagementRequest {
-		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
-	}
-	if err := validateManagementJSON(data); err != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
-	}
-	type targetInput struct {
-		TargetID string `json:"target_id"`
-		ModelID  string `json:"model_id"`
-	}
-	var input targetInput
-	var settings modelconfig.CommandSettings
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if req.URL.Path == "/management/v1/preview" {
-		var previewInput struct {
-			targetInput
-			Settings modelconfig.CommandSettings `json:"settings"`
-		}
-		if err := decoder.Decode(&previewInput); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-		input, settings = previewInput.targetInput, previewInput.Settings
-	} else {
-		if err := decoder.Decode(&input); err != nil {
-			http.Error(w, "invalid request", http.StatusBadRequest)
-			return
-		}
-	}
-	target, ok := management.Targets[input.TargetID]
-	if !ok {
 		http.NotFound(w, req)
 		return
 	}
-	var result any
-	if req.URL.Path == "/management/v1/preview" {
-		result, err = modelconfig.PreviewTarget(target.Directory, target.Filename, input.TargetID, input.ModelID, settings)
-	} else {
-		result, err = modelconfig.ReadSettingsTarget(target.Directory, target.Filename, input.TargetID, input.ModelID)
-	}
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if r.state.Load() != state {
-		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
-		return
-	}
-	writeJSON(r.logger, w, http.StatusOK, result)
 }
 
 func managementBearerAuthorized(req *http.Request, token string) bool {
@@ -382,13 +544,13 @@ func readManagementJSONValue(decoder *json.Decoder, depth int) error {
 				return errors.New("invalid object key")
 			}
 			folded := strings.Map(func(r rune) rune {
-				min := r
+				lowestFolded := r
 				for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
-					if next < min {
-						min = next
+					if next < lowestFolded {
+						lowestFolded = next
 					}
 				}
-				return min
+				return lowestFolded
 			}, name)
 			if keys[folded] {
 				return errors.New("duplicate object key")

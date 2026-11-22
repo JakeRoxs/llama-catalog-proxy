@@ -67,6 +67,14 @@ var validCatalogStatus = map[string]bool{
 // hashed, or used as a map key.
 const maxIdentityRunes = 256
 
+// modelRefPrefix is the opaque bounded model reference prefix. It is applied
+// consistently by isModelReference; changing it changes the public ID scheme.
+const modelRefPrefix = "model-"
+
+// modelCatalogSource is the source label used in provenance and lifecycle
+// records for model catalog observations from the /v1/models endpoint.
+const modelCatalogSource = "/v1/models"
+
 // ModelIdentity stably and boundedly identifies a model. The public ID is the
 // catalog-visible ID (backend prefix + local ID). Backend ID and local ID are
 // the stable internal identifiers; prefix collisions are resolved by the
@@ -483,9 +491,9 @@ func (s *Service) Snapshot(ctx context.Context, backendModels []BackendModel, ba
 				continue
 			}
 			if publicCounts[publicID] > 1 {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: "/v1/models", Verification: provenance.Conflicting}
+				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: modelCatalogSource, Verification: provenance.Conflicting}
 			} else {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: "/v1/models", Verification: provenance.Declared}
+				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: modelCatalogSource, Verification: provenance.Declared}
 			}
 			modelRef, ok := correlation.ModelReference(bm.BackendID, localID)
 			if !ok {
@@ -821,9 +829,9 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 				continue
 			}
 			if publicCounts[publicID] > 1 {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: "/v1/models", Verification: provenance.Conflicting}
+				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: modelCatalogSource, Verification: provenance.Conflicting}
 			} else {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: "/v1/models", Verification: provenance.Declared}
+				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: modelCatalogSource, Verification: provenance.Declared}
 			}
 
 			// Attribute the model to activities whose resolved identity has a
@@ -1628,7 +1636,7 @@ func buildLifecycle(backendID, canonicalRef string, lifecycleModelsByKey map[ref
 		// catalog timestamp exists; never infer unloaded from omission.
 		if (catalogState == "loaded" || catalogState == "unloaded") && !catalogObservedAt.IsZero() {
 			lifecycle.CurrentState = catalogState
-			lifecycle.Source = "/v1/models"
+			lifecycle.Source = modelCatalogSource
 			lifecycle.Observed = true
 			copied := catalogObservedAt
 			lifecycle.ObservedAt = &copied
@@ -1677,12 +1685,12 @@ type gpuSampleKey struct {
 }
 
 // isModelReference reports whether ref is a bounded opaque model reference:
-// the literal prefix "model-" followed by exactly 32 lowercase hex digits.
+// the modelRefPrefix prefix followed by exactly 32 lowercase hex digits.
 func isModelReference(ref string) bool {
-	if len(ref) != len("model-")+32 || !strings.HasPrefix(ref, "model-") {
+	if len(ref) != len(modelRefPrefix)+32 || !strings.HasPrefix(ref, modelRefPrefix) {
 		return false
 	}
-	for _, c := range ref[len("model-"):] {
+	for _, c := range ref[len(modelRefPrefix):] {
 		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
 			return false
 		}

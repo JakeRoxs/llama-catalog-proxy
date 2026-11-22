@@ -439,6 +439,47 @@ func TestCatalogModelFilterIDsResolvesPrefixQualifiedAlias(t *testing.T) {
 	}
 }
 
+// TestValidRequestID verifies the proxy-generated request ID formats: exactly
+// 32 lowercase hex digits, or the nonempty req-<digits> fallback with no
+// length cap. Uppercase hex, wrong lengths, malformed suffixes, and the empty
+// req- suffix are rejected.
+func TestValidRequestID(t *testing.T) {
+	cases := []struct {
+		name string
+		id   string
+		want bool
+	}{
+		// 32 lowercase hex: valid.
+		{"32 lowercase hex", "0123456789abcdef0123456789abcdef", true},
+		{"32 lowercase hex all digits", "01234567890123456789012345678901", true},
+		{"32 lowercase hex all a-f", "abcdefabcdefabcdefabcdefabcdefab", true},
+		// req-<digits> fallback: nonempty, any length.
+		{"req- single digit", "req-1", true},
+		{"req- many digits", "req-1234567890", true},
+		{"req- leading zeros", "req-007", true},
+		// Invalid: uppercase hex is not accepted (lowercase only).
+		{"32 uppercase hex", "0123456789ABCDEF0123456789ABCDEF", false},
+		{"mixed case hex", "0123456789abcdef0123456789ABCDEF", false},
+		// Invalid: wrong length hex.
+		{"31 hex", "0123456789abcdef0123456789abcde", false},
+		{"33 hex", "0123456789abcdef0123456789abcdef0", false},
+		// Invalid: malformed.
+		{"empty", "", false},
+		{"not hex", "gggggggggggggggggggggggggggggggg", false},
+		{"req- empty suffix", "req-", false},
+		{"req- with letters", "req-abc", false},
+		{"req- with hyphen", "req-1-2", false},
+		{"req- only prefix", "req-", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validRequestID(tc.id); got != tc.want {
+				t.Errorf("validRequestID(%q) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDiagnosticsModelsLimit(t *testing.T) {
 	mgmt := newMockDiagnosticsServer(t)
 	defer mgmt.Close()

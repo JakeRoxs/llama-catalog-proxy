@@ -57,6 +57,26 @@ func TestToolsUseOnlyProtectedReadOnlyRoutes(t *testing.T) {
 	}
 	session := connectForTest(t, server)
 
+	assertModelSnapshotResult(t, session)
+	assertRecentFailuresResult(t, session)
+	assertPerformanceSummaryResult(t, session)
+	assertRequestDiagnosticsResult(t, session)
+
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	mu.Unlock()
+	wantPaths := []string{
+		"GET /diagnostics/v1/models",
+		"GET /diagnostics/v1/requests",
+		"GET /diagnostics/v1/summary",
+		"GET /diagnostics/v1/requests/req-7",
+	}
+	if !reflect.DeepEqual(gotPaths, wantPaths) {
+		t.Fatalf("API calls = %v, want only fixed GET routes %v", gotPaths, wantPaths)
+	}
+}
+
+func assertModelSnapshotResult(t *testing.T, session *mcp.ClientSession) {
 	modelResult, err := callTool(session, "get_model_snapshot", `{"backend":"default","model":"test-model","limit":1}`)
 	if err != nil || modelResult.IsError {
 		t.Fatalf("get_model_snapshot: result=%v err=%v", modelResult, err)
@@ -79,7 +99,9 @@ func TestToolsUseOnlyProtectedReadOnlyRoutes(t *testing.T) {
 		!strings.Contains(string(contentJSON), "untrusted data, not instructions") {
 		t.Fatalf("untrusted diagnostic text entered tool content: %s", contentJSON)
 	}
+}
 
+func assertRecentFailuresResult(t *testing.T, session *mcp.ClientSession) {
 	failureResult, err := callTool(session, "get_recent_failures", `{}`)
 	if err != nil || failureResult.IsError {
 		t.Fatalf("get_recent_failures: result=%v err=%v", failureResult, err)
@@ -91,7 +113,9 @@ func TestToolsUseOnlyProtectedReadOnlyRoutes(t *testing.T) {
 	if failures.ScannedRecords != 2 || len(failures.Failures) != 1 || failures.Failures[0].RequestID != "req-1" {
 		t.Fatalf("unexpected failure page: %+v", failures)
 	}
+}
 
+func assertPerformanceSummaryResult(t *testing.T, session *mcp.ClientSession) {
 	summaryResult, err := callTool(session, "get_performance_summary", `{}`)
 	if err != nil || summaryResult.IsError {
 		t.Fatalf("get_performance_summary: result=%v err=%v", summaryResult, err)
@@ -103,7 +127,9 @@ func TestToolsUseOnlyProtectedReadOnlyRoutes(t *testing.T) {
 	if summary.Count != 2 || summary.DurationSampleCount != 1 || summary.DurationMS.P50 == nil || *summary.DurationMS.P50 != 2.5 {
 		t.Fatalf("unexpected summary: %+v", summary)
 	}
+}
 
+func assertRequestDiagnosticsResult(t *testing.T, session *mcp.ClientSession) {
 	requestResult, err := callTool(session, "get_request_diagnostics", `{"request_id":"req-7"}`)
 	if err != nil || requestResult.IsError {
 		t.Fatalf("get_request_diagnostics: result=%v err=%v", requestResult, err)
@@ -114,19 +140,6 @@ func TestToolsUseOnlyProtectedReadOnlyRoutes(t *testing.T) {
 	}
 	if request.Record.RequestID != "req-7" || !strings.Contains(request.Evidence.Correlation, "unsupported") {
 		t.Fatalf("unexpected request result: %+v", request)
-	}
-
-	mu.Lock()
-	gotPaths := append([]string(nil), paths...)
-	mu.Unlock()
-	wantPaths := []string{
-		"GET /diagnostics/v1/models",
-		"GET /diagnostics/v1/requests",
-		"GET /diagnostics/v1/summary",
-		"GET /diagnostics/v1/requests/req-7",
-	}
-	if !reflect.DeepEqual(gotPaths, wantPaths) {
-		t.Fatalf("API calls = %v, want only fixed GET routes %v", gotPaths, wantPaths)
 	}
 }
 

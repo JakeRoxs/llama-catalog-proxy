@@ -3,7 +3,9 @@
 package proxy
 
 import (
+	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -261,8 +263,16 @@ management:
 	if err := os.WriteFile(filepath.Join(targets, "config.yaml"), []byte("models:\n  old: {cmd: 'llama-server --port ${PORT} -m /models/old.gguf'}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	review, err := previewRecordedCreation(r.ingestion.jobs, models, config.ManagementTarget{Directory: targets, Filename: "config.yaml"},
-		"local", "new", "", adopted.ID, modelconfig.CreationCommandInput{Executable: "llama-server"})
+	review, err := previewRecordedCreation(recordedCreationPreviewRequest{
+		jobs:           r.ingestion.jobs,
+		modelDirectory: models,
+		target:         config.ManagementTarget{Directory: targets, Filename: "config.yaml"},
+		targetID:       "local",
+		modelID:        "new",
+		templateID:     "",
+		recordID:       adopted.ID,
+		input:          modelconfig.CreationCommandInput{Executable: "llama-server"},
+	})
 	if err != nil || review.Artifact.Source.Kind != "local" || review.Artifact.RecordMatch != "unknown" {
 		t.Fatalf("adopted artifact cannot be reviewed: %+v %v", review, err)
 	}
@@ -371,4 +381,104 @@ func TestIngestionRejectsDirectoryAlias(t *testing.T) {
 	if err := validateIngestionDirectories(management, nil); err == nil {
 		t.Fatal("target directory alias accepted")
 	}
+}
+
+func TestServeIngestionRecordsRefactor(t *testing.T) {
+	recordsDir := t.TempDir()
+	if err := os.Chmod(recordsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	jobManager, err := ingestion.NewPersistentJobManager(context.Background(), "token", recordsDir, 10)
+	if err != nil {
+		t.Fatalf("job manager: %v", err)
+	}
+	r := &Reloader{
+		logger:    discardLogger(),
+		ingestion: &ingestionRuntime{jobs: jobManager},
+	}
+	var state reloaderState
+	r.state.Store(&state)
+	recordsPath := "/management/v1/ingestion/records"
+	jobID := "ingest-" + hex.EncodeToString(make([]byte, 16))
+
+	newRequest := func(method, path, body string) *http.Request {
+		req := httptest.NewRequest(method, "https://management.example"+path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		return req
+	}
+
+	t.Run("list empty records", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodGet, recordsPath, ""), &state, recordsPath)
+		if w.Code != http.StatusOK {
+			t.Fatalf("list = %d %s", w.Code, w.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("list body = %s", w.Body.String())
+		}
+		if _, ok := body["records"]; !ok {
+			t.Fatalf("list body missing records: %s", w.Body.String())
+		}
+	})
+
+	t.Run("read unknown record is 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodGet, recordsPath+"/"+jobID, ""), &state, recordsPath)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("read unknown = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("acknowledge unknown record is 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodPost, recordsPath+"/"+jobID+"/acknowledge", `{"acknowledge_uncertain_outcome":true}`), &state, recordsPath)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("ack unknown = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("acknowledge requires explicit true", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodPost, recordsPath+"/"+jobID+"/acknowledge", `{"acknowledge_uncertain_outcome":false}`), &state, recordsPath)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("ack implicit = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("acknowledge invalid JSON is 400", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodPost, recordsPath+"/"+jobID+"/acknowledge", `not json`), &state, recordsPath)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("ack bad json = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("post non-acknowledge path is 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodPost, recordsPath+"/"+jobID, ""), &state, recordsPath)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("post non-ack = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("get with slash in id is 404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodGet, recordsPath+"/a/b", ""), &state, recordsPath)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("get slash = %d %s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("stopped is 503", func(t *testing.T) {
+		r.stopped = true
+		w := httptest.NewRecorder()
+		r.serveIngestionRecords(w, newRequest(http.MethodGet, recordsPath, ""), &state, recordsPath)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("stopped = %d %s", w.Code, w.Body.String())
+		}
+		r.stopped = false
+	})
 }

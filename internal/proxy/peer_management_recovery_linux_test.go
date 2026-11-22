@@ -18,6 +18,9 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
+// callFunc is the shared HTTP caller used by every recovery handler phase.
+type callFunc func(method, suffix, credential, contentType, origin, body string) (int, []byte, http.Header)
+
 func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	f := newDelegatedApplyFixture(t)
 	reserveDelegatedFixture(t, f)
@@ -52,16 +55,32 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 		}
 		return resp.StatusCode, data, resp.Header
 	}
+	valid := `{"acknowledge_review":true,"acknowledge_no_retry":true}`
+	assertInitialInspection(t, call, token, f.target)
+	assertInvalidReviewRequests(t, call, token, f.state.management.PreviewToken, valid)
+	assertFlockRejects(t, f, call, token, valid)
+	reviewedAt := assertReviewWithoutWritePeer(t, f, call, token, valid)
+	assertNoRetryAndTarget(t, f, call, token, reviewedAt)
+	assertUnregisteredRouteAuth(t, f, path)
+}
+
+// assertInitialInspection verifies the initial GET inspection returns an unknown,
+// unreviewed record with no-store security headers and no leaked secrets.
+func assertInitialInspection(t *testing.T, call callFunc, token, target string) {
 	status, body, headers := call(http.MethodGet, "", token, "", "", "")
 	var record modelconfig.DelegatedOperation
 	if status != http.StatusOK || json.Unmarshal(body, &record) != nil || record.Outcome != "unknown" || record.ReviewedAt != nil {
 		t.Fatalf("inspection status=%d record=%+v body=%q", status, record, body)
 	}
 	if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" ||
-		bytes.Contains(body, []byte(token)) || bytes.Contains(body, []byte(f.target)) || bytes.Contains(body, []byte("confidential")) {
+		bytes.Contains(body, []byte(token)) || bytes.Contains(body, []byte(target)) || bytes.Contains(body, []byte("confidential")) {
 		t.Fatalf("unsafe inspection response: %s", body)
 	}
-	valid := `{"acknowledge_review":true,"acknowledge_no_retry":true}`
+}
+
+// assertInvalidReviewRequests exercises all 12 malformed or unauthorized review
+// request cases through the shared call helper.
+func assertInvalidReviewRequests(t *testing.T, call callFunc, token, previewToken, valid string) {
 	for _, tt := range []struct {
 		name        string
 		method      string
@@ -73,7 +92,7 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 		want        int
 	}{
 		{"peer token", http.MethodPost, "/review", strings.Repeat("p", 32), "application/json", "", valid, http.StatusUnauthorized},
-		{"preview token", http.MethodPost, "/review", f.state.management.PreviewToken, "application/json", "", valid, http.StatusUnauthorized},
+		{"preview token", http.MethodPost, "/review", previewToken, "application/json", "", valid, http.StatusUnauthorized},
 		{"cross origin", http.MethodPost, "/review", token, "application/json", "https://different.example", valid, http.StatusForbidden},
 		{"missing review", http.MethodPost, "/review", token, "application/json", "", `{"acknowledge_no_retry":true}`, http.StatusBadRequest},
 		{"missing no retry", http.MethodPost, "/review", token, "application/json", "", `{"acknowledge_review":true}`, http.StatusBadRequest},
@@ -92,6 +111,11 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertFlockRejects verifies that a live operation under an exclusive flock
+// rejects review requests with 503 Service Unavailable, then releases the lock.
+func assertFlockRejects(t *testing.T, f delegatedApplyFixture, call callFunc, token, valid string) {
 	dir, err := os.Open(f.operations)
 	if err != nil {
 		t.Fatal(err)
@@ -106,6 +130,12 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	if err := syscall.Flock(int(dir.Fd()), syscall.LOCK_UN); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// assertReviewWithoutWritePeer verifies that review succeeds without the write
+// capability or an enabled peer scope, and that repeated review preserves
+// ReviewedAt.
+func assertReviewWithoutWritePeer(t *testing.T, f delegatedApplyFixture, call callFunc, token, valid string) time.Time {
 	// Review does not require the write capability or an enabled peer scope.
 	f.r.lifecycleMu.Lock()
 	disabled := *f.state
@@ -114,7 +144,8 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	disabled.peer = nil
 	f.r.state.Store(&disabled)
 	f.r.lifecycleMu.Unlock()
-	status, body, _ = call(http.MethodPost, "/review", token, "application/json", "", valid)
+	status, body, _ := call(http.MethodPost, "/review", token, "application/json", "", valid)
+	var record modelconfig.DelegatedOperation
 	if status != http.StatusOK || json.Unmarshal(body, &record) != nil || record.Outcome != "unknown" || record.ReviewedAt == nil {
 		t.Fatalf("review status=%d record=%+v body=%q", status, record, body)
 	}
@@ -123,6 +154,12 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	if status != http.StatusOK || json.Unmarshal(body, &record) != nil || record.ReviewedAt == nil || !record.ReviewedAt.Equal(reviewedAt) {
 		t.Fatalf("repeated review status=%d record=%+v", status, record)
 	}
+	return reviewedAt
+}
+
+// assertNoRetryAndTarget verifies that review does not authorize a retry
+// reservation and that the target file remains unchanged.
+func assertNoRetryAndTarget(t *testing.T, f delegatedApplyFixture, call callFunc, token string, reviewedAt time.Time) {
 	proposal, err := modelconfig.LoadDelegatedProposal(f.proposals, f.input.ProposalID)
 	if err != nil {
 		t.Fatal(err)
@@ -134,6 +171,11 @@ func TestOwnerDelegatedRecoveryHandler(t *testing.T) {
 	if err != nil || !bytes.Equal(current, f.source) {
 		t.Fatalf("recovery changed target: %v", err)
 	}
+}
+
+// assertUnregisteredRouteAuth verifies that the owner recovery route enforces
+// the backup credential scope for unregistered requests.
+func assertUnregisteredRouteAuth(t *testing.T, f delegatedApplyFixture, path string) {
 	unregistered := httptest.NewRequest(http.MethodGet, "https://owner.example"+path, nil)
 	unregistered.Header.Set("Authorization", "Bearer "+f.state.management.PreviewToken)
 	recorder := httptest.NewRecorder()
@@ -227,7 +269,9 @@ func TestOwnerRecoveryRejectsKnownAndWrongOperation(t *testing.T) {
 	}); status != http.StatusUnauthorized {
 		t.Fatalf("duplicate credential status=%d", status)
 	}
-	if status := send(f.input.OperationID, func(req *http.Request) { req.TLS = nil }); status != http.StatusForbidden {
+	if status := send(f.input.OperationID, func(req *http.Request) {
+		req.TLS = nil
+	}); status != http.StatusForbidden {
 		t.Fatalf("plaintext review status=%d", status)
 	}
 	if status := send(f.input.OperationID, func(req *http.Request) {

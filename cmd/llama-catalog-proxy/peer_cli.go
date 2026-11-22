@@ -26,6 +26,12 @@ import (
 
 const defaultPeerConfigPath = "/config/config.yaml"
 
+// peerConfigHelpText is the help text for the --config flag used by peer subcommands.
+const peerConfigHelpText = "path to YAML configuration"
+
+// peerNodeIDFlag is the CLI flag name for the peer node identity used by peer subcommands.
+const peerNodeIDFlag = "node-id"
+
 func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("usage: llama-catalog-proxy peer {catalog-grants|config|discover|inference-grants|invite|join|members|grants} ...")
@@ -115,8 +121,8 @@ func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 
 func runPeerInviteCreate(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer invite create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
-	nodeID := flags.String("node-id", "", "expected node ID to invite")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
+	nodeID := flags.String(peerNodeIDFlag, "", "expected node ID to invite")
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -139,7 +145,7 @@ func runPeerInviteCreate(args []string, stdout, stderr io.Writer) error {
 
 func runPeerInviteList(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer invite list", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -159,8 +165,8 @@ func runPeerInviteList(args []string, stdout, stderr io.Writer) error {
 
 func runPeerInviteRevoke(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer invite revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
-	nodeID := flags.String("node-id", "", "expected node ID whose invitation to cancel")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
+	nodeID := flags.String(peerNodeIDFlag, "", "expected node ID whose invitation to cancel")
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -183,7 +189,7 @@ func runPeerInviteRevoke(args []string, stdout, stderr io.Writer) error {
 
 func runPeerMembersList(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer members list", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -203,8 +209,8 @@ func runPeerMembersList(args []string, stdout, stderr io.Writer) error {
 
 func runPeerMemberRevoke(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer members revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
-	nodeID := flags.String("node-id", "", "paired node ID to revoke")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
+	nodeID := flags.String(peerNodeIDFlag, "", "paired node ID to revoke")
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -227,7 +233,7 @@ func runPeerMemberRevoke(args []string, stdout, stderr io.Writer) error {
 
 func runPeerGrantCreate(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer grants create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	requester := flags.String("requester-node", "", "paired requester node ID")
 	backend := flags.String("backend", "", "locally owned backend ID")
 	models := flags.String("models", "", "comma-separated local model IDs")
@@ -292,7 +298,7 @@ func runPeerGrantCreate(args []string, stdout, stderr io.Writer) error {
 
 func runPeerGrantList(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer grants list", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
@@ -312,7 +318,7 @@ func runPeerGrantList(args []string, stdout, stderr io.Writer) error {
 
 func runPeerGrantRevoke(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer grants revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	grantID := flags.String("grant-id", "", "owner grant ID to revoke")
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
@@ -451,7 +457,7 @@ func randomCLIGrantID() (string, error) {
 
 func runPeerJoin(args []string, stdout, stderr io.Writer) error {
 	flags := peerFlags("peer join", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, "path to YAML configuration")
+	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	peerURL := flags.String("url", "", "HTTPS origin of the node issuing the invitation")
 	discoverNodeID := flags.String("discover-node-id", "", "select the mDNS candidate by exact node ID")
 	expectedNodeID := flags.String("expected-node-id", "", "require this node ID from the peer TLS certificate")
@@ -516,7 +522,14 @@ func runPeerJoin(args []string, stdout, stderr io.Writer) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-		member, err := store.JoinExpected(ctx, targetURL, *expectedNodeID, code, certificate, roots, crls, cfg.Peer.RevocationMaxAge())
+		member, err := store.JoinExpected(ctx, targetURL, federation.JoinExpectedOptions{
+			ExpectedNodeID: *expectedNodeID,
+			Code:           code,
+			Certificate:    certificate,
+			Roots:          roots,
+			CRLs:           crls,
+			MaxCRLAge:      cfg.Peer.RevocationMaxAge(),
+		})
 		if err != nil {
 			return "", "", "", fmt.Errorf("pairing failed: %w", err)
 		}

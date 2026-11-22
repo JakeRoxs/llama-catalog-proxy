@@ -20,6 +20,7 @@ import (
 )
 
 const (
+	adminAuthFailedMsg    = "authentication failed"
 	adminOIDCLoginPath    = "/admin/auth/login"
 	adminOIDCCallbackPath = "/admin/auth/callback"
 	adminOIDCLogoutPath   = "/admin/auth/logout"
@@ -87,17 +88,17 @@ func newAdminAuth(cfg *config.ManagementUIConfig, logger *slog.Logger, client *h
 		}
 		idleTTL = parsed
 	}
-	copy := *cfg
-	copy.RoleGroups = make(map[string][]string, len(cfg.RoleGroups))
+	cfgCopy := *cfg
+	cfgCopy.RoleGroups = make(map[string][]string, len(cfg.RoleGroups))
 	for role, groups := range cfg.RoleGroups {
-		copy.RoleGroups[role] = append([]string(nil), groups...)
+		cfgCopy.RoleGroups[role] = append([]string(nil), groups...)
 	}
-	copy.Scopes = append([]string(nil), cfg.Scopes...)
+	cfgCopy.Scopes = append([]string(nil), cfg.Scopes...)
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &adminAuth{
-		config: copy, logger: logger, httpClient: client, sessionTTL: ttl, idleTTL: idleTTL,
+		config: cfgCopy, logger: logger, httpClient: client, sessionTTL: ttl, idleTTL: idleTTL,
 		pending: make(map[string]oidcLoginTransaction), sessions: make(map[string]adminSession),
 	}, nil
 }
@@ -222,30 +223,30 @@ func (a *adminAuth) callback(w http.ResponseWriter, req *http.Request) {
 		} else {
 			a.logger.Warn("management OIDC code exchange failed", "error_type", fmt.Sprintf("%T", err))
 		}
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		http.Error(w, adminAuthFailedMsg, http.StatusUnauthorized)
 		return
 	}
 	rawIDToken, ok := token.Extra("id_token").(string)
 	if !ok || rawIDToken == "" {
 		a.logger.Warn("management OIDC token response omitted ID token")
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		http.Error(w, adminAuthFailedMsg, http.StatusUnauthorized)
 		return
 	}
 	idToken, err := verifier.Verify(ctx, rawIDToken)
 	if err != nil {
 		a.logger.Warn("management OIDC ID-token verification failed")
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		http.Error(w, adminAuthFailedMsg, http.StatusUnauthorized)
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(idToken.Nonce), []byte(transaction.nonce)) != 1 {
 		a.logger.Warn("management OIDC nonce validation failed")
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		http.Error(w, adminAuthFailedMsg, http.StatusUnauthorized)
 		return
 	}
 	groups, err := oidcGroups(idToken, a.config.GroupsClaim)
 	if err != nil {
 		a.logger.Warn("management OIDC group claim invalid")
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		http.Error(w, adminAuthFailedMsg, http.StatusUnauthorized)
 		return
 	}
 	roles := a.rolesForGroups(groups)

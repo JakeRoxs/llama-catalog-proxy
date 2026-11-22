@@ -180,8 +180,8 @@ func TestStartRejectsUnavailableInterface(t *testing.T) {
 }
 
 func cloneEntry(entry *mdns.ServiceEntry) *mdns.ServiceEntry {
-	copy := *entry
-	copy.InfoFields = append([]string(nil), entry.InfoFields...)
-	copy.AddrV4 = append(net.IP(nil), entry.AddrV4...)
-	return &copy
+	cloned := *entry
+	cloned.InfoFields = append([]string(nil), entry.InfoFields...)
+	cloned.AddrV4 = append(net.IP(nil), entry.AddrV4...)
+	return &cloned
 }

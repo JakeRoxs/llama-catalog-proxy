@@ -21,6 +21,15 @@ var (
 	errDelegationProposalUnknown = errors.New("delegated proposal creation outcome unknown; owner-side review may require cleanup")
 )
 
+// S1192: duplicated string literals replaced by package-level constants.
+// contentTypeHeader ("Content-Type") is declared once in admin_ui.go and
+// reused here for the header key. bearerPrefix and jsonMediaType are unique
+// to this file's delegated management transport protocol.
+const (
+	bearerPrefix  = "Bearer "
+	jsonMediaType = "application/json"
+)
+
 // forwardDelegatedOperation is an internal read-only transport foundation.
 // The owner endpoint and receiving management route are not registered yet.
 func (r *Reloader) forwardDelegatedOperation(req *http.Request, state *reloaderState, owner, proposalID, operationID string) (modelconfig.DelegatedOperation, error) {
@@ -59,8 +68,8 @@ func (r *Reloader) forwardDelegatedOperation(req *http.Request, state *reloaderS
 	if err != nil {
 		return modelconfig.DelegatedOperation{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedOperation{}, errDelegationPeerUnavailable
@@ -86,8 +95,8 @@ func decodeDelegatedOperationResponse(response *http.Response) (modelconfig.Dele
 }
 
 func decodeDelegatedPeerJSON(response *http.Response, dst any) error {
-	contentType, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || contentType != "application/json" || response.Header.Get("Content-Encoding") != "" {
+	contentType, _, err := mime.ParseMediaType(response.Header.Get(contentTypeHeader))
+	if err != nil || contentType != jsonMediaType || response.Header.Get("Content-Encoding") != "" {
 		return errDelegationPeerResponse
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, maxManagementRequest+1))
@@ -140,9 +149,9 @@ func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *re
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Content-Type", "application/json")
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set(contentTypeHeader, jsonMediaType)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationProposalUnknown
@@ -153,10 +162,7 @@ func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *re
 	}
 	var proposal modelconfig.DelegatedProposal
 	if err := decodeDelegatedPeerJSON(response, &proposal); err != nil ||
-		modelconfig.ValidateDelegatedProposal(proposal, input.Owner, state.peer.NodeID, input.Backend, proposal.Proposal.TargetID, time.Now()) != nil ||
-		proposal.Proposal.ModelID != input.Model || proposal.Proposal.Revision != input.Revision ||
-		!reflect.DeepEqual(proposal.Proposal.Settings, input.Settings) ||
-		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
+		!validateDelegatedProposalResponse(proposal, input.Owner, state.peer.NodeID, input.Backend, input.Model, input.Revision, input.Settings, time.Now()) {
 		return modelconfig.DelegatedProposal{}, errDelegationProposalUnknown
 	}
 	return proposal, nil
@@ -191,8 +197,8 @@ func (r *Reloader) forwardDelegatedSettingsGrants(req *http.Request, state *relo
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
@@ -246,9 +252,9 @@ func (r *Reloader) forwardDelegatedSettingsSnapshot(req *http.Request, state *re
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Content-Type", "application/json")
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set(contentTypeHeader, jsonMediaType)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, modelconfig.SettingsSnapshot{}, errDelegationPeerUnavailable
@@ -299,9 +305,9 @@ func (r *Reloader) forwardDelegatedSettingsPreview(req *http.Request, state *rel
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Content-Type", "application/json")
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set(contentTypeHeader, jsonMediaType)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedOwner{}, modelconfig.Preview{}, errDelegationPeerUnavailable
@@ -337,6 +343,87 @@ func validDelegatedSettingChanges(changes []modelconfig.SettingChange) bool {
 		}
 	}
 	return true
+}
+
+// validateDelegatedProposalResponse checks that a decoded proposal response is
+// bound to the requesting owner and matches the request settings, revision, and
+// lifetime. It performs no transport or state mutation.
+func validateDelegatedProposalResponse(proposal modelconfig.DelegatedProposal, owner modelconfig.DelegatedOwner, requesterNodeID, backendID, modelID, revision string, settings modelconfig.CommandSettings, now time.Time) bool {
+	if err := modelconfig.ValidateDelegatedProposal(proposal, owner, requesterNodeID, backendID, proposal.Proposal.TargetID, now); err != nil {
+		return false
+	}
+	if proposal.Proposal.ModelID != modelID || proposal.Proposal.Revision != revision {
+		return false
+	}
+	if !reflect.DeepEqual(proposal.Proposal.Settings, settings) {
+		return false
+	}
+	if proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
+		return false
+	}
+	return true
+}
+
+// validateDelegatedProposalRecoveryResponse checks that a decoded recovery
+// proposal response matches the request bindings and carries a non-empty
+// recovery audit. It performs no transport or state mutation.
+func validateDelegatedProposalRecoveryResponse(proposal modelconfig.DelegatedProposal, owner modelconfig.DelegatedOwner, requesterNodeID, backendID, modelID, revision string, settings modelconfig.CommandSettings, now time.Time) bool {
+	if err := modelconfig.ValidateDelegatedProposal(proposal, owner, requesterNodeID, backendID, proposal.Proposal.TargetID, now); err != nil {
+		return false
+	}
+	if proposal.Proposal.ModelID != modelID || proposal.Proposal.Revision != revision {
+		return false
+	}
+	if !reflect.DeepEqual(proposal.Proposal.Settings, settings) {
+		return false
+	}
+	if proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
+		return false
+	}
+	if len(proposal.RecoveryAudit) == 0 {
+		return false
+	}
+	return true
+}
+
+// validateRecoveryAudit checks the latest recovery audit event identifies the
+// authenticated requester, its credential scope, the owner, and a terminal
+// recovered or expired outcome. It performs no transport.
+func validateRecoveryAudit(audit modelconfig.DelegatedProposalRecoveryAudit, requesterNodeID, ownerNodeID string) bool {
+	return audit.RequesterNode == requesterNodeID &&
+		audit.CredentialScope == modelconfig.DelegatedSettingsCredentialScope &&
+		audit.OwnerNode == ownerNodeID &&
+		(audit.Outcome == "recovered" || audit.Outcome == "expired")
+}
+
+// validateDelegatedApplyReview checks the apply acknowledgements, peer binding,
+// operation id, and proposal binding. It returns the first failing error.
+func validateDelegatedApplyReview(review modelconfig.DelegatedProposal, operationID string, state *reloaderState, ackReview, ackDisruption, ackExclusive bool) error {
+	if !ackReview || !ackDisruption || !ackExclusive {
+		return errDelegationAcknowledgment
+	}
+	if state.peer == nil || review.Owner.NodeID == state.peer.NodeID {
+		return errDelegationPeerUnavailable
+	}
+	if !modelconfig.ValidDelegatedOperationID(operationID) {
+		return modelconfig.ErrProposalInvalid
+	}
+	return modelconfig.ValidateDelegatedProposal(review, review.Owner, state.peer.NodeID, review.BackendID, review.Proposal.TargetID, time.Now())
+}
+
+// validateDelegatedOperationResponse checks that a decoded delegated operation
+// record matches the review identity, operation, backend, target, model, review
+// revision, and proposal expiry. It performs no transport.
+func validateDelegatedOperationResponse(record modelconfig.DelegatedOperation, review modelconfig.DelegatedProposal, requesterNodeID, operationID string) bool {
+	return record.Owner == review.Owner &&
+		record.RequesterNode == requesterNodeID &&
+		record.ProposalID == review.Proposal.ID &&
+		record.OperationID == operationID &&
+		record.BackendID == review.BackendID &&
+		record.TargetID == review.Proposal.TargetID &&
+		record.ModelID == review.Proposal.ModelID &&
+		record.ReviewRevision == review.ReviewRevision &&
+		record.ProposalExpiresAt.Equal(review.ExpiresAt)
 }
 
 // Recovery is a read-only exact-match lookup; repeating it does not reserve an
@@ -379,9 +466,9 @@ func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, s
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Content-Type", "application/json")
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set(contentTypeHeader, jsonMediaType)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
@@ -398,17 +485,10 @@ func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, s
 	}
 	var proposal modelconfig.DelegatedProposal
 	if err := decodeDelegatedPeerJSON(response, &proposal); err != nil ||
-		modelconfig.ValidateDelegatedProposal(proposal, input.Owner, state.peer.NodeID, input.Backend,
-			proposal.Proposal.TargetID, proposal.Proposal.CreatedAt) != nil ||
-		proposal.Proposal.ModelID != input.Model || proposal.Proposal.Revision != input.Revision ||
-		!reflect.DeepEqual(proposal.Proposal.Settings, input.Settings) ||
-		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime ||
-		len(proposal.RecoveryAudit) == 0 {
+		!validateDelegatedProposalRecoveryResponse(proposal, input.Owner, state.peer.NodeID, input.Backend, input.Model, input.Revision, input.Settings, proposal.Proposal.CreatedAt) {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerResponse
 	}
-	audit := proposal.RecoveryAudit[len(proposal.RecoveryAudit)-1]
-	if audit.RequesterNode != state.peer.NodeID || audit.CredentialScope != modelconfig.DelegatedSettingsCredentialScope ||
-		audit.OwnerNode != input.Owner.NodeID || audit.Outcome != "recovered" && audit.Outcome != "expired" {
+	if !validateRecoveryAudit(proposal.RecoveryAudit[len(proposal.RecoveryAudit)-1], state.peer.NodeID, input.Owner.NodeID) {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerResponse
 	}
 	return proposal, nil
@@ -437,16 +517,7 @@ func (r *Reloader) forwardDelegatedSettingsApply(req *http.Request, state *reloa
 	if err := req.Context().Err(); err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}
-	if !acknowledgeReview || !acknowledgeDisruption || !acknowledgeExclusiveWindow {
-		return modelconfig.DelegatedOperation{}, errDelegationAcknowledgment
-	}
-	if state.peer == nil || review.Owner.NodeID == state.peer.NodeID {
-		return modelconfig.DelegatedOperation{}, errDelegationPeerUnavailable
-	}
-	if !modelconfig.ValidDelegatedOperationID(operationID) {
-		return modelconfig.DelegatedOperation{}, modelconfig.ErrProposalInvalid
-	}
-	if err := modelconfig.ValidateDelegatedProposal(review, review.Owner, state.peer.NodeID, review.BackendID, review.Proposal.TargetID, time.Now()); err != nil {
+	if err := validateDelegatedApplyReview(review, operationID, state, acknowledgeReview, acknowledgeDisruption, acknowledgeExclusiveWindow); err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}
 	client := state.peerClients[review.Owner.NodeID]
@@ -465,9 +536,9 @@ func (r *Reloader) forwardDelegatedSettingsApply(req *http.Request, state *reloa
 	if err != nil {
 		return modelconfig.DelegatedOperation{}, errDelegationPeerUnavailable
 	}
-	remote.Header.Set("Authorization", "Bearer "+client.token)
-	remote.Header.Set("Content-Type", "application/json")
-	remote.Header.Set("Accept", "application/json")
+	remote.Header.Set("Authorization", bearerPrefix+client.token)
+	remote.Header.Set(contentTypeHeader, jsonMediaType)
+	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedOperation{}, errDelegationOutcomeUnknown
@@ -477,11 +548,7 @@ func (r *Reloader) forwardDelegatedSettingsApply(req *http.Request, state *reloa
 		return modelconfig.DelegatedOperation{}, errDelegationOutcomeUnknown
 	}
 	record, err := decodeDelegatedOperationResponse(response)
-	if err != nil || record.Owner != review.Owner || record.RequesterNode != state.peer.NodeID ||
-		record.ProposalID != review.Proposal.ID || record.OperationID != operationID ||
-		record.BackendID != review.BackendID || record.TargetID != review.Proposal.TargetID ||
-		record.ModelID != review.Proposal.ModelID || record.ReviewRevision != review.ReviewRevision ||
-		!record.ProposalExpiresAt.Equal(review.ExpiresAt) {
+	if err != nil || !validateDelegatedOperationResponse(record, review, state.peer.NodeID, operationID) {
 		return modelconfig.DelegatedOperation{}, errDelegationOutcomeUnknown
 	}
 	return record, nil

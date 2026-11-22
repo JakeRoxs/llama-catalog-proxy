@@ -29,6 +29,22 @@ const (
 	ownerProposalsPath               = "/management/v1/delegation/owner/proposals"
 )
 
+// Duplicated string literals addressed by sonarqube go:S1192.
+// Each constant replaces a literal repeated across multiple handler paths.
+const (
+	headerCacheControl        = "Cache-Control"
+	headerXContentTypeOptions = "X-Content-Type-Options"
+	cacheControlNoStore       = "no-store"
+
+	errTLSRequired                = "TLS required"
+	errMethodNotAllowed           = "method not allowed"
+	errInvalidRequestOrigin       = "invalid request origin"
+	errRequestBodyNotAllowed      = "request body not allowed"
+	errPeerServiceBusy            = "peer service busy"
+	errPeerAuditStoreUnavailable  = "audit store unavailable"
+	errAuditCompletionUnavailable = "audit completion unavailable"
+)
+
 const delegatedProposalLifetime = 15 * time.Minute
 
 func (r *Reloader) serveDelegatedManagement(w http.ResponseWriter, req *http.Request, state *reloaderState) {
@@ -47,10 +63,10 @@ func (r *Reloader) serveDelegatedManagement(w http.ResponseWriter, req *http.Req
 }
 
 func (r *Reloader) serveReceivingDelegatedSettings(w http.ResponseWriter, req *http.Request, state *reloaderState) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return
 	}
 	if req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path || req.URL.RawQuery != "" || req.URL.ForceQuery {
@@ -58,7 +74,7 @@ func (r *Reloader) serveReceivingDelegatedSettings(w http.ResponseWriter, req *h
 		return
 	}
 	if !sameIngestionOrigin(req) {
-		http.Error(w, "invalid request origin", http.StatusForbidden)
+		http.Error(w, errInvalidRequestOrigin, http.StatusForbidden)
 		return
 	}
 	if state == nil || state.management == nil || !r.delegatedCallerAuthorized(req, state) {
@@ -67,7 +83,7 @@ func (r *Reloader) serveReceivingDelegatedSettings(w http.ResponseWriter, req *h
 	}
 	if req.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 	switch req.URL.Path {
@@ -134,21 +150,21 @@ func delegatedOperationPath(req *http.Request, prefix string, withOwner bool) (s
 }
 
 func prepareDelegatedOperationLookup(w http.ResponseWriter, req *http.Request) bool {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return false
 	}
 	if req.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return false
 	}
 	if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
 		req.Close = true
 		w.Header().Set("Connection", "close")
-		http.Error(w, "request body not allowed", http.StatusBadRequest)
+		http.Error(w, errRequestBodyNotAllowed, http.StatusBadRequest)
 		return false
 	}
 	return true
@@ -168,7 +184,7 @@ func (r *Reloader) servePeerDelegatedOperation(w http.ResponseWriter, req *http.
 	case r.peerSlots <- struct{}{}:
 		defer func() { <-r.peerSlots }()
 	default:
-		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
+		http.Error(w, errPeerServiceBusy, http.StatusServiceUnavailable)
 		return
 	}
 	record, err := r.peerDelegatedOperation(req, r.state.Load(), proposalID, operationID)
@@ -184,7 +200,7 @@ func (r *Reloader) serveReceivingDelegatedOperation(w http.ResponseWriter, req *
 		return
 	}
 	if !sameIngestionOrigin(req) {
-		http.Error(w, "invalid request origin", http.StatusForbidden)
+		http.Error(w, errInvalidRequestOrigin, http.StatusForbidden)
 		return
 	}
 	owner, proposalID, operationID, ok := delegatedOperationPath(req, receivedOperationPath, true)
@@ -201,10 +217,10 @@ func (r *Reloader) serveReceivingDelegatedOperation(w http.ResponseWriter, req *
 }
 
 func (r *Reloader) preparePeerDelegatedSettings(w http.ResponseWriter, req *http.Request, path string) (*reloaderState, bool) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return nil, false
 	}
 	if req.URL.Path != path || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path ||
@@ -214,13 +230,13 @@ func (r *Reloader) preparePeerDelegatedSettings(w http.ResponseWriter, req *http
 	}
 	if req.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return nil, false
 	}
 	select {
 	case r.peerSlots <- struct{}{}:
 	default:
-		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
+		http.Error(w, errPeerServiceBusy, http.StatusServiceUnavailable)
 		return nil, false
 	}
 	state := r.state.Load()
@@ -233,10 +249,10 @@ func (r *Reloader) preparePeerDelegatedSettings(w http.ResponseWriter, req *http
 }
 
 func (r *Reloader) preparePeerDelegatedSettingsGet(w http.ResponseWriter, req *http.Request, path string) (*reloaderState, string, bool) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return nil, "", false
 	}
 	if req.URL.Path != path || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path || req.URL.RawQuery != "" || req.URL.ForceQuery {
@@ -245,13 +261,13 @@ func (r *Reloader) preparePeerDelegatedSettingsGet(w http.ResponseWriter, req *h
 	}
 	if req.Method != http.MethodGet || req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
 		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return nil, "", false
 	}
 	select {
 	case r.peerSlots <- struct{}{}:
 	default:
-		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
+		http.Error(w, errPeerServiceBusy, http.StatusServiceUnavailable)
 		return nil, "", false
 	}
 	state := r.state.Load()
@@ -277,12 +293,12 @@ func (r *Reloader) servePeerDelegatedSettingsGrants(w http.ResponseWriter, req *
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "delegation.grants.list", "", "", "")
 	if auditErr != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errPeerAuditStoreUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	grants, err := modelconfig.ListOwnerGrants(state.management.DelegatedStore.GrantDirectory)
 	if finishAudit(auditTx, auditOutcomeForError(err), "", "", "") != nil {
-		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errAuditCompletionUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	if err != nil {
@@ -334,12 +350,12 @@ func (r *Reloader) servePeerDelegatedSettingsSnapshot(w http.ResponseWriter, req
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.snapshot.read", input.TargetID, input.ModelID, "")
 	if auditErr != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errPeerAuditStoreUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	snapshot, err := modelconfig.ReadSettingsTarget(target.Directory, target.Filename, input.TargetID, input.ModelID)
 	if finishAudit(auditTx, auditOutcomeForError(err), input.TargetID, input.ModelID, "") != nil {
-		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errAuditCompletionUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	if err != nil {
@@ -371,12 +387,12 @@ func (r *Reloader) servePeerDelegatedSettingsPreview(w http.ResponseWriter, req 
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.preview", input.TargetID, input.ModelID, "")
 	if auditErr != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errPeerAuditStoreUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	preview, err := modelconfig.PreviewTarget(target.Directory, target.Filename, input.TargetID, input.ModelID, input.Settings)
 	if finishAudit(auditTx, auditOutcomeForError(err), input.TargetID, input.ModelID, "") != nil {
-		http.Error(w, "audit completion unavailable", http.StatusServiceUnavailable)
+		http.Error(w, errAuditCompletionUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	if err != nil {
@@ -470,17 +486,34 @@ func (r *Reloader) servePeerDelegatedSettingsApply(w http.ResponseWriter, req *h
 	writeJSON(r.logger, w, http.StatusOK, record)
 }
 
+// requireReviewAcknowledgements decodes and validates the owner review acknowledgement
+// body. It returns nil when no review is requested or when both acknowledgements are
+// present; otherwise it returns an error describing the rejection.
+func requireReviewAcknowledgements(req *http.Request, review bool) error {
+	if !review {
+		return nil
+	}
+	var input struct {
+		AcknowledgeReview  bool `json:"acknowledge_review"`
+		AcknowledgeNoRetry bool `json:"acknowledge_no_retry"`
+	}
+	if err := decodeBenchmarkJSON(req, &input); err != nil || !input.AcknowledgeReview || !input.AcknowledgeNoRetry {
+		return errors.New("review and no-retry acknowledgements required")
+	}
+	return nil
+}
+
 // Owner review acknowledges an unknown outcome without resolving it or permitting retry.
 // This handler is intentionally not registered on the management listener.
 func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return
 	}
 	if !sameIngestionOrigin(req) {
-		http.Error(w, "invalid request origin", http.StatusForbidden)
+		http.Error(w, errInvalidRequestOrigin, http.StatusForbidden)
 		return
 	}
 	pathRequest := *req
@@ -501,13 +534,13 @@ func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http
 	}
 	if req.Method != method {
 		w.Header().Set("Allow", method)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 	if !review && (req.ContentLength != 0 || len(req.TransferEncoding) != 0) {
 		req.Close = true
 		w.Header().Set("Connection", "close")
-		http.Error(w, "request body not allowed", http.StatusBadRequest)
+		http.Error(w, errRequestBodyNotAllowed, http.StatusBadRequest)
 		return
 	}
 	state := r.state.Load()
@@ -523,15 +556,9 @@ func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http
 		http.Error(w, "management service busy", http.StatusServiceUnavailable)
 		return
 	}
-	if review {
-		var input struct {
-			AcknowledgeReview  bool `json:"acknowledge_review"`
-			AcknowledgeNoRetry bool `json:"acknowledge_no_retry"`
-		}
-		if err := decodeBenchmarkJSON(req, &input); err != nil || !input.AcknowledgeReview || !input.AcknowledgeNoRetry {
-			http.Error(w, "review and no-retry acknowledgements required", http.StatusBadRequest)
-			return
-		}
+	if err := requireReviewAcknowledgements(req, review); err != nil {
+		http.Error(w, "review and no-retry acknowledgements required", http.StatusBadRequest)
+		return
 	}
 	record, err := r.ownerDelegatedOperation(req, state, proposalID, operationID, review)
 	if err != nil {
@@ -545,10 +572,10 @@ func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http
 // the management listener. Cleanup names proposals explicitly and rechecks
 // expiry and operation-ledger absence while both stores are locked.
 func (r *Reloader) serveOwnerDelegatedProposals(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set(headerCacheControl, cacheControlNoStore)
+	w.Header().Set(headerXContentTypeOptions, "nosniff")
 	if req.TLS == nil {
-		http.Error(w, "TLS required", http.StatusForbidden)
+		http.Error(w, errTLSRequired, http.StatusForbidden)
 		return
 	}
 	if req.URL.Path != ownerProposalsPath || req.URL.RawPath != "" || req.URL.EscapedPath() != req.URL.Path ||
@@ -557,19 +584,19 @@ func (r *Reloader) serveOwnerDelegatedProposals(w http.ResponseWriter, req *http
 		return
 	}
 	if !sameIngestionOrigin(req) {
-		http.Error(w, "invalid request origin", http.StatusForbidden)
+		http.Error(w, errInvalidRequestOrigin, http.StatusForbidden)
 		return
 	}
 	cleanup := req.Method == http.MethodPost
 	if !cleanup && req.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET, POST")
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, errMethodNotAllowed, http.StatusMethodNotAllowed)
 		return
 	}
 	if !cleanup && (req.ContentLength != 0 || len(req.TransferEncoding) != 0) {
 		req.Close = true
 		w.Header().Set("Connection", "close")
-		http.Error(w, "request body not allowed", http.StatusBadRequest)
+		http.Error(w, errRequestBodyNotAllowed, http.StatusBadRequest)
 		return
 	}
 	state := r.state.Load()

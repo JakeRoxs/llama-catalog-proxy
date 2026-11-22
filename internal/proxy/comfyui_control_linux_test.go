@@ -73,16 +73,46 @@ func controlOperation(t *testing.T, client *http.Client, operation, leaseID stri
 }
 
 func TestComfyUIControlLifecycleAndRestart(t *testing.T) {
+	c, control, client, calls := newComfyUICoordinatorFixture(t, time.Second)
+	assertFailClosedStartup(t, client, calls)
+	assertCoordinatorExclusivityEstablished(t, c)
+	acquired := assertAcquireActivateRelease(t, client, calls)
+	assertDuplicateReleaseIsCallback(t, client, acquired, calls)
+	newLease := assertNewAcquireUsesNewLeaseID(t, client, acquired)
+	assertReplyNotRelabeledWithCurrentLease(t, control, newLease, acquired)
+	assertStaleReleaseRejected(t, client, acquired)
+	assertShutdownAndSocketCleanup(t, control, c)
+	assertRestartStartsFresh(t, c, control, calls, newLease)
+}
+
+// newComfyUICoordinatorFixture builds a coordinator and control fixture, asserting
+// the private socket contract. It returns the coordinator, control, HTTP client,
+// and the verifier call counter shared by the lifecycle phases.
+func newComfyUICoordinatorFixture(t *testing.T, timeout time.Duration) (*comfyUICoordinator, *comfyUIControl, *http.Client, *atomic.Int32) {
+	t.Helper()
 	var calls atomic.Int32
 	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
 		calls.Add(1)
 		return confirmedCoordinatorEvidence(), nil
 	})
-	control, client := comfyUIControlFixture(t, c, time.Second)
+	control, client := comfyUIControlFixture(t, c, timeout)
+	assertPrivateSocket(t, control)
+	return c, control, client, &calls
+}
+
+// assertPrivateSocket verifies the control socket is a private (0o600) socket file.
+func assertPrivateSocket(t *testing.T, control *comfyUIControl) {
+	t.Helper()
 	info, err := os.Lstat(control.path)
 	if err != nil || info.Mode().Perm() != 0o600 || info.Mode()&os.ModeSocket == 0 {
 		t.Fatalf("private socket mode=%v err=%v", info, err)
 	}
+}
+
+// assertFailClosedStartup verifies startup rejects mutations before the owner
+// establishes exclusivity and that the verifier is not invoked by the control plane.
+func assertFailClosedStartup(t *testing.T, client *http.Client, calls *atomic.Int32) {
+	t.Helper()
 	if result := controlOperation(t, client, "status", "", 200); result.State != "unknown" || result.LeaseID != "" || calls.Load() != 0 {
 		t.Fatalf("startup was not fail-closed: %+v calls=%d", result, calls.Load())
 	}
@@ -91,10 +121,22 @@ func TestComfyUIControlLifecycleAndRestart(t *testing.T) {
 	if result.Error != "exclusive_reconciliation_not_bound" || calls.Load() != 0 {
 		t.Fatal("remote reconciliation inferred exclusive admission or called /free")
 	}
+}
+
+// assertCoordinatorExclusivityEstablished records the future owner's direct
+// reconciliation, which must establish exclusivity before internal admission.
+func assertCoordinatorExclusivityEstablished(t *testing.T, c *comfyUICoordinator) {
+	t.Helper()
 	// The future owner binding must establish exclusivity before this internal call.
 	if _, err := c.reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// assertAcquireActivateRelease drives acquire, activate, and release, returning the
+// acquire response for use by later phases.
+func assertAcquireActivateRelease(t *testing.T, client *http.Client, calls *atomic.Int32) comfyUIControlResponse {
+	t.Helper()
 	acquired := controlOperation(t, client, "acquire", "", 200)
 	if acquired.State != "acquiring" || len(acquired.LeaseID) != 32 || acquired.OperationLeaseID != acquired.LeaseID {
 		t.Fatalf("acquire response=%+v", acquired)
@@ -104,14 +146,34 @@ func TestComfyUIControlLifecycleAndRestart(t *testing.T) {
 	if released.State != "released" || released.Receipt == nil || released.Receipt.State != "confirmed" || released.OperationLeaseID != acquired.OperationLeaseID {
 		t.Fatalf("release response=%+v", released)
 	}
+	return acquired
+}
+
+// assertDuplicateReleaseIsCallback verifies a duplicate release is counted as a
+// control callback without re-verifying.
+func assertDuplicateReleaseIsCallback(t *testing.T, client *http.Client, acquired comfyUIControlResponse, calls *atomic.Int32) {
+	t.Helper()
 	controlOperation(t, client, "release", acquired.LeaseID, 200)
 	if calls.Load() != 2 {
 		t.Fatal("duplicate control callback repeated verification")
 	}
+}
+
+// assertNewAcquireUsesNewLeaseID verifies re-acquisition after release obtains a
+// distinct lease ID.
+func assertNewAcquireUsesNewLeaseID(t *testing.T, client *http.Client, acquired comfyUIControlResponse) comfyUIControlResponse {
+	t.Helper()
 	newLease := controlOperation(t, client, "acquire", "", 200)
 	if newLease.LeaseID == acquired.LeaseID {
 		t.Fatal("new control acquisition reused old ID")
 	}
+	return newLease
+}
+
+// assertReplyNotRelabeledWithCurrentLease verifies a control reply preserves the
+// operation lease ID instead of relabeling it with the current lease snapshot.
+func assertReplyNotRelabeledWithCurrentLease(t *testing.T, control *comfyUIControl, newLease, acquired comfyUIControlResponse) {
+	t.Helper()
 	// Replies distinguish a completed operation from a newer current lease snapshot.
 	response := httptest.NewRecorder()
 	cached := confirmedCoordinatorEvidence()
@@ -121,9 +183,20 @@ func TestComfyUIControlLifecycleAndRestart(t *testing.T) {
 		concurrentReply.LeaseID != newLease.LeaseID || concurrentReply.OperationLeaseID != acquired.OperationLeaseID {
 		t.Fatalf("operation evidence was relabeled with current lease: %+v err=%v", concurrentReply, err)
 	}
+}
+
+// assertStaleReleaseRejected verifies a release against a superseded lease is rejected.
+func assertStaleReleaseRejected(t *testing.T, client *http.Client, acquired comfyUIControlResponse) {
+	t.Helper()
 	if stale := controlOperation(t, client, "release", acquired.LeaseID, 409); stale.Error != "stale_lease" {
 		t.Fatalf("stale control callback=%+v", stale)
 	}
+}
+
+// assertShutdownAndSocketCleanup verifies shutdown clears admission state and
+// removes the socket file.
+func assertShutdownAndSocketCleanup(t *testing.T, control *comfyUIControl, c *comfyUICoordinator) {
+	t.Helper()
 	if err := control.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -133,12 +206,18 @@ func TestComfyUIControlLifecycleAndRestart(t *testing.T) {
 	if _, err := os.Lstat(control.path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("socket not removed after close: %v", err)
 	}
+}
+
+// assertRestartStartsFresh verifies a restart on the same socket path begins with
+// no retained state and rejects releases against stale leases.
+func assertRestartStartsFresh(t *testing.T, c *comfyUICoordinator, control *comfyUIControl, calls *atomic.Int32, newLease comfyUIControlResponse) {
+	t.Helper()
 	restarted, err := newComfyUIControl(control.path, c, time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restarted.Close()
-	client = comfyUIControlClient(t, control.path)
+	client := comfyUIControlClient(t, control.path)
 	if state := controlOperation(t, client, "status", "", 200); state.State != "unknown" || state.LeaseID != "" || calls.Load() != 2 {
 		t.Fatalf("restart reused receipts or called verifier: %+v calls=%d", state, calls.Load())
 	}

@@ -70,27 +70,35 @@ func (p *metadataParser) feed(chunk []byte) (meaningful, answer bool) {
 	return
 }
 
+// endEvent finalizes a completed SSE event. It detects the [DONE] terminal
+// marker or parses the buffered event, then clears all event/line state and
+// resets the dropping/eventSize flags. It preserves the (meaningful, answer)
+// return order of the blank branch of endLine.
+func (p *metadataParser) endEvent() (bool, bool) {
+	var m, a bool
+	if !p.dropping && len(p.event) > 0 {
+		data := p.event[:len(p.event)-1] // remove the final SSE data newline
+		if bytes.Equal(data, []byte("[DONE]")) {
+			p.terminal = true
+			p.recognized = true
+		} else {
+			m, a = p.parse(data, true)
+		}
+	}
+	clear(p.event)
+	p.event = nil
+	clear(p.line)
+	p.line = nil
+	p.eventSize = 0
+	p.dropping = false
+	return m, a
+}
+
 func (p *metadataParser) endLine() (bool, bool) {
 	blank := p.lineSize == 0
 	p.lineSize = 0
 	if blank {
-		var m, a bool
-		if !p.dropping && len(p.event) > 0 {
-			data := p.event[:len(p.event)-1] // remove the final SSE data newline
-			if bytes.Equal(data, []byte("[DONE]")) {
-				p.terminal = true
-				p.recognized = true
-			} else {
-				m, a = p.parse(data, true)
-			}
-		}
-		clear(p.event)
-		p.event = nil
-		clear(p.line)
-		p.line = nil
-		p.eventSize = 0
-		p.dropping = false
-		return m, a
+		return p.endEvent()
 	}
 	if !p.dropping && bytes.HasPrefix(p.line, []byte("data:")) {
 		data := p.line[5:]

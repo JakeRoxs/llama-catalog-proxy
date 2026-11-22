@@ -296,9 +296,9 @@ func boundedToken(value any) string {
 	return s
 }
 
-func boundedString(value any, max int) string {
+func boundedString(value any, maxBytes int) string {
 	s, ok := value.(string)
-	if !ok || len(s) > max || !utf8.ValidString(s) {
+	if !ok || len(s) > maxBytes || !utf8.ValidString(s) {
 		return ""
 	}
 	return s

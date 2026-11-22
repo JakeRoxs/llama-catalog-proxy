@@ -108,6 +108,15 @@ func TestObserveReadyModelAcceptsBackendAliasResolution(t *testing.T) {
 }
 
 func TestRunUsesBoundedSyntheticRequestsAndPersistsNoResponseText(t *testing.T) {
+	record := runBoundedSyntheticBenchmark(t)
+	assertRecordStatusAndWorkloads(t, record)
+	assertOutputTokensReserved(t, record)
+	assertAllSamplesCorrectAndDiagnosticsAvailable(t, record)
+	assertReportOmitsPrivateText(t, record)
+	assertRunPersistence(t, record)
+}
+
+func runBoundedSyntheticBenchmark(t *testing.T) RunRecord {
 	server := newFakeProxy(t, false)
 	defer server.Close()
 	client, err := NewAPIClient(server.URL, "test-key")
@@ -122,12 +131,21 @@ func TestRunUsesBoundedSyntheticRequestsAndPersistsNoResponseText(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	return record
+}
+func assertRecordStatusAndWorkloads(t *testing.T, record RunRecord) {
 	if record.Status != RunCompleted || len(record.Workloads) != len(syntheticWorkloads) {
 		t.Fatalf("status/workload count = %s/%d", record.Status, len(record.Workloads))
 	}
+}
+
+func assertOutputTokensReserved(t *testing.T, record RunRecord) {
 	if record.OutputTokensReserved != len(syntheticWorkloads)*64+64 {
 		t.Fatalf("reserved output tokens = %d", record.OutputTokensReserved)
 	}
+}
+
+func assertAllSamplesCorrectAndDiagnosticsAvailable(t *testing.T, record RunRecord) {
 	for _, workload := range record.Workloads {
 		for _, sample := range workload.Samples {
 			if sample.Correctness != CorrectnessPassed {
@@ -140,20 +158,24 @@ func TestRunUsesBoundedSyntheticRequestsAndPersistsNoResponseText(t *testing.T) 
 			}
 		}
 	}
+}
 
+func assertReportOmitsPrivateText(t *testing.T, record RunRecord) {
 	report, err := json.Marshal(record)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, privateText := range []string{
-		"TOOL_ROUND_TRIP_OK", "REASONING_CONTROL_OK", "SYSTEM_DEFAULTS_OK", "</think>",
+		"TOOL_ROUND_TRIP_OK", "REASONING_CONTROL_OK", "SYSTEM_DEFAULTS_OK", "</thin>",
 		"PRIVATE_RESPONSE_SENTINEL",
 	} {
 		if strings.Contains(string(report), privateText) {
 			t.Fatalf("report persisted response or fixture text %q", privateText)
 		}
 	}
+}
 
+func assertRunPersistence(t *testing.T, record RunRecord) {
 	directory := filepath.Join(t.TempDir(), "benchmark-runs")
 	path, err := WriteRun(directory, record)
 	if err != nil {
@@ -192,6 +214,16 @@ func TestRunUsesBoundedSyntheticRequestsAndPersistsNoResponseText(t *testing.T) 
 	}
 }
 
+// TestCompareSeparatesCorrectnessAndPerformanceAndMarksUnsupportedEvidence verifies that
+// correctness gating is independent of performance metrics, that incomplete/truncated
+// outcomes are counted per run, that declared cache-state divergence is flagged as a
+// confounder, that metrics are deterministically ordered, that the latency comparison
+// reflects the baseline/candidate direction, that context evidence retains unsupported
+// state, and that the interpretation guards against overclaiming performance.
+// Correctness, metrics, context, and interpretation assertions were extracted into named
+// helpers to keep cognitive complexity below the S3776 threshold while preserving every
+// assertion, comparison input, metric order, sample count, missing/unsupported state, and
+// overclaim guard.
 func TestCompareSeparatesCorrectnessAndPerformanceAndMarksUnsupportedEvidence(t *testing.T) {
 	baseline := comparisonRun("bench-00000000000000000000000000000001", 100, CorrectnessPassed, 0.5, 8000)
 	candidate := comparisonRun("bench-00000000000000000000000000000002", 80, CorrectnessFailed, 0.75, 9000)
@@ -205,20 +237,52 @@ func TestCompareSeparatesCorrectnessAndPerformanceAndMarksUnsupportedEvidence(t 
 		t.Fatal(err)
 	}
 	first := report.Workloads[0]
+	assertCorrectnessSeparated(t, first)
+	assertFailureOutcomesCounted(t, first)
+	assertCacheConfounderPresent(t, report)
+	assertMetricsDeterministicallyOrdered(t, first)
+	assertLatencyComparison(t, first)
+	assertContextEvidence(t, report)
+	assertInterpretationGuardsOverclaim(t, report)
+}
+
+// assertCorrectnessSeparated verifies correctness is gated independently of performance:
+// the baseline passes and the candidate fails.
+func assertCorrectnessSeparated(t *testing.T, first WorkloadComparison) {
 	if first.Correctness.Baseline.Passed != 1 || first.Correctness.Candidate.Failed != 1 {
 		t.Fatalf("correctness was not separated: %#v", first.Correctness)
 	}
+}
+
+// assertFailureOutcomesCounted verifies incomplete transport, incomplete generation, and
+// truncated generation failures are counted on the correct side of the comparison.
+func assertFailureOutcomesCounted(t *testing.T, first WorkloadComparison) {
 	if first.Failures.Baseline.IncompleteTransport != 1 ||
 		first.Failures.Baseline.IncompleteGeneration != 1 ||
 		first.Failures.Candidate.TruncatedGeneration != 1 {
 		t.Fatalf("incomplete/truncated outcomes were not counted: %#v", first.Failures)
 	}
+}
+
+// assertCacheConfounderPresent verifies that declared cache-state divergence is reported
+// as a confounder.
+func assertCacheConfounderPresent(t *testing.T, report ComparisonReport) {
 	if !containsString(report.Confounders, "declared cache states differ") {
 		t.Fatalf("cache confounder missing: %#v", report.Confounders)
 	}
+}
+
+// assertMetricsDeterministicallyOrdered verifies metrics are present and ordered with
+// completion_tokens first.
+func assertMetricsDeterministicallyOrdered(t *testing.T, first WorkloadComparison) {
 	if len(first.Metrics) == 0 || first.Metrics[0].Name != "completion_tokens" {
 		t.Fatalf("metrics were not deterministically ordered: %#v", first.Metrics)
 	}
+}
+
+// assertLatencyComparison locates the upstream_header_ms metric and verifies the
+// baseline-to-candidate direction (candidate 80ms vs baseline 100ms => -20%).
+func assertLatencyComparison(t *testing.T, first WorkloadComparison) {
 	var latency *MetricComparison
 	for i := range first.Metrics {
 		if first.Metrics[i].Name == "upstream_header_ms" {
@@ -228,11 +292,21 @@ func TestCompareSeparatesCorrectnessAndPerformanceAndMarksUnsupportedEvidence(t 
 	if latency == nil || latency.ChangePercent == nil || math.Abs(*latency.ChangePercent+20) > 1e-9 {
 		t.Fatalf("latency comparison = %#v, want -20%%", latency)
 	}
+}
+
+// assertContextEvidence verifies context retains per-round acceptance state and
+// unsupported aggregate/GPU state rather than fabricating per-run attribution.
+func assertContextEvidence(t *testing.T, report ComparisonReport) {
 	if report.Context.PerRoundAcceptanceState == "" ||
 		report.Context.BaselineAfter.AggregateAcceptanceRate == nil ||
 		report.Context.CandidateAfter.GPUMemoryMaxMB == nil {
 		t.Fatalf("context evidence missing or unsupported state omitted: %#v", report.Context)
 	}
+}
+
+// assertInterpretationGuardsOverclaim verifies the interpretation does not treat a
+// higher acceptance percentage as evidence of faster performance.
+func assertInterpretationGuardsOverclaim(t *testing.T, report ComparisonReport) {
 	if !strings.Contains(report.Interpretation, "not evidence of faster performance") {
 		t.Fatalf("interpretation does not guard against overclaiming: %q", report.Interpretation)
 	}
@@ -250,46 +324,50 @@ func TestCompareIncompleteRunsReportsMissingWorkloadsAndObservations(t *testing.
 	candidate.Workloads = nil
 	candidate.OutputTokensReserved = 0
 	for _, pair := range [][2]RunRecord{{baseline, candidate}, {candidate, baseline}} {
-		report, err := Compare(pair[0], pair[1])
-		if err != nil {
-			t.Fatal(err)
+		assertIncompleteComparison(t, pair[0], pair[1])
+	}
+}
+
+func assertIncompleteComparison(t *testing.T, baseline, candidate RunRecord) {
+	report, err := Compare(baseline, candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Workloads) != len(syntheticWorkloads) {
+		t.Fatalf("comparison has %d workloads", len(report.Workloads))
+	}
+	if !containsString(report.Confounders, "baseline run is "+string(baseline.Status)) ||
+		!containsString(report.Confounders, "candidate run is "+string(candidate.Status)) {
+		t.Fatalf("missing incomplete run confounders: %v", report.Confounders)
+	}
+	first := report.Workloads[0]
+	recorded := WorkloadCoverage{Recorded: true, SamplesRecorded: 1, SamplesExpected: 1}
+	missing := WorkloadCoverage{SamplesExpected: 1}
+	wantCoverage := PairedWorkloadCoverage{Baseline: recorded, Candidate: missing}
+	if baseline.Status == RunCanceled {
+		wantCoverage = PairedWorkloadCoverage{Baseline: missing, Candidate: recorded}
+	}
+	if first.Coverage != wantCoverage {
+		t.Fatalf("incorrect comparison coverage: %+v", first.Coverage)
+	}
+	for _, metric := range first.Metrics {
+		if metric.ChangePercent != nil {
+			t.Fatalf("computed a change without samples on both sides: %+v", metric)
 		}
-		if len(report.Workloads) != len(syntheticWorkloads) {
-			t.Fatalf("comparison has %d workloads", len(report.Workloads))
-		}
-		if !containsString(report.Confounders, "baseline run is "+string(pair[0].Status)) ||
-			!containsString(report.Confounders, "candidate run is "+string(pair[1].Status)) {
-			t.Fatalf("missing incomplete run confounders: %v", report.Confounders)
-		}
-		first := report.Workloads[0]
-		recorded := WorkloadCoverage{Recorded: true, SamplesRecorded: 1, SamplesExpected: 1}
-		missing := WorkloadCoverage{SamplesExpected: 1}
-		wantCoverage := PairedWorkloadCoverage{Baseline: recorded, Candidate: missing}
-		if pair[0].Status == RunCanceled {
-			wantCoverage = PairedWorkloadCoverage{Baseline: missing, Candidate: recorded}
-		}
-		if first.Coverage != wantCoverage {
-			t.Fatalf("incorrect comparison coverage: %+v", first.Coverage)
-		}
-		for _, metric := range first.Metrics {
-			if metric.ChangePercent != nil {
-				t.Fatalf("computed a change without samples on both sides: %+v", metric)
-			}
-		}
-		failures := first.Failures.Baseline
-		if pair[0].Status == RunCanceled {
-			failures = first.Failures.Candidate
-		}
-		if failures.UnknownTransport != 1 || failures.UnknownGeneration != 1 {
-			t.Fatalf("missing observations were not reported as unknown: %+v", failures)
-		}
-		last := report.Workloads[len(report.Workloads)-1]
-		if last.Coverage.Baseline.Recorded || last.Coverage.Candidate.Recorded || len(last.Metrics) != 0 {
-			t.Fatalf("missing workload unexpectedly reported measurements: %+v", last)
-		}
-		if _, err := WriteComparison(t.TempDir(), report); err != nil {
-			t.Fatalf("persist incomplete comparison: %v", err)
-		}
+	}
+	failures := first.Failures.Baseline
+	if baseline.Status == RunCanceled {
+		failures = first.Failures.Candidate
+	}
+	if failures.UnknownTransport != 1 || failures.UnknownGeneration != 1 {
+		t.Fatalf("missing observations were not reported as unknown: %+v", failures)
+	}
+	last := report.Workloads[len(report.Workloads)-1]
+	if last.Coverage.Baseline.Recorded || last.Coverage.Candidate.Recorded || len(last.Metrics) != 0 {
+		t.Fatalf("missing workload unexpectedly reported measurements: %+v", last)
+	}
+	if _, err := WriteComparison(t.TempDir(), report); err != nil {
+		t.Fatalf("persist incomplete comparison: %v", err)
 	}
 }
 
@@ -431,21 +509,29 @@ func TestJobManagerReportsUncertainReportWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var status JobStatus
 	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		status, err = manager.Status(job.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if status.State == "failed" {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	status := waitForJobState(t, manager, job.ID, "failed", deadline)
 	if status.State != "failed" || status.ErrorCode != "report_write_outcome_unknown" || status.RunID == "" {
 		t.Fatalf("failed report write = %+v", status)
 	}
+}
+
+func waitForJobState(t *testing.T, manager *JobManager, jobID string, wantState string, deadline time.Time) JobStatus {
+	t.Helper()
+	var status JobStatus
+	var err error
+	for time.Now().Before(deadline) {
+		status, err = manager.Status(jobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.State == wantState {
+			return status
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for job %s to reach state %q", jobID, wantState)
+	return JobStatus{}
 }
 
 func TestJobManagerPersistsCompletedRun(t *testing.T) {

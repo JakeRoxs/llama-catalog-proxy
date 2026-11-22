@@ -106,22 +106,43 @@ func TestPeerRouteAliasDeduplicatesLegacyBackendPrefix(t *testing.T) {
 	}
 }
 
-func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
+// newPeerModelRouteTestHandler builds a Handler and peer identity for the peer
+// model alias routing tests. It constructs a fresh receipt for owner "bigboi"
+// with the given local model ID and a cache entry whose routeInference flag is
+// true; cacheStatus is passed through to cache.update (e.g. "" or "unavailable").
+func newPeerModelRouteTestHandler(t *testing.T, localID, cacheStatus string) (*Handler, nodecontract.ModelIdentity) {
+	t.Helper()
 	now := time.Now()
-	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "comfyui_auto"}
+	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: localID}
 	expiresAt := now.Add(time.Minute)
 	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
 		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
 			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh"}}}}
 	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
-	cache.update("bigboi", receipt, "", now)
+	cache.update("bigboi", receipt, cacheStatus, now)
 	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
 		peerClients: map[string]*peerClient{"bigboi": {routeInference: true}}}
-	body := `{"prompt":{"1":{"class_type":"KSampler"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(body))
+	return h, identity
+}
+
+// servePeerModelTestRequest builds a JSON peer-model request, records the
+// response, and invokes the peer model route. It returns the request (so the
+// caller can verify body restoration), the response recorder, and whether the
+// route handled the request.
+func servePeerModelTestRequest(t *testing.T, h *Handler, path, body string) (*http.Request, *httptest.ResponseRecorder, bool) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
-	if h.servePeerModelRoute(response, req, &routeInfo{}) {
+	handled := h.servePeerModelRoute(response, req, &routeInfo{})
+	return req, response, handled
+}
+
+func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
+	h, _ := newPeerModelRouteTestHandler(t, "comfyui_auto", "")
+	body := `{"prompt":{"1":{"class_type":"KSampler"}}}`
+	req, response, handled := servePeerModelTestRequest(t, h, "/comfyui/prompt", body)
+	if handled {
 		t.Fatalf("ComfyUI path was intercepted by model alias router: status=%d", response.Code)
 	}
 	restored, err := io.ReadAll(req.Body)
@@ -131,49 +152,34 @@ func TestPeerModelAliasDoesNotInterceptComfyUIPathAPI(t *testing.T) {
 }
 
 func TestPeerRouteAliasIsReservedWhilePeerInferenceIsConfigured(t *testing.T) {
-	now := time.Now()
-	identity := nodecontract.ModelIdentity{OwnerNodeID: "bigboi", BackendID: "local", LocalID: "model"}
-	expiresAt := now.Add(time.Minute)
-	receipt := &nodecontract.Receipt{AuthenticatedNodeID: "bigboi", ReceivedAt: now,
-		Report: nodecontract.Report{Source: nodecontract.Source{NodeID: "bigboi"}, GeneratedAt: now,
-			Observations: []nodecontract.Observation{{Identity: identity, State: "supported", ObservedAt: &now, ExpiresAt: &expiresAt, Freshness: "fresh"}}}}
-	cache := &peerCache{entries: map[string]peerCacheEntry{"bigboi": {routeInference: true}}}
-	cache.update("bigboi", receipt, "unavailable", now)
-	h := &Handler{logger: discardLogger(), maxJSONBody: 4096, peerCache: cache,
-		peerClients: map[string]*peerClient{"bigboi": {routeInference: true}}}
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"bigboi/model"}`))
-	req.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	handled := h.servePeerModelRoute(response, req, &routeInfo{})
+	h, _ := newPeerModelRouteTestHandler(t, "model", "unavailable")
+	body := `{"model":"bigboi/model"}`
+	_, response, handled := servePeerModelTestRequest(t, h, "/v1/chat/completions", body)
 	if !handled || response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("stale alias fell back: handled=%v status=%d", handled, response.Code)
 	}
 	h.peerClients["bigboi"].routeInference = false
-	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"bigboi/model"}`))
-	req.Header.Set("Content-Type", "application/json")
-	response = httptest.NewRecorder()
-	if h.servePeerModelRoute(response, req, &routeInfo{}) {
+	_, response, handled = servePeerModelTestRequest(t, h, "/v1/chat/completions", body)
+	if handled {
 		t.Fatalf("disabled peer alias intercepted the legacy static route: status=%d", response.Code)
 	}
 }
 
 func TestMultipartPeerInspection(t *testing.T) {
 	peerID := peerPublicID(nodecontract.ModelIdentity{OwnerNodeID: "node-a", BackendID: "local", LocalID: "model"})
-	makeBody := func(fields ...string) ([]byte, string) {
-		t.Helper()
-		var body bytes.Buffer
-		writer := multipart.NewWriter(&body)
-		for i := 0; i < len(fields); i += 2 {
-			if err := writer.WriteField(fields[i], fields[i+1]); err != nil {
-				t.Fatal(err)
-			}
-		}
-		contentType := writer.FormDataContentType()
-		if err := writer.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return body.Bytes(), contentType
-	}
+	assertMultipartPeerInspectionTable(t, peerID)
+	body, contentType := makeMultipartBody(t, "model", "local")
+	assertOversizedStreamingBody(t, body, contentType)
+	assertInvalidBoundaryRejected(t)
+	assertValidOwnerRewrite(t, body, contentType)
+	missing, missingContentType := makeMultipartBody(t, "other", "value")
+	assertMissingModelRejected(t, missing, missingContentType)
+}
+
+// assertMultipartPeerInspectionTable runs the five multipart peer model
+// inspection cases: pass-through (with body restoration), duplicate, case
+// variant, and invalid peer ID rejection.
+func assertMultipartPeerInspectionTable(t *testing.T, peerID string) {
 	for _, tc := range []struct {
 		name       string
 		fields     []string
@@ -187,25 +193,35 @@ func TestMultipartPeerInspection(t *testing.T) {
 		{"invalid peer ID rejected", []string{"model", "@peer/invalid"}, http.StatusBadRequest, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			body, contentType := makeBody(tc.fields...)
-			req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
-			req.Header.Set("Content-Type", contentType)
-			response := httptest.NewRecorder()
-			h := &Handler{logger: discardLogger(), maxJSONBody: 4096}
-			handled := h.servePeerModelRoute(response, req, &routeInfo{})
-			if handled != tc.handled || response.Code != tc.wantStatus {
-				t.Fatalf("handled=%v status=%d", handled, response.Code)
-			}
-			if !handled {
-				restored, err := io.ReadAll(req.Body)
-				if err != nil || !bytes.Equal(restored, body) {
-					t.Fatalf("local body changed: %v", err)
-				}
-			}
+			assertMultipartPeerCase(t, tc.fields, tc.wantStatus, tc.handled)
 		})
 	}
+}
 
-	body, contentType := makeBody("model", "local")
+// assertMultipartPeerCase builds a multipart request from the given fields,
+// serves it through the peer model route, and asserts the handled/status
+// outcome plus body restoration when not handled.
+func assertMultipartPeerCase(t *testing.T, fields []string, wantStatus int, handled bool) {
+	body, contentType := makeMultipartBody(t, fields...)
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", contentType)
+	response := httptest.NewRecorder()
+	h := &Handler{logger: discardLogger(), maxJSONBody: 4096}
+	gotHandled := h.servePeerModelRoute(response, req, &routeInfo{})
+	if gotHandled != handled || response.Code != wantStatus {
+		t.Fatalf("handled=%v status=%d", gotHandled, response.Code)
+	}
+	if !handled {
+		restored, err := io.ReadAll(req.Body)
+		if err != nil || !bytes.Equal(restored, body) {
+			t.Fatalf("local body changed: %v", err)
+		}
+	}
+}
+
+// assertOversizedStreamingBody verifies the streaming size cap: a multipart
+// body larger than maxJSONBody is rejected with 413.
+func assertOversizedStreamingBody(t *testing.T, body []byte, contentType string) {
 	h := &Handler{logger: discardLogger(), maxJSONBody: int64(len(body) - 1)}
 	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
 	req.ContentLength = -1
@@ -214,21 +230,54 @@ func TestMultipartPeerInspection(t *testing.T) {
 	if !h.servePeerModelRoute(response, req, &routeInfo{}) || response.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized streaming body status=%d", response.Code)
 	}
+}
 
-	req = httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("invalid"))
+// assertInvalidBoundaryRejected verifies that a multipart request with an
+// invalid boundary is rejected with 400.
+func assertInvalidBoundaryRejected(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", strings.NewReader("invalid"))
 	req.Header.Set("Content-Type", "multipart/form-data; boundary=example")
-	response = httptest.NewRecorder()
-	h.maxJSONBody = 4096
+	response := httptest.NewRecorder()
+	h := &Handler{logger: discardLogger(), maxJSONBody: 4096}
 	if !h.servePeerModelRoute(response, req, &routeInfo{}) || response.Code != http.StatusBadRequest {
 		t.Fatalf("invalid boundary status=%d", response.Code)
 	}
-	if _, err := rewriteMultipartModel(body, strings.TrimPrefix(contentType, "multipart/form-data; boundary="), "local", "local", 4096); err != nil {
+}
+
+// assertValidOwnerRewrite verifies that rewriteMultipartModel accepts a valid
+// model field owned by the expected owner and rewrites it.
+func assertValidOwnerRewrite(t *testing.T, body []byte, contentType string) {
+	boundary := strings.TrimPrefix(contentType, "multipart/form-data; boundary=")
+	if _, err := rewriteMultipartModel(body, boundary, "local", "local", 4096); err != nil {
 		t.Fatalf("owner rejected valid multipart model: %v", err)
 	}
-	missing, missingContentType := makeBody("other", "value")
-	if _, err := rewriteMultipartModel(missing, strings.TrimPrefix(missingContentType, "multipart/form-data; boundary="), "local", "local", 4096); err == nil {
+}
+
+// assertMissingModelRejected verifies that rewriteMultipartModel rejects a
+// multipart body that has no model field.
+func assertMissingModelRejected(t *testing.T, body []byte, contentType string) {
+	boundary := strings.TrimPrefix(contentType, "multipart/form-data; boundary=")
+	if _, err := rewriteMultipartModel(body, boundary, "local", "local", 4096); err == nil {
 		t.Fatal("owner accepted missing multipart model")
 	}
+}
+
+// makeMultipartBody builds a multipart form-data body from alternating field
+// name/value pairs and returns the body bytes plus its content type.
+func makeMultipartBody(t *testing.T, fields ...string) ([]byte, string) {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for i := 0; i < len(fields); i += 2 {
+		if err := writer.WriteField(fields[i], fields[i+1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	contentType := writer.FormDataContentType()
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return body.Bytes(), contentType
 }
 
 func TestPeerRoutingRejectsAmbiguousModelFields(t *testing.T) {

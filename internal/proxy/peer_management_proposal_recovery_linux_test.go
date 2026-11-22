@@ -68,6 +68,30 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 		}
 		return response.StatusCode, data, response.Header
 	}
+
+	// The expired eligible proposal is the only cleanup candidate; the response is cached safely and
+	// leaks no credential, target path, or secret marker.
+	assertCleanupCandidateInspection(t, call, expired, token, f.target)
+
+	// Invalid credentials or origins are rejected; cleanup removes the expired proposal once, is
+	// idempotent on repeat, and preserves the operation-backed proposal and its ledger.
+	assertCleanupLifecycle(t, call, expired, token, f.target, f.proposals, f.operations, f.state.management.WriteToken, active)
+
+	// An unregistered route must still enforce the backup credential.
+	unregistered := httptest.NewRequest(http.MethodGet, "https://owner.example"+ownerProposalsPath, nil)
+	unregistered.Header.Set("Authorization", "Bearer "+f.state.management.PreviewToken)
+	recorder := httptest.NewRecorder()
+	f.r.ManagementHandler().ServeHTTP(recorder, unregistered)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("owner proposal inspection did not enforce its backup credential: %d", recorder.Code)
+	}
+}
+
+// assertCleanupCandidateInspection verifies the management listing exposes only the expired eligible
+// proposal, sends no-store and nosniff headers, and leaks no credential, target path, or secret
+// marker from the response body.
+func assertCleanupCandidateInspection(t *testing.T, call func(method, credential, origin, body string) (int, []byte, http.Header), expired modelconfig.DelegatedProposal, token, target string) {
+	t.Helper()
 	status, body, headers := call(http.MethodGet, token, "", "")
 	var response struct {
 		Eligible []modelconfig.DelegatedProposalCleanupCandidate `json:"eligible"`
@@ -77,9 +101,16 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 		t.Fatalf("inspection status=%d response=%+v body=%q", status, response, body)
 	}
 	if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" ||
-		bytes.Contains(body, []byte(token)) || bytes.Contains(body, []byte(f.target)) || bytes.Contains(body, []byte("confidential")) {
+		bytes.Contains(body, []byte(token)) || bytes.Contains(body, []byte(target)) || bytes.Contains(body, []byte("confidential")) {
 		t.Fatalf("unsafe cleanup inspection response: %s", body)
 	}
+}
+
+// assertCleanupLifecycle verifies the four invalid credential/origin cases are rejected, that cleanup
+// removes the expired proposal exactly once, is idempotent on a second call, and preserves the
+// operation-backed proposal and its ledger.
+func assertCleanupLifecycle(t *testing.T, call func(method, credential, origin, body string) (int, []byte, http.Header), expired modelconfig.DelegatedProposal, token, target, proposals, operations, writeToken string, active modelconfig.DelegatedProposal) {
+	t.Helper()
 	for _, tt := range []struct {
 		name       string
 		credential string
@@ -88,7 +119,7 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 	}{
 		{"wrong credential", strings.Repeat("x", 32), "", http.StatusUnauthorized},
 		{"peer credential", strings.Repeat("p", 32), "", http.StatusUnauthorized},
-		{"write credential", f.state.management.WriteToken, "", http.StatusUnauthorized},
+		{"write credential", writeToken, "", http.StatusUnauthorized},
 		{"cross origin", token, "https://different.example", http.StatusForbidden},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -99,7 +130,7 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 		})
 	}
 	cleanupBody := `{"proposal_ids":["` + expired.Proposal.ID + `"]}`
-	status, body, _ = call(http.MethodPost, token, "", cleanupBody)
+	status, body, _ := call(http.MethodPost, token, "", cleanupBody)
 	var cleanupResponse struct {
 		Removed []string `json:"removed"`
 	}
@@ -111,18 +142,11 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 	if status != http.StatusOK || json.Unmarshal(body, &cleanupResponse) != nil || len(cleanupResponse.Removed) != 0 {
 		t.Fatalf("repeated cleanup status=%d response=%+v body=%q", status, cleanupResponse, body)
 	}
-	if _, err := modelconfig.LoadDelegatedProposal(f.proposals, active.Proposal.ID); err != nil {
+	if _, err := modelconfig.LoadDelegatedProposal(proposals, active.Proposal.ID); err != nil {
 		t.Fatalf("operation-backed proposal was removed: %v", err)
 	}
-	if _, err := modelconfig.LoadDelegatedOperation(f.operations, active.Proposal.ID); err != nil {
+	if _, err := modelconfig.LoadDelegatedOperation(operations, active.Proposal.ID); err != nil {
 		t.Fatalf("operation ledger was changed: %v", err)
-	}
-	unregistered := httptest.NewRequest(http.MethodGet, "https://owner.example"+ownerProposalsPath, nil)
-	unregistered.Header.Set("Authorization", "Bearer "+f.state.management.PreviewToken)
-	recorder := httptest.NewRecorder()
-	f.r.ManagementHandler().ServeHTTP(recorder, unregistered)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("owner proposal inspection did not enforce its backup credential: %d", recorder.Code)
 	}
 }
 

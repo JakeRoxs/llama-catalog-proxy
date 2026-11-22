@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
@@ -32,15 +33,39 @@ type pathRequestObservation struct {
 	Body          string
 }
 
-func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
+// federationFixture holds the shared state for the federated ComfyUI path
+// service integration test. Scenario helpers mutate it in sequence so the
+// orchestration stays linear and each helper stays below complexity 15.
+type federationFixture struct {
+	ctx              context.Context
+	observed         chan pathRequestObservation
+	releaseWebSocket chan struct{}
+	comfy            *httptest.Server
+	ownerServer      *httptest.Server
+	requesterServer  *httptest.Server
+	owner            *Reloader
+	ownerPeer        *config.PeerConfig
+	outbound         *peerClient
+	cache            *peerCache
+	requester        *Handler
+	directFallback   *atomic.Int32
+}
+
+func newFederationFixture(t *testing.T, ctx context.Context) *federationFixture {
 	observed := make(chan pathRequestObservation, 2)
 	releaseWebSocket := make(chan struct{})
+
 	comfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
 		observed <- pathRequestObservation{
-			Method: req.Method, Path: req.URL.Path, Query: req.URL.RawQuery,
-			Authorization: req.Header.Get("Authorization"), Cookie: req.Header.Get("Cookie"),
-			Origin: req.Header.Get("Origin"), Upgrade: req.Header.Get("Upgrade"), Body: string(body),
+			Method:        req.Method,
+			Path:          req.URL.Path,
+			Query:         req.URL.RawQuery,
+			Authorization: req.Header.Get("Authorization"),
+			Cookie:        req.Header.Get("Cookie"),
+			Origin:        req.Header.Get("Origin"),
+			Upgrade:       req.Header.Get("Upgrade"),
+			Body:          string(body),
 		}
 		if websocketUpgrade(req.Header) {
 			hijacker, ok := w.(http.Hijacker)
@@ -69,8 +94,6 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = io.WriteString(w, "comfy accepted")
 	}))
-	defer comfy.Close()
-
 	comfyURL, err := url.Parse(comfy.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -102,8 +125,6 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 		peer: ownerPeer, handler: ownerHandler, generation: 1, cacheTTL: time.Minute,
 	})
 	ownerServer := httptest.NewTLSServer(owner.PeerHandler())
-	defer ownerServer.Close()
-
 	ownerClient := ownerServer.Client()
 	ownerTransport := ownerClient.Transport.(*http.Transport).Clone()
 	outbound := &peerClient{
@@ -111,7 +132,7 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 		token: requesterToken, client: ownerClient, inferenceTransport: ownerTransport,
 		routePaths: map[string]string{"/comfyui": "comfyui"},
 	}
-	receipt, reason := outbound.fetch(t.Context())
+	receipt, reason := outbound.fetch(ctx)
 	if receipt == nil || reason != "" {
 		t.Fatalf("fetch owner service report: receipt=%v reason=%q", receipt != nil, reason)
 	}
@@ -135,10 +156,49 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 		}},
 	}
 	requesterServer := httptest.NewServer(requester)
-	defer requesterServer.Close()
 
+	return &federationFixture{
+		ctx:              ctx,
+		observed:         observed,
+		releaseWebSocket: releaseWebSocket,
+		comfy:            comfy,
+		ownerServer:      ownerServer,
+		requesterServer:  requesterServer,
+		owner:            owner,
+		ownerPeer:        ownerPeer,
+		outbound:         outbound,
+		cache:            cache,
+		requester:        requester,
+		directFallback:   &directFallback,
+	}
+}
+
+func (f *federationFixture) teardown() {
+	f.comfy.Close()
+	f.ownerServer.Close()
+	f.requesterServer.Close()
+}
+
+func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
+	ctx := t.Context()
+	f := newFederationFixture(t, ctx)
+	defer f.teardown()
+
+	assertHTTPForwarding(t, f)
+	assertWebSocketUpgrade(t, f)
+	assertNestedOwnerRejected(t, f)
+	assertGrantRevocation(t, f)
+	assertPathOnlyAccess(t, f)
+	assertRemovedService(t, f)
+	assertOwnerOutage(t, f)
+}
+
+// assertHTTPForwarding verifies the HTTP peer path forwards the exact request
+// semantics (method, path, query, body, Origin preserved; Cookie stripped;
+// Authorization rewritten to the owner backend key) and does not fall back.
+func assertHTTPForwarding(t *testing.T, f *federationFixture) {
 	request, err := http.NewRequest(http.MethodPost,
-		requesterServer.URL+"/comfyui/prompt?clientId=peer-test&overwrite=true",
+		f.requesterServer.URL+"/comfyui/prompt?clientId=peer-test&overwrite=true",
 		strings.NewReader(`{"prompt":{"node":"workflow"}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -147,124 +207,312 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 	request.Header.Set("Cookie", "session=frontend-secret")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Origin", "https://frontend.example")
-	response, err := requesterServer.Client().Do(request)
+	response, err := f.requesterServer.Client().Do(request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	responseBody, _ := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	first := <-observed
+	first := <-f.observed
 	if response.StatusCode != http.StatusCreated || string(responseBody) != "comfy accepted" ||
 		first.Method != http.MethodPost || first.Path != "/comfyui/prompt" ||
 		first.Query != "clientId=peer-test&overwrite=true" || first.Body != `{"prompt":{"node":"workflow"}}` ||
 		first.Origin != "https://frontend.example" || first.Cookie != "" || first.Authorization != "Bearer owner-backend-credential" ||
-		directFallback.Load() != 0 {
+		f.directFallback.Load() != 0 {
 		t.Fatalf("peer path request lost semantics or bypassed federation: status=%d body=%q observed=%+v fallback=%d",
-			response.StatusCode, responseBody, first, directFallback.Load())
+			response.StatusCode, responseBody, first, f.directFallback.Load())
 	}
+}
 
-	connection, err := net.Dial("tcp", strings.TrimPrefix(requesterServer.URL, "http://"))
+// assertWebSocketUpgrade verifies the raw WebSocket upgrade through the peer
+// route, the handshake headers, the SHA-1 accept, and the channel release
+// ordering that keeps the backend goroutine from leaking.
+func assertWebSocketUpgrade(t *testing.T, f *federationFixture) {
+	connection, err := net.Dial("tcp", strings.TrimPrefix(f.requesterServer.URL, "http://"))
 	if err != nil {
-		t.Fatal(err)
-	}
-	key := "dGhlIHNhbXBsZSBub25jZQ=="
-	_, err = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=ws-peer HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nOrigin: https://frontend.example\r\n\r\n",
-		strings.TrimPrefix(requesterServer.URL, "http://"), key)
-	if err != nil {
-		_ = connection.Close()
 		t.Fatal(err)
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	_, err = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=ws-peer HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nOrigin: https://frontend.example\r\n\r\n",
+		strings.TrimPrefix(f.requesterServer.URL, "http://"), key)
+	if err != nil {
+		_ = connection.Close()
+		t.Fatal(err)
+	}
+
 	websocketResponse, err := http.ReadResponse(bufio.NewReader(connection), &http.Request{Method: http.MethodGet})
 	if err != nil {
 		_ = connection.Close()
-		close(releaseWebSocket)
+		close(f.releaseWebSocket)
 		t.Fatalf("read websocket response through peer route: %v", err)
 	}
 	_ = websocketResponse.Body.Close()
-	ws := <-observed
+	ws := <-f.observed
 	_ = connection.Close()
-	close(releaseWebSocket)
+	close(f.releaseWebSocket)
+
 	if websocketResponse.StatusCode != http.StatusSwitchingProtocols || ws.Path != "/comfyui/ws" ||
 		ws.Query != "clientId=ws-peer" || ws.Origin != "https://frontend.example" || ws.Upgrade != "websocket" ||
-		ws.Authorization != "Bearer owner-backend-credential" || ws.Cookie != "" || directFallback.Load() != 0 {
-		t.Fatalf("websocket peer route failed: status=%d observed=%+v fallback=%d", websocketResponse.StatusCode, ws, directFallback.Load())
+		ws.Authorization != "Bearer owner-backend-credential" || ws.Cookie != "" || f.directFallback.Load() != 0 {
+		t.Fatalf("websocket peer route failed: status=%d observed=%+v fallback=%d", websocketResponse.StatusCode, ws, f.directFallback.Load())
 	}
+}
 
-	nested, err := http.NewRequest(http.MethodGet, requesterServer.URL+"/comfyui/admin/secret", nil)
+// assertNestedOwnerRejected verifies a nested owner route (/comfyui/admin)
+// escapes its owner-side prefix and is rejected with 503, without falling back.
+func assertNestedOwnerRejected(t *testing.T, f *federationFixture) {
+	nested, err := http.NewRequest(http.MethodGet, f.requesterServer.URL+"/comfyui/admin/secret", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err = requesterServer.Client().Do(nested)
+	response, err := f.requesterServer.Client().Do(nested)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable || directFallback.Load() != 0 {
-		t.Fatalf("exposed path route escaped its owner-side prefix: status=%d fallback=%d", response.StatusCode, directFallback.Load())
+	if response.StatusCode != http.StatusServiceUnavailable || f.directFallback.Load() != 0 {
+		t.Fatalf("exposed path route escaped its owner-side prefix: status=%d fallback=%d", response.StatusCode, f.directFallback.Load())
 	}
+}
 
-	ownerPeer.Peers["udms"] = config.PeerGrant{Token: requesterToken, CatalogRead: true}
-	denied, err := http.NewRequest(http.MethodPost, requesterServer.URL+"/comfyui/prompt", strings.NewReader("{}"))
+// assertGrantRevocation verifies revoking PathAccess rejects the path with 401
+// and does not fall back.
+func assertGrantRevocation(t *testing.T, f *federationFixture) {
+	f.ownerPeer.Peers["udms"] = config.PeerGrant{Token: f.ownerPeer.Peers["udms"].Token, CatalogRead: true}
+	denied, err := http.NewRequest(http.MethodPost, f.requesterServer.URL+"/comfyui/prompt", strings.NewReader("{}"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	denied.Header.Set("Content-Type", "application/json")
-	response, err = requesterServer.Client().Do(denied)
+	response, err := f.requesterServer.Client().Do(denied)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized || directFallback.Load() != 0 {
-		t.Fatalf("ungranted path access was accepted or fell back: status=%d fallback=%d", response.StatusCode, directFallback.Load())
+	if response.StatusCode != http.StatusUnauthorized || f.directFallback.Load() != 0 {
+		t.Fatalf("ungranted path access was accepted or fell back: status=%d fallback=%d", response.StatusCode, f.directFallback.Load())
 	}
+}
 
-	ownerPeer.Peers["udms"] = config.PeerGrant{Token: requesterToken, PathAccess: []string{"comfyui"}}
-	requester.peerCache = nil
-	pathOnly, err := http.NewRequest(http.MethodPost, requesterServer.URL+"/comfyui/prompt", strings.NewReader("path-only access"))
+// assertPathOnlyAccess verifies restoring PathAccess (without CatalogRead) and
+// clearing the peer cache still allows path access, preserving the body.
+func assertPathOnlyAccess(t *testing.T, f *federationFixture) {
+	f.ownerPeer.Peers["udms"] = config.PeerGrant{Token: f.ownerPeer.Peers["udms"].Token, PathAccess: []string{"comfyui"}}
+	f.requester.peerCache = nil
+	pathOnly, err := http.NewRequest(http.MethodPost, f.requesterServer.URL+"/comfyui/prompt", strings.NewReader("path-only access"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	pathOnly.Header.Set("Content-Type", "text/plain")
-	response, err = requesterServer.Client().Do(pathOnly)
+	response, err := f.requesterServer.Client().Do(pathOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
 	pathOnlyBody, _ := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	pathOnlyObservation := <-observed
+	pathOnlyObservation := <-f.observed
 	if response.StatusCode != http.StatusCreated || string(pathOnlyBody) != "comfy accepted" ||
-		pathOnlyObservation.Body != "path-only access" || directFallback.Load() != 0 {
+		pathOnlyObservation.Body != "path-only access" || f.directFallback.Load() != 0 {
 		t.Fatalf("path access incorrectly depended on catalog_read: status=%d body=%q observed=%+v",
 			response.StatusCode, pathOnlyBody, pathOnlyObservation)
 	}
+}
 
-	ownerPeer.ExposedPathRoutes = nil
-	removedService, err := http.NewRequest(http.MethodGet, requesterServer.URL+"/comfyui/view?filename=one.png", nil)
+// assertRemovedService verifies removing the exposed path service yields 503
+// and does not fall back.
+func assertRemovedService(t *testing.T, f *federationFixture) {
+	f.ownerPeer.ExposedPathRoutes = nil
+	removedService, err := http.NewRequest(http.MethodGet, f.requesterServer.URL+"/comfyui/view?filename=one.png", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err = requesterServer.Client().Do(removedService)
+	response, err := f.requesterServer.Client().Do(removedService)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if response.StatusCode != http.StatusServiceUnavailable || directFallback.Load() != 0 {
-		t.Fatalf("removed owner service fell back locally: status=%d fallback=%d", response.StatusCode, directFallback.Load())
+	if response.StatusCode != http.StatusServiceUnavailable || f.directFallback.Load() != 0 {
+		t.Fatalf("removed owner service fell back locally: status=%d fallback=%d", response.StatusCode, f.directFallback.Load())
 	}
+}
 
-	ownerServer.Close()
-	unavailable, err := http.NewRequest(http.MethodGet, requesterServer.URL+"/comfyui/view?filename=one.png", nil)
+// assertOwnerOutage verifies an unavailable owner peer path yields 502 and
+// does not fall back to a local route.
+func assertOwnerOutage(t *testing.T, f *federationFixture) {
+	f.ownerServer.Close()
+	unavailable, err := http.NewRequest(http.MethodGet, f.requesterServer.URL+"/comfyui/view?filename=one.png", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err = requesterServer.Client().Do(unavailable)
+	response, err := f.requesterServer.Client().Do(unavailable)
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = response.Body.Close()
-	if response.StatusCode != http.StatusBadGateway || directFallback.Load() != 0 {
-		t.Fatalf("unavailable peer path fell back to a local route: status=%d fallback=%d", response.StatusCode, directFallback.Load())
+	if response.StatusCode != http.StatusBadGateway || f.directFallback.Load() != 0 {
+		t.Fatalf("unavailable peer path fell back to a local route: status=%d fallback=%d", response.StatusCode, f.directFallback.Load())
+	}
+}
+
+func TestValidPeerPathRequest(t *testing.T) {
+	encode := func(p string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(p))
+	}
+	tests := []struct {
+		name        string
+		encodedPath string
+		service     string
+		localPrefix string
+		method      string
+		wantPath    string
+		wantError   bool
+	}{
+		{
+			name:        "normal path",
+			encodedPath: encode("/comfyui/prompt"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantPath:    "/comfyui/prompt",
+		},
+		{
+			name:        "normal path with nested segments",
+			encodedPath: encode("/comfyui/admin/secret"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodPost,
+			wantPath:    "/comfyui/admin/secret",
+		},
+		{
+			name:        "comfyui frontend root GET exception",
+			encodedPath: encode("/comfyui/"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantPath:    "/comfyui/",
+		},
+		{
+			name:        "comfyui frontend root only excepted for GET",
+			encodedPath: encode("/comfyui/"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodPost,
+			wantError:   true,
+		},
+		{
+			name:        "invalid base64",
+			encodedPath: "not valid base64!!",
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "empty decoded path",
+			encodedPath: encode(""),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "invalid percent escape",
+			encodedPath: encode("%ZZ"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "disallowed query",
+			encodedPath: encode("/comfyui/prompt?x=1"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "disallowed fragment",
+			encodedPath: encode("/comfyui/prompt#x"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "disallowed backslash",
+			encodedPath: encode("/comfyui/prompt\\x"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "path traversal",
+			encodedPath: encode("/comfyui/../etc/passwd"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "out of prefix",
+			encodedPath: encode("/other/path"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "non-root prefix out of prefix",
+			encodedPath: encode("/comfyui-admin/x"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "missing leading slash",
+			encodedPath: encode("comfyui/prompt"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+		{
+			name:        "empty path",
+			encodedPath: encode("/"),
+			service:     "comfyui",
+			localPrefix: "/comfyui",
+			method:      http.MethodGet,
+			wantError:   true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gotPath, gotEscaped, err := validPeerPathRequest(test.encodedPath, test.service, test.localPrefix, test.method)
+			if test.wantError {
+				if err == nil {
+					t.Fatalf("validPeerPathRequest(%q) = %q, %q, nil, want error", test.encodedPath, gotPath, gotEscaped)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("validPeerPathRequest(%q) = %q, %q, %v, want %q", test.encodedPath, gotPath, gotEscaped, err, test.wantPath)
+			}
+			if gotPath != test.wantPath {
+				t.Errorf("validPeerPathRequest(%q) = %q, want %q", test.encodedPath, gotPath, test.wantPath)
+			}
+			decoded, err := base64.RawURLEncoding.DecodeString(test.encodedPath)
+			if err != nil {
+				t.Fatalf("decode test input %q: %v", test.encodedPath, err)
+			}
+			if string(decoded) != gotEscaped {
+				t.Errorf("validPeerPathRequest(%q) escapedPath = %q, want %q", test.encodedPath, gotEscaped, decoded)
+			}
+		})
 	}
 }
 

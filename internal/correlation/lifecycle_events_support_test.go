@@ -28,41 +28,11 @@ func TestDescribeLifecycleEventSupportValidBackends(t *testing.T) {
 		t.Fatalf("expected 2 backend statuses, got %d", len(report.BackendStatuses))
 	}
 	// llama_swap backend: unsupported with transition_payload_not_exposed
-	testStatus, ok := report.BackendStatuses["test"]
-	if !ok {
-		t.Fatal("missing backend status for test")
-	}
-	if testStatus.State != "unsupported" {
-		t.Fatalf("state = %q, want unsupported", testStatus.State)
-	}
-	if testStatus.Reason != "transition_payload_not_exposed" {
-		t.Fatalf("reason = %q, want transition_payload_not_exposed", testStatus.Reason)
-	}
-	if testStatus.Explanation != lifecycleEventExplainTransitionPayloadNotExposed {
-		t.Fatalf("explanation = %q", testStatus.Explanation)
-	}
 	// other backend: disabled
-	otherStatus, ok := report.BackendStatuses["other"]
-	if !ok {
-		t.Fatal("missing backend status for other")
-	}
-	if otherStatus.State != "disabled" {
-		t.Fatalf("state = %q, want disabled", otherStatus.State)
-	}
-	if otherStatus.Reason != "not_enabled" {
-		t.Fatalf("reason = %q, want not_enabled", otherStatus.Reason)
-	}
+	assertLifecycleBackendStatuses(t, report.BackendStatuses)
 	// Explicit unavailability fields
-	if report.SourceTimeUnavailable != "source_time_unavailable" {
-		t.Fatalf("source_time_unavailable = %q", report.SourceTimeUnavailable)
-	}
-	if report.SourceEventIDUnavailable != "source_event_id_unavailable" {
-		t.Fatalf("source_event_id_unavailable = %q", report.SourceEventIDUnavailable)
-	}
-	if report.ReplayUnsupported != "replay_unsupported" {
-		t.Fatalf("replay_unsupported = %q", report.ReplayUnsupported)
-	}
-	// ObservedTransitions is empty
+	assertLifecycleUnavailable(t, report)
+	// ObservedTransitions is empty, no collection claimed
 	if len(report.ObservedTransitions) != 0 {
 		t.Fatalf("expected 0 observed transitions, got %d", len(report.ObservedTransitions))
 	}
@@ -75,7 +45,62 @@ func TestDescribeLifecycleEventSupportValidBackends(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, secret := range []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "secret-key", "secret-header"} {
+	assertNoSecretLeaked(t, output, []string{"http://127.0.0.1:8080", "http://127.0.0.1:8081", "secret-key", "secret-header"})
+}
+
+// assertLifecycleBackendStatuses verifies the capability status for each
+// configured backend: llama_swap is unsupported without transition payloads,
+// all other backends are disabled.
+func assertLifecycleBackendStatuses(t *testing.T, statuses map[string]LifecycleBackendEventSupport) {
+	t.Helper()
+	testStatus, ok := statuses["test"]
+	if !ok {
+		t.Fatal("missing backend status for test")
+	}
+	if testStatus.State != lifecycleEventSupportUnsupported {
+		t.Fatalf("state = %q, want %q", testStatus.State, lifecycleEventSupportUnsupported)
+	}
+	if testStatus.Reason != lifecycleEventReasonTransitionPayloadNotExposed {
+		t.Fatalf("reason = %q, want %q", testStatus.Reason, lifecycleEventReasonTransitionPayloadNotExposed)
+	}
+	if testStatus.Explanation != lifecycleEventExplainTransitionPayloadNotExposed {
+		t.Fatalf("explanation = %q", testStatus.Explanation)
+	}
+	otherStatus, ok := statuses["other"]
+	if !ok {
+		t.Fatal("missing backend status for other")
+	}
+	if otherStatus.State != lifecycleEventSupportDisabled {
+		t.Fatalf("state = %q, want %q", otherStatus.State, lifecycleEventSupportDisabled)
+	}
+	if otherStatus.Reason != lifecycleEventReasonNotEnabled {
+		t.Fatalf("reason = %q, want %q", otherStatus.Reason, lifecycleEventReasonNotEnabled)
+	}
+	if otherStatus.Explanation != lifecycleEventExplainNotEnabled {
+		t.Fatalf("explanation = %q", otherStatus.Explanation)
+	}
+}
+
+// assertLifecycleUnavailable verifies the explicit unavailability statements
+// for the inspected adapter contract.
+func assertLifecycleUnavailable(t *testing.T, report LifecycleEventSupportReport) {
+	t.Helper()
+	if report.SourceTimeUnavailable != lifecycleEventSourceTimeUnavailable {
+		t.Fatalf("source_time_unavailable = %q", report.SourceTimeUnavailable)
+	}
+	if report.SourceEventIDUnavailable != lifecycleEventSourceEventIDUnavailable {
+		t.Fatalf("source_event_id_unavailable = %q", report.SourceEventIDUnavailable)
+	}
+	if report.ReplayUnsupported != lifecycleEventReplayUnsupported {
+		t.Fatalf("replay_unsupported = %q", report.ReplayUnsupported)
+	}
+}
+
+// assertNoSecretLeaked verifies that none of the given secrets appear in the
+// serialized report output.
+func assertNoSecretLeaked(t *testing.T, output []byte, secrets []string) {
+	t.Helper()
+	for _, secret := range secrets {
 		if strings.Contains(string(output), secret) {
 			t.Fatalf("secret leaked in output: %q", secret)
 		}

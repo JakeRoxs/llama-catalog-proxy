@@ -43,14 +43,36 @@ func waitCoordinatorState(t *testing.T, c *comfyUICoordinator, state string) {
 func TestComfyUICoordinatorDrainsAndCachesGenerationBoundRelease(t *testing.T) {
 	var calls atomic.Int32
 	var c *comfyUICoordinator
-	c = newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+	c = newComfyUICoordinator(countingVerifier(t, &c, &calls))
+	assertUnknownConstruction(t, c, &calls)
+	reconcileOnce(t, c)
+	leaseID, finishSubmission := acquireAndActivate(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	drainAndRelease(t, c, ctx, &calls, leaseID, finishSubmission)
+	finishCompeting := reserveCompeting(t, c)
+	assertCompetingBlocksNewLease(t, c)
+	receipt := assertDuplicateReleaseCached(t, c, ctx, &calls, leaseID)
+	assertReceiptDefensiveCopy(t, c, ctx, leaseID, receipt)
+	finishCompeting()
+	finishCompeting()
+	nextID := assertNewLeaseAfterCompeting(t, c, leaseID)
+	assertStaleLeaseRejected(t, c, ctx, &calls, leaseID, nextID)
+}
+
+func countingVerifier(t *testing.T, cPtr **comfyUICoordinator, calls *atomic.Int32) func(context.Context) (ComfyUIReleaseResult, error) {
+	t.Helper()
+	return func(context.Context) (ComfyUIReleaseResult, error) {
 		calls.Add(1)
-		// Callback status reads must not deadlock on an admission mutex.
-		if c.snapshot().Submissions != 0 {
+		if (*cPtr).snapshot().Submissions != 0 {
 			t.Error("verification ran before prompt HTTP submissions drained")
 		}
 		return confirmedCoordinatorEvidence(), nil
-	})
+	}
+}
+
+func assertUnknownConstruction(t *testing.T, c *comfyUICoordinator, calls *atomic.Int32) {
+	t.Helper()
 	if c.snapshot().State != "unknown" || calls.Load() != 0 {
 		t.Fatal("construction inferred released state or performed I/O")
 	}
@@ -60,11 +82,19 @@ func TestComfyUICoordinatorDrainsAndCachesGenerationBoundRelease(t *testing.T) {
 	if _, err := c.reserveCompeting(); !errors.Is(err, errComfyUIAdmissionBlocked) {
 		t.Fatal("unknown state admitted competing work")
 	}
+}
+
+func reconcileOnce(t *testing.T, c *comfyUICoordinator) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if _, err := c.reconcile(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func acquireAndActivate(t *testing.T, c *comfyUICoordinator) (string, func()) {
+	t.Helper()
 	leaseID, err := c.beginLease()
 	if err != nil || len(leaseID) != 32 {
 		t.Fatalf("acquire ID=%q error=%v", leaseID, err)
@@ -76,11 +106,13 @@ func TestComfyUICoordinatorDrainsAndCachesGenerationBoundRelease(t *testing.T) {
 	if err := c.activate(leaseID); err != nil {
 		t.Fatalf("start callback waited for its own HTTP submission: %v", err)
 	}
+	return leaseID, finishSubmission
+}
+
+func drainAndRelease(t *testing.T, c *comfyUICoordinator, ctx context.Context, calls *atomic.Int32, leaseID string, finishSubmission func()) {
+	t.Helper()
 	finished := make(chan error, 1)
-	go func() {
-		_, err := c.release(ctx, leaseID)
-		finished <- err
-	}()
+	go func() { _, err := c.release(ctx, leaseID); finished <- err }()
 	waitCoordinatorState(t, c, "draining")
 	if calls.Load() != 1 {
 		t.Fatal("release verified before outstanding HTTP submission completed")
@@ -93,28 +125,53 @@ func TestComfyUICoordinatorDrainsAndCachesGenerationBoundRelease(t *testing.T) {
 	if err := <-finished; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func reserveCompeting(t *testing.T, c *comfyUICoordinator) func() {
+	t.Helper()
 	finishCompeting, err := c.reserveCompeting()
 	if err != nil {
 		t.Fatal(err)
 	}
+	return finishCompeting
+}
+
+func assertCompetingBlocksNewLease(t *testing.T, c *comfyUICoordinator) {
+	t.Helper()
 	if _, err := c.beginLease(); !errors.Is(err, errComfyUIAdmissionBlocked) {
 		t.Fatal("new ComfyUI lease admitted while competing HTTP work was in flight")
 	}
+}
+
+func assertDuplicateReleaseCached(t *testing.T, c *comfyUICoordinator, ctx context.Context, calls *atomic.Int32, leaseID string) ComfyUIReleaseResult {
+	t.Helper()
 	receipt, err := c.release(ctx, leaseID)
 	if err != nil || calls.Load() != 2 {
 		t.Fatalf("duplicate release performed verification: calls=%d error=%v", calls.Load(), err)
 	}
+	return receipt
+}
+
+func assertReceiptDefensiveCopy(t *testing.T, c *comfyUICoordinator, ctx context.Context, leaseID string, receipt ComfyUIReleaseResult) {
+	t.Helper()
 	receipt.Devices[0].FreeVRAMBytes = 0
 	stored, err := c.release(ctx, leaseID)
 	if err != nil || stored.Devices[0].FreeVRAMBytes != 900 {
 		t.Fatal("caller mutated stored release evidence")
 	}
-	finishCompeting()
-	finishCompeting()
+}
+
+func assertNewLeaseAfterCompeting(t *testing.T, c *comfyUICoordinator, leaseID string) string {
+	t.Helper()
 	nextID, err := c.beginLease()
 	if err != nil || nextID == leaseID {
 		t.Fatalf("new acquisition reused lease ID: %q %v", nextID, err)
 	}
+	return nextID
+}
+
+func assertStaleLeaseRejected(t *testing.T, c *comfyUICoordinator, ctx context.Context, calls *atomic.Int32, leaseID, nextID string) {
+	t.Helper()
 	if _, err := c.release(ctx, leaseID); !errors.Is(err, errComfyUIStaleLease) {
 		t.Fatal("old lease release was accepted for a new acquisition")
 	}

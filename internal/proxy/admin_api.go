@@ -292,17 +292,29 @@ func (r *Reloader) serveAdminActivity(w http.ResponseWriter, req *http.Request) 
 		if record == nil {
 			continue
 		}
-		event := adminActivityEvent{Time: record.RequestTime, BackendID: record.BackendID, Status: record.Status}
-		if record.ProxyObservation != nil {
-			event.DurationMS = record.ProxyObservation.TotalDurationMs
-		}
-		if event.DurationMS == nil {
-			if duration, ok := record.Metadata["duration_ms"].(int64); ok {
-				value := float64(duration)
-				event.DurationMS = &value
-			}
-		}
-		result.Events = append(result.Events, event)
+		result.Events = append(result.Events, adminActivityEventFromRecord(record))
 	}
 	writeJSON(r.logger, w, http.StatusOK, result)
+}
+
+// adminActivityEventFromRecord projects a correlation record into a sanitized
+// admin activity event. Duration is taken from ProxyObservation.TotalDurationMs
+// with a Metadata["duration_ms"] int64 fallback. Private or raw metadata is
+// never copied into the output.
+func adminActivityEventFromRecord(record *correlation.CorrelationRecord) adminActivityEvent {
+	event := adminActivityEvent{
+		Time:      record.RequestTime,
+		BackendID: record.BackendID,
+		Status:    record.Status,
+	}
+	if record.ProxyObservation != nil {
+		event.DurationMS = record.ProxyObservation.TotalDurationMs
+	}
+	if event.DurationMS == nil {
+		if duration, ok := record.Metadata["duration_ms"].(int64); ok {
+			value := float64(duration)
+			event.DurationMS = &value
+		}
+	}
+	return event
 }

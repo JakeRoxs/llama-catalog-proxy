@@ -41,8 +41,19 @@ func TestApplyStoredDelegatedProposalAndReplay(t *testing.T) {
 	target, backup, proposals, operations, source, proposal, binding := delegatedMutationFixture(t)
 	id := strings.Repeat("e", 32)
 	apply := func(operationID string) (DelegatedOperation, bool, error) {
-		return ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, operationID,
-			target, "config.yaml", backup, 2, binding)
+		return ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+			ProposalDirectory:  proposals,
+			OperationDirectory: operations,
+			ProposalID:         proposal.Proposal.ID,
+			OperationID:        operationID,
+			Target: MutationTarget{
+				Directory: target,
+				Filename:  "config.yaml",
+			},
+			BackupDirectory: backup,
+			Limit:           2,
+			Binding:         binding,
+		})
 	}
 	record, reserved, err := apply(id)
 	if err != nil || !reserved || record.Outcome != "written" || record.FinishedAt == nil {
@@ -75,14 +86,36 @@ func TestApplyStoredDelegatedProposalRejectsChangedBindingAndStaleTarget(t *test
 	id := strings.Repeat("e", 32)
 	changed := binding
 	changed.ReviewRevision = strings.Repeat("b", 64)
-	if _, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, changed); !errors.Is(err, ErrDelegatedProposalBinding) || reserved {
+	if _, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         changed,
+	}); !errors.Is(err, ErrDelegatedProposalBinding) || reserved {
 		t.Fatalf("different review accepted: %v, %v", reserved, err)
 	}
 	changed = binding
 	changed.RequesterNode = "other"
-	if _, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, changed); !errors.Is(err, ErrDelegatedProposalBinding) || reserved {
+	if _, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         changed,
+	}); !errors.Is(err, ErrDelegatedProposalBinding) || reserved {
 		t.Fatalf("different requester accepted: %v, %v", reserved, err)
 	}
 	path := filepath.Join(target, "config.yaml")
@@ -90,16 +123,38 @@ func TestApplyStoredDelegatedProposalRejectsChangedBindingAndStaleTarget(t *test
 	if err := os.WriteFile(path, external, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	record, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, binding)
+	record, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         binding,
+	})
 	if !errors.Is(err, ErrProposalStale) || !reserved || record.Outcome != "not_written" {
 		t.Fatalf("stale apply = %+v, %v, %v", record, reserved, err)
 	}
 	if err := os.WriteFile(path, source, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	replay, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, binding)
+	replay, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         binding,
+	})
 	if err != nil || reserved || replay.Outcome != "not_written" {
 		t.Fatalf("stale retry = %+v, %v, %v", replay, reserved, err)
 	}
@@ -121,8 +176,19 @@ func TestDelegatedExecutionLocksOutReview(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		<-start
-		record, reserved, applyErr = ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-			target, "config.yaml", backup, 2, binding)
+		record, reserved, applyErr = ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+			ProposalDirectory:  proposals,
+			OperationDirectory: operations,
+			ProposalID:         proposal.Proposal.ID,
+			OperationID:        id,
+			Target: MutationTarget{
+				Directory: target,
+				Filename:  "config.yaml",
+			},
+			BackupDirectory: backup,
+			Limit:           2,
+			Binding:         binding,
+		})
 	}()
 	go func() {
 		defer wg.Done()
@@ -132,8 +198,19 @@ func TestDelegatedExecutionLocksOutReview(t *testing.T) {
 	close(start)
 	wg.Wait()
 	if errors.Is(applyErr, ErrProposalStore) && !reserved {
-		record, reserved, applyErr = ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-			target, "config.yaml", backup, 2, binding)
+		record, reserved, applyErr = ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+			ProposalDirectory:  proposals,
+			OperationDirectory: operations,
+			ProposalID:         proposal.Proposal.ID,
+			OperationID:        id,
+			Target: MutationTarget{
+				Directory: target,
+				Filename:  "config.yaml",
+			},
+			BackupDirectory: backup,
+			Limit:           2,
+			Binding:         binding,
+		})
 	}
 	if applyErr != nil || !reserved || record.Outcome != "written" {
 		t.Fatalf("apply = %+v, %v, %v", record, reserved, applyErr)
@@ -153,8 +230,19 @@ func TestDelegatedInterruptedReservationNeverExecutesAgain(t *testing.T) {
 	if _, reserved, err := ReserveDelegatedOperation(operations, proposal, id, time.Now()); err != nil || !reserved {
 		t.Fatalf("reserve = %v, %v", reserved, err)
 	}
-	record, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, binding)
+	record, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         binding,
+	})
 	if err != nil || reserved || record.Outcome != "unknown" {
 		t.Fatalf("interrupted retry = %+v, %v, %v", record, reserved, err)
 	}
@@ -165,8 +253,19 @@ func TestDelegatedInterruptedReservationNeverExecutesAgain(t *testing.T) {
 	if err := DeleteDelegatedProposal(proposals, proposal.Proposal.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, reserved, err := ApplyStoredDelegatedProposal(proposals, operations, proposal.Proposal.ID, id,
-		target, "config.yaml", backup, 2, binding); !errors.Is(err, ErrProposalNotFound) || reserved {
+	if _, reserved, err := ApplyStoredDelegatedProposal(DelegatedProposalApplyRequest{
+		ProposalDirectory:  proposals,
+		OperationDirectory: operations,
+		ProposalID:         proposal.Proposal.ID,
+		OperationID:        id,
+		Target: MutationTarget{
+			Directory: target,
+			Filename:  "config.yaml",
+		},
+		BackupDirectory: backup,
+		Limit:           2,
+		Binding:         binding,
+	}); !errors.Is(err, ErrProposalNotFound) || reserved {
 		t.Fatalf("deleted review accepted: %v, %v", reserved, err)
 	}
 }

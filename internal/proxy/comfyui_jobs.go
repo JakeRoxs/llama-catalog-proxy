@@ -128,57 +128,31 @@ func (t *comfyUIJobTracker) wait(ctx context.Context) error {
 	emptySamples := 0
 
 	for {
-		t.mu.Lock()
-		if t.inFlightPrompts > 0 || t.pendingPrompts > 0 {
-			changed := t.changed
-			t.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-changed:
-			}
-			continue
+		if err := t.waitForChange(ctx); err != nil {
+			return err
 		}
-		t.mu.Unlock()
 
 		t.mu.Lock()
-		tracked := t.active
+		active := t.active
 		t.mu.Unlock()
-		if !tracked {
+		if !active {
 			return nil
 		}
-		wasActive := tracked
+		wasActive := active
+
 		busy, err := t.queueBusy(ctx)
 		if err != nil {
 			t.mu.Lock()
-			tracked := t.active
+			active = t.active
 			t.mu.Unlock()
-			if !tracked {
+			if !active {
 				return nil
 			}
 			return err
 		}
-		if busy {
-			t.mu.Lock()
-			t.active = true
-			t.mu.Unlock()
-			emptySamples = 0
-		} else {
-			if !wasActive {
-				return nil
-			}
-			emptySamples++
-			if emptySamples >= 2 {
-				t.mu.Lock()
-				if t.inFlightPrompts == 0 && t.pendingPrompts == 0 {
-					t.active = false
-					t.signalChangeLocked()
-					t.mu.Unlock()
-					return nil
-				}
-				t.mu.Unlock()
-				emptySamples = 0
-			}
+
+		if t.handleQueueTransition(wasActive, busy, &emptySamples) {
+			return nil
 		}
 
 		select {
@@ -187,6 +161,59 @@ func (t *comfyUIJobTracker) wait(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// waitForChange blocks until no prompt is in-flight or pending, or the context
+// is done. t.mu is not held on entry and is released before returning. It
+// snapshots t.changed under t.mu before unlocking, then waits for ctx.Done or
+// changed. It returns the exact context error when the context is done.
+func (t *comfyUIJobTracker) waitForChange(ctx context.Context) error {
+	t.mu.Lock()
+	if t.inFlightPrompts > 0 || t.pendingPrompts > 0 {
+		changed := t.changed
+		t.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+		return nil
+	}
+	t.mu.Unlock()
+	return nil
+}
+
+// handleQueueTransition applies a queue probe result to the tracker state.
+// t.mu is not held on entry and is not held on exit; any lock taken is
+// released before returning. wasActive is the active value snapshotted before
+// the probe. busy reports whether the ComfyUI queue had running or pending
+// prompts. emptySamples is updated in place. It returns true when the caller
+// should stop waiting.
+func (t *comfyUIJobTracker) handleQueueTransition(wasActive bool, busy bool, emptySamples *int) bool {
+	if busy {
+		t.mu.Lock()
+		t.active = true
+		t.mu.Unlock()
+		*emptySamples = 0
+		return false
+	}
+	if !wasActive {
+		return true
+	}
+	*emptySamples++
+	if *emptySamples < 2 {
+		return false
+	}
+	t.mu.Lock()
+	if t.inFlightPrompts == 0 && t.pendingPrompts == 0 {
+		t.active = false
+		t.signalChangeLocked()
+		t.mu.Unlock()
+		return true
+	}
+	t.mu.Unlock()
+	*emptySamples = 0
+	return false
 }
 
 func (t *comfyUIJobTracker) signalChangeLocked() {

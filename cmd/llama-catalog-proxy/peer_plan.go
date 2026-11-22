@@ -49,56 +49,88 @@ func runPeerConfigPlan(args []string, stdout, stderr io.Writer) error {
 	sort.Strings(ids)
 	for _, nodeID := range ids {
 		grant := cfg.Peer.Peers[nodeID]
-		peerPlan := peerHandoffPlan{
+		plan.Peers = append(plan.Peers, peerHandoffPlan{
 			NodeID:                    nodeID,
 			OutboundURLConfigured:     grant.URL != "",
 			InboundTokenConfigured:    grant.Token != "",
 			OutboundTokenConfigured:   grant.OutboundToken != "",
 			OutboundCATrustConfigured: grant.CAFile != "",
 			OutboundCRLConfigured:     grant.CRLFile != "",
-			InboundScopes:             make([]string, 0, 5),
-			OutboundScopes:            make([]string, 0, 4),
-			Handoff:                   make([]string, 0, 3),
-		}
-		peerPlan.InboundScopes = appendPeerScope(peerPlan.InboundScopes, grant.CatalogRead, "catalog_read")
-		peerPlan.InboundScopes = appendPeerScope(peerPlan.InboundScopes, grant.DiagnosticsRead, "diagnostics_read")
-		peerPlan.InboundScopes = appendPeerScope(peerPlan.InboundScopes, grant.Inference, "inference")
-		peerPlan.InboundScopes = appendPeerScope(peerPlan.InboundScopes, grant.ManageSettings, "manage_settings")
-		if len(grant.PathAccess) > 0 {
-			peerPlan.InboundScopes = append(peerPlan.InboundScopes, "path_access")
-		}
-		peerPlan.OutboundScopes = appendPeerScope(peerPlan.OutboundScopes, grant.RouteInference, "route_inference")
-		peerPlan.OutboundScopes = appendPeerScope(peerPlan.OutboundScopes, grant.RouteManagement, "route_management")
-		if len(grant.RoutePaths) > 0 {
-			peerPlan.OutboundScopes = append(peerPlan.OutboundScopes, "route_paths")
-		}
-		switch {
-		case grant.URL != "" && grant.Token != "":
-			peerPlan.Direction = "bidirectional"
-		case grant.URL != "":
-			peerPlan.Direction = "outbound"
-		case grant.Token != "":
-			peerPlan.Direction = "inbound"
-		default:
-			peerPlan.Direction = "unconfigured"
-		}
-		if grant.Token != "" {
-			peerPlan.Handoff = append(peerPlan.Handoff,
-				"remote peers."+cfg.Peer.NodeID+".outbound_token must match this node's inbound token; provide this node's HTTPS peer URL out of band")
-		}
-		if grant.URL != "" {
-			peerPlan.Handoff = append(peerPlan.Handoff,
-				"remote peers."+cfg.Peer.NodeID+".token must match this node's outbound token")
-		}
-		if grant.URL != "" && grant.Token != "" {
-			peerPlan.Handoff = append(peerPlan.Handoff,
-				"bidirectional operation requires two distinct tokens, one per direction; confirm the remote grant independently")
-		}
-		peerPlan.Handoff = append(peerPlan.Handoff,
-			"pairing membership does not grant these scopes; verify trust, firewall reachability, and remote authorization separately")
-		plan.Peers = append(plan.Peers, peerPlan)
+			InboundScopes:             peerInboundScopes(grant),
+			OutboundScopes:            peerOutboundScopes(grant),
+			Direction:                 peerDirection(grant),
+			Handoff:                   peerHandoff(grant, cfg.Peer.NodeID),
+		})
 	}
 	return json.NewEncoder(stdout).Encode(plan)
+}
+
+// peerInboundScopes returns the inbound scope list for a peer grant in the
+// canonical order: configured capability scopes first, then path_access when
+// any path access entries are present.
+func peerInboundScopes(grant config.PeerGrant) []string {
+	scopes := make([]string, 0, 5)
+	scopes = appendPeerScope(scopes, grant.CatalogRead, "catalog_read")
+	scopes = appendPeerScope(scopes, grant.DiagnosticsRead, "diagnostics_read")
+	scopes = appendPeerScope(scopes, grant.Inference, "inference")
+	scopes = appendPeerScope(scopes, grant.ManageSettings, "manage_settings")
+	if len(grant.PathAccess) > 0 {
+		scopes = append(scopes, "path_access")
+	}
+	return scopes
+}
+
+// peerOutboundScopes returns the outbound scope list for a peer grant in the
+// canonical order: configured route scopes first, then route_paths when any
+// route paths are present.
+func peerOutboundScopes(grant config.PeerGrant) []string {
+	scopes := make([]string, 0, 4)
+	scopes = appendPeerScope(scopes, grant.RouteInference, "route_inference")
+	scopes = appendPeerScope(scopes, grant.RouteManagement, "route_management")
+	if len(grant.RoutePaths) > 0 {
+		scopes = append(scopes, "route_paths")
+	}
+	return scopes
+}
+
+// peerDirection returns the peer coupling direction for a grant:
+// bidirectional when both a URL and a token are configured, outbound when only
+// a URL is configured, inbound when only a token is configured, and
+// unconfigured otherwise.
+func peerDirection(grant config.PeerGrant) string {
+	switch {
+	case grant.URL != "" && grant.Token != "":
+		return "bidirectional"
+	case grant.URL != "":
+		return "outbound"
+	case grant.Token != "":
+		return "inbound"
+	default:
+		return "unconfigured"
+	}
+}
+
+// peerHandoff returns the conditional handoff messages for a peer grant, in the
+// canonical order: inbound-token match, outbound-token match, bidirectional
+// token confirmation (when both directions are configured), and the trust
+// verification reminder.
+func peerHandoff(grant config.PeerGrant, localNodeID string) []string {
+	handoff := make([]string, 0, 3)
+	if grant.Token != "" {
+		handoff = append(handoff,
+			"remote peers."+localNodeID+".outbound_token must match this node's inbound token; provide this node's HTTPS peer URL out of band")
+	}
+	if grant.URL != "" {
+		handoff = append(handoff,
+			"remote peers."+localNodeID+".token must match this node's outbound token")
+	}
+	if grant.URL != "" && grant.Token != "" {
+		handoff = append(handoff,
+			"bidirectional operation requires two distinct tokens, one per direction; confirm the remote grant independently")
+	}
+	handoff = append(handoff,
+		"pairing membership does not grant these scopes; verify trust, firewall reachability, and remote authorization separately")
+	return handoff
 }
 
 func appendPeerScope(scopes []string, enabled bool, name string) []string {

@@ -98,47 +98,56 @@ func newTestServer(t *testing.T, prefix, apiKey, customHeader, activityBody, mod
 	}
 	bodies["/api/metrics/activity"] = activityBody
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer "+apiKey {
-			t.Errorf("authorization not applied on %s", r.URL.Path)
-		}
-		if r.Header.Get("X-Api-Key") != apiKey {
-			t.Errorf("x-api-key not applied on %s", r.URL.Path)
-		}
-		if customHeader != "" && r.Header.Get("X-Custom") != customHeader {
-			t.Errorf("custom header not applied on %s", r.URL.Path)
-		}
-		path := r.URL.Path
-		if prefix != "" {
-			if !strings.HasPrefix(path, prefix) {
-				t.Errorf("prefix not preserved on %s", r.URL.Path)
-			}
-			path = strings.TrimPrefix(path, prefix)
-		}
-		if _, ok := bodies[path]; !ok {
-			t.Errorf("unsafe/unexpected path %s", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if path == "/api/metrics/activity" {
-			query := r.URL.RawQuery
-			if query != "limit=1" && query != "limit=100&page=1" {
-				t.Errorf("activity query is not bounded: %s", query)
-			}
-		} else if r.URL.RawQuery != "" {
-			t.Errorf("unexpected query on %s: %s", r.URL.Path, r.URL.RawQuery)
-		}
-		mu.Lock()
-		seen[path]++
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, bodies[path])
+		serveTestRequest(t, apiKey, customHeader, prefix, seen, &mu, bodies, w, r)
 	}))
 	return server, seen
+}
+
+// serveTestRequest handles a single request to the test fixture server. It
+// enforces GET-only, the Authorization/X-Api-Key/X-Custom headers, the
+// optional /proxy prefix, the safe path whitelist, and activity query
+// bounds, then records the path in seen and serves the capability body.
+func serveTestRequest(t *testing.T, apiKey, customHeader, prefix string, seen map[string]int, mu *sync.Mutex, bodies map[string]string, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("Authorization") != "Bearer "+apiKey {
+		t.Errorf("authorization not applied on %s", r.URL.Path)
+	}
+	if r.Header.Get("X-Api-Key") != apiKey {
+		t.Errorf("x-api-key not applied on %s", r.URL.Path)
+	}
+	if customHeader != "" && r.Header.Get("X-Custom") != customHeader {
+		t.Errorf("custom header not applied on %s", r.URL.Path)
+	}
+	path := r.URL.Path
+	if prefix != "" {
+		if !strings.HasPrefix(path, prefix) {
+			t.Errorf("prefix not preserved on %s", r.URL.Path)
+		}
+		path = strings.TrimPrefix(path, prefix)
+	}
+	if _, ok := bodies[path]; !ok {
+		t.Errorf("unsafe/unexpected path %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if path == "/api/metrics/activity" {
+		query := r.URL.RawQuery
+		if query != "limit=1" && query != "limit=100&page=1" {
+			t.Errorf("activity query is not bounded: %s", query)
+		}
+	} else if r.URL.RawQuery != "" {
+		t.Errorf("unexpected query on %s: %s", r.URL.Path, r.URL.RawQuery)
+	}
+	mu.Lock()
+	seen[path]++
+	mu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, bodies[path])
 }
 
 func parseReport(t *testing.T, buf *bytes.Buffer) map[string]any {
@@ -257,26 +266,12 @@ func TestRunDiagnosticsRequestHistoryDisabledBackendNoHTTP(t *testing.T) {
 	}
 }
 
-func TestRunDiagnosticsRequestHistoryLlamaSwap(t *testing.T) {
-	server, seen := newTestServer(t, "/proxy", "sentinel-key", "sentinel-header", activitySchema(), "", "")
-	defer server.Close()
-
-	path := writeTempConfig(t, diagnosticsConfig(t, server.URL+"/proxy", "llama_swap", true))
-	var buf bytes.Buffer
-	ctx := context.Background()
-	if err := runDiagnostics(ctx, path, &buf); err != nil {
-		t.Fatalf("runDiagnostics error: %v", err)
-	}
-	report := parseReport(t, &buf)
-	backendActivity, ok := report["backend_activity"].(map[string]any)
-	if !ok {
-		t.Fatal("backend_activity should be present when request_history is true")
-	}
-	records, ok := backendActivity["records"].([]any)
-	if !ok || len(records) != 1 {
-		t.Fatalf("expected exactly one normalized record, got %v", records)
-	}
-	record := records[0].(map[string]any)
+// assertLlamaSwapRecord verifies the normalized LlamaSwap activity record:
+// backend_id, epoch, activity_id, timestamp, model_id (unknown without an
+// allowlist), status, request_id_mapping, upstream_generation, epoch_scope,
+// and the absence of raw activity fields that must not be copied.
+func assertLlamaSwapRecord(t *testing.T, record map[string]any) {
+	t.Helper()
 	if record["backend_id"] != "test" {
 		t.Fatalf("backend_id = %v, want test", record["backend_id"])
 	}
@@ -309,13 +304,15 @@ func TestRunDiagnosticsRequestHistoryLlamaSwap(t *testing.T) {
 			t.Fatalf("raw field %q should not be copied", field)
 		}
 	}
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header", "SHORT_MODEL_SECRET", "SHORT_TASK_SECRET", "SHORT_ROUTE_SECRET", "SHORT_PEER_SECRET", "SHORT_PATH_SECRET", "SHORT_ERROR_SECRET", "SHORT_KEY_SECRET", "SHORT_VALUE_SECRET"} {
-		if strings.Contains(output, secret) {
-			t.Fatalf("secret leaked in output: %q", secret)
-		}
-	}
-	_, ok = backendActivity["max_records"].(float64)
+}
+
+// assertLlamaSwapBackendActivityState verifies the aggregate backend activity
+// state: max_records is a number, backend_states.test reports collected with
+// reason ok, http_status 200, one row, complete coverage, record_count 1,
+// and epoch 1.
+func assertLlamaSwapBackendActivityState(t *testing.T, backendActivity map[string]any) {
+	t.Helper()
+	_, ok := backendActivity["max_records"].(float64)
 	if !ok {
 		t.Fatal("max_records should be a number (no any sentinel)")
 	}
@@ -335,6 +332,37 @@ func TestRunDiagnosticsRequestHistoryLlamaSwap(t *testing.T) {
 	}
 	if asFloat64(backendActivity["epoch"]) != 1 {
 		t.Fatalf("epoch = %v, want 1", backendActivity["epoch"])
+	}
+}
+
+func TestRunDiagnosticsRequestHistoryLlamaSwap(t *testing.T) {
+	server, seen := newTestServer(t, "/proxy", "sentinel-key", "sentinel-header", activitySchema(), "", "")
+	defer server.Close()
+
+	path := writeTempConfig(t, diagnosticsConfig(t, server.URL+"/proxy", "llama_swap", true))
+	var buf bytes.Buffer
+	ctx := context.Background()
+	if err := runDiagnostics(ctx, path, &buf); err != nil {
+		t.Fatalf("runDiagnostics error: %v", err)
+	}
+	report := parseReport(t, &buf)
+	backendActivity, ok := report["backend_activity"].(map[string]any)
+	if !ok {
+		t.Fatal("backend_activity should be present when request_history is true")
+	}
+	records, ok := backendActivity["records"].([]any)
+	if !ok || len(records) != 1 {
+		t.Fatalf("expected exactly one normalized record, got %v", records)
+	}
+	record := records[0].(map[string]any)
+	assertLlamaSwapRecord(t, record)
+	assertLlamaSwapBackendActivityState(t, backendActivity)
+	// No secrets from the LlamaSwap activity record leaked.
+	output := buf.String()
+	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header", "SHORT_MODEL_SECRET", "SHORT_TASK_SECRET", "SHORT_ROUTE_SECRET", "SHORT_PEER_SECRET", "SHORT_PATH_SECRET", "SHORT_ERROR_SECRET", "SHORT_KEY_SECRET", "SHORT_VALUE_SECRET"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("secret leaked in output: %q", secret)
+		}
 	}
 	if seen["/api/metrics/activity"] != 2 {
 		t.Fatalf("activity path probed %d times, want 2 (capabilities + collector)", seen["/api/metrics/activity"])
@@ -374,10 +402,23 @@ func TestRunDiagnosticsWriterError(t *testing.T) {
 // collection (GET /running) share the activity collector epoch, that the
 // resolved identity links to the current lifecycle snapshot, and that raw
 // aliases, model IDs, commands, URLs, and secrets are never emitted.
-func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
-	// Canonical model "canon" declares alias "shortalias"; an explicit alias
-	// row shortalias -> canon. Both resolve to the canonical ref.
-	modelsBody, err := json.Marshal(map[string]any{
+// mustMarshal marshals v and fatals the test on error.
+func mustMarshal(t *testing.T, v any) string {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// linksLifecycleFixtures builds the models/running/activity fixture bodies
+// for the links-lifecycle test: canon model declaring alias shortalias, a
+// ready /running row carrying raw secrets, and two activity rows (shortalias
+// resolves to canon; nosuchmodel is absent).
+func linksLifecycleFixtures(t *testing.T) (modelsBody, runningBody, activityBody string) {
+	t.Helper()
+	modelsBody = mustMarshal(t, map[string]any{
 		"data": []any{
 			map[string]any{
 				"id": "canon",
@@ -400,12 +441,7 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// /running readiness snapshot for the canonical model; raw fields must
-	// never be copied.
-	runningBody, err := json.Marshal(map[string]any{
+	runningBody = mustMarshal(t, map[string]any{
 		"running": []any{
 			map[string]any{
 				"model":       "canon",
@@ -418,12 +454,7 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Activity source model is "shortalias" (resolves to canon) plus an
-	// activity for an absent model "nosuchmodel" (must remain unknown).
-	activityBody, err := json.Marshal(map[string]any{
+	activityBody = mustMarshal(t, map[string]any{
 		"data": []any{
 			map[string]any{
 				"id":               42,
@@ -457,28 +488,17 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 		"total":       2,
 		"total_pages": 1,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	return modelsBody, runningBody, activityBody
+}
 
-	server, seen := newTestServer(t, "/proxy", "sentinel-key", "sentinel-header", string(activityBody), string(modelsBody), string(runningBody))
-	defer server.Close()
-
-	path := writeTempConfig(t, diagnosticsConfig(t, server.URL+"/proxy", "llama_swap", true))
-	var buf bytes.Buffer
-	ctx := context.Background()
-	if err := runDiagnostics(ctx, path, &buf); err != nil {
-		t.Fatalf("runDiagnostics error: %v", err)
-	}
-	report := parseReport(t, &buf)
-
-	// backend_aliases: alias collector ran GET /v1/models.
+// assertAliasEdges verifies backend_aliases: exactly 2 edges (canon self +
+// shortalias->canon), with the shortalias edge catalog_resolved to canon.
+func assertAliasEdges(t *testing.T, report map[string]any, canonRef, shortaliasRef string) {
+	t.Helper()
 	backendAliases := toStruct[correlation.AliasReport](t, report["backend_aliases"])
 	if len(backendAliases.Edges) != 2 {
 		t.Fatalf("expected 2 alias edges (canon self + shortalias->canon), got %d", len(backendAliases.Edges))
 	}
-	shortaliasRef, _ := correlation.ModelReference("test", "shortalias")
-	canonRef, _ := correlation.ModelReference("test", "canon")
 	var aliasEdge *correlation.AliasEdge
 	for i := range backendAliases.Edges {
 		if backendAliases.Edges[i].Ref == shortaliasRef {
@@ -491,8 +511,12 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 	if aliasEdge.State != "catalog_resolved" || aliasEdge.CanonicalRef != canonRef {
 		t.Fatalf("alias edge wrong: %#v", aliasEdge)
 	}
+}
 
-	// activity_model_identity: the shortalias activity resolves to canon.
+// assertActivityIdentities verifies activity_model_identity: 2 identities,
+// shortalias resolves to canon (catalog_resolved), nosuchmodel unknown.
+func assertActivityIdentities(t *testing.T, report map[string]any, canonRef, shortaliasRef string) {
+	t.Helper()
 	identities := toStruct[[]correlation.ActivityModelIdentity](t, report["activity_model_identity"])
 	if len(identities) != 2 {
 		t.Fatalf("expected 2 identities, got %d", len(identities))
@@ -514,8 +538,12 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 	if absent.State != "unknown" || absent.CanonicalRef != "" {
 		t.Fatalf("absent identity should be unknown: %#v", absent)
 	}
+}
 
-	// backend_lifecycle: lifecycle collector ran GET /running.
+// assertLifecycleReport verifies backend_lifecycle: 1 model, ready state,
+// canon ref, nil ReadySince.
+func assertLifecycleReport(t *testing.T, report map[string]any, canonRef string) {
+	t.Helper()
 	lifecycleReport := toStruct[correlation.LifecycleReport](t, report["backend_lifecycle"])
 	if len(lifecycleReport.Models) != 1 {
 		t.Fatalf("expected 1 lifecycle model, got %d", len(lifecycleReport.Models))
@@ -530,8 +558,13 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 	if lm.ReadySince != nil {
 		t.Fatal("ReadySince should be nil (/running does not expose it)")
 	}
+}
 
-	// activity_lifecycle: link resolves to the ready model.
+// assertActivityLifecycleObservations verifies activity_lifecycle: 2
+// observations; the shortalias observation links to the ready canon with the
+// expected flags, and the absent-model observation is unknown/unobserved.
+func assertActivityLifecycleObservations(t *testing.T, report map[string]any, canonRef, shortaliasRef string) {
+	t.Helper()
 	observations := toStruct[[]correlation.ActivityLifecycleObservation](t, report["activity_lifecycle"])
 	if len(observations) != 2 {
 		t.Fatalf("expected 2 observations, got %d", len(observations))
@@ -578,14 +611,14 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 	if o2.CurrentState != "unknown" || o2.Observed || o2.ObservedAt != nil {
 		t.Fatalf("absent observation should be unknown and unobserved: %#v", o2)
 	}
+}
 
-	// Raw aliases, model IDs, commands, URLs, and secrets must never be
-	// emitted as values. Opaque refs must not contain raw IDs. Field names
-	// such as "canonical_ref" legitimately contain the substring "canon", so
-	// check for quoted JSON string values instead of bare substrings.
-	output := buf.String()
+// assertNoLlamaSwapSecretsOrRawIDs verifies the diagnostics output leaks no
+// secrets and no raw model IDs/commands.
+func assertNoLlamaSwapSecretsOrRawIDs(t *testing.T, serverURL, output string, canonRef, shortaliasRef string) {
+	t.Helper()
 	for _, secret := range []string{
-		server.URL, "sentinel-key", "sentinel-header",
+		serverURL, "sentinel-key", "sentinel-header",
 		"SHORT_CMD_SECRET", "SHORT_PROXY_SECRET", "SHORT_NAME_SECRET", "SHORT_DESC_SECRET",
 	} {
 		if strings.Contains(output, secret) {
@@ -600,12 +633,42 @@ func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
 	if strings.Contains(canonRef, "canon") || strings.Contains(shortaliasRef, "shortalias") {
 		t.Fatal("opaque ref must not leak raw model ID")
 	}
-	// GET-only base-path auth: only the expected paths were probed.
+}
+
+// assertProbedPaths verifies all expected GET-only base paths were probed.
+func assertProbedPaths(t *testing.T, seen map[string]int) {
+	t.Helper()
 	for _, op := range []string{"/v1/models", "/running", "/api/metrics/activity", "/api/version", "/api/metrics/stats", "/api/performance", "/api/hardware"} {
 		if _, ok := seen[op]; !ok {
 			t.Fatalf("expected path %s to be probed", op)
 		}
 	}
+}
+
+func TestRunDiagnosticsRequestHistoryLinksLifecycle(t *testing.T) {
+	modelsBody, runningBody, activityBody := linksLifecycleFixtures(t)
+
+	server, seen := newTestServer(t, "/proxy", "sentinel-key", "sentinel-header", activityBody, modelsBody, runningBody)
+	defer server.Close()
+
+	path := writeTempConfig(t, diagnosticsConfig(t, server.URL+"/proxy", "llama_swap", true))
+	var buf bytes.Buffer
+	ctx := context.Background()
+	if err := runDiagnostics(ctx, path, &buf); err != nil {
+		t.Fatalf("runDiagnostics error: %v", err)
+	}
+	report := parseReport(t, &buf)
+
+	canonRef, _ := correlation.ModelReference("test", "canon")
+	shortaliasRef, _ := correlation.ModelReference("test", "shortalias")
+
+	assertAliasEdges(t, report, canonRef, shortaliasRef)
+	assertActivityIdentities(t, report, canonRef, shortaliasRef)
+	assertLifecycleReport(t, report, canonRef)
+	assertActivityLifecycleObservations(t, report, canonRef, shortaliasRef)
+
+	assertNoLlamaSwapSecretsOrRawIDs(t, server.URL, buf.String(), canonRef, shortaliasRef)
+	assertProbedPaths(t, seen)
 }
 
 // TestRunDiagnosticsRequestHistoryLifecycleEventsOnlyWhenFlagTrue verifies
@@ -641,6 +704,29 @@ func TestRunDiagnosticsRequestHistoryLifecycleEventsOnlyWhenFlagTrue(t *testing.
 	if !ok {
 		t.Fatal("backend_lifecycle_events should be a map when request_history is true")
 	}
+	assertLifecycleEventSupport(t, support)
+	// No /api/events or /api/events/logs requests even if server advertises SSE.
+	for _, op := range []string{"/api/events", "/api/events/logs"} {
+		if _, ok := seen[op]; ok {
+			t.Fatalf("unexpected path %s was probed", op)
+		}
+	}
+	// No secrets leaked.
+	output := buf.String()
+	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header"} {
+		if strings.Contains(output, secret) {
+			t.Fatalf("secret leaked in output: %q", secret)
+		}
+	}
+}
+
+// assertLifecycleEventSupport verifies the backend_lifecycle_events support
+// report for an unsupported adapter contract: capability-sourced, collector
+// epoch scoped, unsupported state with the transition payload not exposed
+// reason, unavailability fields present, no collection performed, and an
+// unknown (nil) observed transitions list.
+func assertLifecycleEventSupport(t *testing.T, support map[string]any) {
+	t.Helper()
 	if support["source"] != "adapter_capability" {
 		t.Fatalf("source = %v, want adapter_capability", support["source"])
 	}
@@ -676,19 +762,6 @@ func TestRunDiagnosticsRequestHistoryLifecycleEventsOnlyWhenFlagTrue(t *testing.
 	}
 	if support["observed_transitions"] != nil {
 		t.Fatal("uncollected transitions should be unknown, not an observed empty list")
-	}
-	// No /api/events or /api/events/logs requests even if server advertises SSE.
-	for _, op := range []string{"/api/events", "/api/events/logs"} {
-		if _, ok := seen[op]; ok {
-			t.Fatalf("unexpected path %s was probed", op)
-		}
-	}
-	// No secrets leaked.
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header"} {
-		if strings.Contains(output, secret) {
-			t.Fatalf("secret leaked in output: %q", secret)
-		}
 	}
 }
 
@@ -837,6 +910,67 @@ func TestRunDiagnosticsRequestHistoryActivityLifecycleEvents(t *testing.T) {
 	}
 }
 
+// serveSSEFixtureRequest handles a single diagnostics request against an
+// SSE-advertising fixture. It enforces GET-only, Authorization/X-Api-Key/
+// X-Custom headers, the /proxy prefix, serves the GET-only capability bodies,
+// counts and fails on /api/events and /api/events/logs probes, and rejects
+// any other path. Counter updates are guarded by mu.
+func serveSSEFixtureRequest(t *testing.T, eventsCount, logsCount *int, mu *sync.Mutex, bodies map[string]string, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if r.Header.Get("Authorization") != "Bearer sentinel-key" {
+		t.Errorf("authorization not applied on %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if r.Header.Get("X-Api-Key") != "sentinel-key" {
+		t.Errorf("x-api-key not applied on %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if r.Header.Get("X-Custom") != "sentinel-header" {
+		t.Errorf("custom header not applied on %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	path := r.URL.Path
+	if !strings.HasPrefix(path, "/proxy") {
+		t.Errorf("prefix not preserved on %s", r.URL.Path)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	path = strings.TrimPrefix(path, "/proxy")
+	if _, ok := bodies[path]; ok {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, bodies[path])
+		return
+	}
+	if path == "/api/events" {
+		mu.Lock()
+		(*eventsCount)++
+		mu.Unlock()
+		t.Errorf("unexpected /api/events request")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data:{\"type\":\"modelStatus\",\"data\":\"[...]\"}\n\n")
+		return
+	}
+	if path == "/api/events/logs" {
+		mu.Lock()
+		(*logsCount)++
+		mu.Unlock()
+		t.Errorf("unexpected /api/events/logs request")
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data:{\"type\":\"modelStatus\",\"data\":\"[...]\"}\n\n")
+		return
+	}
+	t.Errorf("unsafe/unexpected path %s", r.URL.Path)
+	w.WriteHeader(http.StatusBadRequest)
+}
+
 // TestRunDiagnosticsSSEFixtureNeverRead verifies that no /api/events or
 // /api/events/logs request is made even when the server advertises SSE with
 // secrets. The SSE fixture handler counts requests and fails the test if
@@ -846,58 +980,7 @@ func TestRunDiagnosticsSSEFixtureNeverRead(t *testing.T) {
 	var mu sync.Mutex
 	bodies := validCapabilityBodies()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer sentinel-key" {
-			t.Errorf("authorization not applied on %s", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if r.Header.Get("X-Api-Key") != "sentinel-key" {
-			t.Errorf("x-api-key not applied on %s", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if r.Header.Get("X-Custom") != "sentinel-header" {
-			t.Errorf("custom header not applied on %s", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		path := r.URL.Path
-		if !strings.HasPrefix(path, "/proxy") {
-			t.Errorf("prefix not preserved on %s", r.URL.Path)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		path = strings.TrimPrefix(path, "/proxy")
-		if _, ok := bodies[path]; ok {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, bodies[path])
-			return
-		}
-		if path == "/api/events" {
-			mu.Lock()
-			eventsCount++
-			mu.Unlock()
-			t.Errorf("unexpected /api/events request")
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "data:{\"type\":\"modelStatus\",\"data\":\"[...]\"}\n\n")
-			return
-		}
-		if path == "/api/events/logs" {
-			mu.Lock()
-			logsCount++
-			mu.Unlock()
-			t.Errorf("unexpected /api/events/logs request")
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, "data:{\"type\":\"modelStatus\",\"data\":\"[...]\"}\n\n")
-			return
-		}
-		t.Errorf("unsafe/unexpected path %s", r.URL.Path)
-		w.WriteHeader(http.StatusBadRequest)
+		serveSSEFixtureRequest(t, &eventsCount, &logsCount, &mu, bodies, w, r)
 	}))
 	defer server.Close()
 

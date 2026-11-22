@@ -47,7 +47,14 @@ func TestJoinExpectedRejectsDiscoveredIdentityBeforeEnrollment(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := store.JoinExpected(ctx, server.URL, "node-c", invitation.Code, clientCertificate, roots, []*x509.RevocationList{crl}, 24*time.Hour); err == nil {
+	if _, err := store.JoinExpected(ctx, server.URL, JoinExpectedOptions{
+		ExpectedNodeID: "node-c",
+		Code:           invitation.Code,
+		Certificate:    clientCertificate,
+		Roots:          roots,
+		CRLs:           []*x509.RevocationList{crl},
+		MaxCRLAge:      24 * time.Hour,
+	}); err == nil {
 		t.Fatal("pairing accepted a TLS identity different from the selected candidate")
 	}
 	if enrollRequests.Load() != 0 {
@@ -55,6 +62,63 @@ func TestJoinExpectedRejectsDiscoveredIdentityBeforeEnrollment(t *testing.T) {
 	}
 	if store.IsMember("node-b") {
 		t.Fatal("identity-mismatched candidate was added to membership")
+	}
+}
+
+func TestJoinExpectedPairsWithValidPeer(t *testing.T) {
+	ca, caKey := newRevocationTestCA(t, 1)
+	clientCertificate := newPairingJoinCertificate(t, ca, caKey, "node-a", nil)
+	serverCertificate := newPairingJoinCertificate(t, ca, caKey, "node-b", []net.IP{net.ParseIP("127.0.0.1")})
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	now := time.Now().UTC()
+	crl := newRevocationTestCRL(t, ca, caKey, 1, now.Add(-time.Minute), now.Add(time.Hour))
+
+	var enrollRequests atomic.Int64
+	var inviteHeader string
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enrollRequests.Add(1)
+		inviteHeader = r.Header.Get("X-Llama-Catalog-Invite")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"state":"paired","federation_id":"lab.example","local_node_id":"node-b","node_id":"node-a","paired_at":"2026-11-16T12:00:00Z"}`))
+	}))
+	server.TLS = &tls.Config{
+		MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth: tls.RequestClientCert, ClientCAs: roots,
+	}
+	server.StartTLS()
+	defer server.Close()
+
+	_, store := pairingStoreFixture(t)
+	invitation, err := store.CreateInvitation("node-b", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	member, err := store.JoinExpected(ctx, server.URL, JoinExpectedOptions{
+		ExpectedNodeID: "node-b",
+		Code:           invitation.Code,
+		Certificate:    clientCertificate,
+		Roots:          roots,
+		CRLs:           []*x509.RevocationList{crl},
+		MaxCRLAge:      24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("join expected = %v", err)
+	}
+	if enrollRequests.Load() != 1 {
+		t.Fatalf("enrollment endpoint received %d requests", enrollRequests.Load())
+	}
+	if inviteHeader != invitation.Code {
+		t.Fatalf("invite header = %q", inviteHeader)
+	}
+	if member.NodeID != "node-b" {
+		t.Fatalf("member = %+v", member)
+	}
+	if !store.IsMember("node-b") {
+		t.Fatal("peer was not added to membership")
 	}
 }
 

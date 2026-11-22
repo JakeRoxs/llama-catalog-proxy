@@ -24,6 +24,11 @@ const (
 	maxChatResponseBytes        = 1 << 20
 	maxChatRequestBytes         = 64 << 10
 	maxReadyObservationAge      = 5 * time.Minute
+
+	// contentTypeJSON is the media type used for diagnostics and chat
+	// request/response bodies. Centralizing it avoids duplicating the
+	// "application/json" literal across header assignments.
+	contentTypeJSON = "application/json"
 )
 
 type APIClient struct {
@@ -208,7 +213,7 @@ func (c *APIClient) getDiagnostics(ctx context.Context, path string, query url.V
 	if err != nil {
 		return errors.New("could not create diagnostics API request")
 	}
-	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Accept", contentTypeJSON)
 	request.Header.Set("Authorization", "Bearer "+c.apiKey)
 	response, err := c.http.Do(request)
 	if err != nil {
@@ -297,8 +302,8 @@ func (c *APIClient) Complete(ctx context.Context, model string, messages []chatM
 		measurement.ErrorClass = "request_failed"
 		return chatResult{Measure: measurement}, "request_failed"
 	}
-	request.Header.Set("Accept", "application/json")
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", contentTypeJSON)
+	request.Header.Set("Content-Type", contentTypeJSON)
 	response, err := c.http.Do(request)
 	measurement.EndedAt = time.Now()
 	if err != nil {

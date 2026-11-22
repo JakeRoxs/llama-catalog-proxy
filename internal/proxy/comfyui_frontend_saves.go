@@ -16,13 +16,17 @@ import (
 const (
 	maxComfyUISettingsSaveBytes = 1 << 20
 	maxComfyUIWorkflowSaveBytes = 4 << 20
+
+	// comfyUIUserDataPathPrefix is the path fragment under the ComfyUI
+	// frontend root under which user data files are served.
+	comfyUIUserDataPathPrefix = "/userdata/"
 )
 
 func comfyUIJSONSaveKind(request *http.Request) string {
 	if request == nil || request.URL == nil || request.Method != http.MethodPost || !strings.HasPrefix(request.URL.Path, "/comfyui/") {
 		return ""
 	}
-	endpoint := strings.TrimPrefix(request.URL.Path, "/comfyui")
+	endpoint := strings.TrimPrefix(request.URL.Path, comfyUIPathPrefix)
 	if strings.HasPrefix(endpoint, "/api/") {
 		endpoint = strings.TrimPrefix(endpoint, "/api")
 	}
@@ -31,7 +35,7 @@ func comfyUIJSONSaveKind(request *http.Request) string {
 		return "settings"
 	case strings.HasPrefix(endpoint, "/settings/"):
 		return "setting"
-	case strings.HasPrefix(endpoint, "/userdata/"):
+	case strings.HasPrefix(endpoint, comfyUIUserDataPathPrefix):
 		return "workflow"
 	default:
 		return ""
@@ -39,7 +43,7 @@ func comfyUIJSONSaveKind(request *http.Request) string {
 }
 
 func (h *Handler) serveComfyUIJSONSave(w http.ResponseWriter, request *http.Request, info *routeInfo, kind string) {
-	endpoint := strings.TrimPrefix(request.URL.Path, "/comfyui")
+	endpoint := strings.TrimPrefix(request.URL.Path, comfyUIPathPrefix)
 	if strings.HasPrefix(endpoint, "/api/") {
 		endpoint = strings.TrimPrefix(endpoint, "/api")
 	}
@@ -60,13 +64,13 @@ func (h *Handler) serveComfyUIJSONSave(w http.ResponseWriter, request *http.Requ
 		}
 	}
 	if kind == "workflow" {
-		filename := strings.TrimPrefix(endpoint, "/userdata/")
-		escapedEndpoint := strings.TrimPrefix(request.URL.EscapedPath(), "/comfyui")
+		filename := strings.TrimPrefix(endpoint, comfyUIUserDataPathPrefix)
+		escapedEndpoint := strings.TrimPrefix(request.URL.EscapedPath(), comfyUIPathPrefix)
 		if strings.HasPrefix(escapedEndpoint, "/api/") {
 			escapedEndpoint = strings.TrimPrefix(escapedEndpoint, "/api")
 		}
 		// One escaped parameter distinguishes a save from /userdata/{file}/move/{dest}.
-		if !strings.HasPrefix(escapedEndpoint, "/userdata/") || strings.Contains(strings.TrimPrefix(escapedEndpoint, "/userdata/"), "/") {
+		if !strings.HasPrefix(escapedEndpoint, comfyUIUserDataPathPrefix) || strings.Contains(strings.TrimPrefix(escapedEndpoint, comfyUIUserDataPathPrefix), "/") {
 			writeJSONError(h.logger, w, http.StatusBadRequest, "nested ComfyUI save filenames must be URL-encoded")
 			return
 		}

@@ -344,6 +344,11 @@ func withDelegatedProposalStores(proposalDirectory, operationDirectory string, f
 	})
 }
 
+// delegatedProposalNames lists the proposal IDs stored in the delegated
+// proposal directory, sorted. It bounds the directory scan at MaxProposals+2
+// entries and rejects the audit file, temporary files, unexpected names,
+// invalid IDs, and directories. The audit file is validated but is never
+// returned as a proposal ID.
 func delegatedProposalNames(root *os.Root, dir *os.File) ([]string, error) {
 	entries, err := dir.ReadDir(MaxProposals + 2)
 	if err != nil && err != io.EOF || len(entries) > MaxProposals+1 {
@@ -351,30 +356,59 @@ func delegatedProposalNames(root *os.Root, dir *os.File) ([]string, error) {
 	}
 	ids := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		name := entry.Name()
-		if name == delegatedProposalAuditFilename {
-			if entry.IsDir() {
-				return nil, ErrProposalStore
-			}
-			if _, err := readDelegatedProposalRecoveryAudit(root, name); err != nil {
+		if isDelegatedAuditEntry(entry) {
+			if err := validateDelegatedAuditEntry(root, entry); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		if strings.HasPrefix(name, ".delegated-") && strings.HasSuffix(name, ".tmp") {
-			return nil, ErrProposalStore
-		}
-		if !strings.HasPrefix(name, delegatedProposalPrefix) || !strings.HasSuffix(name, ".json") {
-			return nil, ErrProposalStore
-		}
-		id := strings.TrimSuffix(strings.TrimPrefix(name, delegatedProposalPrefix), ".json")
-		if !validProposalID(id) || entry.IsDir() {
+		id, ok := parseDelegatedProposalName(entry)
+		if !ok {
 			return nil, ErrProposalStore
 		}
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	return ids, nil
+}
+
+// isDelegatedAuditEntry reports whether a directory entry is the recovery
+// audit file. The audit file is validated separately and is never returned
+// as a proposal ID.
+func isDelegatedAuditEntry(entry os.DirEntry) bool {
+	return entry.Name() == delegatedProposalAuditFilename
+}
+
+// validateDelegatedAuditEntry rejects a directory that shares the audit file
+// name and validates the audit file contents. Audit errors are propagated to
+// the caller.
+func validateDelegatedAuditEntry(root *os.Root, entry os.DirEntry) error {
+	if entry.IsDir() {
+		return ErrProposalStore
+	}
+	if _, err := readDelegatedProposalRecoveryAudit(root, entry.Name()); err != nil {
+		return err
+	}
+	return nil
+}
+
+// parseDelegatedProposalName classifies a directory entry as a delegated
+// proposal file and extracts its proposal ID. It rejects temporary files,
+// names that do not match the exact delegated prefix and JSON suffix,
+// invalid IDs, and directories.
+func parseDelegatedProposalName(entry os.DirEntry) (string, bool) {
+	name := entry.Name()
+	if strings.HasPrefix(name, ".delegated-") && strings.HasSuffix(name, ".tmp") {
+		return "", false
+	}
+	if !strings.HasPrefix(name, delegatedProposalPrefix) || !strings.HasSuffix(name, ".json") {
+		return "", false
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(name, delegatedProposalPrefix), ".json")
+	if !validProposalID(id) || entry.IsDir() {
+		return "", false
+	}
+	return id, true
 }
 
 func replaceDelegatedProposal(root *os.Root, dir *os.File, id string, data []byte) (result error) {

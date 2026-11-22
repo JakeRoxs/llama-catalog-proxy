@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,6 +12,15 @@ import (
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/ingestion"
+)
+
+// S1192: duplicated HTTP error message literals replaced by package-level
+// constants. Names are unique within the proxy package; the existing
+// `managementConfigChangedMsg` ("management configuration changed") covers a
+// different message and is not reused here.
+const (
+	ingestionManagementConfigChangedOrServiceStoppedMsg = "management configuration changed or service stopped"
+	ingestionRecordsUnavailableMsg                      = "ingestion records unavailable"
 )
 
 type ingestionRuntime struct {
@@ -48,30 +58,137 @@ func newIngestionRuntime(cfg config.Config) (*ingestionRuntime, error) {
 	return &ingestionRuntime{config: options, duration: duration, mode: mode, jobs: jobs}, nil
 }
 
-func validateIngestionDirectories(management *config.ManagementConfig, benchmark *config.BenchmarkConfig) error {
-	directory := management.Ingestion.Directory
-	records := management.Ingestion.RecordDirectory
+// validateIngestionDirectoryMetadata verifies the ingestion directory exists, is a
+// regular directory (not a symlink), and is not group/world writable.
+func validateIngestionDirectoryMetadata(directory string) error {
 	info, err := os.Lstat(directory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o022 != 0 {
 		return errors.New("ingestion directory must exist and not be a symlink or group/world writable")
 	}
-	if !separateProposalDirectory(directory, management.Targets) {
+	return nil
+}
+
+// validateIngestionDirectoryTargets verifies the ingestion directory is separated
+// from every management target.
+func validateIngestionDirectoryTargets(directory string, targets map[string]config.ManagementTarget) error {
+	if !separateProposalDirectory(directory, targets) {
 		return errors.New("ingestion directory overlaps or cannot be separated from management targets")
 	}
-	if !separateDirectories(directory, records) || !separateProposalDirectory(records, management.Targets) {
+	return nil
+}
+
+// validateIngestionRecordDirectory verifies the ingestion directory and record
+// directory are separated from each other and from every management target.
+func validateIngestionRecordDirectory(directory, records string, targets map[string]config.ManagementTarget) error {
+	if !separateDirectories(directory, records) || !separateProposalDirectory(records, targets) {
 		return errors.New("ingestion record directory overlaps or cannot be separated from models or management targets")
 	}
+	return nil
+}
+
+// validateIngestionStoreDirectories verifies the ingestion directory is separated
+// from the proposal, backup, and benchmark stores.
+func validateIngestionStoreDirectories(directory string, management *config.ManagementConfig, benchmark *config.BenchmarkConfig) error {
 	if management.ProposalStore != nil && !separateDirectories(directory, management.ProposalStore.Directory) ||
 		management.BackupStore != nil && !separateDirectories(directory, management.BackupStore.Directory) ||
 		benchmark != nil && !separateDirectories(directory, benchmark.ReportDirectory) {
 		return errors.New("ingestion directory overlaps or cannot be separated from management or benchmark stores")
 	}
+	return nil
+}
+
+// validateIngestionRecordStoreDirectories verifies the ingestion record directory
+// is separated from the proposal, backup, and benchmark stores.
+func validateIngestionRecordStoreDirectories(records string, management *config.ManagementConfig, benchmark *config.BenchmarkConfig) error {
 	if management.ProposalStore != nil && !separateDirectories(records, management.ProposalStore.Directory) ||
 		management.BackupStore != nil && !separateDirectories(records, management.BackupStore.Directory) ||
 		benchmark != nil && !separateDirectories(records, benchmark.ReportDirectory) {
 		return errors.New("ingestion record directory overlaps or cannot be separated from management or benchmark stores")
 	}
 	return nil
+}
+
+func validateIngestionDirectories(management *config.ManagementConfig, benchmark *config.BenchmarkConfig) error {
+	directory := management.Ingestion.Directory
+	records := management.Ingestion.RecordDirectory
+	if err := validateIngestionDirectoryMetadata(directory); err != nil {
+		return err
+	}
+	if err := validateIngestionDirectoryTargets(directory, management.Targets); err != nil {
+		return err
+	}
+	if err := validateIngestionRecordDirectory(directory, records, management.Targets); err != nil {
+		return err
+	}
+	if err := validateIngestionStoreDirectories(directory, management, benchmark); err != nil {
+		return err
+	}
+	if err := validateIngestionRecordStoreDirectories(records, management, benchmark); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ingestionRoute classifies the top-level ingestion management route.
+type ingestionRoute int
+
+const (
+	ingestionRouteRecords ingestionRoute = iota
+	ingestionRouteStart
+	ingestionRouteJob
+)
+
+// ingestionJobAction is the operation on a specific job.
+type ingestionJobAction int
+
+const (
+	ingestionJobStatus ingestionJobAction = iota
+	ingestionJobCancel
+)
+
+// ingestionJobRequest is a parsed job-level ingestion request.
+type ingestionJobRequest struct {
+	action ingestionJobAction
+	id     string
+}
+
+// errInvalidIngestionJobRequest is returned by parseIngestionRoute when the
+// request is invalid. The parser writes the exact 400/404 disposition, so the
+// caller returns immediately.
+var errInvalidIngestionJobRequest = errors.New("invalid ingestion job request")
+
+// parseIngestionRoute classifies the ingestion management route. For the
+// records and start routes the caller dispatches and returns. For the job
+// route it returns a parsed ingestionJobRequest; invalid requests receive
+// their exact 400/404 disposition from the parser and the caller returns.
+func parseIngestionRoute(w http.ResponseWriter, req *http.Request) (ingestionRoute, *ingestionJobRequest, error) {
+	const recordsPath = "/management/v1/ingestion/records"
+	if req.URL.Path == recordsPath || strings.HasPrefix(req.URL.Path, recordsPath+"/") {
+		return ingestionRouteRecords, nil, nil
+	}
+	const jobsPath = "/management/v1/ingestion/jobs"
+	if req.URL.Path == jobsPath && req.Method == http.MethodPost {
+		return ingestionRouteStart, nil, nil
+	}
+	if !strings.HasPrefix(req.URL.Path, jobsPath+"/") {
+		http.NotFound(w, req)
+		return ingestionRouteJob, nil, errInvalidIngestionJobRequest
+	}
+	id := strings.TrimPrefix(req.URL.Path, jobsPath+"/")
+	cancel := req.Method == http.MethodPost && strings.HasSuffix(id, "/cancel")
+	if cancel {
+		id = strings.TrimSuffix(id, "/cancel")
+		if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+			http.Error(w, "request body not allowed", http.StatusBadRequest)
+			return ingestionRouteJob, nil, errInvalidIngestionJobRequest
+		}
+		return ingestionRouteJob, &ingestionJobRequest{action: ingestionJobCancel, id: id}, nil
+	}
+	if req.Method != http.MethodGet || strings.Contains(id, "/") {
+		http.NotFound(w, req)
+		return ingestionRouteJob, nil, errInvalidIngestionJobRequest
+	}
+	return ingestionRouteJob, &ingestionJobRequest{action: ingestionJobStatus, id: id}, nil
 }
 
 func (r *Reloader) serveIngestion(w http.ResponseWriter, req *http.Request, state *reloaderState) {
@@ -85,39 +202,26 @@ func (r *Reloader) serveIngestion(w http.ResponseWriter, req *http.Request, stat
 		return
 	}
 	const recordsPath = "/management/v1/ingestion/records"
-	if req.URL.Path == recordsPath || strings.HasPrefix(req.URL.Path, recordsPath+"/") {
+	route, jobReq, err := parseIngestionRoute(w, req)
+	if err != nil {
+		return
+	}
+	if route == ingestionRouteRecords {
 		r.serveIngestionRecords(w, req, state, recordsPath)
 		return
 	}
-	const jobsPath = "/management/v1/ingestion/jobs"
-	if req.URL.Path == jobsPath && req.Method == http.MethodPost {
+	if route == ingestionRouteStart {
 		r.startIngestionJob(w, req, state)
-		return
-	}
-	if !strings.HasPrefix(req.URL.Path, jobsPath+"/") {
-		http.NotFound(w, req)
-		return
-	}
-	id := strings.TrimPrefix(req.URL.Path, jobsPath+"/")
-	cancel := req.Method == http.MethodPost && strings.HasSuffix(id, "/cancel")
-	if cancel {
-		id = strings.TrimSuffix(id, "/cancel")
-		if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
-			http.Error(w, "request body not allowed", http.StatusBadRequest)
-			return
-		}
-	} else if req.Method != http.MethodGet || strings.Contains(id, "/") {
-		http.NotFound(w, req)
 		return
 	}
 	r.lifecycleMu.Lock()
 	if r.stopped || r.state.Load() != state {
 		r.lifecycleMu.Unlock()
-		http.Error(w, "management configuration changed or service stopped", http.StatusServiceUnavailable)
+		http.Error(w, ingestionManagementConfigChangedOrServiceStoppedMsg, http.StatusServiceUnavailable)
 		return
 	}
-	if cancel {
-		err := r.ingestion.jobs.Cancel(id)
+	if jobReq.action == ingestionJobCancel {
+		err := r.cancelIngestionJob(jobReq.id)
 		r.lifecycleMu.Unlock()
 		if err != nil {
 			if errors.Is(err, ingestion.ErrJobNotFound) {
@@ -130,13 +234,7 @@ func (r *Reloader) serveIngestion(w http.ResponseWriter, req *http.Request, stat
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	var job ingestion.JobStatus
-	var err error
-	if id == "current" {
-		job, err = r.ingestion.jobs.Current()
-	} else {
-		job, err = r.ingestion.jobs.Status(id)
-	}
+	job, err := r.statusIngestionJob(jobReq.id)
 	r.lifecycleMu.Unlock()
 	if err != nil {
 		http.NotFound(w, req)
@@ -145,7 +243,51 @@ func (r *Reloader) serveIngestion(w http.ResponseWriter, req *http.Request, stat
 	writeJSON(r.logger, w, http.StatusOK, job)
 }
 
-func (r *Reloader) serveIngestionRecords(w http.ResponseWriter, req *http.Request, state *reloaderState, path string) {
+// cancelIngestionJob cancels a job while the caller holds r.lifecycleMu. It
+// does not acquire or release the lock and returns the cancel error.
+func (r *Reloader) cancelIngestionJob(id string) error {
+	return r.ingestion.jobs.Cancel(id)
+}
+
+// statusIngestionJob returns the job status while the caller holds r.lifecycleMu.
+// It does not acquire or release the lock.
+func (r *Reloader) statusIngestionJob(id string) (ingestion.JobStatus, error) {
+	var job ingestion.JobStatus
+	var err error
+	if id == "current" {
+		job, err = r.ingestion.jobs.Current()
+	} else {
+		job, err = r.ingestion.jobs.Status(id)
+	}
+	return job, err
+}
+
+// ingestionRecordAction classifies the kind of ingestion records request.
+type ingestionRecordAction int
+
+const (
+	ingestionRecordList ingestionRecordAction = iota
+	ingestionRecordRead
+	ingestionRecordAcknowledge
+)
+
+// ingestionRecordRequest is a parsed, typed ingestion records request.
+type ingestionRecordRequest struct {
+	action ingestionRecordAction
+	id     string
+}
+
+// errInvalidIngestionRecordRequest is returned by parseIngestionRecordRequest
+// when the request is invalid. The parser writes the exact 400/404 response,
+// so the caller simply returns.
+var errInvalidIngestionRecordRequest = errors.New("invalid ingestion records request")
+
+// parseIngestionRecordRequest extracts the typed ingestion records request
+// from the URL path and HTTP method. It preserves the original path trimming,
+// the POST-only /acknowledge rule, the exact acknowledgement JSON requirement,
+// and the method/slash/id validation. Invalid requests receive their exact
+// 400/404 disposition from the parser; the caller returns immediately.
+func parseIngestionRecordRequest(w http.ResponseWriter, req *http.Request, path string) (*ingestionRecordRequest, error) {
 	id := strings.TrimPrefix(req.URL.Path, path)
 	acknowledge := req.Method == http.MethodPost && strings.HasPrefix(id, "/") && strings.HasSuffix(id, "/acknowledge")
 	if acknowledge {
@@ -155,56 +297,94 @@ func (r *Reloader) serveIngestionRecords(w http.ResponseWriter, req *http.Reques
 		}
 		if err := decodeBenchmarkJSON(req, &input); err != nil || !input.Acknowledge {
 			http.Error(w, "explicit acknowledgment is required", http.StatusBadRequest)
-			return
+			return nil, errInvalidIngestionRecordRequest
 		}
 	} else if req.Method == http.MethodGet && strings.HasPrefix(id, "/") {
 		id = strings.TrimPrefix(id, "/")
 	} else if req.Method != http.MethodGet || id != "" {
 		http.NotFound(w, req)
-		return
+		return nil, errInvalidIngestionRecordRequest
 	}
 	if strings.Contains(id, "/") || (id == "" && req.URL.Path != path) || (acknowledge && id == "") {
 		http.NotFound(w, req)
+		return nil, errInvalidIngestionRecordRequest
+	}
+	action := ingestionRecordList
+	if id != "" {
+		action = ingestionRecordRead
+	}
+	if acknowledge {
+		action = ingestionRecordAcknowledge
+	}
+	return &ingestionRecordRequest{action: action, id: id}, nil
+}
+
+// ingestionRecordOperationResult is the outcome of a locked ingestion records
+// operation. The caller holds r.lifecycleMu when invoking the operation; this
+// helper does not acquire or release the lock.
+type ingestionRecordOperationResult struct {
+	record  ingestion.Record
+	records []ingestion.Record
+	err     error
+}
+
+// performIngestionRecordOperation executes the list/read/acknowledge operation
+// while the caller holds r.lifecycleMu. It does not acquire or release the
+// lock, so it must only be called from a locked section.
+func (r *Reloader) performIngestionRecordOperation(action ingestionRecordAction, id string) ingestionRecordOperationResult {
+	var result ingestionRecordOperationResult
+	switch action {
+	case ingestionRecordList:
+		result.records, result.err = r.ingestion.jobs.Records()
+	case ingestionRecordAcknowledge:
+		result.record, result.err = r.ingestion.jobs.Acknowledge(id)
+	default:
+		result.record, result.err = r.ingestion.jobs.Record(id)
+	}
+	return result
+}
+
+// mapIngestionRecordError maps an ingestion records operation error to the
+// exact HTTP response used by serveIngestionRecords. It logs warnings for
+// unexpected and listing failures and preserves the 404/409/503 disposition.
+func mapIngestionRecordError(w http.ResponseWriter, req *http.Request, logger *slog.Logger, err error, isList bool) {
+	switch {
+	case errors.Is(err, ingestion.ErrRecordNotFound):
+		http.NotFound(w, req)
+	case errors.Is(err, ingestion.ErrRecordReview):
+		http.Error(w, "record is not available for acknowledgment", http.StatusConflict)
+	default:
+		if isList {
+			logger.Warn("ingestion record listing failed", "error", err)
+		} else {
+			logger.Warn("ingestion record access failed", "error", err)
+		}
+		http.Error(w, ingestionRecordsUnavailableMsg, http.StatusServiceUnavailable)
+	}
+}
+
+func (r *Reloader) serveIngestionRecords(w http.ResponseWriter, req *http.Request, state *reloaderState, path string) {
+	parsed, err := parseIngestionRecordRequest(w, req, path)
+	if err != nil {
 		return
 	}
 	r.lifecycleMu.Lock()
 	if r.stopped || r.state.Load() != state {
 		r.lifecycleMu.Unlock()
-		http.Error(w, "management configuration changed or service stopped", http.StatusServiceUnavailable)
+		http.Error(w, ingestionManagementConfigChangedOrServiceStoppedMsg, http.StatusServiceUnavailable)
 		return
 	}
-	if id == "" {
-		records, err := r.ingestion.jobs.Records()
-		r.lifecycleMu.Unlock()
-		if err != nil {
-			r.logger.Warn("ingestion record listing failed", "error", err)
-			http.Error(w, "ingestion records unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		writeJSON(r.logger, w, http.StatusOK, map[string]any{"records": records})
-		return
-	}
-	var record ingestion.Record
-	var err error
-	if acknowledge {
-		record, err = r.ingestion.jobs.Acknowledge(id)
-	} else {
-		record, err = r.ingestion.jobs.Record(id)
-	}
+	result := r.performIngestionRecordOperation(parsed.action, parsed.id)
 	r.lifecycleMu.Unlock()
-	if err != nil {
-		switch {
-		case errors.Is(err, ingestion.ErrRecordNotFound):
-			http.NotFound(w, req)
-		case errors.Is(err, ingestion.ErrRecordReview):
-			http.Error(w, "record is not available for acknowledgment", http.StatusConflict)
-		default:
-			r.logger.Warn("ingestion record access failed", "error", err)
-			http.Error(w, "ingestion records unavailable", http.StatusServiceUnavailable)
-		}
+	if result.err != nil {
+		mapIngestionRecordError(w, req, r.logger, result.err, parsed.action == ingestionRecordList)
 		return
 	}
-	writeJSON(r.logger, w, http.StatusOK, record)
+	if parsed.action == ingestionRecordList {
+		writeJSON(r.logger, w, http.StatusOK, map[string]any{"records": result.records})
+		return
+	}
+	writeJSON(r.logger, w, http.StatusOK, result.record)
 }
 
 func sameIngestionOrigin(req *http.Request) bool {
@@ -280,7 +460,7 @@ func (r *Reloader) startIngestionJob(w http.ResponseWriter, req *http.Request, s
 	r.lifecycleMu.Lock()
 	if r.stopped || r.state.Load() != state {
 		r.lifecycleMu.Unlock()
-		http.Error(w, "management configuration changed or service stopped", http.StatusServiceUnavailable)
+		http.Error(w, ingestionManagementConfigChangedOrServiceStoppedMsg, http.StatusServiceUnavailable)
 		return
 	}
 	var benchmark *config.BenchmarkConfig
@@ -312,7 +492,7 @@ func (r *Reloader) startIngestionJob(w http.ResponseWriter, req *http.Request, s
 			http.Error(w, "ingestion service stopped", http.StatusServiceUnavailable)
 		case errors.Is(err, ingestion.ErrRecordStore):
 			r.logger.Warn("ingestion record store unavailable", "error", err)
-			http.Error(w, "ingestion records unavailable", http.StatusServiceUnavailable)
+			http.Error(w, ingestionRecordsUnavailableMsg, http.StatusServiceUnavailable)
 		case errors.Is(err, ingestion.ErrStageInvalid):
 			http.Error(w, "invalid ingestion request", http.StatusBadRequest)
 		default:

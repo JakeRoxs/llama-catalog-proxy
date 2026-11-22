@@ -16,7 +16,14 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 )
 
-const maxTrustBundleSize = 1 << 20
+const (
+	maxTrustBundleSize = 1 << 20
+
+	// nodeIdentityPathPrefix is the SPIFFE peer identity URI path prefix for a
+	// federated node. It is defined once here and referenced by URI construction
+	// and prefix validation so the "/node/" literal is never duplicated.
+	nodeIdentityPathPrefix = "/node/"
+)
 
 func LoadTrustRoots(path string) (*x509.CertPool, error) {
 	file, err := os.Open(path)
@@ -72,7 +79,7 @@ func ValidateIdentityCertificate(cert *x509.Certificate, federationID, nodeID st
 }
 
 func PeerIdentityURI(federationID, nodeID string) string {
-	return "spiffe://" + federationID + "/node/" + nodeID
+	return "spiffe://" + federationID + nodeIdentityPathPrefix + nodeID
 }
 
 func PeerIdentityNodeID(cert *x509.Certificate, federationID string) (string, error) {
@@ -81,11 +88,11 @@ func PeerIdentityNodeID(cert *x509.Certificate, federationID string) (string, er
 	}
 	uri := cert.URIs[0]
 	if uri.Scheme != "spiffe" || uri.Host != federationID || uri.User != nil || uri.Opaque != "" ||
-		uri.RawQuery != "" || uri.Fragment != "" || uri.RawPath != "" || !strings.HasPrefix(uri.Path, "/node/") {
+		uri.RawQuery != "" || uri.Fragment != "" || uri.RawPath != "" || !strings.HasPrefix(uri.Path, nodeIdentityPathPrefix) {
 		return "", ErrInvitation
 	}
-	nodeID := strings.TrimPrefix(uri.Path, "/node/")
-	if !identity.ValidNodeID(nodeID) || uri.Path != "/node/"+nodeID || ValidateIdentityCertificate(cert, federationID, nodeID) != nil {
+	nodeID := strings.TrimPrefix(uri.Path, nodeIdentityPathPrefix)
+	if !identity.ValidNodeID(nodeID) || uri.Path != nodeIdentityPathPrefix+nodeID || ValidateIdentityCertificate(cert, federationID, nodeID) != nil {
 		return "", ErrInvitation
 	}
 	return nodeID, nil

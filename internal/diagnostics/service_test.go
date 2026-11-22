@@ -51,6 +51,115 @@ func writeValid(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// assertDiagnosticsRequest validates that an incoming diagnostics request uses the
+// configured credentials, probes only allowed paths with bounded queries, and
+// records the observed path. It rewrites the path by stripping the base prefix
+// before delegating to writeValid.
+func assertDiagnosticsRequest(t *testing.T, seen *map[string]bool, w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer sentinel-key" ||
+		r.Header.Get("X-Api-Key") != "sentinel-key" || r.Header.Get("X-Custom") != "sentinel-header" {
+		t.Error("method or configured credentials not applied")
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/prefix")
+	if _, ok := validBodies[path]; !ok {
+		t.Errorf("unsafe/unexpected path %s", r.URL.Path)
+	}
+	if path == "/api/metrics/activity" && r.URL.RawQuery != "limit=1" {
+		t.Error("activity query is not bounded")
+	}
+	if path != "/api/metrics/activity" && r.URL.RawQuery != "" {
+		t.Error("unexpected query")
+	}
+	(*seen)[path] = true
+	r.URL.Path = path
+	writeValid(w, r)
+}
+
+// assertSupportedFreshCapabilities checks that every capability observation is
+// supported, not stale, and observed at a non-zero time.
+func assertSupportedFreshCapabilities(t *testing.T, result Snapshot) {
+	for name, observation := range result.Capabilities {
+		if observation.State != Supported || observation.Stale || observation.ObservedAt.IsZero() {
+			t.Errorf("%s = %#v", name, observation)
+		}
+	}
+}
+
+// assertNoSecretLeaked checks that the encoded snapshot does not contain any of
+// the provided secret values.
+func assertNoSecretLeaked(t *testing.T, encoded []byte, secrets ...string) {
+	for _, secret := range secrets {
+		if strings.Contains(string(encoded), secret) {
+			t.Fatal("snapshot leaked backend secret or address")
+		}
+	}
+}
+
+// serveBackoffHandler returns a handler that counts requests and, once fail is
+// set, responds with 500 without delegating to writeValid.
+func serveBackoffHandler(count *atomic.Int32, fail *atomic.Bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		if fail.Load() {
+			w.WriteHeader(500)
+			return
+		}
+		writeValid(w, r)
+	}
+}
+
+// assertCacheIsolation verifies that a cached snapshot is a deep copy with
+// original data and that no fresh requests were made.
+func assertCacheIsolation(t *testing.T, s *Service, count *atomic.Int32) {
+	cached := getSnapshot(t, s)
+	if cached.Capabilities["version"].Build.Version != "v1.2.3" || len(cached.Capabilities) != len(operations) {
+		t.Fatal("cache aliases returned data")
+	}
+	if count.Load() != int32(len(operations)) {
+		t.Fatal("fresh cache re-probed")
+	}
+}
+
+// assertBackoffStale verifies the stale observation state and that backoff
+// suppresses further requests while recording the expected probe count.
+func assertBackoffStale(t *testing.T, s *Service, count *atomic.Int32, now time.Time, index int) {
+	s.now = func() time.Time { return now }
+	stale := getSnapshot(t, s).Capabilities["version"]
+	if stale.State != Supported || !stale.Stale || stale.LastAttemptState != Unavailable {
+		t.Fatalf("stale = %#v", stale)
+	}
+	calls := count.Load()
+	getSnapshot(t, s)
+	if count.Load() != calls {
+		t.Fatal("backoff ignored")
+	}
+	if calls != int32((index+2)*len(operations)) {
+		t.Fatal("unexpected probe count")
+	}
+}
+
+// assertExpired verifies that the version capability has expired after the TTL.
+func assertExpired(t *testing.T, s *Service, now time.Time) {
+	s.now = func() time.Time { return now }
+	expired := getSnapshot(t, s).Capabilities["version"]
+	if expired.State != Unknown || expired.Reason != "expired" || expired.Build != nil {
+		t.Fatalf("expired = %#v", expired)
+	}
+}
+
+// assertRecovered verifies that the service recovers after the failure window
+// and that success resets the backoff.
+func assertRecovered(t *testing.T, s *Service, now time.Time) {
+	s.now = func() time.Time { return now }
+	recovered := getSnapshot(t, s)
+	if recovered.Capabilities["version"].State != Supported || recovered.Capabilities["version"].Stale {
+		t.Fatal("did not recover")
+	}
+	if !recovered.RetryAt.Equal(now.Add(s.ttl)) {
+		t.Fatal("success did not reset backoff")
+	}
+}
+
 func TestOptInAndConstructionNeverIssueRequests(t *testing.T) {
 	var count atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { count.Add(1); writeValid(w, r) }))
@@ -85,23 +194,7 @@ func TestOptInAndConstructionNeverIssueRequests(t *testing.T) {
 func TestAllowedOperationsCredentialsAndBasePath(t *testing.T) {
 	seen := make(map[string]bool)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer sentinel-key" ||
-			r.Header.Get("X-Api-Key") != "sentinel-key" || r.Header.Get("X-Custom") != "sentinel-header" {
-			t.Error("method or configured credentials not applied")
-		}
-		path := strings.TrimPrefix(r.URL.Path, "/prefix")
-		if _, ok := validBodies[path]; !ok {
-			t.Errorf("unsafe/unexpected path %s", r.URL.Path)
-		}
-		if path == "/api/metrics/activity" && r.URL.RawQuery != "limit=1" {
-			t.Error("activity query is not bounded")
-		}
-		if path != "/api/metrics/activity" && r.URL.RawQuery != "" {
-			t.Error("unexpected query")
-		}
-		seen[path] = true
-		r.URL.Path = path
-		writeValid(w, r)
+		assertDiagnosticsRequest(t, &seen, w, r)
 	}))
 	defer server.Close()
 	s, err := New(map[string]config.Backend{"test": {URL: server.URL + "/prefix", Diagnostics: "llama_swap",
@@ -110,11 +203,7 @@ func TestAllowedOperationsCredentialsAndBasePath(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := getSnapshot(t, s)
-	for name, observation := range result.Capabilities {
-		if observation.State != Supported || observation.Stale || observation.ObservedAt.IsZero() {
-			t.Errorf("%s = %#v", name, observation)
-		}
-	}
+	assertSupportedFreshCapabilities(t, result)
 	if len(seen) != len(operations) {
 		t.Fatalf("probed %d paths", len(seen))
 	}
@@ -122,11 +211,7 @@ func TestAllowedOperationsCredentialsAndBasePath(t *testing.T) {
 		t.Fatal("missing sanitized build")
 	}
 	encoded, _ := json.Marshal(result)
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header"} {
-		if strings.Contains(string(encoded), secret) {
-			t.Fatal("snapshot leaked backend secret or address")
-		}
-	}
+	assertNoSecretLeaked(t, encoded, server.URL, "sentinel-key", "sentinel-header")
 }
 
 func TestConfiguredAuthorizationTakesPrecedence(t *testing.T) {
@@ -228,14 +313,7 @@ func TestMalformedAndOversizedResponses(t *testing.T) {
 func TestCacheBackoffExpiryRecoveryAndCopies(t *testing.T) {
 	var count atomic.Int32
 	var fail atomic.Bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count.Add(1)
-		if fail.Load() {
-			w.WriteHeader(500)
-			return
-		}
-		writeValid(w, r)
-	}))
+	server := httptest.NewServer(serveBackoffHandler(&count, &fail))
 	defer server.Close()
 	s := newTestService(t, server)
 	start := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
@@ -244,43 +322,17 @@ func TestCacheBackoffExpiryRecoveryAndCopies(t *testing.T) {
 	first := getSnapshot(t, s)
 	first.Capabilities["version"].Build.Version = "mutated"
 	delete(first.Capabilities, "models")
-	cached := getSnapshot(t, s)
-	if cached.Capabilities["version"].Build.Version != "v1.2.3" || len(cached.Capabilities) != len(operations) {
-		t.Fatal("cache aliases returned data")
-	}
-	if count.Load() != int32(len(operations)) {
-		t.Fatal("fresh cache re-probed")
-	}
+	assertCacheIsolation(t, s, &count)
 	fail.Store(true)
 	for index, seconds := range []int{31, 32, 34, 38, 46, 62, 94, 154, 214, 274} {
 		now = start.Add(time.Duration(seconds) * time.Second)
-		stale := getSnapshot(t, s).Capabilities["version"]
-		if stale.State != Supported || !stale.Stale || stale.LastAttemptState != Unavailable {
-			t.Fatalf("stale = %#v", stale)
-		}
-		calls := count.Load()
-		getSnapshot(t, s)
-		if count.Load() != calls {
-			t.Fatal("backoff ignored")
-		}
-		if calls != int32((index+2)*len(operations)) {
-			t.Fatal("unexpected probe count")
-		}
+		assertBackoffStale(t, s, &count, now, index)
 	}
 	now = start.Add(301 * time.Second)
-	expired := getSnapshot(t, s).Capabilities["version"]
-	if expired.State != Unknown || expired.Reason != "expired" || expired.Build != nil {
-		t.Fatalf("expired = %#v", expired)
-	}
+	assertExpired(t, s, now)
 	now = start.Add(335 * time.Second)
 	fail.Store(false)
-	recovered := getSnapshot(t, s)
-	if recovered.Capabilities["version"].State != Supported || recovered.Capabilities["version"].Stale {
-		t.Fatal("did not recover")
-	}
-	if !recovered.RetryAt.Equal(now.Add(s.ttl)) {
-		t.Fatal("success did not reset backoff")
-	}
+	assertRecovered(t, s, now)
 }
 
 func TestConcurrentRefreshCoalescesAndWaitingCancellationIsIndependent(t *testing.T) {

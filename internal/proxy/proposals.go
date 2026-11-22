@@ -17,6 +17,10 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
+// managementConfigChangedMsg centralizes the HTTP error message reported when
+// the management configuration changes while a proposal request is in flight.
+const managementConfigChangedMsg = "management configuration changed"
+
 func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, state *reloaderState) {
 	const base = "/management/v1/proposals"
 	if req.URL.RawQuery != "" {
@@ -75,7 +79,7 @@ func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, stat
 			r.lifecycleMu.Lock()
 			if r.stopped || r.state.Load() != state {
 				r.lifecycleMu.Unlock()
-				http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+				http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
 				return
 			}
 			err = modelconfig.DeleteProposal(directory, id)
@@ -90,7 +94,7 @@ func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, stat
 		return
 	}
 	if req.Method != http.MethodDelete && r.state.Load() != state {
-		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
 		return
 	}
 	if req.Method == http.MethodDelete {
@@ -133,7 +137,7 @@ func (r *Reloader) verifyProposal(w http.ResponseWriter, state *reloaderState, d
 		return
 	}
 	if r.state.Load() != state {
-		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(r.logger, w, http.StatusOK, struct {
@@ -171,7 +175,7 @@ func (r *Reloader) verifyCreationProposal(w http.ResponseWriter, state *reloader
 		return
 	}
 	if r.state.Load() != state {
-		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
 		return
 	}
 	writeJSON(r.logger, w, http.StatusOK, struct {
@@ -275,7 +279,7 @@ func (r *Reloader) createProposal(w http.ResponseWriter, req *http.Request, stat
 	r.lifecycleMu.Lock()
 	if r.stopped || r.state.Load() != state {
 		r.lifecycleMu.Unlock()
-		http.Error(w, "management configuration changed", http.StatusServiceUnavailable)
+		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
 		return
 	}
 	err = modelconfig.SaveProposal(directory, proposal)

@@ -70,16 +70,8 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 		return response.StatusCode, data, response.Header
 	}
 	status, data, headers := get(caller, "")
-	var record modelconfig.DelegatedOperation
-	if status != http.StatusOK || json.Unmarshal(data, &record) != nil ||
-		record.OperationID != owner.input.OperationID || record.Outcome != "unknown" {
-		t.Fatalf("lookup status=%d record=%+v body=%q", status, record, data)
-	}
-	if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" ||
-		bytes.Contains(data, []byte(caller)) || bytes.Contains(data, []byte(peerToken)) ||
-		bytes.Contains(data, []byte("confidential")) || bytes.Contains(data, []byte(owner.target)) {
-		t.Fatalf("unsafe lookup response: %s", data)
-	}
+	assertDelegatedLookupResponse(t, status, data, headers, http.StatusOK, "unknown",
+		owner.input.OperationID, []byte(caller), []byte(peerToken), []byte("confidential"), []byte(owner.target))
 	if status, _, _ := get(peerToken, ""); status != http.StatusUnauthorized {
 		t.Fatalf("peer credential accepted as caller: %d", status)
 	}
@@ -91,9 +83,7 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, data, _ = get(caller, "")
-	if status != http.StatusOK || json.Unmarshal(data, &record) != nil || record.Outcome != "not_written" {
-		t.Fatalf("terminal lookup status=%d record=%+v body=%q", status, record, data)
-	}
+	assertDelegatedLookupResponse(t, status, data, nil, http.StatusOK, "not_written", "")
 	updated := *owner.state
 	updated.peer = copyPeerConfig(owner.state.peer)
 	updated.peer.Peers["requester"] = config.PeerGrant{Token: peerToken, CatalogRead: true}
@@ -120,6 +110,34 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 	receiver.ManagementHandler().ServeHTTP(recorder, receivingRequest)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("receiving lookup did not report revoked owner grant: %d", recorder.Code)
+	}
+}
+
+// assertDelegatedLookupResponse verifies a delegated-operation lookup response: HTTP status, JSON
+// record shape, expected outcome, and (when secrets are provided) cache-control/no-sniff headers
+// plus the absence of those secrets from the body.
+func assertDelegatedLookupResponse(t *testing.T, status int, data []byte, headers http.Header,
+	wantStatus int, wantOutcome, wantOperationID string, secrets ...[]byte) {
+	t.Helper()
+	if status != wantStatus {
+		t.Fatalf("lookup status=%d, want=%d, body=%q", status, wantStatus, data)
+	}
+	var record modelconfig.DelegatedOperation
+	if json.Unmarshal(data, &record) != nil || record.Outcome != wantOutcome {
+		t.Fatalf("lookup outcome=%q status=%d body=%q", record.Outcome, status, data)
+	}
+	if wantOperationID != "" && record.OperationID != wantOperationID {
+		t.Fatalf("lookup operationID=%q, want=%q, body=%q", record.OperationID, wantOperationID, data)
+	}
+	if len(secrets) > 0 {
+		if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("unsafe lookup response headers: %v", headers)
+		}
+		for _, secret := range secrets {
+			if bytes.Contains(data, secret) {
+				t.Fatalf("secret leaked in lookup response: %q", secret)
+			}
+		}
 	}
 }
 

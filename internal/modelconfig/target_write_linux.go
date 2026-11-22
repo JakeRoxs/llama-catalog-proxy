@@ -117,11 +117,11 @@ func (t *targetWrite) checkUnchanged() error {
 
 // replace reports confirmed rename; a rename error can leave the outcome unknown.
 func (t *targetWrite) replace(candidate []byte) (bool, error) {
-	if len(candidate) == 0 || len(candidate) > maxConfigBytes || !utf8.Valid(candidate) {
+	if err := validateCandidate(candidate, t.source); err != nil {
+		if errors.Is(err, errTargetNoChange) {
+			return false, errTargetNoChange
+		}
 		return false, errTargetWrite
-	}
-	if bytes.Equal(candidate, t.source) {
-		return false, errTargetNoChange
 	}
 	if err := t.checkUnchanged(); err != nil {
 		return false, err
@@ -149,28 +149,8 @@ func (t *targetWrite) replace(candidate []byte) (bool, error) {
 		}
 		return false, errTargetWrite
 	}
-	stat := t.info.Sys().(*syscall.Stat_t)
-	if uint64(int(stat.Uid)) != uint64(stat.Uid) || uint64(int(stat.Gid)) != uint64(stat.Gid) ||
-		temp.Chown(int(stat.Uid), int(stat.Gid)) != nil || temp.Chmod(t.info.Mode().Perm()) != nil {
-		return fail()
-	}
-	if err := copyTargetAttributes(temp, t.attributes); err != nil {
-		return fail()
-	}
-	if _, err := temp.Write(candidate); err != nil {
-		return fail()
-	}
-	tempInfo, err := temp.Stat()
-	if err != nil || !safeTargetMetadata(tempInfo) || tempInfo.Mode().Perm() != t.info.Mode().Perm() {
-		return fail()
-	}
-	tempStat := tempInfo.Sys().(*syscall.Stat_t)
-	attrs, err := readTargetAttributes(temp)
-	if err != nil || tempStat.Uid != stat.Uid || tempStat.Gid != stat.Gid ||
-		!sameTargetAttributes(attrs, t.attributes) {
-		return fail()
-	}
-	if err := temp.Sync(); err != nil {
+	tempInfo, err := stageTempFile(temp, t.info, t.attributes, candidate)
+	if err != nil {
 		return fail()
 	}
 	if err := t.checkUnchanged(); err != nil {
@@ -179,12 +159,74 @@ func (t *targetWrite) replace(candidate []byte) (bool, error) {
 		}
 		return false, err
 	}
-	staged, stagedInfo, err := readOpenedTarget(t.root, name, temp)
-	stagedAttrs, attrErr := readTargetAttributes(temp)
-	if err != nil || attrErr != nil || !sameTargetMetadata(tempInfo, stagedInfo) ||
-		!bytes.Equal(staged, candidate) || !sameTargetAttributes(stagedAttrs, t.attributes) {
+	if err := validateStagedTemp(t.root, name, temp, tempInfo, candidate, t.attributes); err != nil {
 		return fail()
 	}
+	return commitTemp(temp, name, t)
+}
+
+// validateCandidate bounds and validates the replacement payload. A no-op
+// candidate is reported as errTargetNoChange so the caller can skip mutation.
+func validateCandidate(candidate, source []byte) error {
+	if len(candidate) == 0 || len(candidate) > maxConfigBytes || !utf8.Valid(candidate) {
+		return errTargetWrite
+	}
+	if bytes.Equal(candidate, source) {
+		return errTargetNoChange
+	}
+	return nil
+}
+
+// stageTempFile prepares the temporary target: ownership, mode, attributes,
+// contents, metadata, and durability. It returns the staged file info.
+func stageTempFile(temp *os.File, info os.FileInfo, attributes map[string][]byte, candidate []byte) (os.FileInfo, error) {
+	stat := info.Sys().(*syscall.Stat_t)
+	if uint64(int(stat.Uid)) != uint64(stat.Uid) || uint64(int(stat.Gid)) != uint64(stat.Gid) ||
+		temp.Chown(int(stat.Uid), int(stat.Gid)) != nil || temp.Chmod(info.Mode().Perm()) != nil {
+		return nil, errTargetWrite
+	}
+	if err := copyTargetAttributes(temp, attributes); err != nil {
+		return nil, errTargetWrite
+	}
+	if _, err := temp.Write(candidate); err != nil {
+		return nil, errTargetWrite
+	}
+	tempInfo, err := temp.Stat()
+	if err != nil || !safeTargetMetadata(tempInfo) || tempInfo.Mode().Perm() != info.Mode().Perm() {
+		return nil, errTargetWrite
+	}
+	tempStat := tempInfo.Sys().(*syscall.Stat_t)
+	attrs, err := readTargetAttributes(temp)
+	if err != nil || tempStat.Uid != stat.Uid || tempStat.Gid != stat.Gid ||
+		!sameTargetAttributes(attrs, attributes) {
+		return nil, errTargetWrite
+	}
+	if err := temp.Sync(); err != nil {
+		return nil, errTargetWrite
+	}
+	return tempInfo, nil
+}
+
+// validateStagedTemp confirms the staged temp matches the candidate and the
+// recorded attributes, and that its metadata matches the staged snapshot.
+func validateStagedTemp(root *os.Root, name string, temp *os.File, tempInfo os.FileInfo, candidate []byte, attributes map[string][]byte) error {
+	staged, stagedInfo, err := readOpenedTarget(root, name, temp)
+	if err != nil {
+		return errTargetWrite
+	}
+	stagedAttrs, attrErr := readTargetAttributes(temp)
+	if attrErr != nil {
+		return errTargetWrite
+	}
+	if !sameTargetMetadata(tempInfo, stagedInfo) || !bytes.Equal(staged, candidate) || !sameTargetAttributes(stagedAttrs, attributes) {
+		return errTargetWrite
+	}
+	return nil
+}
+
+// commitTemp performs the atomic rename and post-rename directory sync. The
+// rename block is kept verbatim so an uncertain rename outcome is preserved.
+func commitTemp(temp *os.File, name string, t *targetWrite) (bool, error) {
 	if err := temp.Close(); err != nil {
 		if removeErr := t.removeTemporary(name); removeErr != nil {
 			return false, removeErr
@@ -219,6 +261,20 @@ func (t *targetWrite) removeTemporary(name string) error {
 
 func readTargetAttributes(file *os.File) (map[string][]byte, error) {
 	fd := int(file.Fd())
+	names, err := readTargetAttributeNames(fd)
+	if err != nil {
+		return nil, errTargetWrite
+	}
+	result, err := readTargetAttributeValues(fd, names)
+	if err != nil {
+		return nil, errTargetWrite
+	}
+	return result, nil
+}
+
+// readTargetAttributeNames performs the Flistxattr size, count, and NUL
+// terminator checks. The caller maps any failure to errTargetWrite.
+func readTargetAttributeNames(fd int) ([]byte, error) {
 	size, err := unix.Flistxattr(fd, nil)
 	if err != nil || size > maxTargetAttributeNames {
 		return nil, errTargetWrite
@@ -230,6 +286,12 @@ func readTargetAttributes(file *os.File) (map[string][]byte, error) {
 			return nil, errTargetWrite
 		}
 	}
+	return names, nil
+}
+
+// readTargetAttributeValues parses NUL-separated names with duplicate and
+// count limits and reads each value within the byte bound.
+func readTargetAttributeValues(fd int, names []byte) (map[string][]byte, error) {
 	result := make(map[string][]byte)
 	total := 0
 	for len(names) > 0 {

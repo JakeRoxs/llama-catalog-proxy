@@ -760,7 +760,7 @@ func (c *Correlator) QueryPage(filter QueryFilter, pageReq PageRequest) (PageRes
 		}
 		return c.resumeSnapshot(pageReq.Cursor, pageReq, storeSecret, filter)
 	}
-	return c.createSnapshot(filter, pageReq, nil)
+	return c.createSnapshot(filter, pageReq)
 }
 
 // ensureStoreSecret lazily initializes the per-store HMAC secret. It fails
@@ -772,11 +772,54 @@ func (c *Correlator) ensureStoreSecret() ([]byte, error) {
 	return c.storeSecret, c.storeSecretErr
 }
 
+// filterAndSortRecords filters records matching the filter, bounding the match
+// count at pageCap so oversized results are rejected explicitly. It sorts the
+// matches newest-first by RequestTime, then by RequestID for a deterministic
+// tie-break, and returns defensive clones. It reads records only and does not
+// mutate store state; the caller must hold the mutex when reading c.records.
+func filterAndSortRecords(records map[string]*CorrelationRecord, filter QueryFilter, pageCap int) ([]*CorrelationRecord, error) {
+	if pageCap <= 0 {
+		pageCap = snapshotDefaultPageCap
+	}
+	var filtered []*CorrelationRecord
+	matchCount := 0
+	for _, record := range records {
+		if !matchesFilter(record, filter) {
+			continue
+		}
+		matchCount++
+		if matchCount > pageCap {
+			return nil, ErrSnapshotTooLarge
+		}
+		filtered = append(filtered, record)
+	}
+
+	// Sort by request time (newest first), then request ID for deterministic tie-break.
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].RequestTime.Equal(filtered[j].RequestTime) {
+			return filtered[i].RequestID < filtered[j].RequestID
+		}
+		return filtered[i].RequestTime.After(filtered[j].RequestTime)
+	})
+
+	// Clone records into frozen defensive copies.
+	cloned := make([]*CorrelationRecord, 0, len(filtered))
+	for _, r := range filtered {
+		cloned = append(cloned, r.Clone())
+	}
+	return cloned, nil
+}
+
 // createSnapshot freezes a sorted, filtered snapshot of defensive copies and
 // returns its first page. Caller must hold the mutex. It rejects oversized
 // filtered results instead of silently truncating, and rejects snapshots that
-// would exceed the size cap before insertion.
-func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest, storeSecret []byte) (PageResponse, error) {
+// would exceed the size cap before insertion. It orchestrates two focused
+// helpers: filterAndSortRecords (bounded filter/sort/clone) and
+// insertSnapshotAndReturnFirstPage (store-ID/secret/random-ID, snapshot
+// insertion, first page, and failure cleanup). All helpers requiring store
+// mutation run under the caller-held mutex. Entropy is consumed in this order:
+// store ID, then store secret, then snapshot random ID.
+func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest) (PageResponse, error) {
 	// Age eviction on read so idle entries expire (consistent with Query).
 	c.evictAgeLocked()
 
@@ -793,31 +836,9 @@ func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest, sto
 	if pageCap <= 0 {
 		pageCap = snapshotDefaultPageCap
 	}
-	var filtered []*CorrelationRecord
-	matchCount := 0
-	for _, record := range c.records {
-		if !matchesFilter(record, filter) {
-			continue
-		}
-		matchCount++
-		if matchCount > pageCap {
-			return PageResponse{}, ErrSnapshotTooLarge
-		}
-		filtered = append(filtered, record)
-	}
-
-	// Sort by request time (newest first), then request ID for deterministic tie-break.
-	sort.Slice(filtered, func(i, j int) bool {
-		if filtered[i].RequestTime.Equal(filtered[j].RequestTime) {
-			return filtered[i].RequestID < filtered[j].RequestID
-		}
-		return filtered[i].RequestTime.After(filtered[j].RequestTime)
-	})
-
-	// Clone records into frozen defensive copies.
-	records := make([]*CorrelationRecord, 0, len(filtered))
-	for _, r := range filtered {
-		records = append(records, r.Clone())
+	records, err := filterAndSortRecords(c.records, filter, pageCap)
+	if err != nil {
+		return PageResponse{}, err
 	}
 
 	// No records: return empty page without storing a snapshot.
@@ -852,6 +873,19 @@ func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest, sto
 		return PageResponse{}, ErrSnapshotTooLarge
 	}
 
+	// Create and insert the snapshot, then return its first page. On page
+	// failure the snapshot is removed. All store mutation below requires the
+	// caller-held mutex. Entropy is consumed in this order: store ID, then
+	// store secret, then snapshot random ID.
+	return c.insertSnapshotAndReturnFirstPage(records, pageSize, filterDigest, sizeBytes)
+}
+
+// insertSnapshotAndReturnFirstPage creates a snapshot from the given frozen
+// records, inserts it under the store caps, and returns its first page. If the
+// page cannot be returned, the snapshot is removed. All store mutation below
+// requires the caller-held mutex. Entropy is consumed in this order: store ID,
+// then store secret, then snapshot random ID.
+func (c *Correlator) insertSnapshotAndReturnFirstPage(records []*CorrelationRecord, pageSize int, filterDigest []byte, sizeBytes int64) (PageResponse, error) {
 	// Lazily initialize the per-store ID on first snapshot creation. This
 	// defers entropy consumption to paging time so ordinary (non-paging)
 	// startup never requires cursor entropy and never panics when entropy is
@@ -865,12 +899,11 @@ func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest, sto
 		c.storeID = id
 	}
 
-	storeSecret, err = c.ensureStoreSecret()
+	storeSecret, err := c.ensureStoreSecret()
 	if err != nil {
 		return PageResponse{}, err
 	}
 
-	// Create snapshot.
 	randomID, err := newSnapshotID(c.entropyReader)
 	if err != nil {
 		return PageResponse{}, err
@@ -900,10 +933,9 @@ func (c *Correlator) createSnapshot(filter QueryFilter, pageReq PageRequest, sto
 	// Evict old snapshots to stay within caps.
 	c.evictSnapshotsToCapLocked()
 
-	// Return first page.
+	// Return first page. If the page fails, remove the snapshot.
 	page, err := c.snapshotPage(randomID, 0, pageSize, storeSecret)
 	if err != nil {
-		// If the page fails, remove the snapshot.
 		c.evictSnapshotLocked(randomID)
 		return PageResponse{}, err
 	}

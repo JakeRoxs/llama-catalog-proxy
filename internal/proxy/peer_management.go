@@ -88,47 +88,14 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 			retErr = errDelegationOutcomeUnknown
 		}
 	}()
-	if r.state.Load() != state {
-		return modelconfig.DelegatedProposal{}, errDelegationChanged
-	}
-	owner := modelconfig.DelegatedOwner{
-		NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation,
-	}
-	if input.Owner != owner {
-		return modelconfig.DelegatedProposal{}, errDelegationChanged
-	}
-	if state.management == nil || !slices.Contains(state.peer.LocalBackends, input.Backend) {
-		return modelconfig.DelegatedProposal{}, errDelegationTarget
-	}
-	targetID, ok := state.peer.ManagementTargets[input.Backend]
+
+	proposal, targetID, stores, err := r.validateCreateSettingsPreLock(state, requester, input, lifetime)
 	auditTarget = targetID
-	target, targetExists := state.management.Targets[targetID]
-	if !ok || !targetExists || input.TargetID != "" && input.TargetID != targetID {
-		return modelconfig.DelegatedProposal{}, errDelegationTarget
-	}
-	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
-	}
-	stores := state.management.DelegatedStore
-	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
-		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalStore
-	}
-	preview, err := modelconfig.PreviewTarget(target.Directory, target.Filename, targetID, input.Model, input.Settings)
-	if err != nil {
-		return modelconfig.DelegatedProposal{}, err
-	}
-	if preview.Revision != input.Revision {
-		return modelconfig.DelegatedProposal{}, errDelegationChanged
-	}
-	local, err := modelconfig.NewProposal(target.Directory, target.Filename, preview, input.Settings)
-	if err != nil {
-		return modelconfig.DelegatedProposal{}, err
-	}
-	proposal, err := modelconfig.NewDelegatedProposal(owner, requester, input.Backend, local, lifetime)
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
 	auditCorrelation = proposal.Proposal.ID
+
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
 	if r.stopped || r.state.Load() != state {
@@ -137,16 +104,83 @@ func (r *Reloader) createDelegatedSettingsProposal(req *http.Request, state *rel
 	if err := req.Context().Err(); err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
-	if !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
-		return modelconfig.DelegatedProposal{}, modelconfig.ErrProposalStore
-	}
-	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+	if err := r.validateCreateSettingsPostLock(req, state, requester, input, proposal, stores, targetID); err != nil {
+		return modelconfig.DelegatedProposal{}, err
 	}
 	if err := modelconfig.SaveDelegatedProposal(stores.ProposalDirectory, proposal); err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
 	return proposal, nil
+}
+
+// validateCreateSettingsPreLock validates all pre-lock conditions for creating
+// a delegated settings proposal. It constructs the proposal and returns it with
+// the resolved target ID and stores, or an error if any validation fails.
+func (r *Reloader) validateCreateSettingsPreLock(state *reloaderState, requester string, input delegatedSettingsRequest, lifetime time.Duration) (modelconfig.DelegatedProposal, string, *config.DelegatedStoreConfig, error) {
+	if r.state.Load() != state {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationChanged
+	}
+	owner := modelconfig.DelegatedOwner{
+		NodeID:           state.peer.NodeID,
+		ProxyInstanceID:  r.instanceID,
+		ConfigGeneration: state.generation,
+	}
+	if input.Owner != owner {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationChanged
+	}
+	if state.management == nil || !slices.Contains(state.peer.LocalBackends, input.Backend) {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationTarget
+	}
+	targetID, ok := state.peer.ManagementTargets[input.Backend]
+	if !ok {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationTarget
+	}
+	target, targetExists := state.management.Targets[targetID]
+	if !targetExists || input.TargetID != "" && input.TargetID != targetID {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationTarget
+	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationUnauthorized
+	}
+	stores := state.management.DelegatedStore
+	if stores == nil || !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
+		return modelconfig.DelegatedProposal{}, "", nil, modelconfig.ErrProposalStore
+	}
+	preview, err := modelconfig.PreviewTarget(target.Directory, target.Filename, targetID, input.Model, input.Settings)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, "", nil, err
+	}
+	if preview.Revision != input.Revision {
+		return modelconfig.DelegatedProposal{}, "", nil, errDelegationChanged
+	}
+	local, err := modelconfig.NewProposal(target.Directory, target.Filename, preview, input.Settings)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, "", nil, err
+	}
+	proposal, err := modelconfig.NewDelegatedProposal(owner, requester, input.Backend, local, lifetime)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, "", nil, err
+	}
+	return proposal, targetID, stores, nil
+}
+
+// validateCreateSettingsPostLock validates post-lock conditions for creating a
+// delegated settings proposal. It runs under the lifecycle lock and returns an
+// error if any validation fails.
+func (r *Reloader) validateCreateSettingsPostLock(req *http.Request, state *reloaderState, requester string, input delegatedSettingsRequest, proposal modelconfig.DelegatedProposal, stores *config.DelegatedStoreConfig, targetID string) error {
+	if r.stopped || r.state.Load() != state {
+		return errDelegationChanged
+	}
+	if err := req.Context().Err(); err != nil {
+		return err
+	}
+	if !r.separateDelegatedStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
+		return modelconfig.ErrProposalStore
+	}
+	if !delegatedOwnerGrantAllows(state, requester, input.Backend, targetID, input.Model) {
+		return errDelegationUnauthorized
+	}
+	return nil
 }
 
 // recoverDelegatedSettingsProposal returns a unique exact match for the
@@ -259,31 +293,10 @@ func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderStat
 	if !input.AcknowledgeReview || !input.AcknowledgeDisruption || !input.AcknowledgeExclusiveWindow {
 		return modelconfig.DelegatedOperation{}, false, errDelegationAcknowledgment
 	}
-	management := state.management
-	if management == nil || management.WriteToken == "" || management.ProposalStore == nil || management.BackupStore == nil {
-		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrTargetWrite
-	}
-	stores := management.DelegatedStore
-	if stores == nil {
-		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrProposalStore
-	}
-	if !slices.Contains(state.peer.LocalBackends, input.Backend) {
-		return modelconfig.DelegatedOperation{}, false, errDelegationTarget
-	}
-	targetID, ok := state.peer.ManagementTargets[input.Backend]
-	target, exists := management.Targets[targetID]
-	if !ok || !exists {
-		return modelconfig.DelegatedOperation{}, false, errDelegationTarget
-	}
-	if !r.separateDelegatedExecutionStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
-		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrProposalStore
-	}
-	proposal, err := modelconfig.LoadDelegatedProposal(stores.ProposalDirectory, input.ProposalID)
+
+	proposal, targetID, target, stores, management, err := r.validateApplySettingsPreCommit(state, requester, input)
 	if err != nil {
 		return modelconfig.DelegatedOperation{}, false, err
-	}
-	if proposal.RequesterNode != requester || proposal.BackendID != input.Backend || proposal.Proposal.TargetID != targetID {
-		return modelconfig.DelegatedOperation{}, false, modelconfig.ErrDelegatedProposalBinding
 	}
 	auditTarget, auditModel = targetID, proposal.Proposal.ModelID
 	if modelconfig.ValidDelegatedOperationID(input.OperationID) {
@@ -298,9 +311,56 @@ func (r *Reloader) applyDelegatedSettings(req *http.Request, state *reloaderStat
 		},
 		RequesterNode: requester, BackendID: input.Backend, TargetID: targetID, ReviewRevision: input.ReviewRevision,
 	}
-	record, committed, retErr = modelconfig.ApplyStoredDelegatedProposal(stores.ProposalDirectory, stores.OperationDirectory, input.ProposalID, input.OperationID,
-		target.Directory, target.Filename, management.BackupStore.Directory, management.BackupStore.MaxBackups, binding)
+	record, committed, retErr = modelconfig.ApplyStoredDelegatedProposal(modelconfig.DelegatedProposalApplyRequest{
+		ProposalDirectory:  stores.ProposalDirectory,
+		OperationDirectory: stores.OperationDirectory,
+		ProposalID:         input.ProposalID,
+		OperationID:        input.OperationID,
+		Target: modelconfig.MutationTarget{
+			Directory: target.Directory,
+			Filename:  target.Filename,
+		},
+		BackupDirectory: management.BackupStore.Directory,
+		Limit:           management.BackupStore.MaxBackups,
+		Binding:         binding,
+	})
 	return record, committed, retErr
+}
+
+// validateApplySettingsPreCommit validates all pre-commit conditions for
+// applying a delegated settings proposal. It returns the loaded proposal,
+// target, stores, and management config, or an error if any validation fails.
+func (r *Reloader) validateApplySettingsPreCommit(state *reloaderState, requester string, input delegatedSettingsApply) (modelconfig.DelegatedProposal, string, config.ManagementTarget, *config.DelegatedStoreConfig, *config.ManagementConfig, error) {
+	management := state.management
+	if management == nil || management.WriteToken == "" || management.ProposalStore == nil || management.BackupStore == nil {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, modelconfig.ErrTargetWrite
+	}
+	stores := management.DelegatedStore
+	if stores == nil {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, modelconfig.ErrProposalStore
+	}
+	if !slices.Contains(state.peer.LocalBackends, input.Backend) {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, errDelegationTarget
+	}
+	targetID, ok := state.peer.ManagementTargets[input.Backend]
+	if !ok {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, errDelegationTarget
+	}
+	target, exists := management.Targets[targetID]
+	if !ok || !exists {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, errDelegationTarget
+	}
+	if !r.separateDelegatedExecutionStores(state, stores.ProposalDirectory, stores.OperationDirectory) {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, modelconfig.ErrProposalStore
+	}
+	proposal, err := modelconfig.LoadDelegatedProposal(stores.ProposalDirectory, input.ProposalID)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, err
+	}
+	if proposal.RequesterNode != requester || proposal.BackendID != input.Backend || proposal.Proposal.TargetID != targetID {
+		return modelconfig.DelegatedProposal{}, "", config.ManagementTarget{}, nil, nil, modelconfig.ErrDelegatedProposalBinding
+	}
+	return proposal, targetID, target, stores, management, nil
 }
 
 func (r *Reloader) separateDelegatedExecutionStores(state *reloaderState, proposals, operations string) bool {

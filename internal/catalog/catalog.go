@@ -110,6 +110,37 @@ func New(backends []Backend, client *http.Client, ttl time.Duration, healthTimeo
 	return &Service{client: client, ttl: ttl, healthTimeout: healthTimeout, catalogTimeout: catalogTimeout, logger: logger, backends: states, defaultID: defaultID}
 }
 
+// aggregateModels merges cached backend model catalogs into one aggregated
+// model list. Optional backend failures are logged as warnings and skipped;
+// duplicate public IDs are rejected with the first backend winning; model
+// objects are cloned and their IDs prefixed by the owning backend.
+func aggregateModels(results []catalogResult, logger *slog.Logger) []any {
+	aggregated := make([]any, 0)
+	owners := make(map[string]string)
+	for _, result := range results {
+		if result.err != nil {
+			logger.Warn("optional backend model catalog unavailable", "backend_id", result.backend.ID, "error", result.err)
+			continue
+		}
+		for _, source := range result.models {
+			model := cloneObject(source)
+			localID := stringValue(model["id"])
+			if localID == "" {
+				continue
+			}
+			publicID := result.backend.Prefix + localID
+			if owner, exists := owners[publicID]; exists {
+				logger.Warn("duplicate public model ID rejected", "model_id", publicID, "backend_id", result.backend.ID, "existing_backend_id", owner)
+				continue
+			}
+			model["id"] = publicID
+			owners[publicID] = result.backend.ID
+			aggregated = append(aggregated, model)
+		}
+	}
+	return aggregated
+}
+
 func (s *Service) Models(ctx context.Context, requestHeader http.Header) (Response, error) {
 	results := s.fetchCatalogs(ctx, requestHeader)
 	var defaultResult catalogResult
@@ -127,30 +158,7 @@ func (s *Service) Models(ctx context.Context, requestHeader http.Header) (Respon
 	}
 
 	root := cloneObject(defaultResult.root)
-	aggregated := make([]any, 0)
-	owners := make(map[string]string)
-	for _, result := range results {
-		if result.err != nil {
-			s.logger.Warn("optional backend model catalog unavailable", "backend_id", result.backend.ID, "error", result.err)
-			continue
-		}
-		for _, source := range result.models {
-			model := cloneObject(source)
-			localID := stringValue(model["id"])
-			if localID == "" {
-				continue
-			}
-			publicID := result.backend.Prefix + localID
-			if owner, exists := owners[publicID]; exists {
-				s.logger.Warn("duplicate public model ID rejected", "model_id", publicID, "backend_id", result.backend.ID, "existing_backend_id", owner)
-				continue
-			}
-			model["id"] = publicID
-			owners[publicID] = result.backend.ID
-			aggregated = append(aggregated, model)
-		}
-	}
-	root["data"] = aggregated
+	root["data"] = aggregateModels(results, s.logger)
 	body, err := json.Marshal(root)
 	if err != nil {
 		return Response{}, fmt.Errorf("encode aggregated model catalog: %w", err)
@@ -195,30 +203,50 @@ func (s *Service) BackendPrefix(id string) (string, bool) {
 	return "", false
 }
 
-// ModelAliases returns bounded, exact aliases advertised by a backend model
-// catalog. Llama-swap exposes them in meta.llamaswap.aliases; a top-level
-// aliases field is accepted for compatible backends. Alias-list records are
-// not model identities and should be skipped when projecting canonical rows.
-func ModelAliases(model map[string]any) []string {
-	values := make([]any, 0)
+// aliasSources collects the raw alias values advertised by a model from the
+// top-level aliases field and the llama-swap meta.aliases field. Within each
+// source, both []any and []string forms are accepted.
+func aliasSources(model map[string]any) []any {
+	var values []any
 	if aliases, ok := model["aliases"].([]any); ok {
 		values = append(values, aliases...)
 	} else if aliases, ok := model["aliases"].([]string); ok {
-		for _, alias := range aliases {
-			values = append(values, alias)
-		}
+		values = append(values, aliasSourceValues(aliases)...)
 	}
 	if meta, ok := model["meta"].(map[string]any); ok {
 		if llamaSwap, ok := meta["llamaswap"].(map[string]any); ok {
 			if aliases, ok := llamaSwap["aliases"].([]any); ok {
 				values = append(values, aliases...)
 			} else if aliases, ok := llamaSwap["aliases"].([]string); ok {
-				for _, alias := range aliases {
-					values = append(values, alias)
-				}
+				values = append(values, aliasSourceValues(aliases)...)
 			}
 		}
 	}
+	return values
+}
+
+// aliasSourceValues converts one aliases field value ([]any or []string) into
+// a []any slice.
+func aliasSourceValues(source any) []any {
+	switch a := source.(type) {
+	case []any:
+		return a
+	case []string:
+		result := make([]any, 0, len(a))
+		for _, alias := range a {
+			result = append(result, alias)
+		}
+		return result
+	}
+	return nil
+}
+
+// ModelAliases returns bounded, exact aliases advertised by a backend model
+// catalog. Llama-swap exposes them in meta.llamaswap.aliases; a top-level
+// aliases field is accepted for compatible backends. Alias-list records are
+// not model identities and should be skipped when projecting canonical rows.
+func ModelAliases(model map[string]any) []string {
+	values := aliasSources(model)
 	result := make([]string, 0, min(len(values), maxModelAliases))
 	seen := make(map[string]struct{}, cap(result))
 	for _, value := range values {
@@ -411,52 +439,94 @@ func (s *Service) RefreshBackendModels(ctx context.Context, selected []string, m
 	workers.Wait()
 }
 
-func (s *Service) backendCatalogWithTTL(ctx context.Context, backend *backendState, requestHeader http.Header, ttl time.Duration) (map[string]any, []map[string]any, http.Header, error) {
-	if !backend.mu.TryLock() {
-		ticker := time.NewTicker(5 * time.Millisecond)
-		defer ticker.Stop()
-		for !backend.mu.TryLock() {
-			select {
-			case <-ctx.Done():
-				return nil, nil, nil, ctx.Err()
-			case <-ticker.C:
-			}
+// acquireBackendLock acquires backend.mu, retrying with a 5 ms ticker until the
+// lock is obtained or the context is cancelled. The returned unlock function
+// must be deferred by the caller, so the caller retains lock ownership for the
+// whole catalog operation. If the context is cancelled before the lock is
+// obtained, the lock is not held and no unlock is performed.
+func acquireBackendLock(ctx context.Context, backend *backendState) (unlock func(), err error) {
+	if backend.mu.TryLock() {
+		return func() { backend.mu.Unlock() }, nil
+	}
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for !backend.mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
 		}
 	}
-	defer backend.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return nil, nil, nil, err
-	}
+	return func() { backend.mu.Unlock() }, nil
+}
 
-	now := time.Now()
+// cacheHit returns the cached catalog when the backend has a fresh successful
+// cache or a fresh error cache within ttl. Fresh successful caches take
+// precedence; a fresh error cache returns the last error unless a stale
+// successful cache is available, which is returned instead. The ok flag
+// reports whether a short-circuit occurred.
+func cacheHit(backend *backendState, now time.Time, ttl time.Duration) (map[string]any, []map[string]any, http.Header, error, bool) {
 	if backend.root != nil && now.Sub(backend.fetchedAt) < ttl {
-		return backend.root, backend.models, backend.header, nil
+		return backend.root, backend.models, backend.header, nil, true
 	}
 	if backend.lastErr != nil && now.Sub(backend.lastTry) < ttl {
 		if backend.root != nil {
-			return backend.root, backend.models, backend.header, nil
+			return backend.root, backend.models, backend.header, nil, true
 		}
-		return nil, nil, nil, backend.lastErr
+		return nil, nil, nil, backend.lastErr, true
 	}
+	return nil, nil, nil, nil, false
+}
 
-	operationCtx, cancel := context.WithTimeout(ctx, s.catalogTimeout)
-	defer cancel()
-	refreshStart := time.Now()
-
+// fetchBackendCatalog fetches and decodes one backend model catalog using the
+// supplied, already timeout-bounded context. Non-2xx responses and decode
+// failures are returned as errors; the response header is returned only on
+// success.
+func (s *Service) fetchBackendCatalog(ctx context.Context, backend *backendState, requestHeader http.Header) (map[string]any, []map[string]any, http.Header, error) {
 	s.logger.Info("refreshing backend model catalog", "backend_id", backend.ID, "backend_url", safeBackendURL(backend.URL))
-	response, err := s.fetch(operationCtx, endpointURL(backend.URL, "/v1/models"), requestHeader, backend)
+	response, err := s.fetch(ctx, endpointURL(backend.URL, "/v1/models"), requestHeader, backend)
 	if err == nil && (response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) {
 		err = fmt.Errorf("backend returned HTTP %d", response.StatusCode)
 	}
 	var root map[string]any
 	var models []map[string]any
+	var header http.Header
 	if err == nil {
 		var values []any
 		root, values, err = decodeCatalog(response.Body)
 		if err == nil {
 			models = modelObjects(values)
+			header = response.Header
 		}
 	}
+	return root, models, header, err
+}
+
+func (s *Service) backendCatalogWithTTL(ctx context.Context, backend *backendState, requestHeader http.Header, ttl time.Duration) (map[string]any, []map[string]any, http.Header, error) {
+	unlock, err := acquireBackendLock(ctx, backend)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	defer unlock()
+
+	if err := ctx.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+
+	now := time.Now()
+	if root, models, header, err, ok := cacheHit(backend, now, ttl); ok {
+		return root, models, header, err
+	}
+
+	var root map[string]any
+	var models []map[string]any
+	var header http.Header
+
+	operationCtx, cancel := context.WithTimeout(ctx, s.catalogTimeout)
+	defer cancel()
+	refreshStart := time.Now()
+
+	root, models, header, err = s.fetchBackendCatalog(operationCtx, backend, requestHeader)
 	if err != nil {
 		backend.lastTry = time.Now()
 		backend.lastErr = err
@@ -481,7 +551,7 @@ func (s *Service) backendCatalogWithTTL(ctx context.Context, backend *backendSta
 
 	backend.root = root
 	backend.models = models
-	backend.header = response.Header
+	backend.header = header
 	backend.fetchedAt = time.Now()
 	backend.lastTry = backend.fetchedAt
 	backend.lastErr = nil
@@ -595,32 +665,57 @@ func (s *Service) showMetadata(ctx context.Context, backend *backendState, model
 	return normalizeShowMetadata(shown), nil
 }
 
-func normalizeShowMetadata(shown map[string]any) map[string]any {
+// showDetails extracts the documented show-metadata fields from the details
+// object when present.
+func showDetails(details map[string]any) map[string]any {
 	metadata := make(map[string]any)
-	details := nestedObject(shown, "details")
 	for _, field := range []string{"context_length", "max_completion_tokens", "parameter_size", "quantization_level", "family", "format"} {
 		if value, ok := details[field]; ok {
 			metadata[field] = value
 		}
 	}
-	if capabilities, ok := shown["capabilities"].([]any); ok {
-		values := make([]any, 0, len(capabilities))
-		for _, capability := range capabilities {
-			if text, ok := capability.(string); ok {
-				values = append(values, text)
+	return metadata
+}
+
+// showCapabilities filters the capabilities list to its string entries.
+func showCapabilities(capabilities []any) []any {
+	values := make([]any, 0, len(capabilities))
+	for _, capability := range capabilities {
+		if text, ok := capability.(string); ok {
+			values = append(values, text)
+		}
+	}
+	return values
+}
+
+// architectureContextLength derives context_length from the model's general
+// architecture when no explicit context length is present.
+func architectureContextLength(shown map[string]any) (any, bool) {
+	if architecture, ok := nestedValue(shown, "model_info", "general.architecture"); ok {
+		if text, ok := architecture.(string); ok && text != "" {
+			if contextLength, ok := nestedValue(shown, "model_info", text+".context_length"); ok {
+				return contextLength, true
 			}
 		}
-		if len(values) > 0 {
+	}
+	return nil, false
+}
+
+func normalizeShowMetadata(shown map[string]any) map[string]any {
+	metadata := make(map[string]any)
+	if details, ok := shown["details"].(map[string]any); ok {
+		for field, value := range showDetails(details) {
+			metadata[field] = value
+		}
+	}
+	if capabilities, ok := shown["capabilities"].([]any); ok {
+		if values := showCapabilities(capabilities); len(values) > 0 {
 			metadata["capabilities"] = values
 		}
 	}
 	if _, exists := metadata["context_length"]; !exists {
-		if architecture, ok := nestedValue(shown, "model_info", "general.architecture"); ok {
-			if text, ok := architecture.(string); ok && text != "" {
-				if contextLength, ok := nestedValue(shown, "model_info", text+".context_length"); ok {
-					metadata["context_length"] = contextLength
-				}
-			}
+		if contextLength, ok := architectureContextLength(shown); ok {
+			metadata["context_length"] = contextLength
 		}
 	}
 	return metadata

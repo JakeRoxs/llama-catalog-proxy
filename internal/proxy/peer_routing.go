@@ -30,6 +30,17 @@ const (
 	peerGenerationHeader = "X-Catalog-Peer-Generation"
 )
 
+// S1192: duplicated string literals replaced by package-level constants.
+// Names are unique within the proxy package: contentTypeHeader and
+// contentTypeJSON are already declared elsewhere in the package.
+const (
+	applicationJSONMediaType   = "application/json"
+	multipartFormDataMediaType = "multipart/form-data"
+	peerModelUnavailableMsg    = "peer model unavailable"
+	httpContentTypeHeader      = "Content-Type"
+	xForwardedForHeader        = "X-Forwarded-For"
+)
+
 func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, info *routeInfo) bool {
 	if strings.Contains(r.URL.Path, peerModelPrefix) {
 		writeJSONError(h.logger, w, http.StatusBadRequest, "peer model IDs require JSON inference requests")
@@ -62,9 +73,9 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		}
 		return false
 	}
-	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if r.Header.Get("Content-Type") == "" {
-		mediaType, err = "application/json", nil
+	mediaType, params, err := mime.ParseMediaType(r.Header.Get(httpContentTypeHeader))
+	if r.Header.Get(httpContentTypeHeader) == "" {
+		mediaType, err = applicationJSONMediaType, nil
 	}
 	if err != nil {
 		if isInferenceRequest(r) {
@@ -73,14 +84,14 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		}
 		return false
 	}
-	if mediaType != "application/json" && mediaType != "multipart/form-data" {
+	if mediaType != applicationJSONMediaType && mediaType != multipartFormDataMediaType {
 		if isInferenceRequest(r) {
 			writeJSONError(h.logger, w, http.StatusUnsupportedMediaType, "unsupported inference content type with peer routing")
 			return true
 		}
 		return false
 	}
-	if mediaType == "multipart/form-data" && !isInferenceRequest(r) {
+	if mediaType == multipartFormDataMediaType && !isInferenceRequest(r) {
 		return false
 	}
 	if r.ContentLength > h.maxJSONBody {
@@ -101,7 +112,7 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 	var model string
 	var object map[string]any
 	var ambiguous bool
-	if mediaType == "multipart/form-data" {
+	if mediaType == multipartFormDataMediaType {
 		model, ambiguous, err = multipartPeerModel(body, params["boundary"], h.isPeerPublicModelID)
 		if err != nil {
 			writeJSONError(h.logger, w, http.StatusBadRequest, "invalid multipart request")
@@ -138,16 +149,16 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 		return true
 	}
 	if id.OwnerNodeID == "" {
-		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, peerModelUnavailableMsg)
 		return true
 	}
 	source, fresh := h.peerCache.freshModel(id, time.Now())
 	if client == nil || !client.routeInference || !fresh {
-		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, peerModelUnavailableMsg)
 		return true
 	}
 	var rewritten []byte
-	if mediaType == "multipart/form-data" {
+	if mediaType == multipartFormDataMediaType {
 		rewritten, err = rewriteMultipartModel(body, params["boundary"], model, requestedLocalID, h.maxJSONBody)
 	} else {
 		object["model"] = requestedLocalID
@@ -316,7 +327,7 @@ func rewriteMultipartModel(body []byte, boundary, expected, replacement string, 
 			return nil, err
 		}
 		headers := make(textproto.MIMEHeader)
-		for _, name := range []string{"Content-Disposition", "Content-Type"} {
+		for _, name := range []string{"Content-Disposition", httpContentTypeHeader} {
 			for _, value := range part.Header.Values(name) {
 				headers.Add(name, value)
 			}
@@ -368,7 +379,7 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 	target, err := url.Parse(client.origin)
 	if err != nil {
 		h.logger.Error("invalid configured peer origin")
-		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer model unavailable")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, peerModelUnavailableMsg)
 		return
 	}
 	ctx, cancel := context.WithCancel(r.Context())
@@ -384,9 +395,9 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 			req.Out.Trailer = nil
 			req.Out.TransferEncoding = nil
 			req.Out.Header = copyPeerClientAddressHeaders(req.In)
-			req.Out.Header.Set("Content-Type", req.In.Header.Get("Content-Type"))
-			if req.Out.Header.Get("Content-Type") == "" {
-				req.Out.Header.Set("Content-Type", "application/json")
+			req.Out.Header.Set(httpContentTypeHeader, req.In.Header.Get(httpContentTypeHeader))
+			if req.Out.Header.Get(httpContentTypeHeader) == "" {
+				req.Out.Header.Set(httpContentTypeHeader, applicationJSONMediaType)
 			}
 			if accept := req.In.Header.Get("Accept"); accept != "" {
 				req.Out.Header.Set("Accept", accept)
@@ -410,12 +421,12 @@ func (h *Handler) proxyPeerInference(w http.ResponseWriter, r *http.Request, cli
 
 func copyPeerClientAddressHeaders(req *http.Request) http.Header {
 	forwarded := make(http.Header)
-	for _, name := range []string{"X-Forwarded-For", "X-Real-IP"} {
+	for _, name := range []string{xForwardedForHeader, "X-Real-IP"} {
 		for _, value := range req.Header.Values(name) {
 			forwarded.Add(name, value)
 		}
 	}
-	if forwarded.Get("X-Forwarded-For") == "" {
+	if forwarded.Get(xForwardedForHeader) == "" {
 		address := forwarded.Get("X-Real-IP")
 		if address == "" {
 			address = req.RemoteAddr
@@ -424,7 +435,7 @@ func copyPeerClientAddressHeaders(req *http.Request) http.Header {
 			}
 		}
 		if address != "" {
-			forwarded.Set("X-Forwarded-For", address)
+			forwarded.Set(xForwardedForHeader, address)
 		}
 	}
 	return forwarded

@@ -20,7 +20,7 @@
       <h1>Sign in to this node</h1>
       <p class="lede">Your identity and role are checked locally. Peer access remains separately scoped by each node.</p>
       <a class="button primary" href="/admin/auth/login">Continue with identity provider <span aria-hidden="true">→</span></a>
-      <p id="login-error" class="notice" role="status" hidden></p>
+      <output id="login-error" class="notice" hidden></output>
     </section>
 
     <section id="denied-panel" class="gate" hidden>
@@ -36,7 +36,7 @@
         <div class="session"><span id="signed-in-as"></span><button id="refresh" class="button quiet" type="button">Refresh snapshot</button><form id="signout-form"><input type="hidden" id="csrf-signout"><button class="button quiet" type="submit">Sign out</button></form></div>
       </div>
 
-      <div id="load-error" class="notice" role="status" hidden></div>
+      <output id="load-error" class="notice" hidden></output>
       <div class="metrics">
         <article class="metric"><span class="eyebrow">LOCAL NODE</span><strong id="node-id">—</strong></article>
         <article class="metric"><span class="eyebrow">MODELS VISIBLE</span><strong id="model-count">—</strong></article>
@@ -77,7 +77,7 @@
       <section id="pairing-panel" class="panel outcomes-panel" hidden>
         <div class="panel-heading"><div><p class="eyebrow">IDENTITY / LOCAL APPROVAL</p><h2>Pair federation nodes</h2></div></div>
         <p class="small-note">Pairing establishes identity membership only; it grants no operation scopes. Invitation codes are single-use and shown only when created. Pairing requires operator-CA mTLS on both nodes.</p>
-        <div id="pairing-notice" class="notice" role="status" hidden></div>
+        <output id="pairing-notice" class="notice" hidden></output>
         <div class="pairing-forms">
           <form id="invite-form">
             <h3>Create invitation</h3>
@@ -184,7 +184,7 @@
       <section id="remote-settings-panel" class="panel outcomes-panel" hidden>
         <div class="panel-heading"><div><p class="eyebrow">DELEGATED SETTINGS</p><h2>Review remote model settings</h2></div></div>
         <p class="small-note">Only owner-granted typed settings are available. No raw YAML, secrets, trust roots, peer scopes, inference, or arbitrary commands are exposed.</p>
-        <div id="remote-settings-notice" class="notice" role="status" hidden></div>
+        <output id="remote-settings-notice" class="notice" hidden></output>
         <form id="remote-grant-load" class="grant-form">
           <label for="remote-owner-id">Owner node ID</label>
           <input id="remote-owner-id" required autocomplete="off">

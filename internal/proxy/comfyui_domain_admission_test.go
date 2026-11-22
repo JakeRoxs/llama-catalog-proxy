@@ -91,41 +91,45 @@ func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
 		{"failed prompt leaves lease unknown", http.StatusBadGateway, "unknown", http.StatusBadGateway},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var sends atomic.Int32
-			c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
-				return confirmedCoordinatorEvidence(), nil
-			})
-			if _, err := c.reconcile(t.Context()); err != nil {
-				t.Fatal(err)
-			}
-			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				sends.Add(1)
-				state := c.snapshot()
-				if state.State != "acquiring" || state.Submissions != 1 || state.LeaseID == "" {
-					t.Errorf("first prompt was forwarded without an acquisition reservation: %+v", state)
-				}
-				w.WriteHeader(test.status)
-			}))
-			defer backend.Close()
-			cfg := baseConfig(backend.URL)
-			cfg.PathRoutes = map[string]string{"/comfyui": "default"}
-			h := newHandler(t, cfg).(*Handler)
-			admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
-			if err != nil {
-				t.Fatal(err)
-			}
-			h.backendAdmission = admit
-			w := httptest.NewRecorder()
-			h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", nil))
-			if state := c.snapshot(); w.Code != test.wantStatus || sends.Load() != 1 || state.State != test.wantState || state.Submissions != 0 {
-				t.Fatalf("first prompt status=%d sends=%d state=%+v", w.Code, sends.Load(), state)
-			}
-			if test.wantState == "unknown" {
-				if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default"); allowed {
-					t.Fatal("ambiguous first prompt opened competing admission")
-				}
-			}
+			runComfyUIDomainFirstPromptActivationCase(t, test.status, test.wantState, test.wantStatus)
 		})
+	}
+}
+
+func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantState string, wantStatus int) {
+	var sends atomic.Int32
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		return confirmedCoordinatorEvidence(), nil
+	})
+	if _, err := c.reconcile(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		sends.Add(1)
+		state := c.snapshot()
+		if state.State != "acquiring" || state.Submissions != 1 || state.LeaseID == "" {
+			t.Errorf("first prompt was forwarded without an acquisition reservation: %+v", state)
+		}
+		w.WriteHeader(status)
+	}))
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	h := newHandler(t, cfg).(*Handler)
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", nil))
+	if state := c.snapshot(); w.Code != wantStatus || sends.Load() != 1 || state.State != wantState || state.Submissions != 0 {
+		t.Fatalf("first prompt status=%d sends=%d state=%+v", w.Code, sends.Load(), state)
+	}
+	if wantState == "unknown" {
+		if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default"); allowed {
+			t.Fatal("ambiguous first prompt opened competing admission")
+		}
 	}
 }
 
@@ -228,6 +232,157 @@ func TestComfyUIRootBootstrapsThroughSchedulerWhenPersistentServiceIsStopped(t *
 	}
 }
 
+// handoffFixture holds the shared scenario state for the admission handoff
+// test so the top-level test stays a simple true/false subtest loop.
+type handoffFixture struct {
+	ctx     context.Context
+	cancel  context.CancelFunc
+	checks  atomic.Int32
+	sends   atomic.Int32
+	started chan struct{}
+	unblock chan struct{}
+	c       *comfyUICoordinator
+	backend *httptest.Server
+	h       *Handler
+	admit   func(*http.Request, string) (func(), bool)
+	status  func(method, path string) int
+	result  chan int
+	id      string
+}
+
+// newHandoffFixture builds the coordinator, backend, handler and admission
+// used by the handoff scenario. The verifier confirms on its first call and
+// then blocks on the fixture's unblock channel until the test releases it.
+func newHandoffFixture(t *testing.T, verifyOK bool) *handoffFixture {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	f := &handoffFixture{
+		ctx:     ctx,
+		cancel:  cancel,
+		started: make(chan struct{}),
+		unblock: make(chan struct{}),
+	}
+	f.c = newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
+		if f.checks.Add(1) == 1 {
+			return confirmedCoordinatorEvidence(), nil
+		}
+		close(f.started)
+		select {
+		case <-ctx.Done():
+			return ComfyUIReleaseResult{}, ctx.Err()
+		case <-f.unblock:
+		}
+		if !verifyOK {
+			return ComfyUIReleaseResult{}, ErrComfyUIReleaseUnknown
+		}
+		return confirmedCoordinatorEvidence(), nil
+	})
+	f.backend = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		f.sends.Add(1)
+		if state := f.c.snapshot(); state.State != "released" || state.Competing != 1 {
+			t.Errorf("backend called without a competing reservation: %+v", state)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	f.h = newHandler(t, baseConfig(f.backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(f.c, []string{"default", "alternate"}, "default", 3*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.h.backendAdmission = admit
+	f.admit = admit
+	f.status = func(method, path string) int {
+		w := httptest.NewRecorder()
+		f.h.ServeHTTP(w, httptest.NewRequestWithContext(ctx, method, path, nil))
+		return w.Code
+	}
+	return f
+}
+
+// exercisePreconditions validates the unmanaged backend, unknown startup state,
+// reconciliation, lease-gated dispatch routes and the noncanonical path.
+func exercisePreconditions(t *testing.T, f *handoffFixture) {
+	if done, allowed := f.admit(httptest.NewRequest(http.MethodGet, "/props", nil), "outside-domain"); !allowed || done != nil {
+		t.Fatal("unmanaged backend was gated")
+	}
+	if f.c.snapshot().State != "unknown" || f.checks.Load() != 0 {
+		t.Fatalf("coordinator did not start unknown: state=%+v checks=%d", f.c.snapshot(), f.checks.Load())
+	}
+	if _, err := f.c.reconcile(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/upstream/example/", "/v1/realtime"} {
+		if got := f.status(http.MethodGet, path); got != http.StatusAccepted {
+			t.Fatalf("model dispatch route %s did not use lease handoff: status=%d", path, got)
+		}
+	}
+	if got := f.status(http.MethodGet, "/%70rops"); got != http.StatusServiceUnavailable {
+		t.Fatalf("noncanonical model path was admitted: status=%d", got)
+	}
+	if f.sends.Load() != 2 {
+		t.Fatalf("recognized model dispatch routes were not forwarded: %d", f.sends.Load())
+	}
+}
+
+// reserveAndDrain reserves the first prompt, activates the lease, drains the
+// submission, and blocks until release verification has started.
+func reserveAndDrain(t *testing.T, f *handoffFixture) {
+	prompt := httptest.NewRequestWithContext(f.ctx, http.MethodPost, "/comfyui/api/prompt", nil)
+	if _, allowed := f.admit(prompt, "alternate"); allowed {
+		t.Fatal("managed non-prompt backend admitted a prompt")
+	}
+	finish, allowed := f.admit(prompt, "default")
+	if !allowed || finish == nil {
+		t.Fatal("prompt could not reserve during acquisition")
+	}
+	f.id = f.c.snapshot().LeaseID // Test observation only, not a helper credential exchange.
+	if _, allowed := f.admit(prompt, "default"); allowed {
+		t.Fatal("second prompt was admitted before helper activation")
+	}
+	if err := f.c.activate(f.id); err != nil {
+		t.Fatal(err)
+	}
+	f.result = make(chan int, 1)
+	go func() { f.result <- f.status(http.MethodGet, "/props?model=example") }()
+	waitCoordinatorState(t, f.c, "draining")
+	if f.sends.Load() != 2 || f.checks.Load() != 1 {
+		t.Fatal("forwarding or verification started before the prompt drained")
+	}
+	if _, allowed := f.admit(prompt, "default"); allowed {
+		t.Fatal("draining admitted a new prompt")
+	}
+	finish()
+	select {
+	case <-f.started:
+	case <-f.ctx.Done():
+		t.Fatal("release verification did not start")
+	}
+	if f.sends.Load() != 2 {
+		t.Fatal("competing GET reached the backend before verification")
+	}
+	close(f.unblock)
+}
+
+// unblockAndVerify releases the unblock channel, validates the handoff result,
+// and exercises the confirmed stop-receipt reuse or the blocked rejection path.
+func unblockAndVerify(t *testing.T, f *handoffFixture, verifyOK bool) {
+	wantStatus, wantSends := http.StatusServiceUnavailable, int32(2)
+	if verifyOK {
+		wantStatus, wantSends = http.StatusAccepted, 3
+	}
+	if got := <-f.result; got != wantStatus || f.sends.Load() != wantSends || f.c.snapshot().Competing != 0 {
+		t.Fatalf("handoff status=%d sends=%d state=%+v", got, f.sends.Load(), f.c.snapshot())
+	}
+	if verifyOK {
+		if _, err := f.c.release(f.ctx, f.id); err != nil || f.checks.Load() != 2 {
+			t.Fatalf("stop callback did not reuse release receipt: checks=%d err=%v", f.checks.Load(), err)
+		}
+	} else if _, err := f.c.reserveCompeting(); !errors.Is(err, errComfyUIAdmissionBlocked) {
+		t.Fatal("unconfirmed release opened admission")
+	} else if got := f.status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || f.checks.Load() != 2 || f.sends.Load() != 2 {
+		t.Fatal("competing POST retried an unconfirmed release or forwarded")
+	}
+}
+
 func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 	for _, verifyOK := range []bool{true, false} {
 		name := "confirmed"
@@ -235,115 +390,12 @@ func TestComfyUIDomainAdmissionHandoff(t *testing.T) {
 			name = "unknown"
 		}
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			var checks, sends atomic.Int32
-			started, unblock := make(chan struct{}), make(chan struct{})
-			c := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
-				if checks.Add(1) == 1 {
-					return confirmedCoordinatorEvidence(), nil
-				}
-				close(started)
-				select {
-				case <-ctx.Done():
-					return ComfyUIReleaseResult{}, ctx.Err()
-				case <-unblock:
-				}
-				if !verifyOK {
-					return ComfyUIReleaseResult{}, ErrComfyUIReleaseUnknown
-				}
-				return confirmedCoordinatorEvidence(), nil
-			})
-			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				sends.Add(1)
-				if state := c.snapshot(); state.State != "released" || state.Competing != 1 {
-					t.Errorf("backend called without a competing reservation: %+v", state)
-				}
-				w.WriteHeader(http.StatusAccepted)
-			}))
-			defer backend.Close()
-			h := newHandler(t, baseConfig(backend.URL)).(*Handler)
-			admit, err := newComfyUIDomainAdmission(c, []string{"default", "alternate"}, "default", 3*time.Second)
-			if err != nil {
-				t.Fatal(err)
-			}
-			h.backendAdmission = admit
-			if done, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "outside-domain"); !allowed || done != nil {
-				t.Fatal("unmanaged backend was gated")
-			}
-			status := func(method, path string) int {
-				w := httptest.NewRecorder()
-				h.ServeHTTP(w, httptest.NewRequestWithContext(ctx, method, path, nil))
-				return w.Code
-			}
-			if c.snapshot().State != "unknown" || checks.Load() != 0 {
-				t.Fatalf("coordinator did not start unknown: state=%+v checks=%d", c.snapshot(), checks.Load())
-			}
-			if _, err := c.reconcile(ctx); err != nil {
-				t.Fatal(err)
-			}
-			for _, path := range []string{"/upstream/example/", "/v1/realtime"} {
-				if got := status(http.MethodGet, path); got != http.StatusAccepted {
-					t.Fatalf("model dispatch route %s did not use lease handoff: status=%d", path, got)
-				}
-			}
-			if got := status(http.MethodGet, "/%70rops"); got != http.StatusServiceUnavailable {
-				t.Fatalf("noncanonical model path was admitted: status=%d", got)
-			}
-			if sends.Load() != 2 {
-				t.Fatalf("recognized model dispatch routes were not forwarded: %d", sends.Load())
-			}
-			prompt := httptest.NewRequestWithContext(ctx, http.MethodPost, "/comfyui/api/prompt", nil)
-			if _, allowed := admit(prompt, "alternate"); allowed {
-				t.Fatal("managed non-prompt backend admitted a prompt")
-			}
-			finish, allowed := admit(prompt, "default")
-			if !allowed || finish == nil {
-				t.Fatal("prompt could not reserve during acquisition")
-			}
-			defer finish()
-			id := c.snapshot().LeaseID // Test observation only, not a helper credential exchange.
-			if _, allowed := admit(prompt, "default"); allowed {
-				t.Fatal("second prompt was admitted before helper activation")
-			}
-			if err := c.activate(id); err != nil {
-				t.Fatal(err)
-			}
-			result := make(chan int, 1)
-			go func() { result <- status(http.MethodGet, "/props?model=example") }()
-			waitCoordinatorState(t, c, "draining")
-			if sends.Load() != 2 || checks.Load() != 1 {
-				t.Fatal("forwarding or verification started before the prompt drained")
-			}
-			if _, allowed := admit(prompt, "default"); allowed {
-				t.Fatal("draining admitted a new prompt")
-			}
-			finish()
-			select {
-			case <-started:
-			case <-ctx.Done():
-				t.Fatal("release verification did not start")
-			}
-			if sends.Load() != 2 {
-				t.Fatal("competing GET reached the backend before verification")
-			}
-			close(unblock)
-			wantStatus, wantSends := http.StatusServiceUnavailable, int32(2)
-			if verifyOK {
-				wantStatus, wantSends = http.StatusAccepted, 3
-			}
-			if got := <-result; got != wantStatus || sends.Load() != wantSends || c.snapshot().Competing != 0 {
-				t.Fatalf("handoff status=%d sends=%d state=%+v", got, sends.Load(), c.snapshot())
-			}
-			if verifyOK {
-				if _, err := c.release(ctx, id); err != nil || checks.Load() != 2 {
-					t.Fatalf("stop callback did not reuse release receipt: checks=%d err=%v", checks.Load(), err)
-				}
-			} else if _, err := c.reserveCompeting(); !errors.Is(err, errComfyUIAdmissionBlocked) {
-				t.Fatal("unconfirmed release opened admission")
-			} else if got := status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || checks.Load() != 2 || sends.Load() != 2 {
-				t.Fatal("competing POST retried an unconfirmed release or forwarded")
-			}
+			f := newHandoffFixture(t, verifyOK)
+			defer f.backend.Close()
+			defer f.cancel()
+			exercisePreconditions(t, f)
+			reserveAndDrain(t, f)
+			unblockAndVerify(t, f, verifyOK)
 		})
 	}
 }

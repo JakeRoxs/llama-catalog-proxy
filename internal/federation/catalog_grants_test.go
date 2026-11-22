@@ -10,64 +10,27 @@ import (
 
 func TestCatalogReadGrantPersistsAndBindsToCertificateFingerprint(t *testing.T) {
 	directory := t.TempDir()
-	if err := os.Chmod(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	store, err := OpenCatalogGrantStore(directory, "lab.example", "node-a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := setupCatalogGrantStore(t, directory)
 	now := time.Now().UTC()
 	firstFingerprint := strings.Repeat("a", 64)
 	member := Membership{NodeID: "node-b", Fingerprint: firstFingerprint, PairedAt: now}
-	grant, err := store.GrantCatalogRead(member, now)
-	if err != nil || grant.NodeID != member.NodeID || grant.Fingerprint != firstFingerprint || !grant.GrantedAt.Equal(now) {
-		t.Fatalf("grant = %+v, %v", grant, err)
-	}
-	allowed, err := store.AllowsCatalogRead("node-b", firstFingerprint)
-	if err != nil || !allowed {
-		t.Fatalf("matching fingerprint allowed = %v, %v", allowed, err)
-	}
-	allowed, err = store.AllowsCatalogRead("node-b", strings.Repeat("b", 64))
-	if err != nil || allowed {
-		t.Fatalf("different fingerprint allowed = %v, %v", allowed, err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(filepath.Join(directory, catalogGrantFilename))
-	if err != nil || info.Mode().Perm() != 0o600 {
-		t.Fatalf("catalog grant file mode = %v, %v", info, err)
-	}
+	grant := grantCatalogRead(t, store, member, now)
+	assertCatalogGrant(t, grant, member, now)
+	assertAllowsCatalogRead(t, store, "node-b", firstFingerprint, true)
+	assertAllowsCatalogRead(t, store, "node-b", strings.Repeat("b", 64), false)
+	closeCatalogGrantStore(t, store)
+	assertCatalogGrantFileMode(t, directory)
 
-	store, err = OpenCatalogGrantStore(directory, "lab.example", "node-a")
-	if err != nil {
-		t.Fatal(err)
-	}
+	store = reopenCatalogGrantStore(t, directory)
 	defer store.Close()
-	grants, err := store.ListCatalogReadGrants()
-	if err != nil || len(grants) != 1 || grants[0] != grant {
-		t.Fatalf("restored grants = %+v, %v", grants, err)
-	}
+	assertCatalogReadGrants(t, store, grant)
 	rotatedFingerprint := strings.Repeat("c", 64)
-	if _, err := store.GrantCatalogRead(Membership{NodeID: "node-b", Fingerprint: rotatedFingerprint, PairedAt: now.Add(time.Hour)}, now.Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if allowed, err := store.AllowsCatalogRead("node-b", firstFingerprint); err != nil || allowed {
-		t.Fatalf("old fingerprint retained grant = %v, %v", allowed, err)
-	}
-	if allowed, err := store.AllowsCatalogRead("node-b", rotatedFingerprint); err != nil || !allowed {
-		t.Fatalf("rotated fingerprint grant = %v, %v", allowed, err)
-	}
-	if err := store.RevokeCatalogRead("node-b"); err != nil {
-		t.Fatal(err)
-	}
-	if allowed, err := store.AllowsCatalogRead("node-b", rotatedFingerprint); err != nil || allowed {
-		t.Fatalf("revoked catalog grant = %v, %v", allowed, err)
-	}
-	if err := store.RevokeCatalogRead("node-b"); err != ErrCatalogGrantMissing {
-		t.Fatalf("revoke missing grant error = %v", err)
-	}
+	grantCatalogRead(t, store, Membership{NodeID: "node-b", Fingerprint: rotatedFingerprint, PairedAt: now.Add(time.Hour)}, now.Add(time.Hour))
+	assertAllowsCatalogRead(t, store, "node-b", firstFingerprint, false)
+	assertAllowsCatalogRead(t, store, "node-b", rotatedFingerprint, true)
+	revokeCatalogRead(t, store, "node-b")
+	assertAllowsCatalogRead(t, store, "node-b", rotatedFingerprint, false)
+	assertRevokeMissingCatalogGrant(t, store, "node-b")
 }
 
 func TestCatalogGrantStoreRejectsUnsafeDirectoryAndMalformedData(t *testing.T) {
@@ -118,6 +81,31 @@ func TestCatalogGrantStoreRejectsInvalidAndDuplicateCertificateGrants(t *testing
 
 func TestInferenceGrantDirectionsRemainSeparateFromCatalogRead(t *testing.T) {
 	directory := t.TempDir()
+	store := setupCatalogGrantStore(t, directory)
+	defer store.Close()
+	now := time.Now().UTC()
+	fingerprint := strings.Repeat("d", 64)
+	member := Membership{NodeID: "node-b", Fingerprint: fingerprint, PairedAt: now}
+	assertInferenceNeedsCatalog(t, store, member, now)
+	grantCatalogRead(t, store, member, now)
+	grant := grantInference(t, store, member, true, false, now)
+	assertInferenceGrant(t, grant, true, false)
+	assertAllowsCatalogRead(t, store, "node-b", fingerprint, true)
+	assertAllowsIncomingInference(t, store, "node-b", fingerprint, true)
+	assertAllowsOutgoingInference(t, store, "node-b", fingerprint, false)
+	grantInference(t, store, member, true, true, now.Add(time.Minute))
+	assertAllowsOutgoingInference(t, store, "node-b", fingerprint, true)
+	revokeCatalogRead(t, store, "node-b")
+	assertAllowsCatalogRead(t, store, "node-b", fingerprint, false)
+	assertAllowsOutgoingInference(t, store, "node-b", fingerprint, false)
+	assertAllowsIncomingInference(t, store, "node-b", fingerprint, true)
+	revokeInference(t, store, "node-b")
+	assertAllowsIncomingInference(t, store, "node-b", fingerprint, false)
+	assertAllowsOutgoingInference(t, store, "node-b", fingerprint, false)
+}
+
+// setupCatalogGrantStore creates a 0o700-owned temp directory and opens a catalog grant store.
+func setupCatalogGrantStore(t *testing.T, directory string) *CatalogGrantStore {
 	if err := os.Chmod(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -125,54 +113,106 @@ func TestInferenceGrantDirectionsRemainSeparateFromCatalogRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	now := time.Now().UTC()
-	fingerprint := strings.Repeat("d", 64)
-	member := Membership{NodeID: "node-b", Fingerprint: fingerprint, PairedAt: now}
-	if _, err := store.GrantInference(member, false, true, now); err != ErrInferenceNeedsCatalog {
+	return store
+}
+
+func closeCatalogGrantStore(t *testing.T, store *CatalogGrantStore) {
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func reopenCatalogGrantStore(t *testing.T, directory string) *CatalogGrantStore {
+	store, err := OpenCatalogGrantStore(directory, "lab.example", "node-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func grantCatalogRead(t *testing.T, store *CatalogGrantStore, member Membership, grantedAt time.Time) CatalogReadGrant {
+	grant, err := store.GrantCatalogRead(member, grantedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return grant
+}
+
+func assertCatalogGrant(t *testing.T, grant CatalogReadGrant, member Membership, grantedAt time.Time) {
+	if grant.NodeID != member.NodeID || grant.Fingerprint != member.Fingerprint || !grant.GrantedAt.Equal(grantedAt) {
+		t.Fatalf("grant = %+v", grant)
+	}
+}
+
+func assertAllowsCatalogRead(t *testing.T, store *CatalogGrantStore, nodeID, fingerprint string, allowed bool) {
+	ok, err := store.AllowsCatalogRead(nodeID, fingerprint)
+	if err != nil || ok != allowed {
+		t.Fatalf("AllowsCatalogRead(%q, %q) = %v, %v", nodeID, fingerprint, ok, err)
+	}
+}
+
+func assertCatalogGrantFileMode(t *testing.T, directory string) {
+	info, err := os.Stat(filepath.Join(directory, catalogGrantFilename))
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("catalog grant file mode = %v, %v", info, err)
+	}
+}
+
+func assertCatalogReadGrants(t *testing.T, store *CatalogGrantStore, expected CatalogReadGrant) {
+	grants, err := store.ListCatalogReadGrants()
+	if err != nil || len(grants) != 1 || grants[0] != expected {
+		t.Fatalf("restored grants = %+v, %v", grants, err)
+	}
+}
+
+func revokeCatalogRead(t *testing.T, store *CatalogGrantStore, nodeID string) {
+	if err := store.RevokeCatalogRead(nodeID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertRevokeMissingCatalogGrant(t *testing.T, store *CatalogGrantStore, nodeID string) {
+	if err := store.RevokeCatalogRead(nodeID); err != ErrCatalogGrantMissing {
+		t.Fatalf("revoke missing grant error = %v", err)
+	}
+}
+
+func assertInferenceNeedsCatalog(t *testing.T, store *CatalogGrantStore, member Membership, at time.Time) {
+	if _, err := store.GrantInference(member, false, true, at); err != ErrInferenceNeedsCatalog {
 		t.Fatalf("route inference without catalog discovery grant = %v", err)
 	}
-	if _, err := store.GrantCatalogRead(member, now); err != nil {
+}
+
+func grantInference(t *testing.T, store *CatalogGrantStore, member Membership, allowIncoming, routeOutgoing bool, at time.Time) InferenceGrant {
+	grant, err := store.GrantInference(member, allowIncoming, routeOutgoing, at)
+	if err != nil {
 		t.Fatal(err)
 	}
-	grant, err := store.GrantInference(member, true, false, now)
-	if err != nil || !grant.AllowIncoming || grant.RouteOutgoing {
-		t.Fatalf("incoming-only inference grant = %+v, %v", grant, err)
+	return grant
+}
+
+func assertInferenceGrant(t *testing.T, grant InferenceGrant, allowIncoming, routeOutgoing bool) {
+	if grant.AllowIncoming != allowIncoming || grant.RouteOutgoing != routeOutgoing {
+		t.Fatalf("inference grant = %+v", grant)
 	}
-	if allowed, err := store.AllowsCatalogRead("node-b", fingerprint); err != nil || !allowed {
-		t.Fatalf("inference grant changed catalog-read scope: %v, %v", allowed, err)
+}
+
+func assertAllowsIncomingInference(t *testing.T, store *CatalogGrantStore, nodeID, fingerprint string, allowed bool) {
+	incoming, err := store.AllowsIncomingInference(nodeID, fingerprint)
+	if err != nil || incoming != allowed {
+		t.Fatalf("AllowsIncomingInference(%q, %q) = %v, %v", nodeID, fingerprint, incoming, err)
 	}
-	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || !allowed {
-		t.Fatalf("incoming inference grant = %v, %v", allowed, err)
+}
+
+func assertAllowsOutgoingInference(t *testing.T, store *CatalogGrantStore, nodeID, fingerprint string, allowed bool) {
+	outgoing, err := store.AllowsOutgoingInference(nodeID, fingerprint)
+	if err != nil || outgoing != allowed {
+		t.Fatalf("AllowsOutgoingInference(%q, %q) = %v, %v", nodeID, fingerprint, outgoing, err)
 	}
-	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
-		t.Fatalf("incoming grant enabled outbound routing: %v, %v", allowed, err)
-	}
-	if _, err := store.GrantInference(member, true, true, now.Add(time.Minute)); err != nil {
+}
+
+func revokeInference(t *testing.T, store *CatalogGrantStore, nodeID string) {
+	if err := store.RevokeInference(nodeID); err != nil {
 		t.Fatal(err)
-	}
-	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || !allowed {
-		t.Fatalf("explicit outgoing inference grant = %v, %v", allowed, err)
-	}
-	if err := store.RevokeCatalogRead("node-b"); err != nil {
-		t.Fatal(err)
-	}
-	if allowed, err := store.AllowsCatalogRead("node-b", fingerprint); err != nil || allowed {
-		t.Fatalf("catalog read remained after its separate revoke: %v, %v", allowed, err)
-	}
-	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
-		t.Fatalf("catalog revoke left outbound inference active: %v, %v", allowed, err)
-	}
-	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || !allowed {
-		t.Fatalf("catalog revoke changed the separate inbound inference grant: %v, %v", allowed, err)
-	}
-	if err := store.RevokeInference("node-b"); err != nil {
-		t.Fatal(err)
-	}
-	if allowed, err := store.AllowsIncomingInference("node-b", fingerprint); err != nil || allowed {
-		t.Fatalf("inference revoke left incoming grant active: %v, %v", allowed, err)
-	}
-	if allowed, err := store.AllowsOutgoingInference("node-b", fingerprint); err != nil || allowed {
-		t.Fatalf("inference revoke left route grant active: %v, %v", allowed, err)
 	}
 }

@@ -92,7 +92,21 @@ func TestPeerCacheDropsRevokedDynamicCatalogButRetainsStaticAndGrantedPeers(t *t
 	}
 }
 
-func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.T) {
+type discoveredPeerHarness struct {
+	server            *httptest.Server
+	reportRequests    *atomic.Int32
+	inferenceRequests *atomic.Int32
+	localCertificate  tls.Certificate
+	roots             *x509.CertPool
+	serverLeaf        *x509.Certificate
+	crls              []*x509.RevocationList
+}
+
+// newDiscoveredPeerHarness creates an mTLS peer test server that serves catalog
+// reports and inference, together with the client identity material used by the
+// discovered peer client.
+func newDiscoveredPeerHarness(t *testing.T) *discoveredPeerHarness {
+	t.Helper()
 	ca, caKey, roots := newPeerIdentityTestCA(t)
 	localCertificate, _ := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-a")
 	serverCertificate, serverLeaf := newPeerIdentityTestPair(t, ca, caKey, "lab.example", "node-b")
@@ -136,8 +150,29 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	server.TLS = &tls.Config{MinVersion: tls.VersionTLS12, Certificates: []tls.Certificate{serverCertificate},
 		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots}
 	server.StartTLS()
-	defer server.Close()
+	return &discoveredPeerHarness{
+		server:            server,
+		reportRequests:    &reportRequests,
+		inferenceRequests: &inferenceRequests,
+		localCertificate:  localCertificate,
+		roots:             roots,
+		serverLeaf:        serverLeaf,
+		crls:              []*x509.RevocationList{newPeerIdentityTestCRL(t, ca, caKey)},
+	}
+}
 
+// discoveredPeerStore bundles the pairing and catalog grant stores plus the
+// provisioned member for the discovered peer end-to-end test.
+type discoveredPeerStore struct {
+	members *federation.PairingStore
+	grants  *federation.CatalogGrantStore
+}
+
+// newDiscoveredPeerStore creates temp pairing and catalog grant stores, pairs
+// node-b with the given server leaf fingerprint, and grants catalog read plus
+// outgoing inference to the member.
+func newDiscoveredPeerStore(t *testing.T, serverLeaf *x509.Certificate) *discoveredPeerStore {
+	t.Helper()
 	membershipDir, grantDir := t.TempDir(), t.TempDir()
 	for _, directory := range []string{membershipDir, grantDir} {
 		if err := os.Chmod(directory, 0o700); err != nil {
@@ -148,7 +183,6 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer members.Close()
 	now := time.Now().UTC()
 	member, err := members.AddMember("node-b", peerCertificateFingerprint(serverLeaf), now)
 	if err != nil {
@@ -158,42 +192,51 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer grants.Close()
 	if _, err := grants.GrantCatalogRead(member, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := grants.GrantInference(member, false, true, now); err != nil {
 		t.Fatal(err)
 	}
-	state := &reloaderState{
+	return &discoveredPeerStore{members: members, grants: grants}
+}
+
+func newDiscoveredPeerState(t *testing.T, harness *discoveredPeerHarness, store *discoveredPeerStore) *reloaderState {
+	t.Helper()
+	return &reloaderState{
 		peer: &config.PeerConfig{NodeID: "node-a", FederationID: "lab.example", Discovery: &config.PeerDiscoveryConfig{
 			Enabled: true, Interface: "lan0", AdvertiseURL: "https://node-a.local:9293",
 		}},
-		certificate: &localCertificate, peerClientCAs: roots,
-		peerClientCRLs: []*x509.RevocationList{newPeerIdentityTestCRL(t, ca, caKey)},
-		pairingStore:   members, catalogGrantStore: grants, peerContext: context.Background(), cacheTTL: time.Minute,
+		certificate: &harness.localCertificate, peerClientCAs: harness.roots,
+		peerClientCRLs: harness.crls,
+		pairingStore:   store.members, catalogGrantStore: store.grants, peerContext: context.Background(), cacheTTL: time.Minute,
 	}
-	discovered, err := (&Reloader{}).buildDiscoveredPeerClientsWithBrowse(state, func(_ context.Context, settings discovery.Settings, timeout time.Duration) (discovery.CandidateResult, error) {
-		if settings.NodeID != "node-a" || settings.FederationID != "lab.example" || settings.Interface != "lan0" || timeout < 250*time.Millisecond {
-			t.Fatalf("dynamic discovery settings = %+v, timeout %v", settings, timeout)
-		}
-		return discovery.CandidateResult{Candidates: []discovery.Candidate{{
-			NodeID: "node-b", FederationID: "lab.example", PeerURL: server.URL,
-		}}}, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := discovered.clients["node-b"]
+}
+
+// assertDiscoveredPeerClient verifies the discovered client's dynamic mTLS flags
+// and the authorized discovery ID set.
+func assertDiscoveredPeerClient(t *testing.T, client *peerClient, discovered discoveredPeerClients) {
+	t.Helper()
 	if client == nil || !client.dynamic || client.token != "" || !client.routeInference || len(discovered.authorizedIDs) != 1 {
 		t.Fatalf("dynamic peer client set = %+v / %+v", client, discovered)
 	}
-	defer closePeerClients(map[string]*peerClient{"node-b": client})
+}
+
+// assertDiscoveredPeerFetch verifies the mTLS catalog fetch returns an
+// authenticated receipt with the expected observation.
+func assertDiscoveredPeerFetch(t *testing.T, client *peerClient) {
+	t.Helper()
 	receipt, reason := client.fetch(context.Background())
 	if reason != "" || receipt == nil || receipt.AuthenticatedNodeID != "node-b" || len(receipt.Report.Observations) != 1 {
 		t.Fatalf("mTLS catalog fetch = %#v, reason %q", receipt, reason)
 	}
-	inferenceResponse, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(server.URL + "/peer/v1/inference")
+}
+
+// assertDiscoveredPeerInference verifies the separately granted mTLS inference
+// request succeeds.
+func assertDiscoveredPeerInference(t *testing.T, client *peerClient, serverURL string) {
+	t.Helper()
+	inferenceResponse, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(serverURL + "/peer/v1/inference")
 	if err != nil {
 		t.Fatalf("separately granted mTLS inference request failed: %v", err)
 	}
@@ -201,19 +244,51 @@ func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.
 	if inferenceResponse.StatusCode != http.StatusOK {
 		t.Fatalf("dynamic inference status = %d", inferenceResponse.StatusCode)
 	}
-	if err := grants.RevokeCatalogRead("node-b"); err != nil {
-		t.Fatal(err)
-	}
+}
+
+// assertDiscoveredPeerRevoked verifies that revoking the catalog read grant makes
+// the catalog fetch unavailable and disables inference through the cascade.
+func assertDiscoveredPeerRevoked(t *testing.T, client *peerClient, serverURL string) {
+	t.Helper()
 	if receipt, reason := client.fetch(context.Background()); receipt != nil || reason != "unavailable" {
 		t.Fatalf("revoked mTLS catalog fetch = %#v, reason %q", receipt, reason)
 	}
-	if _, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(server.URL + "/peer/v1/inference"); err == nil {
+	if _, err := (&http.Client{Transport: client.inferenceTransport, Timeout: peerReportTimeout}).Get(serverURL + "/peer/v1/inference"); err == nil {
 		t.Fatal("outbound inference remained enabled after catalog grant revocation cascade")
 	}
-	if got := reportRequests.Load(); got != 1 {
+}
+
+func TestDiscoveredPeerClientUsesMTLSAndRechecksExplicitCatalogGrant(t *testing.T) {
+	harness := newDiscoveredPeerHarness(t)
+	defer harness.server.Close()
+	store := newDiscoveredPeerStore(t, harness.serverLeaf)
+	defer store.members.Close()
+	defer store.grants.Close()
+	state := newDiscoveredPeerState(t, harness, store)
+	discovered, err := (&Reloader{}).buildDiscoveredPeerClientsWithBrowse(state, func(_ context.Context, settings discovery.Settings, timeout time.Duration) (discovery.CandidateResult, error) {
+		if settings.NodeID != "node-a" || settings.FederationID != "lab.example" || settings.Interface != "lan0" || timeout < 250*time.Millisecond {
+			t.Fatalf("dynamic discovery settings = %+v, timeout %v", settings, timeout)
+		}
+		return discovery.CandidateResult{Candidates: []discovery.Candidate{{
+			NodeID: "node-b", FederationID: "lab.example", PeerURL: harness.server.URL,
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := discovered.clients["node-b"]
+	assertDiscoveredPeerClient(t, client, discovered)
+	defer closePeerClients(map[string]*peerClient{"node-b": client})
+	assertDiscoveredPeerFetch(t, client)
+	assertDiscoveredPeerInference(t, client, harness.server.URL)
+	if err := store.grants.RevokeCatalogRead("node-b"); err != nil {
+		t.Fatal(err)
+	}
+	assertDiscoveredPeerRevoked(t, client, harness.server.URL)
+	if got := harness.reportRequests.Load(); got != 1 {
 		t.Fatalf("report requests after grant revocation = %d, want 1", got)
 	}
-	if got := inferenceRequests.Load(); got != 1 {
+	if got := harness.inferenceRequests.Load(); got != 1 {
 		t.Fatalf("inference requests after grant revocation = %d, want 1", got)
 	}
 }
@@ -388,7 +463,33 @@ func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
 	tokenA, tokenB := strings.Repeat("a", 32), strings.Repeat("b", 32)
 	diag := strings.Repeat("d", 32)
 	pathA, pathB := configPath(t), configPath(t)
-	write := func(path, id, addr, cert, key, backend, peerID, peerAddr, peerCA, incoming, outgoing string, withPeer bool) {
+	// peerFileConfig groups the local node/backend fields and the optional peer
+	// block fields into a single argument, keeping the config writer under the
+	// 7-parameter limit. peerID is always emitted as the peer node_id; the peer
+	// block (peers:) is only written when peer is non-nil.
+	type peerLocal struct {
+		id      string
+		addr    string
+		cert    string
+		key     string
+		backend string
+	}
+
+	type peerBlock struct {
+		addr     string
+		ca       string
+		inToken  string
+		outToken string
+	}
+
+	type peerFileConfig struct {
+		path   string
+		local  peerLocal
+		peerID string
+		peer   *peerBlock
+	}
+
+	write := func(cfg peerFileConfig) {
 		t.Helper()
 		text := fmt.Sprintf(`default_backend: local
 diagnostics_api_key: %q
@@ -401,17 +502,27 @@ peer:
   tls_cert_file: %q
   tls_key_file: %q
   local_backends: [local]
-`, diag, backend, id+"/", id, peerID, addr, cert, key)
-		if withPeer {
+`, diag, cfg.local.backend, cfg.local.id+"/", cfg.local.id, cfg.peerID, cfg.local.addr, cfg.local.cert, cfg.local.key)
+		if cfg.peer != nil {
 			text += fmt.Sprintf("  peers:\n    %s: {token: %q, catalog_read: true, diagnostics_read: true, inference: true, url: %q, outbound_token: %q, ca_file: %q, route_inference: true}\n",
-				peerID, incoming, "https://"+peerAddr, outgoing, peerCA)
+				cfg.peerID, cfg.peer.inToken, "https://"+cfg.peer.addr, cfg.peer.outToken, cfg.peer.ca)
 		}
-		if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		if err := os.WriteFile(cfg.path, []byte(text), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
-	write(pathA, "udms", addrA, certA, keyA, backendA.URL, "bigboi", addrB, certB, tokenA, tokenB, true)
-	write(pathB, "bigboi", addrB, certB, keyB, backendB.URL, "udms", addrA, certA, tokenB, tokenA, true)
+	write(peerFileConfig{
+		path:   pathA,
+		local:  peerLocal{id: "udms", addr: addrA, cert: certA, key: keyA, backend: backendA.URL},
+		peerID: "bigboi",
+		peer:   &peerBlock{addr: addrB, ca: certB, inToken: tokenA, outToken: tokenB},
+	})
+	write(peerFileConfig{
+		path:   pathB,
+		local:  peerLocal{id: "bigboi", addr: addrB, cert: certB, key: keyB, backend: backendB.URL},
+		peerID: "udms",
+		peer:   &peerBlock{addr: addrA, ca: certA, inToken: tokenB, outToken: tokenA},
+	})
 	a, _, err := NewReloader(pathA, discardLogger(), nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -681,7 +792,11 @@ peer:
 	case <-time.After(time.Second):
 		t.Fatal("recovered owner backend did not receive request")
 	}
-	write(pathB, "bigboi", addrB, certB, keyB, backendB.URL, "udms", addrA, certA, tokenB, tokenA, false)
+	write(peerFileConfig{
+		path:   pathB,
+		local:  peerLocal{id: "bigboi", addr: addrB, cert: certB, key: keyB, backend: backendB.URL},
+		peerID: "udms",
+	})
 	if err := b.reload(); err != nil {
 		t.Fatal(err)
 	}

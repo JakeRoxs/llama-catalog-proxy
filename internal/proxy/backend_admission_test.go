@@ -51,87 +51,64 @@ func TestOwnerBackendDispatchSharesAdmissionBoundary(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			for _, allowed := range []bool{false, true} {
-				checks, releases := 0, 0
-				h.backendAdmission = func(req *http.Request, backendID string) (func(), bool) {
-					checks++
-					if backendID != "default" || req.URL.Path != test.target || req.Method != test.method {
-						t.Errorf("incorrect admission target: %s %s %s", backendID, req.Method, req.URL.Path)
-					}
-					if !allowed {
-						return nil, false
-					}
-					return func() { releases++ }, true
-				}
-				req := httptest.NewRequest(test.method, test.path, strings.NewReader(test.body))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Authorization", "Bearer "+token)
-				req.TLS = &tls.ConnectionState{}
-				w := httptest.NewRecorder()
-				before := forwarded.Load()
-				switch test.name {
-				case "peer path":
-					req.Header.Set(peerPathServiceHeader, "comfyui")
-					req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(test.target)))
-					owner.PeerHandler().ServeHTTP(w, req)
-				case "peer inference":
-					req.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte("default")))
-					req.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte("example")))
-					req.Header.Set(peerPathHeader, test.target)
-					req.Header.Set(peerInstanceHeader, owner.instanceID)
-					req.Header.Set(peerGenerationHeader, "1")
-					owner.PeerHandler().ServeHTTP(w, req)
-				default:
-					h.ServeHTTP(w, req)
-				}
-				wantStatus, wantSends := http.StatusServiceUnavailable, 0
-				if allowed {
-					wantStatus, wantSends = http.StatusAccepted, 1
-				}
-				if w.Code != wantStatus || checks != 1 || releases != wantSends || forwarded.Load()-before != int32(wantSends) {
-					t.Fatalf("allowed=%v status=%d checks=%d releases=%d sends=%d body=%q", allowed, w.Code, checks, releases, forwarded.Load()-before, w.Body.String())
-				}
+				runAdmissionCase(t, h, owner, &forwarded, token, test.name, test.method, test.path, test.body, test.target, allowed)
 			}
 		})
 	}
 }
 
+// runAdmissionCase builds and dispatches one admission-matrix request, then
+// asserts the admission callback ran once, the release/send counters match the
+// allowed decision, and the upstream was forwarded exactly when admission passed.
+func runAdmissionCase(t *testing.T, h *Handler, owner *Reloader, forwarded *atomic.Int32, token, name, method, path, body, target string, allowed bool) {
+	t.Helper()
+	var checks, releases int
+	h.backendAdmission = func(req *http.Request, backendID string) (func(), bool) {
+		checks++
+		if backendID != "default" || req.URL.Path != target || req.Method != method {
+			t.Errorf("incorrect admission target: %s %s %s", backendID, req.Method, req.URL.Path)
+		}
+		if !allowed {
+			return nil, false
+		}
+		return func() { releases++ }, true
+	}
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.TLS = &tls.ConnectionState{}
+	w := httptest.NewRecorder()
+	before := forwarded.Load()
+	switch name {
+	case "peer path":
+		req.Header.Set(peerPathServiceHeader, "comfyui")
+		req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(target)))
+		owner.PeerHandler().ServeHTTP(w, req)
+	case "peer inference":
+		req.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte("default")))
+		req.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte("example")))
+		req.Header.Set(peerPathHeader, target)
+		req.Header.Set(peerInstanceHeader, owner.instanceID)
+		req.Header.Set(peerGenerationHeader, "1")
+		owner.PeerHandler().ServeHTTP(w, req)
+	default:
+		h.ServeHTTP(w, req)
+	}
+	wantStatus, wantSends := http.StatusServiceUnavailable, 0
+	if allowed {
+		wantStatus, wantSends = http.StatusAccepted, 1
+	}
+	if w.Code != wantStatus || checks != 1 || releases != wantSends || forwarded.Load()-before != int32(wantSends) {
+		t.Fatalf("allowed=%v status=%d checks=%d releases=%d sends=%d body=%q", allowed, w.Code, checks, releases, forwarded.Load()-before, w.Body.String())
+	}
+}
+
 func TestConfiguredComfyUIAdmissionWaitsForReleaseAndAllowsRetryAfterLoadFailure(t *testing.T) {
 	var freeRequests, statsRequests, competingRequests, promptRequests atomic.Int32
-	comfy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/queue":
-			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
-		case r.Method == http.MethodPost && r.URL.Path == "/free":
-			freeRequests.Add(1)
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodGet && r.URL.Path == "/system_stats":
-			count := statsRequests.Add(1)
-			freeVRAM := int64(600)
-			if count >= 3 {
-				freeVRAM = 900
-			}
-			_, _ = fmt.Fprintf(w, `{"devices":[{"name":"GPU","type":"cuda","index":0,"vram_total":1000,"vram_free":%d}]}`, freeVRAM)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	comfy := newComfyTestServer(t, &freeRequests, &statsRequests)
 	defer comfy.Close()
 
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/props":
-			if competingRequests.Add(1) == 1 {
-				w.WriteHeader(http.StatusBadGateway)
-				return
-			}
-			w.WriteHeader(http.StatusAccepted)
-		case "/comfyui/api/prompt":
-			promptRequests.Add(1)
-			w.WriteHeader(http.StatusAccepted)
-		default:
-			w.WriteHeader(http.StatusAccepted)
-		}
-	}))
+	backend := newBackendTestServer(t, &competingRequests, &promptRequests)
 	defer backend.Close()
 
 	cfg := baseConfig(backend.URL)
@@ -170,4 +147,45 @@ func TestConfiguredComfyUIAdmissionWaitsForReleaseAndAllowsRetryAfterLoadFailure
 	if secondCompeting.Code != http.StatusAccepted || freeRequests.Load() != 2 || competingRequests.Load() != 2 {
 		t.Fatalf("active lease handoff status=%d frees=%d competing=%d", secondCompeting.Code, freeRequests.Load(), competingRequests.Load())
 	}
+}
+
+func newComfyTestServer(t *testing.T, freeRequests, statsRequests *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/queue":
+			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/free":
+			freeRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/system_stats":
+			count := statsRequests.Add(1)
+			freeVRAM := int64(600)
+			if count >= 3 {
+				freeVRAM = 900
+			}
+			_, _ = fmt.Fprintf(w, `{"devices":[{"name":"GPU","type":"cuda","index":0,"vram_total":1000,"vram_free":%d}]}`, freeVRAM)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func newBackendTestServer(t *testing.T, competingRequests, promptRequests *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/props":
+			if competingRequests.Add(1) == 1 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+		case "/comfyui/api/prompt":
+			promptRequests.Add(1)
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
 }

@@ -129,6 +129,21 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	_, state, nonce, challenge, stateCookie := loginStart(t, auth)
+	idp.mu.Lock()
+	idp.nonce, idp.challenge = nonce, challenge
+	idp.mu.Unlock()
+	sessionCookie := oidcCallback(t, auth, stateCookie, state)
+	sessionRequest := httptest.NewRequest(http.MethodGet, "https://catalog.example"+adminSessionPath, nil)
+	csrf := checkSession(t, auth, sessionRequest, sessionCookie)
+	adminLogout(t, auth, sessionRequest, sessionCookie, csrf)
+}
+
+// loginStart performs the OIDC login initiation and asserts the redirect
+// carries state, nonce, and PKCE S256 challenge with a protected state cookie.
+// It returns the authorize URL, state, nonce, code_challenge, and state cookie.
+func loginStart(t *testing.T, auth *adminAuth) (*url.URL, string, string, string, *http.Cookie) {
+	t.Helper()
 	login := httptest.NewRequest(http.MethodGet, "https://catalog.example/admin/auth/login", nil)
 	login.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "attacker-fixed-session"})
 	loginResponse := httptest.NewRecorder()
@@ -136,18 +151,15 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 	if loginResponse.Code != http.StatusFound {
 		t.Fatalf("login start = %d %s", loginResponse.Code, loginResponse.Body.String())
 	}
-	authorizeURL, err := url.Parse(loginResponse.Header().Get("Location"))
+	u, err := url.Parse(loginResponse.Header().Get("Location"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, nonce := authorizeURL.Query().Get("state"), authorizeURL.Query().Get("nonce")
-	challenge := authorizeURL.Query().Get("code_challenge")
-	if state == "" || nonce == "" || challenge == "" || authorizeURL.Query().Get("code_challenge_method") != "S256" {
-		t.Fatalf("OIDC redirect lacks state/nonce/PKCE: %s", authorizeURL.Redacted())
+	state, nonce := u.Query().Get("state"), u.Query().Get("nonce")
+	challenge := u.Query().Get("code_challenge")
+	if state == "" || nonce == "" || challenge == "" || u.Query().Get("code_challenge_method") != "S256" {
+		t.Fatalf("OIDC redirect lacks state/nonce/PKCE: %s", u.Redacted())
 	}
-	idp.mu.Lock()
-	idp.nonce, idp.challenge = nonce, challenge
-	idp.mu.Unlock()
 	var stateCookie *http.Cookie
 	for _, cookie := range loginResponse.Result().Cookies() {
 		if cookie.Name == adminStateCookie {
@@ -157,6 +169,13 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 	if stateCookie == nil || !stateCookie.Secure || !stateCookie.HttpOnly || stateCookie.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("OIDC state cookie is not protected: %+v", stateCookie)
 	}
+	return u, state, nonce, challenge, stateCookie
+}
+
+// oidcCallback performs the callback request with the state cookie and asserts
+// the issued session cookie is protected and not attacker-fixed.
+func oidcCallback(t *testing.T, auth *adminAuth, stateCookie *http.Cookie, state string) *http.Cookie {
+	t.Helper()
 	callbackURL := "https://catalog.example" + adminOIDCCallbackPath + "?state=" + url.QueryEscape(state) + "&code=valid-code"
 	callback := httptest.NewRequest(http.MethodGet, callbackURL, nil)
 	callback.AddCookie(stateCookie)
@@ -174,8 +193,14 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 	if sessionCookie == nil || sessionCookie.Value == "attacker-fixed-session" || !sessionCookie.Secure || !sessionCookie.HttpOnly || sessionCookie.SameSite != http.SameSiteLaxMode {
 		t.Fatalf("admin session cookie is not protected: %+v", sessionCookie)
 	}
+	return sessionCookie
+}
 
-	sessionRequest := httptest.NewRequest(http.MethodGet, "https://catalog.example"+adminSessionPath, nil)
+// checkSession asserts the session endpoint returns the expected subject and
+// role mapping, keeps the access token secret, and that role gating matches the
+// configured mapping. It returns the session CSRF token.
+func checkSession(t *testing.T, auth *adminAuth, sessionRequest *http.Request, sessionCookie *http.Cookie) string {
+	t.Helper()
 	sessionRequest.AddCookie(sessionCookie)
 	sessionResponse := httptest.NewRecorder()
 	auth.ServeHTTP(sessionResponse, sessionRequest)
@@ -195,10 +220,17 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 	if _, ok := auth.RequireRole(sessionRequest, "administer_federation"); ok {
 		t.Fatal("unassigned federation role was granted")
 	}
+	return session.CSRF
+}
+
+// adminLogout asserts foreign-origin logout is rejected, a valid CSRF logout
+// succeeds, and the session is invalidated afterward.
+func adminLogout(t *testing.T, auth *adminAuth, sessionRequest *http.Request, sessionCookie *http.Cookie, csrf string) {
+	t.Helper()
 	foreignLogout := httptest.NewRequest(http.MethodPost, "https://catalog.example"+adminOIDCLogoutPath, nil)
 	foreignLogout.AddCookie(sessionCookie)
 	foreignLogout.Header.Set("Origin", "https://attacker.example")
-	foreignLogout.Header.Set(adminCSRFHeader, session.CSRF)
+	foreignLogout.Header.Set(adminCSRFHeader, csrf)
 	foreignResponse := httptest.NewRecorder()
 	auth.ServeHTTP(foreignResponse, foreignLogout)
 	if foreignResponse.Code != http.StatusForbidden {
@@ -207,7 +239,7 @@ func TestAdminOIDCLoginSessionRolesAndLogout(t *testing.T) {
 	logout := httptest.NewRequest(http.MethodPost, "https://catalog.example"+adminOIDCLogoutPath, nil)
 	logout.AddCookie(sessionCookie)
 	logout.Header.Set("Origin", "https://catalog.example")
-	logout.Header.Set(adminCSRFHeader, session.CSRF)
+	logout.Header.Set(adminCSRFHeader, csrf)
 	logoutResponse := httptest.NewRecorder()
 	auth.ServeHTTP(logoutResponse, logout)
 	if logoutResponse.Code != http.StatusNoContent {

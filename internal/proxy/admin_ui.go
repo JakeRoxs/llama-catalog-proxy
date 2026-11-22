@@ -9,6 +9,10 @@ import (
 //go:embed benchmark_ui/admin.html benchmark_ui/admin.css benchmark_ui/admin.js
 var adminAssets embed.FS
 
+// contentTypeHeader is the HTTP header key used for admin asset MIME types.
+// Declared once so the "Content-Type" literal is not duplicated (go:S1192).
+const contentTypeHeader = "Content-Type"
+
 func serveAdminAsset(w http.ResponseWriter, req *http.Request, name string) {
 	if req.Method != http.MethodGet || req.URL.RawQuery != "" || req.URL.RawPath != "" || path.Base(name) != name {
 		http.NotFound(w, req)
@@ -24,11 +28,11 @@ func serveAdminAsset(w http.ResponseWriter, req *http.Request, name string) {
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'self'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
 	switch name {
 	case "admin.html":
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set(contentTypeHeader, "text/html; charset=utf-8")
 	case "admin.css":
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set(contentTypeHeader, "text/css; charset=utf-8")
 	case "admin.js":
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+		w.Header().Set(contentTypeHeader, "text/javascript; charset=utf-8")
 	default:
 		http.NotFound(w, req)
 		return

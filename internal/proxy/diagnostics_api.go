@@ -88,6 +88,40 @@ const (
 	modelSnapshotCursorMaxLen = 256
 )
 
+// diagnosticsErr* are the fixed diagnostic response messages duplicated across
+// handlers. They are centralized here so the wire response message is defined
+// once and referenced everywhere, satisfying go:S1192 without changing any
+// response payload or behavior.
+const (
+	// diagnosticsErrCursorTooLong is returned when a client cursor exceeds the
+	// bounded byte length.
+	diagnosticsErrCursorTooLong = "cursor too long"
+	// diagnosticsErrInvalidFilterValue is returned when a string filter is not
+	// valid UTF-8 or exceeds the maximum query parameter length.
+	diagnosticsErrInvalidFilterValue = "invalid filter value"
+	// diagnosticsErrInvalidLimit is returned when the limit query parameter is
+	// not a non-negative integer.
+	diagnosticsErrInvalidLimit = "invalid limit"
+	// diagnosticsErrDiagnosticsTemporarilyUnavailable is returned when the
+	// diagnostics service cannot admit or complete a request.
+	diagnosticsErrDiagnosticsTemporarilyUnavailable = "diagnostics temporarily unavailable"
+	// diagnosticsErrModelSnapshotFailed is returned when model snapshot
+	// collection or pagination fails.
+	diagnosticsErrModelSnapshotFailed = "model snapshot failed"
+	// diagnosticsErrDuplicateQueryParam is returned when a query parameter is
+	// supplied more than once.
+	diagnosticsErrDuplicateQueryParam = "duplicate query parameter"
+	// diagnosticsErrInvalidStatusFilter is returned when a status filter value
+	// is not in the finite accepted set.
+	diagnosticsErrInvalidStatusFilter = "invalid status filter"
+	// diagnosticsErrUnknownDiagnosticsPath is returned for an unrecognized
+	// diagnostics subpath.
+	diagnosticsErrUnknownDiagnosticsPath = "unknown diagnostics path"
+	// diagnosticsErrDiagnosticsRequestTimedOut is returned when a diagnostics
+	// request exceeds its deadline or is canceled.
+	diagnosticsErrDiagnosticsRequestTimedOut = "diagnostics request timed out"
+)
+
 // errDiagnosticsBusy is returned when the semaphore is full and a new query
 // cannot be admitted without waiting.
 var errDiagnosticsBusy = errors.New("diagnostics busy")
@@ -131,7 +165,7 @@ func (h *Handler) serveDiagnosticsAPI(w http.ResponseWriter, r *http.Request, in
 	case strings.HasPrefix(r.URL.Path, diagnosticRequestIDPrefix):
 		id := r.URL.Path[len(diagnosticRequestIDPrefix):]
 		if id == "" || strings.Contains(id, "/") {
-			writeDiagnosticsError(w, http.StatusNotFound, "unknown diagnostics path")
+			writeDiagnosticsError(w, http.StatusNotFound, diagnosticsErrUnknownDiagnosticsPath)
 			return
 		}
 		h.serveDiagnosticsRequestByID(w, r, id)
@@ -142,7 +176,7 @@ func (h *Handler) serveDiagnosticsAPI(w http.ResponseWriter, r *http.Request, in
 	case r.URL.Path == diagnosticPeersPath && h.peerCache != nil:
 		h.serveDiagnosticsPeers(w, r)
 	default:
-		writeDiagnosticsError(w, http.StatusNotFound, "unknown diagnostics path")
+		writeDiagnosticsError(w, http.StatusNotFound, diagnosticsErrUnknownDiagnosticsPath)
 	}
 }
 
@@ -280,31 +314,43 @@ func validTransportStatus(s string) bool {
 }
 
 // validRequestID reports whether id is a proxy-generated request ID: 32
-// lowercase hex digits or the bounded req-<digits> fallback.
+// lowercase hex digits or the nonempty req-<digits> fallback. No length cap
+// is applied to the req-<digits> fallback.
 func validRequestID(id string) bool {
-	if len(id) == 32 {
-		for i := 0; i < 32; i++ {
-			c := id[i]
-			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-				return false
-			}
-		}
-		return true
+	return validLowerHex32(id) || validReqDigits(id)
+}
+
+// validLowerHex32 reports whether id is exactly 32 lowercase hex digits.
+// Uppercase hex and any other length are rejected.
+func validLowerHex32(id string) bool {
+	if len(id) != 32 {
+		return false
 	}
-	// Bounded fallback: req-<digits>.
-	if strings.HasPrefix(id, "req-") {
-		rest := id[4:]
-		if rest == "" {
+	for i := 0; i < 32; i++ {
+		c := id[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 			return false
 		}
-		for i := 0; i < len(rest); i++ {
-			if rest[i] < '0' || rest[i] > '9' {
-				return false
-			}
-		}
-		return true
 	}
-	return false
+	return true
+}
+
+// validReqDigits reports whether id is the nonempty req-<digits> fallback:
+// the prefix req- followed by one or more ASCII digits, with no length cap.
+func validReqDigits(id string) bool {
+	if !strings.HasPrefix(id, "req-") {
+		return false
+	}
+	rest := id[4:]
+	if rest == "" {
+		return false
+	}
+	for i := 0; i < len(rest); i++ {
+		if rest[i] < '0' || rest[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // rejectDuplicateQueryParams returns an error if any of the named query
@@ -762,10 +808,10 @@ func (h *Handler) serveDiagnosticsBackends(w http.ResponseWriter, r *http.Reques
 	release, err := h.diagnoseRateLimit(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics temporarily unavailable")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 		return
 	}
 	defer release()
@@ -773,7 +819,7 @@ func (h *Handler) serveDiagnosticsBackends(w http.ResponseWriter, r *http.Reques
 	snapshots, err := h.diagnostics.All(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
 		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics snapshot failed")
@@ -814,7 +860,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 
 	// Reject duplicate query parameters.
 	if err := rejectDuplicateQueryParams(r.URL.Query(), "backend", "model", "status", "cursor", "offset", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, "duplicate query parameter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
 		return
 	}
 
@@ -826,7 +872,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 
 	// Validate cursor length.
 	if cursor != "" && len(cursor) > modelSnapshotCursorMaxLen {
-		writeDiagnosticsError(w, http.StatusBadRequest, "cursor too long")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
 		return
 	}
 
@@ -834,7 +880,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	for _, v := range []string{backendFilter, modelFilter, statusFilter} {
 		if v != "" {
 			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, "invalid filter value")
+				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
 				return
 			}
 		}
@@ -843,7 +889,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	// Validate status filter against the finite exact set derived from
 	// typed ModelSnapshot.Lifecycle.CurrentState.
 	if statusFilter != "" && !validModelStatus[statusFilter] {
-		writeDiagnosticsError(w, http.StatusBadRequest, "invalid status filter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
 		return
 	}
 
@@ -860,7 +906,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	if limitParam != "" {
 		l, err := strconv.Atoi(limitParam)
 		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, "invalid limit")
+			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
 			return
 		}
 		if l > maxDiagnosticQueryLimit {
@@ -883,14 +929,14 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	}
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
 		if err == errDiagnosticsBusy {
-			writeDiagnosticsError(w, http.StatusTooManyRequests, "diagnostics temporarily unavailable")
+			writeDiagnosticsError(w, http.StatusTooManyRequests, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics temporarily unavailable")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 		return
 	}
 	defer release()
@@ -917,7 +963,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 				writeDiagnosticsError(w, http.StatusNotFound, "snapshot not found")
 				return
 			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "model snapshot failed")
+			writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
 			return
 		}
 		writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
@@ -954,7 +1000,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	snapshots, err := h.diagnostics.All(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
 		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics snapshot failed")
@@ -969,7 +1015,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		actRecords, err := h.activityCollector.Refresh(ctx)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 				return
 			}
 			writeDiagnosticsError(w, http.StatusServiceUnavailable, "activity collection failed")
@@ -993,7 +1039,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		report, err := h.aliasCollector.Collect(ctx, epoch)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 				return
 			}
 			writeDiagnosticsError(w, http.StatusServiceUnavailable, "alias collection failed")
@@ -1014,7 +1060,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		report, err := h.gpuCollector.Collect(ctx, epoch)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 				return
 			}
 			writeDiagnosticsError(w, http.StatusServiceUnavailable, "GPU collection failed")
@@ -1046,7 +1092,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		report, err := h.lifecycleCollector.Collect(ctx, epoch)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 				return
 			}
 			writeDiagnosticsError(w, http.StatusServiceUnavailable, "lifecycle collection failed")
@@ -1074,10 +1120,10 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	modelSnaps, err := h.modelDiagnostics.SnapshotWithSources(ctx, mdBackendModels, mdSnapshots, sources)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "model snapshot failed")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
 		return
 	}
 
@@ -1235,7 +1281,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 			writeDiagnosticsError(w, http.StatusNotFound, "snapshot not found")
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "model snapshot failed")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
 		return
 	}
 
@@ -1276,6 +1322,28 @@ func cloneModelSnapshot(m *modeldiagnostics.ModelSnapshot) *modeldiagnostics.Mod
 	return clone
 }
 
+// catalogModelPublicIDForFilter returns the canonical public ID (prefix +
+// local ID) of a catalog model row that matches the model filter, or false
+// when the row does not match. Alias rows, missing/empty IDs, and
+// nonmatching prefix-qualified/public/local/alias IDs are rejected. The
+// backend parameter supplies the prefix used to build the public ID; backend
+// filtering remains the caller's responsibility.
+func catalogModelPublicIDForFilter(backend catalog.BackendModel, model map[string]any, filter string) (string, bool) {
+	// Skip alias rows: canonical rows already carry their aliases.
+	if catalog.IsAliasModelRow(model) {
+		return "", false
+	}
+	localID, _ := model["id"].(string)
+	if localID == "" {
+		return "", false
+	}
+	publicID := backend.Prefix + localID
+	if publicID == filter || localID == filter || catalogModelAliasMatches(model, backend.Prefix, filter) {
+		return publicID, true
+	}
+	return "", false
+}
+
 // catalogModelFilterIDs maps a cached catalog ID or alias to canonical public
 // model IDs. Alias metadata is consumed only for exact matching and is never
 // returned to the caller.
@@ -1286,15 +1354,7 @@ func catalogModelFilterIDs(backendModels []catalog.BackendModel, backendFilter, 
 			continue
 		}
 		for _, m := range bm.Models {
-			if catalog.IsAliasModelRow(m) {
-				continue
-			}
-			localID, _ := m["id"].(string)
-			if localID == "" {
-				continue
-			}
-			publicID := bm.Prefix + localID
-			if publicID == modelFilter || localID == modelFilter || catalogModelAliasMatches(m, bm.Prefix, modelFilter) {
+			if publicID, ok := catalogModelPublicIDForFilter(bm, m, modelFilter); ok {
 				ids[publicID] = struct{}{}
 			}
 		}
@@ -1365,7 +1425,7 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 
 	// Reject duplicate query parameters.
 	if err := rejectDuplicateQueryParams(r.URL.Query(), "since", "until", "backend", "model", "status", "requestid", "cursor", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, "duplicate query parameter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
 		return
 	}
 
@@ -1390,7 +1450,7 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 	for _, v := range []string{backendFilter, statusFilter, requestIDFilter} {
 		if v != "" {
 			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, "invalid filter value")
+				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
 				return
 			}
 		}
@@ -1398,7 +1458,7 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 
 	// Validate cursor length.
 	if cursor != "" && len(cursor) > maxCursorLength {
-		writeDiagnosticsError(w, http.StatusBadRequest, "cursor too long")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
 		return
 	}
 
@@ -1407,7 +1467,7 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 	if limitParam != "" {
 		l, err := strconv.Atoi(limitParam)
 		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, "invalid limit")
+			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
 			return
 		}
 		if l > maxDiagnosticQueryLimit {
@@ -1426,7 +1486,7 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 
 	// Validate status filter: finite union of Correlation transport enums.
 	if statusFilter != "" && !validTransportStatus(statusFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, "invalid status filter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
 		return
 	}
 
@@ -1440,10 +1500,10 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 	release, err := h.diagnoseRateLimit(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics temporarily unavailable")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 		return
 	}
 	defer release()
@@ -1493,7 +1553,7 @@ func (h *Handler) serveDiagnosticsRequestByID(w http.ResponseWriter, r *http.Req
 	// Validate exact bounded path segment: 32 lowercase hex or req-<digits>
 	// fallback. No raw ID is echoed in errors.
 	if !validRequestID(id) {
-		writeDiagnosticsError(w, http.StatusNotFound, "unknown diagnostics path")
+		writeDiagnosticsError(w, http.StatusNotFound, diagnosticsErrUnknownDiagnosticsPath)
 		return
 	}
 
@@ -1507,10 +1567,10 @@ func (h *Handler) serveDiagnosticsRequestByID(w http.ResponseWriter, r *http.Req
 	release, err := h.diagnoseRateLimit(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics temporarily unavailable")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 		return
 	}
 	defer release()
@@ -1549,7 +1609,7 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 
 	// Reject duplicate query parameters.
 	if err := rejectDuplicateQueryParams(r.URL.Query(), "since", "until", "backend", "model", "status", "requestid", "cursor", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, "duplicate query parameter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
 		return
 	}
 
@@ -1574,7 +1634,7 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 	for _, v := range []string{backendFilter, statusFilter, requestIDFilter} {
 		if v != "" {
 			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, "invalid filter value")
+				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
 				return
 			}
 		}
@@ -1582,7 +1642,7 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 
 	// Validate cursor length.
 	if cursor != "" && len(cursor) > maxCursorLength {
-		writeDiagnosticsError(w, http.StatusBadRequest, "cursor too long")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
 		return
 	}
 
@@ -1591,7 +1651,7 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 	if limitParam != "" {
 		l, err := strconv.Atoi(limitParam)
 		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, "invalid limit")
+			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
 			return
 		}
 		if l > maxDiagnosticSummaryLimit {
@@ -1610,7 +1670,7 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 
 	// Validate status filter: finite union of Correlation transport enums.
 	if statusFilter != "" && !validTransportStatus(statusFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, "invalid status filter")
+		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
 		return
 	}
 
@@ -1624,10 +1684,10 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 	release, err := h.diagnoseRateLimit(ctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, "diagnostics request timed out")
+			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
 			return
 		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics temporarily unavailable")
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
 		return
 	}
 	defer release()

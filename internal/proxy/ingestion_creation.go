@@ -23,60 +23,95 @@ type recordedCreationPreview struct {
 	ReviewRevision string                      `json:"review_revision"`
 }
 
-// The caller must keep ingestion and management configuration stable.
-func previewRecordedCreation(jobs *ingestion.JobManager, modelDirectory string, target config.ManagementTarget,
-	targetID, modelID, templateID, recordID string, input modelconfig.CreationCommandInput) (recordedCreationPreview, error) {
-	if jobs == nil || input.ModelPath != "" {
-		return recordedCreationPreview{}, errors.New("invalid recorded creation request")
-	}
+// recordedCreationPreviewRequest groups the arguments used to record a creation preview.
+type recordedCreationPreviewRequest struct {
+	jobs           *ingestion.JobManager
+	modelDirectory string
+	target         config.ManagementTarget
+	targetID       string
+	modelID        string
+	templateID     string
+	recordID       string
+	input          modelconfig.CreationCommandInput
+}
+
+// withStableRecordedArtifact checks the recorded artifact before and after an
+// operation. The operation receives the pre-operation artifact evidence. When
+// the operation errors, the post-operation check is skipped and the error is
+// returned immediately. On success the artifact is rechecked and
+// ingestion.ErrArtifactChanged is returned when the revision changed; otherwise
+// the result's Artifact field is replaced with the post-operation evidence.
+func withStableRecordedArtifact(jobs *ingestion.JobManager, modelDirectory, recordID string,
+	operation func(before ingestion.ArtifactEvidence) (recordedCreationPreview, error)) (recordedCreationPreview, error) {
 	before, err := jobs.CheckRecordedArtifact(modelDirectory, recordID)
 	if err != nil {
 		return recordedCreationPreview{}, err
 	}
-	input.ModelPath = filepath.Join(modelDirectory, before.Source.Filename)
-	preview, err := modelconfig.PreviewCreationTarget(target.Directory, target.Filename, targetID, modelID, templateID, input)
+	result, err := operation(before)
 	if err != nil {
-		return recordedCreationPreview{}, err
+		return result, err
 	}
 	after, err := jobs.CheckRecordedArtifact(modelDirectory, recordID)
 	if err != nil {
-		return recordedCreationPreview{}, err
+		return result, err
 	}
 	if before.Revision != after.Revision {
-		return recordedCreationPreview{}, ingestion.ErrArtifactChanged
+		return result, ingestion.ErrArtifactChanged
 	}
-	preview.Artifact = after.Presence
-	result := recordedCreationPreview{Preview: preview, Artifact: after}
-	review, err := json.Marshal(struct {
-		Preview  modelconfig.CreationPreview `json:"preview"`
-		Artifact ingestion.ArtifactEvidence  `json:"artifact"`
-	}{Preview: preview, Artifact: after})
-	if err != nil {
-		return recordedCreationPreview{}, err
-	}
-	digest := sha256.Sum256(review)
-	result.ReviewRevision = hex.EncodeToString(digest[:])
+	result.Artifact = after
 	return result, nil
 }
 
-func storeRecordedCreation(jobs *ingestion.JobManager, modelDirectory, store string, target config.ManagementTarget,
-	targetID, modelID, templateID, recordID, expectedRevision, expectedArtifactRevision, expectedReviewRevision string,
-	input modelconfig.CreationCommandInput) (modelconfig.CreationProposal, error) {
-	preview, err := previewRecordedCreation(jobs, modelDirectory, target, targetID, modelID, templateID, recordID, input)
+// The caller must keep ingestion and management configuration stable.
+func previewRecordedCreation(req recordedCreationPreviewRequest) (recordedCreationPreview, error) {
+	if req.jobs == nil || req.input.ModelPath != "" {
+		return recordedCreationPreview{}, errors.New("invalid recorded creation request")
+	}
+	return withStableRecordedArtifact(req.jobs, req.modelDirectory, req.recordID, func(before ingestion.ArtifactEvidence) (recordedCreationPreview, error) {
+		input := req.input
+		input.ModelPath = filepath.Join(req.modelDirectory, before.Source.Filename)
+		preview, err := modelconfig.PreviewCreationTarget(req.target.Directory, req.target.Filename, req.targetID, req.modelID, req.templateID, input)
+		if err != nil {
+			return recordedCreationPreview{}, err
+		}
+		preview.Artifact = before.Presence
+		review, err := json.Marshal(struct {
+			Preview  modelconfig.CreationPreview `json:"preview"`
+			Artifact ingestion.ArtifactEvidence  `json:"artifact"`
+		}{Preview: preview, Artifact: before})
+		if err != nil {
+			return recordedCreationPreview{}, err
+		}
+		digest := sha256.Sum256(review)
+		return recordedCreationPreview{Preview: preview, ReviewRevision: hex.EncodeToString(digest[:])}, nil
+	})
+}
+
+// storeRecordedCreationRequest groups the preview request, proposal store, and expected revisions.
+type storeRecordedCreationRequest struct {
+	previewRequest           recordedCreationPreviewRequest
+	store                    string
+	expectedRevision         string
+	expectedArtifactRevision string
+	expectedReviewRevision   string
+}
+
+func storeRecordedCreation(req storeRecordedCreationRequest) (modelconfig.CreationProposal, error) {
+	preview, err := previewRecordedCreation(req.previewRequest)
 	if err != nil {
 		return modelconfig.CreationProposal{}, err
 	}
-	if preview.Preview.Revision != expectedRevision {
+	if preview.Preview.Revision != req.expectedRevision {
 		return modelconfig.CreationProposal{}, modelconfig.ErrProposalStale
 	}
-	if preview.Artifact.Revision != expectedArtifactRevision {
+	if preview.Artifact.Revision != req.expectedArtifactRevision {
 		return modelconfig.CreationProposal{}, modelconfig.ErrProposalArtifact
 	}
-	if preview.ReviewRevision != expectedReviewRevision {
+	if preview.ReviewRevision != req.expectedReviewRevision {
 		return modelconfig.CreationProposal{}, modelconfig.ErrProposalReview
 	}
-	proposal, err := modelconfig.SaveCreationProposal(store, target.Directory, target.Filename, preview.Preview,
-		recordID, preview.Artifact.Revision, input)
+	proposal, err := modelconfig.SaveCreationProposal(req.store, req.previewRequest.target.Directory, req.previewRequest.target.Filename, preview.Preview,
+		req.previewRequest.recordID, preview.Artifact.Revision, req.previewRequest.input)
 	if err != nil && !errors.Is(err, modelconfig.ErrProposalInvalid) {
 		return modelconfig.CreationProposal{}, errors.Join(modelconfig.ErrProposalStore, err)
 	}
@@ -107,41 +142,82 @@ func validCreationDigest(value string) bool {
 }
 
 func (r *Reloader) serveCreation(w http.ResponseWriter, req *http.Request, state *reloaderState, create bool) {
+	data, handled := serveCreationGuards(w, req)
+	if handled {
+		return
+	}
+	input, sourceRevision, artifactRevision, reviewRevision, err := decodeCreationBody(data, create)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	target, ok := state.management.Targets[input.TargetID]
+	if !ok {
+		http.NotFound(w, req)
+		return
+	}
+	result, ready, err := r.runCreationOperation(state, input, target, create, sourceRevision, artifactRevision, reviewRevision)
+	if !ready {
+		http.Error(w, "management configuration changed or ingestion unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		writeCreationError(w, err)
+		return
+	}
+	status := http.StatusOK
+	if create {
+		status = http.StatusCreated
+	}
+	writeJSON(r.logger, w, status, result)
+}
+
+// serveCreationGuards validates the request origin, method, content type, body,
+// size, and JSON shape. When handled is true the caller must not write a
+// response; the guard has already done so. It preserves every early status and
+// body of the previous inline implementation.
+func serveCreationGuards(w http.ResponseWriter, req *http.Request) (data []byte, handled bool) {
 	if req.URL.RawQuery != "" || req.URL.ForceQuery || !sameIngestionOrigin(req) {
 		http.Error(w, "invalid request origin or query", http.StatusForbidden)
-		return
+		return nil, true
 	}
 	if req.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return nil, true
 	}
 	contentType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" || req.Header.Get("Content-Encoding") != "" {
 		http.Error(w, "JSON request required", http.StatusUnsupportedMediaType)
-		return
+		return nil, true
 	}
 	if req.Body == nil {
 		http.Error(w, "request body required", http.StatusBadRequest)
-		return
+		return nil, true
 	}
-	data, err := io.ReadAll(io.LimitReader(req.Body, maxManagementRequest+1))
+	data, err = io.ReadAll(io.LimitReader(req.Body, maxManagementRequest+1))
 	if err != nil {
 		http.Error(w, "request could not be read", http.StatusBadRequest)
-		return
+		return nil, true
 	}
 	if len(data) > maxManagementRequest {
 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-		return
+		return nil, true
 	}
 	if validateManagementJSON(data) != nil {
 		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
+		return nil, true
 	}
+	return data, false
+}
+
+// decodeCreationBody decodes the validated management request body. When create
+// is true it requires the create wrapper with valid revision digests; otherwise
+// it decodes a plain creation request. The returned revisions are empty when
+// create is false. Error messages match the previous inline implementation.
+func decodeCreationBody(data []byte, create bool) (creationRequest, string, string, string, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	var input creationRequest
-	var sourceRevision, artifactRevision, reviewRevision string
 	if create {
 		var proposal struct {
 			creationRequest
@@ -151,62 +227,74 @@ func (r *Reloader) serveCreation(w http.ResponseWriter, req *http.Request, state
 		}
 		if decoder.Decode(&proposal) != nil || !validCreationDigest(proposal.Revision) ||
 			!validCreationDigest(proposal.ArtifactRevision) || !validCreationDigest(proposal.ReviewRevision) {
-			http.Error(w, "invalid request or review revisions", http.StatusBadRequest)
-			return
+			return creationRequest{}, "", "", "", errors.New("invalid request or review revisions")
 		}
-		input, sourceRevision, artifactRevision, reviewRevision = proposal.creationRequest, proposal.Revision, proposal.ArtifactRevision, proposal.ReviewRevision
-	} else if decoder.Decode(&input) != nil {
-		http.Error(w, "invalid request", http.StatusBadRequest)
-		return
+		return proposal.creationRequest, proposal.Revision, proposal.ArtifactRevision, proposal.ReviewRevision, nil
 	}
-	target, ok := state.management.Targets[input.TargetID]
-	if !ok {
-		http.NotFound(w, req)
-		return
+	var input creationRequest
+	if decoder.Decode(&input) != nil {
+		return creationRequest{}, "", "", "", errors.New("invalid request")
 	}
+	return input, "", "", "", nil
+}
+
+// runCreationOperation performs the lifecycle-guarded creation operation. The
+// lifecycle lock covers the availability validation and the store/preview call
+// and is released before the caller maps errors to HTTP responses. When the
+// runtime is unavailable it returns ready=false and no error.
+func (r *Reloader) runCreationOperation(state *reloaderState, input creationRequest, target config.ManagementTarget, create bool, revisions ...string) (result any, ready bool, err error) {
 	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
 	if r.stopped || r.state.Load() != state || r.ingestion == nil || r.ingestion.jobs == nil ||
 		state.management.Ingestion == nil || r.ingestion.config.Directory != state.management.Ingestion.Directory ||
 		r.ingestion.config.RecordDirectory != state.management.Ingestion.RecordDirectory ||
 		validateIngestionDirectories(state.management, nil) != nil {
-		r.lifecycleMu.Unlock()
-		http.Error(w, "management configuration changed or ingestion unavailable", http.StatusServiceUnavailable)
-		return
+		return nil, false, nil
 	}
-	var result any
+	sourceRevision, artifactRevision, reviewRevision := revisions[0], revisions[1], revisions[2]
+	previewRequest := recordedCreationPreviewRequest{
+		jobs:           r.ingestion.jobs,
+		modelDirectory: r.ingestion.config.Directory,
+		target:         target,
+		targetID:       input.TargetID,
+		modelID:        input.ModelID,
+		templateID:     input.TemplateID,
+		recordID:       input.ArtifactRecordID,
+		input:          input.command(),
+	}
 	if create {
-		result, err = storeRecordedCreation(r.ingestion.jobs, r.ingestion.config.Directory, state.management.ProposalStore.Directory,
-			target, input.TargetID, input.ModelID, input.TemplateID, input.ArtifactRecordID,
-			sourceRevision, artifactRevision, reviewRevision, input.command())
+		result, err = storeRecordedCreation(storeRecordedCreationRequest{
+			previewRequest:           previewRequest,
+			store:                    state.management.ProposalStore.Directory,
+			expectedRevision:         sourceRevision,
+			expectedArtifactRevision: artifactRevision,
+			expectedReviewRevision:   reviewRevision,
+		})
 	} else {
-		result, err = previewRecordedCreation(r.ingestion.jobs, r.ingestion.config.Directory, target,
-			input.TargetID, input.ModelID, input.TemplateID, input.ArtifactRecordID, input.command())
+		result, err = previewRecordedCreation(previewRequest)
 	}
-	r.lifecycleMu.Unlock()
-	if err != nil {
-		switch {
-		case errors.Is(err, modelconfig.ErrProposalStoreFull):
-			http.Error(w, "proposal store is full", http.StatusConflict)
-		case errors.Is(err, modelconfig.ErrProposalStale), errors.Is(err, modelconfig.ErrProposalArtifact),
-			errors.Is(err, modelconfig.ErrProposalReview), errors.Is(err, ingestion.ErrArtifactChanged),
-			errors.Is(err, ingestion.ErrArtifactUnavailable), errors.Is(err, ingestion.ErrArtifactRecord),
-			errors.Is(err, ingestion.ErrRecordNotFound):
-			http.Error(w, "creation review no longer matches or is unavailable", http.StatusConflict)
-		case errors.Is(err, modelconfig.ErrProposalStore):
-			http.Error(w, "proposal store unavailable; creation outcome may be uncertain", http.StatusServiceUnavailable)
-		case errors.Is(err, ingestion.ErrRecordStore), errors.Is(err, ingestion.ErrArtifactBusy), errors.Is(err, ingestion.ErrJobActive),
-			errors.Is(err, ingestion.ErrStageDirectory):
-			http.Error(w, "creation service unavailable", http.StatusServiceUnavailable)
-		default:
-			http.Error(w, err.Error(), http.StatusBadRequest)
-		}
-		return
+	return result, true, err
+}
+
+// writeCreationError maps creation operation errors to HTTP responses,
+// preserving the exact status codes and bodies of the previous implementation.
+func writeCreationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, modelconfig.ErrProposalStoreFull):
+		http.Error(w, "proposal store is full", http.StatusConflict)
+	case errors.Is(err, modelconfig.ErrProposalStale), errors.Is(err, modelconfig.ErrProposalArtifact),
+		errors.Is(err, modelconfig.ErrProposalReview), errors.Is(err, ingestion.ErrArtifactChanged),
+		errors.Is(err, ingestion.ErrArtifactUnavailable), errors.Is(err, ingestion.ErrArtifactRecord),
+		errors.Is(err, ingestion.ErrRecordNotFound):
+		http.Error(w, "creation review no longer matches or is unavailable", http.StatusConflict)
+	case errors.Is(err, modelconfig.ErrProposalStore):
+		http.Error(w, "proposal store unavailable; creation outcome may be uncertain", http.StatusServiceUnavailable)
+	case errors.Is(err, ingestion.ErrRecordStore), errors.Is(err, ingestion.ErrArtifactBusy), errors.Is(err, ingestion.ErrJobActive),
+		errors.Is(err, ingestion.ErrStageDirectory):
+		http.Error(w, "creation service unavailable", http.StatusServiceUnavailable)
+	default:
+		http.Error(w, err.Error(), http.StatusBadRequest)
 	}
-	status := http.StatusOK
-	if create {
-		status = http.StatusCreated
-	}
-	writeJSON(r.logger, w, status, result)
 }
 
 func verifyRecordedCreation(jobs *ingestion.JobManager, modelDirectory, store string, target config.ManagementTarget,
@@ -218,21 +306,16 @@ func verifyRecordedCreation(jobs *ingestion.JobManager, modelDirectory, store st
 	if err != nil {
 		return recordedCreationPreview{}, err
 	}
-	before, err := jobs.CheckRecordedArtifact(modelDirectory, proposal.ArtifactRecordID)
-	if err != nil {
-		return recordedCreationPreview{}, err
-	}
-	preview, err := modelconfig.RevalidateStoredCreationProposal(store, proposalID, target.Directory, target.Filename,
-		targetID, before.Revision, filepath.Join(modelDirectory, before.Source.Filename))
-	if err != nil {
-		return recordedCreationPreview{}, err
-	}
-	after, err := jobs.CheckRecordedArtifact(modelDirectory, proposal.ArtifactRecordID)
-	if err != nil {
-		return recordedCreationPreview{}, err
-	}
-	if before.Revision != after.Revision {
-		return recordedCreationPreview{}, ingestion.ErrArtifactChanged
-	}
-	return recordedCreationPreview{Preview: preview, Artifact: after}, nil
+	return withStableRecordedArtifact(jobs, modelDirectory, proposal.ArtifactRecordID, func(before ingestion.ArtifactEvidence) (recordedCreationPreview, error) {
+		if before.Revision != proposal.ArtifactRevision {
+			return recordedCreationPreview{}, modelconfig.ErrProposalArtifact
+		}
+		var preview modelconfig.CreationPreview
+		preview, err = modelconfig.RevalidateStoredCreationProposal(store, proposalID, target.Directory, target.Filename,
+			targetID, before.Revision, filepath.Join(modelDirectory, before.Source.Filename))
+		if err != nil {
+			return recordedCreationPreview{}, err
+		}
+		return recordedCreationPreview{Preview: preview}, nil
+	})
 }

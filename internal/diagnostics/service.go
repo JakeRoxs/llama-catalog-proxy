@@ -254,23 +254,11 @@ func (s *Service) probe(ctx context.Context, b *backend, name, path string) Obse
 		result.Reason = "timeout_or_cancellation"
 		return result
 	}
-	u := b.url.JoinPath(path)
-	if name == "activity" {
-		u.RawQuery = "limit=1"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := buildProbeRequest(ctx, b.url, path, name, b.config)
 	if err != nil {
 		result.State, result.Reason = Unknown, "invalid_request"
 		return result
 	}
-	for key, value := range b.config.Headers {
-		req.Header.Set(key, value)
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
-	}
-	req.Header.Set("Accept", "application/json")
 	response, err := s.client.Do(req)
 	if err != nil {
 		result.Reason = "request_failed"
@@ -278,32 +266,21 @@ func (s *Service) probe(ctx context.Context, b *backend, name, path string) Obse
 	}
 	defer response.Body.Close()
 	result.HTTPStatus = response.StatusCode
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		result.State, result.Reason = Unauthorized, "authorization_required"
-		return result
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		result.State = Unsupported
-		return result
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		result.State, result.Reason = Unknown, "redirect_refused"
-		return result
-	case response.StatusCode != http.StatusOK && !(name == "performance" && response.StatusCode == http.StatusServiceUnavailable):
-		result.Reason = "http_error"
+	if state, reason, stop := classifyProbeStatus(name, response.StatusCode); stop {
+		result.Reason = reason
+		// A zero State means leave the current state unchanged (e.g. http_error).
+		if state != "" {
+			result.State = state
+		}
 		return result
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil {
-		result.Reason = "response_read_failed"
-		return result
-	}
-	if len(body) > maxResponseBytes {
-		result.State, result.Reason = Unknown, "response_too_large"
-		return result
-	}
-	var object map[string]json.RawMessage
-	if json.Unmarshal(body, &object) != nil || object == nil {
-		result.State, result.Reason = Unknown, "invalid_json"
+	object, state, reason, stop := readProbeBody(response.Body)
+	if stop {
+		result.Reason = reason
+		// A zero State means leave the current state unchanged (e.g. read failure).
+		if state != "" {
+			result.State = state
+		}
 		return result
 	}
 	result.State, result.Build = recognize(name, object)
@@ -316,52 +293,158 @@ func (s *Service) probe(ctx context.Context, b *backend, name, path string) Obse
 	return result
 }
 
+// buildProbeRequest builds the GET request used to probe a backend operation.
+// Backend headers are applied first, the APIKey fallback is added only when
+// neither Authorization nor X-Api-Key is present, and Accept is always set.
+func buildProbeRequest(ctx context.Context, base *url.URL, path, name string, cfg config.Backend) (*http.Request, error) {
+	u := base.JoinPath(path)
+	if name == "activity" {
+		u.RawQuery = "limit=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range cfg.Headers {
+		req.Header.Set(key, value)
+	}
+	if cfg.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		req.Header.Set("X-Api-Key", cfg.APIKey)
+	}
+	req.Header.Set("Accept", "application/json")
+	return req, nil
+}
+
+// classifyProbeStatus maps an HTTP status to an observation state and reason.
+// It returns stop=true when the caller should apply the result and return. The
+// performance endpoint tolerates 503 as an enabled-but-unavailable signal. A
+// zero State means leave the current state unchanged.
+func classifyProbeStatus(name string, status int) (State, string, bool) {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return Unauthorized, "authorization_required", true
+	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
+		return Unsupported, "", true
+	case status >= 300 && status < 400:
+		return Unknown, "redirect_refused", true
+	case status != http.StatusOK && !(name == "performance" && status == http.StatusServiceUnavailable):
+		return "", "http_error", true
+	}
+	return "", "", false
+}
+
+// readProbeBody reads at most maxResponseBytes+1 bytes, rejects oversized
+// bodies, and decodes a JSON object. It returns stop=true when the caller
+// should apply the result and return. A zero State means leave the current
+// state unchanged.
+func readProbeBody(body io.ReadCloser) (map[string]json.RawMessage, State, string, bool) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, "", "response_read_failed", true
+	}
+	if len(raw) > maxResponseBytes {
+		return nil, Unknown, "response_too_large", true
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return nil, Unknown, "invalid_json", true
+	}
+	return object, "", "", false
+}
+
 var (
 	versionPattern = regexp.MustCompile(`^(v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9._-]+)?|dev|unknown)$`)
 	commitPattern  = regexp.MustCompile(`^([0-9a-fA-F]{7,64}|unknown)$`)
 )
 
 func recognize(name string, object map[string]json.RawMessage) (State, *Build) {
-	var valid bool
 	switch name {
 	case "version":
-		var raw struct {
-			Version, Commit string
-			BuildDate       string `json:"build_date"`
-		}
-		encoded, _ := json.Marshal(object)
-		valid = json.Unmarshal(encoded, &raw) == nil && raw.Version != ""
-		build := &Build{}
-		if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 {
-			build.Version = raw.Version
-		}
-		if commitPattern.MatchString(raw.Commit) {
-			build.Commit = raw.Commit
-		}
-		if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil {
-			build.Date = date.Format(time.RFC3339)
-		}
-		if valid {
-			return Supported, build
-		}
+		return recognizeVersion(object)
 	case "models":
-		valid = isArray(object["data"])
+		return recognizeModels(object)
 	case "activity":
-		valid = isArray(object["data"]) && isCount(object["page"]) && isCount(object["total"])
+		return recognizeActivity(object)
 	case "stats":
-		valid = isCount(object["total_requests"]) && isCount(object["total_input_tokens"]) && isCount(object["total_output_tokens"])
+		return recognizeStats(object)
 	case "performance":
-		var enabled *bool
-		if value, exists := object["enabled"]; exists && json.Unmarshal(value, &enabled) == nil && enabled != nil {
-			if !*enabled {
-				return Disabled, nil
-			}
-			valid = isArray(object["sys_stats"]) && isArray(object["gpu_stats"])
-		}
+		return recognizePerformance(object)
 	case "hardware":
-		valid = isCount(object["schema_version"]) && isArray(object["accelerators"])
+		return recognizeHardware(object)
 	}
-	if valid {
+	return Unknown, nil
+}
+
+// recognizeVersion validates and builds the version observation. A missing or
+// unparseable version yields Unknown; a valid version yields Supported with the
+// parsed build metadata (unset fields remain nil when they do not validate).
+func recognizeVersion(object map[string]json.RawMessage) (State, *Build) {
+	var raw struct {
+		Version, Commit string
+		BuildDate       string `json:"build_date"`
+	}
+	encoded, _ := json.Marshal(object)
+	if json.Unmarshal(encoded, &raw) != nil || raw.Version == "" {
+		return Unknown, nil
+	}
+	build := &Build{}
+	if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 {
+		build.Version = raw.Version
+	}
+	if commitPattern.MatchString(raw.Commit) {
+		build.Commit = raw.Commit
+	}
+	if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil {
+		build.Date = date.Format(time.RFC3339)
+	}
+	return Supported, build
+}
+
+// recognizeModels reports Supported when the response is a JSON array under data.
+func recognizeModels(object map[string]json.RawMessage) (State, *Build) {
+	if isArray(object["data"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizeActivity reports Supported when data is an array and page/total are counts.
+func recognizeActivity(object map[string]json.RawMessage) (State, *Build) {
+	if isArray(object["data"]) && isCount(object["page"]) && isCount(object["total"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizeStats reports Supported when all three totals are counts.
+func recognizeStats(object map[string]json.RawMessage) (State, *Build) {
+	if isCount(object["total_requests"]) && isCount(object["total_input_tokens"]) && isCount(object["total_output_tokens"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizePerformance reports Disabled only for an explicit enabled:false, and
+// Supported when enabled is true and sys_stats/gpu_stats are arrays. Any other
+// input (missing or unparseable enabled) yields Unknown.
+func recognizePerformance(object map[string]json.RawMessage) (State, *Build) {
+	var enabled *bool
+	if value, exists := object["enabled"]; exists && json.Unmarshal(value, &enabled) == nil && enabled != nil {
+		if !*enabled {
+			return Disabled, nil
+		}
+		if isArray(object["sys_stats"]) && isArray(object["gpu_stats"]) {
+			return Supported, nil
+		}
+	}
+	return Unknown, nil
+}
+
+// recognizeHardware reports Supported when schema_version is a count and
+// accelerators is an array.
+func recognizeHardware(object map[string]json.RawMessage) (State, *Build) {
+	if isCount(object["schema_version"]) && isArray(object["accelerators"]) {
 		return Supported, nil
 	}
 	return Unknown, nil

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/correlation"
 )
 
 const observedStream = "data: {\"choices\":[{\"delta\":{\"content\":\"PRIVATE_COMPLETION\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n"
@@ -53,6 +54,22 @@ func observedHandler(t *testing.T, cfg config.Config) (http.Handler, *synchroniz
 	return h, logs
 }
 
+// observationRequest executes a streaming chat request against the proxy backed by
+// backend with the given observation setting, returning the response recorder and
+// the captured log text. The shared backend fixture is owned by the caller.
+func observationRequest(t *testing.T, backend *httptest.Server, enabled bool) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	cfg := baseConfig(backend.URL)
+	cfg.RequestObservation = enabled
+	h, logs := observedHandler(t, cfg)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"PRIVATE_MODEL","messages":[{"role":"user","content":"PRIVATE_PROMPT"}],"stream":true}`))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Authorization", "PRIVATE_AUTH")
+	h.ServeHTTP(w, r)
+	return w, logs.String()
+}
+
 func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request map[string]any
@@ -65,25 +82,23 @@ func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 		_, _ = io.WriteString(w, observedStream)
 	}))
 	defer backend.Close()
-	for _, enabled := range []bool{false, true} {
-		cfg := baseConfig(backend.URL)
-		cfg.RequestObservation = enabled
-		h, logs := observedHandler(t, cfg)
-		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"PRIVATE_MODEL","messages":[{"role":"user","content":"PRIVATE_PROMPT"}],"stream":true}`))
-		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("Authorization", "PRIVATE_AUTH")
-		h.ServeHTTP(w, r)
+
+	t.Run("disabled default off does not observe", func(t *testing.T) {
+		w, logs := observationRequest(t, backend, false)
 		if w.Body.String() != observedStream || w.Header().Get("X-Private") != "PRIVATE_HEADER" || w.Code != 200 {
 			t.Fatal("passthrough changed")
 		}
-		if !enabled {
-			if strings.Contains(logs.String(), "request_observation") {
-				t.Fatal("default-off still observed")
-			}
-			continue
+		if strings.Contains(logs, "request_observation") {
+			t.Fatal("default-off still observed")
 		}
-		s := loggedObservation(t, logs.String())
+	})
+
+	t.Run("enabled observes safe summary", func(t *testing.T) {
+		w, logs := observationRequest(t, backend, true)
+		if w.Body.String() != observedStream || w.Header().Get("X-Private") != "PRIVATE_HEADER" || w.Code != 200 {
+			t.Fatal("passthrough changed")
+		}
+		s := loggedObservation(t, logs)
 		if s["generation_outcome"] != "completed" || s["transport_outcome"] != "returned" {
 			t.Fatalf("bad outcomes: %+v", s)
 		}
@@ -92,11 +107,11 @@ func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 			t.Fatal("late usage lost")
 		}
 		for _, secret := range []string{"PRIVATE_COMPLETION", "PRIVATE_MODEL", "PRIVATE_PROMPT", "PRIVATE_AUTH", "PRIVATE_HEADER"} {
-			if strings.Contains(logs.String(), secret) {
+			if strings.Contains(logs, secret) {
 				t.Fatal("secret in request logs")
 			}
 		}
-	}
+	})
 }
 
 func TestObservationFlushBeforeCompletionAndHeaderPhase(t *testing.T) {
@@ -255,11 +270,19 @@ func TestObservationRouteGateAndReload(t *testing.T) {
 	}
 }
 
-func TestObservationConcurrentRequests(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+// newObservedStreamBackend returns an httptest server that echoes observedStream
+// with Content-Type text/event-stream, mirroring the shared observedStream
+// fixture used across observation tests.
+func newObservedStreamBackend(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w, observedStream)
 	}))
+}
+
+func TestObservationConcurrentRequests(t *testing.T) {
+	backend := newObservedStreamBackend(t)
 	defer backend.Close()
 	cfg := baseConfig(backend.URL)
 	cfg.RequestObservation = true
@@ -284,11 +307,105 @@ func TestObservationConcurrentRequests(t *testing.T) {
 	}
 }
 
+// fourFlagCombo builds a handler for the given RequestHistory/RequestObservation
+// flags, issues a streaming chat request against the shared backend, and returns
+// the handler, captured log text, and response recorder.
+func fourFlagCombo(t *testing.T, backend *httptest.Server, history, observation bool) (*Handler, string, *httptest.ResponseRecorder) {
+	t.Helper()
+	cfg := baseConfig(backend.URL)
+	cfg.RequestHistory = history
+	cfg.RequestObservation = observation
+	logger, logs := captureLogger()
+	h, err := New(cfg, logger, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := h.(*Handler)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true}`))
+	r.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, r)
+	return handler, logs.String(), w
+}
+
+func assertFourFlagPassthrough(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Body.String() != observedStream {
+		t.Fatal("passthrough changed")
+	}
+}
+
+func assertFourFlagRequestID(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	requestID := w.Header().Get("X-Request-ID")
+	if requestID == "" {
+		t.Fatal("no request ID")
+	}
+	return requestID
+}
+
+func assertFourFlagObservationLog(t *testing.T, logs string, want bool) {
+	t.Helper()
+	if want {
+		if !strings.Contains(logs, "request_observation") {
+			t.Fatal("observation log missing")
+		}
+	} else {
+		if strings.Contains(logs, "request_observation") {
+			t.Fatal("observation log should not be present")
+		}
+	}
+}
+
+func assertFourFlagHistory(t *testing.T, handler *Handler, requestID string, history, observation bool) {
+	t.Helper()
+	if history {
+		if handler.history == nil {
+			t.Fatal("history should be non-nil")
+		}
+		record, ok := handler.history.GetByRequestID(requestID)
+		if !ok {
+			t.Fatal("no history record")
+		}
+		assertFourFlagObservationMetadata(t, record, observation)
+	} else {
+		if handler.history != nil {
+			t.Fatal("history should be nil when disabled")
+		}
+	}
+}
+
+func assertFourFlagObservationMetadata(t *testing.T, record *correlation.CorrelationRecord, observation bool) {
+	t.Helper()
+	if observation {
+		if record.ProxyObservation == nil {
+			t.Fatal("ProxyObservation should be present")
+		}
+		if record.ProxyObservation.Source != "proxy" {
+			t.Fatalf("source = %q, want proxy", record.ProxyObservation.Source)
+		}
+		if record.ProxyObservation.Scope != "proxy_request_only" {
+			t.Fatalf("scope = %q, want proxy_request_only", record.ProxyObservation.Scope)
+		}
+		if record.ProxyObservation.UpstreamRequestMapping != "not_established" {
+			t.Fatalf("mapping = %q, want not_established", record.ProxyObservation.UpstreamRequestMapping)
+		}
+		if record.ActivityID != "" {
+			t.Fatalf("activity ID should be empty, got %q", record.ActivityID)
+		}
+		if record.ModelID != "" {
+			t.Fatalf("model ID should be empty, got %q", record.ModelID)
+		}
+	} else {
+		if record.ProxyObservation != nil {
+			t.Fatal("ProxyObservation should be nil when observation disabled")
+		}
+	}
+}
+
 func TestObservationFourFlagCombos(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, observedStream)
-	}))
+	backend := newObservedStreamBackend(t)
 	defer backend.Close()
 
 	combos := []struct {
@@ -306,80 +423,37 @@ func TestObservationFourFlagCombos(t *testing.T) {
 
 	for _, combo := range combos {
 		t.Run(combo.name, func(t *testing.T) {
-			cfg := baseConfig(backend.URL)
-			cfg.RequestHistory = combo.history
-			cfg.RequestObservation = combo.observation
+			handler, logs, w := fourFlagCombo(t, backend, combo.history, combo.observation)
 
-			logger, logs := captureLogger()
-			h, err := New(cfg, logger, nil, nil, nil, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			handler := h.(*Handler)
-
-			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-				strings.NewReader(`{"model":"m","stream":true}`))
-			r.Header.Set("Content-Type", "application/json")
-			handler.ServeHTTP(w, r)
-
-			if w.Body.String() != observedStream {
-				t.Fatal("passthrough changed")
-			}
-
-			requestID := w.Header().Get("X-Request-ID")
-			if requestID == "" {
-				t.Fatal("no request ID")
-			}
-
-			if combo.observation {
-				if !strings.Contains(logs.String(), "request_observation") {
-					t.Fatal("observation log missing")
-				}
-			} else {
-				if strings.Contains(logs.String(), "request_observation") {
-					t.Fatal("observation log should not be present")
-				}
-			}
-
-			if combo.history {
-				if handler.history == nil {
-					t.Fatal("history should be non-nil")
-				}
-				record, ok := handler.history.GetByRequestID(requestID)
-				if !ok {
-					t.Fatal("no history record")
-				}
-				if combo.observation {
-					if record.ProxyObservation == nil {
-						t.Fatal("ProxyObservation should be present")
-					}
-					if record.ProxyObservation.Source != "proxy" {
-						t.Fatalf("source = %q, want proxy", record.ProxyObservation.Source)
-					}
-					if record.ProxyObservation.Scope != "proxy_request_only" {
-						t.Fatalf("scope = %q, want proxy_request_only", record.ProxyObservation.Scope)
-					}
-					if record.ProxyObservation.UpstreamRequestMapping != "not_established" {
-						t.Fatalf("mapping = %q, want not_established", record.ProxyObservation.UpstreamRequestMapping)
-					}
-					if record.ActivityID != "" {
-						t.Fatalf("activity ID should be empty, got %q", record.ActivityID)
-					}
-					if record.ModelID != "" {
-						t.Fatalf("model ID should be empty, got %q", record.ModelID)
-					}
-				} else {
-					if record.ProxyObservation != nil {
-						t.Fatal("ProxyObservation should be nil when observation disabled")
-					}
-				}
-			} else {
-				if handler.history != nil {
-					t.Fatal("history should be nil when disabled")
-				}
-			}
+			assertFourFlagPassthrough(t, w)
+			requestID := assertFourFlagRequestID(t, w)
+			assertFourFlagObservationLog(t, logs, combo.observation)
+			assertFourFlagHistory(t, handler, requestID, combo.history, combo.observation)
 		})
+	}
+}
+
+// openAIStyleRequest builds a handler for the given backend, enables request
+// observation, issues a streaming chat request, and returns the response
+// recorder and captured log text.
+func openAIStyleRequest(t *testing.T, backend *httptest.Server) (*httptest.ResponseRecorder, string) {
+	t.Helper()
+	cfg := baseConfig(backend.URL)
+	cfg.RequestObservation = true
+	h, logs := observedHandler(t, cfg)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true}`))
+	r.Header.Set("Content-Type", "application/json")
+	h.ServeHTTP(w, r)
+	return w, logs.String()
+}
+
+func assertOpenAIStyleSecrets(t *testing.T, logs string) {
+	t.Helper()
+	for _, secret := range []string{"hello", "boom"} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("secret %q leaked into logs", secret)
+		}
 	}
 }
 
@@ -497,26 +571,16 @@ func TestObservationOpenAIStyles(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := baseConfig(tt.backend.URL)
-			cfg.RequestObservation = true
-			h, logs := observedHandler(t, cfg)
-			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true}`))
-			r.Header.Set("Content-Type", "application/json")
-			h.ServeHTTP(w, r)
+			w, logs := openAIStyleRequest(t, tt.backend)
 			if w.Code != tt.wantCode {
 				t.Fatalf("code = %d, want %d", w.Code, tt.wantCode)
 			}
 			if w.Body.String() == "" {
 				t.Fatal("empty body")
 			}
-			s := loggedObservation(t, logs.String())
+			s := loggedObservation(t, logs)
 			tt.check(t, s, w.Code)
-			for _, secret := range []string{"hello", "boom"} {
-				if strings.Contains(logs.String(), secret) {
-					t.Fatalf("secret %q leaked into logs", secret)
-				}
-			}
+			assertOpenAIStyleSecrets(t, logs)
 		})
 	}
 }
@@ -620,13 +684,11 @@ func (httpBody) Read([]byte) (int, error) {
 
 func (httpBody) Close() error { return nil }
 
-func TestObservationHistorySecrets(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, observedStream)
-	}))
-	defer backend.Close()
-
+// newObservedHandler returns a handler with request history and observation
+// enabled against the given backend, using a discard logger. It preserves the
+// exact config flags and logger of the tests that share this setup.
+func newObservedHandler(t *testing.T, backend *httptest.Server) *Handler {
+	t.Helper()
 	cfg := baseConfig(backend.URL)
 	cfg.RequestHistory = true
 	cfg.RequestObservation = true
@@ -634,7 +696,27 @@ func TestObservationHistorySecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := handler.(*Handler)
+	return handler.(*Handler)
+}
+
+// serveObservedStream issues a streaming chat request through h and asserts the
+// response body is byte-exact observedStream, returning the recorder.
+func serveObservedStream(t *testing.T, h *Handler) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"m","stream":true}`)))
+	if w.Body.String() != observedStream {
+		t.Fatal("passthrough changed")
+	}
+	return w
+}
+
+func TestObservationHistorySecrets(t *testing.T) {
+	backend := newObservedStreamBackend(t)
+	defer backend.Close()
+
+	h := newObservedHandler(t, backend)
 
 	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions?token=super-secret&key=query-key",
 		strings.NewReader(`{"model":"qwen","password":"sensitive-pw","stream":true}`))
@@ -677,14 +759,7 @@ func TestObservationHealthCatalogSkipAttachment(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	cfg := baseConfig(backend.URL)
-	cfg.RequestHistory = true
-	cfg.RequestObservation = true
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := handler.(*Handler)
+	h := newObservedHandler(t, backend)
 
 	for _, path := range []string{"/health", "/ready", "/v1/models"} {
 		w := httptest.NewRecorder()
@@ -760,14 +835,7 @@ func TestObservationUnknownModel(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	cfg := baseConfig(backend.URL)
-	cfg.RequestHistory = true
-	cfg.RequestObservation = true
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := handler.(*Handler)
+	h := newObservedHandler(t, backend)
 
 	// Unknown model (no prefix match) routes to default backend with empty ModelID.
 	w := httptest.NewRecorder()
@@ -791,27 +859,12 @@ func TestObservationUnknownModel(t *testing.T) {
 }
 
 func TestObservationRequestIDLookup(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, observedStream)
-	}))
+	backend := newObservedStreamBackend(t)
 	defer backend.Close()
 
-	cfg := baseConfig(backend.URL)
-	cfg.RequestHistory = true
-	cfg.RequestObservation = true
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := handler.(*Handler)
+	h := newObservedHandler(t, backend)
 
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-		strings.NewReader(`{"model":"m","stream":true}`)))
-	if w.Body.String() != observedStream {
-		t.Fatal("passthrough changed")
-	}
+	w := serveObservedStream(t, h)
 
 	requestID := w.Header().Get("X-Request-ID")
 	if requestID == "" {
@@ -835,10 +888,7 @@ func TestObservationRequestIDLookup(t *testing.T) {
 }
 
 func TestObservationConcurrentIndependent(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, observedStream)
-	}))
+	backend := newObservedStreamBackend(t)
 	defer backend.Close()
 
 	cfg := baseConfig(backend.URL)
@@ -887,31 +937,16 @@ func TestObservationConcurrentIndependent(t *testing.T) {
 }
 
 func TestObservationRetentionBounds(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, observedStream)
-	}))
+	backend := newObservedStreamBackend(t)
 	defer backend.Close()
 
-	cfg := baseConfig(backend.URL)
-	cfg.RequestHistory = true
-	cfg.RequestObservation = true
-	handler, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := handler.(*Handler)
+	h := newObservedHandler(t, backend)
 
 	// Tighten retention to a small count.
 	h.history.WithRetention(3, 0, 0)
 
 	for i := 0; i < 5; i++ {
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
-			strings.NewReader(`{"model":"m","stream":true}`)))
-		if w.Body.String() != observedStream {
-			t.Fatal("passthrough changed")
-		}
+		serveObservedStream(t, h)
 	}
 
 	stats := h.history.Stats()

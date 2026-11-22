@@ -15,6 +15,8 @@ const (
 	maxGGUFArrayElements = 1 << 20
 	maxGGUFKeyBytes      = 1024
 	maxGGUFTextBytes     = 4096
+	// generalNameKey is the GGUF metadata key for the model name.
+	generalNameKey = "general.name"
 )
 
 var (
@@ -82,12 +84,12 @@ func ggufReadError(err error) error {
 	return fmt.Errorf("%w: %w", ErrGGUFRead, err)
 }
 
-func (g *ggufReader) text(max int) (string, error) {
+func (g *ggufReader) text(limit int) (string, error) {
 	size, err := g.uint64()
 	if err != nil {
 		return "", err
 	}
-	if size > uint64(max) || size > uint64(g.reader.N) {
+	if size > uint64(limit) || size > uint64(g.reader.N) {
 		return "", ErrGGUFInspectLimit
 	}
 	data := make([]byte, int(size))
@@ -128,6 +130,105 @@ func (g *ggufReader) skipValues(valueType uint32, count uint64) error {
 	return g.skip(count * ggufScalarWidths[valueType])
 }
 
+// readGGUFHeader validates the GGUF magic, version, tensor count, and key count,
+// returning the initial metadata and the number of metadata keys to iterate.
+func readGGUFHeader(r *ggufReader) (GGUFMetadata, uint64, error) {
+	var magic [4]byte
+	if err := r.read(magic[:]); err != nil {
+		return GGUFMetadata{}, 0, err
+	}
+	if string(magic[:]) != "GGUF" {
+		return GGUFMetadata{}, 0, ErrInvalidGGUF
+	}
+	version, err := r.uint32()
+	if err != nil {
+		return GGUFMetadata{}, 0, err
+	}
+	if version != 2 && version != 3 {
+		return GGUFMetadata{}, 0, ErrUnsupportedGGUF
+	}
+	tensors, err := r.uint64()
+	if err != nil {
+		return GGUFMetadata{}, 0, err
+	}
+	keys, err := r.uint64()
+	if err != nil {
+		return GGUFMetadata{}, 0, err
+	}
+	if tensors > math.MaxInt64 {
+		return GGUFMetadata{}, 0, ErrInvalidGGUF
+	}
+	if keys > maxGGUFMetadataKeys {
+		return GGUFMetadata{}, 0, ErrGGUFInspectLimit
+	}
+	return GGUFMetadata{Version: version, TensorCount: tensors, MetadataKeys: keys}, keys, nil
+}
+
+// readGGUFMetadataEntry processes one metadata key/value pair from the reader.
+func readGGUFMetadataEntry(r *ggufReader, result *GGUFMetadata, seen map[string]bool) error {
+	key, err := r.text(maxGGUFKeyBytes)
+	if err != nil {
+		return err
+	}
+	if key == "" || seen[key] {
+		return ErrInvalidGGUF
+	}
+	seen[key] = true
+	valueType, err := r.uint32()
+	if err != nil {
+		return err
+	}
+	switch {
+	case (key == generalNameKey || key == "general.architecture") && valueType == 8:
+		return readGGUFTextValue(r, result, key)
+	case key == "general.file_type" && valueType == 4:
+		return readGGUFFileType(r, result)
+	case key == generalNameKey || key == "general.architecture" || key == "general.file_type":
+		return ErrInvalidGGUF
+	case valueType == 9:
+		return readGGUFArray(r)
+	default:
+		return r.skipValues(valueType, 1)
+	}
+}
+
+// readGGUFTextValue reads a text value for a name or architecture key.
+func readGGUFTextValue(r *ggufReader, result *GGUFMetadata, key string) error {
+	value, err := r.text(maxGGUFTextBytes)
+	if err != nil {
+		return err
+	}
+	if key == generalNameKey {
+		result.Name = &value
+	} else {
+		result.Architecture = &value
+	}
+	return nil
+}
+
+// readGGUFFileType reads a uint32 file_type value.
+func readGGUFFileType(r *ggufReader, result *GGUFMetadata) error {
+	value, err := r.uint32()
+	if err != nil {
+		return err
+	}
+	result.FileType = &value
+	return nil
+}
+
+// readGGUFArray skips a type-9 array value (item type, count, and items).
+func readGGUFArray(r *ggufReader) error {
+	itemType, err := r.uint32()
+	if err != nil {
+		return err
+	}
+	count, err := r.uint64()
+	if err != nil {
+		return err
+	}
+	return r.skipValues(itemType, count)
+}
+
 // InspectGGUF reads bounded little-endian GGUF v2/v3 metadata without reading
 // tensor descriptors or tensor data.
 func InspectGGUF(input io.Reader) (GGUFMetadata, error) {
@@ -135,84 +236,14 @@ func InspectGGUF(input io.Reader) (GGUFMetadata, error) {
 		return GGUFMetadata{}, ErrInvalidGGUF
 	}
 	reader := ggufReader{reader: &io.LimitedReader{R: input, N: maxGGUFMetadataBytes}}
-	var magic [4]byte
-	if err := reader.read(magic[:]); err != nil {
-		return GGUFMetadata{}, err
-	}
-	if string(magic[:]) != "GGUF" {
-		return GGUFMetadata{}, ErrInvalidGGUF
-	}
-	version, err := reader.uint32()
+	result, keys, err := readGGUFHeader(&reader)
 	if err != nil {
 		return GGUFMetadata{}, err
 	}
-	if version != 2 && version != 3 {
-		return GGUFMetadata{}, ErrUnsupportedGGUF
-	}
-	tensors, err := reader.uint64()
-	if err != nil {
-		return GGUFMetadata{}, err
-	}
-	keys, err := reader.uint64()
-	if err != nil {
-		return GGUFMetadata{}, err
-	}
-	if tensors > math.MaxInt64 {
-		return GGUFMetadata{}, ErrInvalidGGUF
-	}
-	if keys > maxGGUFMetadataKeys {
-		return GGUFMetadata{}, ErrGGUFInspectLimit
-	}
-	result := GGUFMetadata{Version: version, TensorCount: tensors, MetadataKeys: keys}
 	seen := make(map[string]bool, int(keys))
 	for i := uint64(0); i < keys; i++ {
-		key, err := reader.text(maxGGUFKeyBytes)
-		if err != nil {
+		if err := readGGUFMetadataEntry(&reader, &result, seen); err != nil {
 			return GGUFMetadata{}, err
-		}
-		if key == "" || seen[key] {
-			return GGUFMetadata{}, ErrInvalidGGUF
-		}
-		seen[key] = true
-		valueType, err := reader.uint32()
-		if err != nil {
-			return GGUFMetadata{}, err
-		}
-		switch {
-		case (key == "general.name" || key == "general.architecture") && valueType == 8:
-			value, err := reader.text(maxGGUFTextBytes)
-			if err != nil {
-				return GGUFMetadata{}, err
-			}
-			if key == "general.name" {
-				result.Name = &value
-			} else {
-				result.Architecture = &value
-			}
-		case key == "general.file_type" && valueType == 4:
-			value, err := reader.uint32()
-			if err != nil {
-				return GGUFMetadata{}, err
-			}
-			result.FileType = &value
-		case key == "general.name" || key == "general.architecture" || key == "general.file_type":
-			return GGUFMetadata{}, ErrInvalidGGUF
-		case valueType == 9:
-			itemType, err := reader.uint32()
-			if err != nil {
-				return GGUFMetadata{}, err
-			}
-			count, err := reader.uint64()
-			if err != nil {
-				return GGUFMetadata{}, err
-			}
-			if err := reader.skipValues(itemType, count); err != nil {
-				return GGUFMetadata{}, err
-			}
-		default:
-			if err := reader.skipValues(valueType, 1); err != nil {
-				return GGUFMetadata{}, err
-			}
 		}
 	}
 	return result, nil

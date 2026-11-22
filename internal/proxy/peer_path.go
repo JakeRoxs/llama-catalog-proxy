@@ -16,10 +16,13 @@ import (
 )
 
 const (
-	peerPathEndpoint       = "/peer/v1/path"
-	peerPathServiceHeader  = "X-Catalog-Peer-Path-Service"
-	peerServicePathHeader  = "X-Catalog-Peer-Service-Path"
-	maxPeerServicePathSize = 8192
+	peerPathEndpoint              = "/peer/v1/path"
+	peerPathServiceHeader         = "X-Catalog-Peer-Path-Service"
+	peerServicePathHeader         = "X-Catalog-Peer-Service-Path"
+	maxPeerServicePathSize        = 8192
+	peerPathServiceUnavailableMsg = "peer path service unavailable"
+	pathServiceUnavailableMsg     = "path service unavailable"
+	invalidPathServiceRequestMsg  = "invalid path service request"
 )
 
 type peerPathRoute struct {
@@ -67,7 +70,7 @@ func (h *Handler) servePeerPathRoute(w http.ResponseWriter, req *http.Request, i
 	}
 	client := h.peerClients[route.peerID]
 	if client == nil || client.routePaths[route.prefix] != route.service {
-		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer path service unavailable")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, peerPathServiceUnavailableMsg)
 		return true
 	}
 	// The route is explicitly configured; the owner validates the service name,
@@ -81,7 +84,7 @@ func (h *Handler) servePeerPathRoute(w http.ResponseWriter, req *http.Request, i
 	}
 	target, err := url.Parse(client.origin)
 	if err != nil {
-		writeJSONError(h.logger, w, http.StatusServiceUnavailable, "peer path service unavailable")
+		writeJSONError(h.logger, w, http.StatusServiceUnavailable, peerPathServiceUnavailableMsg)
 		return true
 	}
 	encodedPath := base64.RawURLEncoding.EncodeToString([]byte(req.URL.EscapedPath()))
@@ -101,7 +104,7 @@ func (h *Handler) servePeerPathRoute(w http.ResponseWriter, req *http.Request, i
 		Transport: client.inferenceTransport,
 		ErrorHandler: func(writer http.ResponseWriter, request *http.Request, err error) {
 			h.logger.Warn("peer path request failed", "peer_id", route.peerID, "error", err)
-			writeJSONError(h.logger, writer, http.StatusBadGateway, "peer path service unavailable")
+			writeJSONError(h.logger, writer, http.StatusBadGateway, peerPathServiceUnavailableMsg)
 		},
 	}
 	proxy.ServeHTTP(w, req)
@@ -141,30 +144,22 @@ func (r *Reloader) servePeerPath(w http.ResponseWriter, req *http.Request) {
 	}
 	localPrefix, exposed := state.peer.ExposedPathRoutes[service]
 	if !exposed {
-		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, pathServiceUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	encodedPath, err := exactlyOneHeader(req.Header, peerServicePathHeader, maxPeerServicePathSize)
 	if err != nil {
-		http.Error(w, "invalid path service request", http.StatusBadRequest)
+		http.Error(w, invalidPathServiceRequestMsg, http.StatusBadRequest)
 		return
 	}
-	escapedPathBytes, err := base64.RawURLEncoding.DecodeString(encodedPath)
-	if err != nil || len(escapedPathBytes) == 0 || len(escapedPathBytes) > maxPeerServicePathSize {
-		http.Error(w, "invalid path service request", http.StatusBadRequest)
-		return
-	}
-	escapedPath := string(escapedPathBytes)
-	requestPath, err := url.PathUnescape(escapedPath)
-	frontendRoot := service == "comfyui" && localPrefix == "/comfyui" && requestPath == "/comfyui/" && req.Method == http.MethodGet
-	if err != nil || requestPath == "" || requestPath[0] != '/' || (!frontendRoot && path.Clean(requestPath) != requestPath) ||
-		strings.ContainsAny(requestPath, "?#\\") || !pathHasPrefix(requestPath, localPrefix) {
-		http.Error(w, "invalid path service request", http.StatusBadRequest)
+	requestPath, escapedPath, err := validPeerPathRequest(encodedPath, service, localPrefix, req.Method)
+	if err != nil {
+		http.Error(w, invalidPathServiceRequestMsg, http.StatusBadRequest)
 		return
 	}
 	handler, ok := state.handler.(*Handler)
 	if !ok {
-		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, pathServiceUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	forwarded := req.Clone(req.Context())
@@ -177,7 +172,7 @@ func (r *Reloader) servePeerPath(w http.ResponseWriter, req *http.Request) {
 	}
 	backendID, matchedPrefix, matched := handler.routePathMatch(requestPath)
 	if !matched || matchedPrefix != localPrefix {
-		http.Error(w, "path service unavailable", http.StatusServiceUnavailable)
+		http.Error(w, pathServiceUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	handler.servePathRoute(w, forwarded, &routeInfo{}, backendID)
@@ -202,6 +197,27 @@ func allowedPeerPathMethod(method string) bool {
 
 func pathHasPrefix(requestPath, prefix string) bool {
 	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
+}
+
+// validPeerPathRequest validates the peer path service request path.
+// It decodes the base64-encoded escaped path, unescapes it, applies the
+// ComfyUI frontend-root exception, and enforces path safety and prefix rules.
+// It returns the validated request path, the escaped path for the backend raw
+// path, or an error if any check fails.
+// Validation order: base64 decode, path unescape, safety/prefix.
+func validPeerPathRequest(encodedPath, service, localPrefix, method string) (requestPath, escapedPath string, err error) {
+	escapedPathBytes, err := base64.RawURLEncoding.DecodeString(encodedPath)
+	if err != nil || len(escapedPathBytes) == 0 || len(escapedPathBytes) > maxPeerServicePathSize {
+		return "", "", fmt.Errorf("invalid path service request")
+	}
+	escapedPath = string(escapedPathBytes)
+	requestPath, err = url.PathUnescape(escapedPath)
+	frontendRoot := service == "comfyui" && localPrefix == "/comfyui" && requestPath == "/comfyui/" && method == http.MethodGet
+	if err != nil || requestPath == "" || requestPath[0] != '/' || (!frontendRoot && path.Clean(requestPath) != requestPath) ||
+		strings.ContainsAny(requestPath, "?#\\") || !pathHasPrefix(requestPath, localPrefix) {
+		return "", "", fmt.Errorf("invalid path service request")
+	}
+	return requestPath, escapedPath, nil
 }
 
 func peerPathForwardHeaders(source http.Header) http.Header {

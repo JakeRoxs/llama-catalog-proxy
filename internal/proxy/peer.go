@@ -20,6 +20,16 @@ const peerReportTimeout = 5 * time.Second
 const peerEnrollmentPath = "/peer/v1/enroll"
 const peerInvitationHeader = "X-Llama-Catalog-Invite"
 
+// peerReportUnavailable is the exact HTTP body and log message reported when a
+// peer catalog report cannot be produced. It replaces the duplicated literal so
+// the message is defined once and referenced everywhere.
+const peerReportUnavailable = "peer report unavailable"
+
+// peerEnrollmentUnavailable is the exact HTTP body reported when peer enrollment
+// cannot be completed. It replaces the duplicated literal so the message is
+// defined once and referenced everywhere.
+const peerEnrollmentUnavailable = "peer enrollment unavailable"
+
 type peerScope int
 
 const (
@@ -137,7 +147,7 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	handler, ok := state.handler.(*Handler)
 	if !ok {
 		r.logger.Error("peer report unavailable: unexpected handler type")
-		http.Error(w, "peer report unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), peerReportTimeout)
@@ -146,8 +156,8 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		NodeID: peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation,
 	}, peer.LocalBackends, handler.catalog, time.Now(), state.cacheTTL)
 	if err != nil {
-		r.logger.Warn("peer report unavailable", "error", err)
-		http.Error(w, "peer report unavailable", http.StatusServiceUnavailable)
+		r.logger.Warn(peerReportUnavailable, "error", err)
+		http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	for service := range peer.ExposedPathRoutes {
@@ -167,14 +177,14 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		report, err = nodecontract.AddBackendReadiness(report, handler.catalog.CachedBackendReadiness(peer.LocalBackends), state.cacheTTL)
 		if err != nil {
 			r.logger.Warn("peer readiness report unavailable", "error", err)
-			http.Error(w, "peer report unavailable", http.StatusServiceUnavailable)
+			http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
 			return
 		}
 	}
 	data, err := json.Marshal(report)
 	if err != nil {
 		r.logger.Error("encode peer report failed", "error", err)
-		http.Error(w, "peer report unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	if r.state.Load() != state {
@@ -220,7 +230,7 @@ func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request)
 	state := r.state.Load()
 	if state == nil || state.peer == nil || state.peer.FederationID == "" || state.pairingStore == nil || req.TLS == nil ||
 		len(req.TLS.VerifiedChains) == 0 || len(req.TLS.PeerCertificates) == 0 {
-		http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	clientCert := req.TLS.PeerCertificates[0]
@@ -231,7 +241,7 @@ func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request)
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, nodeID, "pairing.accept", nodeID, "", "")
 	if auditErr != nil {
-		http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	member, err := state.pairingStore.ConsumeInvitation(codes[0], nodeID, peerCertificateFingerprint(clientCert), time.Now())
@@ -241,7 +251,7 @@ func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request)
 	}
 	if err != nil {
 		if errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitationFull) {
-			http.Error(w, "peer enrollment unavailable", http.StatusServiceUnavailable)
+			http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
 			return
 		}
 		if errors.Is(err, federation.ErrMemberExists) {

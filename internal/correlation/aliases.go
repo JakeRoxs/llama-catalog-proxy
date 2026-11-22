@@ -86,6 +86,11 @@ const (
 	aliasSourceCatalogMetadata     = "catalog_metadata"
 )
 
+// modelReferencePrefix is the opaque prefix for serialized SHA256-derived
+// model references. It is used verbatim by ModelReference and isModelReference
+// so the serialized reference format stays byte-identical across the package.
+const modelReferencePrefix = "model-"
+
 // ModelReference returns an opaque SHA256-derived reference for a reported
 // model ID under a backend. The digest is SHA256(backendID + NUL + reportedID)
 // and the result is the lowercase hex of the first 16 bytes prefixed with
@@ -103,7 +108,7 @@ func ModelReference(backendID, reportedID string) (string, bool) {
 	h.Write([]byte("\x00"))
 	h.Write([]byte(reportedID))
 	digest := h.Sum(nil)
-	return "model-" + hex.EncodeToString(digest[:16]), true
+	return modelReferencePrefix + hex.EncodeToString(digest[:16]), true
 }
 
 // aliasBackendInfo holds the configured backend and its parsed URL.
@@ -770,10 +775,10 @@ func ResolveActivityAliases(activities []*ActivityRecord, report AliasReport) ([
 }
 
 func isModelReference(ref string) bool {
-	if len(ref) != len("model-")+32 || !strings.HasPrefix(ref, "model-") {
+	if len(ref) != len(modelReferencePrefix)+32 || !strings.HasPrefix(ref, modelReferencePrefix) {
 		return false
 	}
-	for _, c := range ref[len("model-"):] {
+	for _, c := range ref[len(modelReferencePrefix):] {
 		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
 			return false
 		}

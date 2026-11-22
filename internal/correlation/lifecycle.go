@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -407,6 +408,8 @@ func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (Lifecycl
 // collect fetches one page of lifecycle from a backend and normalizes it. It
 // never follows redirects, never leaks credentials, and bounds the response
 // body and model count. The only allowed upstream path is GET /running.
+// Complexity is kept low by delegating to pure helpers: request building,
+// status classification, bounded page decode/validation, and row normalization.
 func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycleBackendInfo, epoch int64) ([]LifecycleModel, LifecycleBackendState) {
 	state := LifecycleBackendState{
 		State:         lifecycleUnknownState,
@@ -416,11 +419,48 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	u := b.url.JoinPath(lifecyclePath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+
+	req, err := buildLifecycleRequest(ctx, b)
 	if err != nil {
 		state.State, state.Reason = lifecycleUnsupportedState, "invalid_request"
 		return nil, state
+	}
+	response, err := c.client.Do(req)
+	if err != nil {
+		state.State, state.Reason = lifecycleUnavailableState, "request_failed"
+		state.HTTPStatus = 0
+		return nil, state
+	}
+	defer response.Body.Close()
+	state.HTTPStatus = response.StatusCode
+	if st, reason, stop := classifyLifecycleStatus(response.StatusCode); stop {
+		state.State, state.Reason = st, reason
+		return nil, state
+	}
+	page, err := readAndDecodeLifecyclePage(response.Body, c.maxResponseBytes)
+	if err != nil {
+		state.State, state.Reason = lifecycleErrorState(err)
+		return nil, state
+	}
+	models, pageState := c.normalizeLifecyclePage(id, page.Running, c.maxModelsPerBackend, epoch)
+	state.State = pageState.State
+	state.Reason = pageState.Reason
+	state.Rows = pageState.Rows
+	state.Coverage = pageState.Coverage
+	state.Truncated = pageState.Truncated
+	return models, state
+}
+
+// buildLifecycleRequest builds the fixed, allowlisted request for one backend.
+// Only GET /running is requested. Config headers are applied only when not
+// already set on the request; the API key is added only when no Authorization
+// or X-Api-Key header is present. Redirects are refused by the client's
+// CheckRedirect policy, so this builder never enables following them.
+func buildLifecycleRequest(ctx context.Context, b *lifecycleBackendInfo) (*http.Request, error) {
+	u := b.url.JoinPath(lifecyclePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	for key, value := range b.config.Headers {
@@ -432,58 +472,83 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
 		req.Header.Set("X-Api-Key", b.config.APIKey)
 	}
-	response, err := c.client.Do(req)
-	if err != nil {
-		state.State, state.Reason = lifecycleUnavailableState, "request_failed"
-		state.HTTPStatus = 0
-		return nil, state
-	}
-	defer response.Body.Close()
-	state.HTTPStatus = response.StatusCode
+	return req, nil
+}
 
-	// Check HTTP status codes first. 401/403, 404/405, 3xx, and other
-	// non-200 statuses are returned without parsing the body.
+// classifyLifecycleStatus maps an HTTP status to the backend state/reason and
+// whether collection should stop. A 200 continues; every other status stops
+// with a documented state/reason. Redirects are refused (never followed) and
+// reported as redirect_refused rather than followed.
+func classifyLifecycleStatus(code int) (state, reason string, stop bool) {
 	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		state.State, state.Reason = lifecycleUnauthorizedState, "authorization_required"
-		return nil, state
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		state.State, state.Reason = lifecycleUnsupportedState, "not_available"
-		return nil, state
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		state.State, state.Reason = lifecycleUnknownState, "redirect_refused"
-		return nil, state
-	case response.StatusCode != http.StatusOK:
-		state.State, state.Reason = lifecycleUnavailableState, "http_error"
-		return nil, state
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
+		return lifecycleUnauthorizedState, "authorization_required", true
+	case code == http.StatusNotFound || code == http.StatusMethodNotAllowed:
+		return lifecycleUnsupportedState, "not_available", true
+	case code >= 300 && code < 400:
+		return lifecycleUnknownState, "redirect_refused", true
+	case code != http.StatusOK:
+		return lifecycleUnavailableState, "http_error", true
 	}
+	return "", "", false
+}
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+var (
+	errLifecyclePageTooLarge    = errors.New("lifecycle response body exceeds the configured byte limit")
+	errLifecyclePageMalformed   = errors.New("lifecycle page running is missing or null")
+	errLifecyclePageInvalidJSON = errors.New("lifecycle page is not valid JSON")
+)
+
+// readAndDecodeLifecyclePage reads a bounded response body, decodes the
+// /running page, and validates required fields. The caller is responsible for
+// closing the body. It returns a sentinel error for size/malformed/JSON
+// failures so the caller can map each to the exact state/reason; other read
+// errors map to the generic response_read_failed state.
+func readAndDecodeLifecyclePage(body io.ReadCloser, maxResponseBytes int64) (*lifecycleRunningPage, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
 	if err != nil {
-		state.State, state.Reason = lifecycleUnavailableState, "response_read_failed"
-		return nil, state
+		return nil, fmt.Errorf("read lifecycle response: %w", err)
 	}
-	if len(body) > int(c.maxResponseBytes) {
-		state.State, state.Reason = lifecycleUnknownState, "response_too_large"
-		return nil, state
+	if len(raw) > int(maxResponseBytes) {
+		return nil, errLifecyclePageTooLarge
 	}
-
 	var page lifecycleRunningPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		state.State, state.Reason = lifecycleUnknownState, "invalid_json"
-		return nil, state
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, fmt.Errorf("decode lifecycle page: %w", errLifecyclePageInvalidJSON)
 	}
-	// Validate required page field: running must be an array (non-nil). A bare
+	// Validate required page fields: running must be an array (non-nil). A bare
 	// {} or {"running":null} is malformed.
 	if page.Running == nil {
-		state.State, state.Reason = lifecycleUnknownState, "malformed_page"
-		return nil, state
+		return nil, errLifecyclePageMalformed
 	}
+	return &page, nil
+}
 
-	models := make([]LifecycleModel, 0, c.maxModelsPerBackend)
+// lifecycleErrorState maps a read/decode error from readAndDecodeLifecyclePage
+// to the exact backend state/reason. Read failures are unavailable, size and
+// schema failures are unknown.
+func lifecycleErrorState(err error) (state, reason string) {
+	switch {
+	case errors.Is(err, errLifecyclePageTooLarge):
+		return lifecycleUnknownState, "response_too_large"
+	case errors.Is(err, errLifecyclePageMalformed):
+		return lifecycleUnknownState, "malformed_page"
+	case errors.Is(err, errLifecyclePageInvalidJSON):
+		return lifecycleUnknownState, "invalid_json"
+	default:
+		return lifecycleUnavailableState, "response_read_failed"
+	}
+}
+
+// normalizeLifecyclePage bounds rows by the per-backend cap, normalizes each
+// row, and assigns the final collected state. It returns the normalized
+// models and the BackendState to assign (State/Reason/Rows/Coverage/Truncated).
+// The caller preserves HTTPStatus/ObservedAt/LastAttemptAt from its own state.
+func (c *LifecycleCollector) normalizeLifecyclePage(id string, entries []lifecycleRunningModel, maxModelsPerBackend int, epoch int64) ([]LifecycleModel, LifecycleBackendState) {
+	models := make([]LifecycleModel, 0, maxModelsPerBackend)
 	truncated := false
-	for _, entry := range page.Running {
-		if len(models) >= c.maxModelsPerBackend {
+	for _, entry := range entries {
+		if len(models) >= maxModelsPerBackend {
 			truncated = true
 			break
 		}
@@ -493,9 +558,7 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 		}
 		models = append(models, *m)
 	}
-	state.State = lifecycleEnabledState
-	state.Reason = "ok"
-	state.Rows = len(models)
+	state := LifecycleBackendState{State: lifecycleEnabledState, Reason: "ok", Rows: len(models)}
 	if truncated {
 		state.Coverage = "truncated"
 		state.Truncated = true

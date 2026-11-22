@@ -14,6 +14,29 @@ import (
 	"time"
 )
 
+// tempDelegatedDir returns a private temporary directory for delegated
+// operation tests, preserving the 0o700 directory permission requirement.
+func tempDelegatedDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// mustReserveDelegatedOperation reserves a delegated operation and fails the
+// test if the reservation fails or does not reserve. It returns the reserved
+// record.
+func mustReserveDelegatedOperation(t *testing.T, dir string, proposal DelegatedProposal, operationID string, now time.Time) DelegatedOperation {
+	t.Helper()
+	record, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, now)
+	if err != nil || !reserved {
+		t.Fatalf("reserve = %v, %v", reserved, err)
+	}
+	return record
+}
+
 func TestDelegatedOperationReservationAndReplay(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -139,51 +162,79 @@ func TestDelegatedOperationConcurrentReservation(t *testing.T) {
 }
 
 func TestDelegatedOperationTerminalOutcomeAndRetention(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	owner, proposal := delegatedFixture(t)
-	id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
-	started := proposal.Proposal.CreatedAt
-	if _, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, started); err != nil || !reserved {
-		t.Fatalf("reserve = %v, %v", reserved, err)
-	}
-	written := MutationResult{Written: true, Durable: true}
-	if _, err := FinishDelegatedOperation(dir, id, operationID, strings.Repeat("b", 32), written, nil, started); !errors.Is(err, ErrDelegatedOperationConflict) {
-		t.Fatalf("restarted owner completed old operation: %v", err)
-	}
-	finishedAt := started.Add(time.Second)
-	finished, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, written, nil, finishedAt)
-	if err != nil || finished.Outcome != "written" || finished.FinishedAt == nil || !finished.FinishedAt.Equal(finishedAt) {
-		t.Fatalf("finish = %#v, %v", finished, err)
-	}
-	replayed, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, proposal.ExpiresAt)
-	if err != nil || reserved || replayed.Outcome != "written" {
-		t.Fatalf("replay did not preserve outcome: %#v, %v, %v", replayed, reserved, err)
-	}
-	if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, written, nil, finishedAt.Add(time.Second)); err != nil {
-		t.Fatalf("identical finish was not idempotent: %v", err)
-	}
-	if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, MutationResult{}, ErrTargetWrite, finishedAt); !errors.Is(err, ErrDelegatedOperationConflict) {
-		t.Fatalf("terminal outcome changed: %v", err)
-	}
-	cutoff := proposal.ExpiresAt.Add(DelegatedOperationRetention)
-	if removed, err := PruneDelegatedOperations(dir, cutoff.Add(-time.Nanosecond)); err != nil || removed != 0 {
-		t.Fatalf("record pruned prematurely: %d, %v", removed, err)
-	}
-	if removed, err := PruneDelegatedOperations(dir, cutoff); err != nil || removed != 1 {
-		t.Fatalf("record not pruned at retention boundary: %d, %v", removed, err)
-	}
-	if _, err := LoadDelegatedOperation(dir, id); !errors.Is(err, ErrProposalNotFound) {
-		t.Fatalf("terminal record retained after pruning: %v", err)
-	}
-	if _, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, started.Add(time.Second)); !errors.Is(err, ErrDelegatedClockRollback) || reserved {
-		t.Fatalf("clock rollback reopened expired proposal: %v, %v", reserved, err)
-	}
-	if removed, err := PruneDelegatedOperations(dir, cutoff.Add(-time.Nanosecond)); !errors.Is(err, ErrDelegatedClockRollback) || removed != 0 {
-		t.Fatalf("prune accepted clock rollback: %d, %v", removed, err)
-	}
+	t.Run("terminal outcome and idempotency", func(t *testing.T) {
+		dir := tempDelegatedDir(t)
+		owner, proposal := delegatedFixture(t)
+		id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
+		started := proposal.Proposal.CreatedAt
+		mustReserveDelegatedOperation(t, dir, proposal, operationID, started)
+		written := MutationResult{Written: true, Durable: true}
+		if _, err := FinishDelegatedOperation(dir, id, operationID, strings.Repeat("b", 32), written, nil, started); !errors.Is(err, ErrDelegatedOperationConflict) {
+			t.Fatalf("restarted owner completed old operation: %v", err)
+		}
+		finishedAt := started.Add(time.Second)
+		finished, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, written, nil, finishedAt)
+		if err != nil || finished.Outcome != "written" || finished.FinishedAt == nil || !finished.FinishedAt.Equal(finishedAt) {
+			t.Fatalf("finish = %#v, %v", finished, err)
+		}
+		replayed, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, proposal.ExpiresAt)
+		if err != nil || reserved || replayed.Outcome != "written" {
+			t.Fatalf("replay did not preserve outcome: %#v, %v, %v", replayed, reserved, err)
+		}
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, written, nil, finishedAt.Add(time.Second)); err != nil {
+			t.Fatalf("identical finish was not idempotent: %v", err)
+		}
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, MutationResult{}, ErrTargetWrite, finishedAt); !errors.Is(err, ErrDelegatedOperationConflict) {
+			t.Fatalf("terminal outcome changed: %v", err)
+		}
+	})
+
+	t.Run("retention boundary", func(t *testing.T) {
+		dir := tempDelegatedDir(t)
+		owner, proposal := delegatedFixture(t)
+		id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
+		started := proposal.Proposal.CreatedAt
+		mustReserveDelegatedOperation(t, dir, proposal, operationID, started)
+		finishedAt := started.Add(time.Second)
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, MutationResult{Written: true, Durable: true}, nil, finishedAt); err != nil {
+			t.Fatalf("finish = %v", err)
+		}
+		cutoff := proposal.ExpiresAt.Add(DelegatedOperationRetention)
+		if removed, err := PruneDelegatedOperations(dir, cutoff.Add(-time.Nanosecond)); err != nil || removed != 0 {
+			t.Fatalf("record pruned prematurely: %d, %v", removed, err)
+		}
+		if removed, err := PruneDelegatedOperations(dir, cutoff); err != nil || removed != 1 {
+			t.Fatalf("record not pruned at retention boundary: %d, %v", removed, err)
+		}
+		if _, err := LoadDelegatedOperation(dir, id); !errors.Is(err, ErrProposalNotFound) {
+			t.Fatalf("terminal record retained after pruning: %v", err)
+		}
+	})
+
+	t.Run("clock rollback", func(t *testing.T) {
+		dir := tempDelegatedDir(t)
+		owner, proposal := delegatedFixture(t)
+		id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
+		started := proposal.Proposal.CreatedAt
+		mustReserveDelegatedOperation(t, dir, proposal, operationID, started)
+		finishedAt := started.Add(time.Second)
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, MutationResult{Written: true, Durable: true}, nil, finishedAt); err != nil {
+			t.Fatalf("finish = %v", err)
+		}
+		cutoff := proposal.ExpiresAt.Add(DelegatedOperationRetention)
+		if removed, err := PruneDelegatedOperations(dir, cutoff); err != nil || removed != 1 {
+			t.Fatalf("record not pruned at retention boundary: %d, %v", removed, err)
+		}
+		if _, err := LoadDelegatedOperation(dir, id); !errors.Is(err, ErrProposalNotFound) {
+			t.Fatalf("terminal record retained after pruning: %v", err)
+		}
+		if _, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, started.Add(time.Second)); !errors.Is(err, ErrDelegatedClockRollback) || reserved {
+			t.Fatalf("clock rollback reopened expired proposal: %v, %v", reserved, err)
+		}
+		if removed, err := PruneDelegatedOperations(dir, cutoff.Add(-time.Nanosecond)); !errors.Is(err, ErrDelegatedClockRollback) || removed != 0 {
+			t.Fatalf("prune accepted clock rollback: %d, %v", removed, err)
+		}
+	})
 }
 
 func TestDelegatedMutationOutcome(t *testing.T) {
@@ -278,58 +329,70 @@ func TestDelegatedUncertainMutationStaysUnknown(t *testing.T) {
 }
 
 func TestDelegatedOperationConcurrentFinishes(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	owner, proposal := delegatedFixture(t)
-	id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
-	now := proposal.Proposal.CreatedAt
-	if _, reserved, err := ReserveDelegatedOperation(dir, proposal, operationID, now); err != nil || !reserved {
-		t.Fatalf("reserve = %v, %v", reserved, err)
-	}
-	type result struct {
-		record DelegatedOperation
-		err    error
-	}
-	results := make(chan result, 2)
-	var wg sync.WaitGroup
-	for _, written := range []bool{false, true} {
-		wg.Add(1)
-		go func(written bool) {
-			defer wg.Done()
-			mutation, mutationErr := MutationResult{}, ErrTargetWrite
-			if written {
-				mutation, mutationErr = MutationResult{Written: true, Durable: true}, nil
-			}
-			record, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, mutation, mutationErr, now)
-			results <- result{record, err}
-		}(written)
-	}
-	wg.Wait()
-	close(results)
-	successes := 0
-	for result := range results {
-		if result.err == nil {
-			successes++
-		} else if !errors.Is(result.err, ErrProposalStore) && !errors.Is(result.err, ErrDelegatedOperationConflict) {
-			t.Fatalf("unexpected finish error: %v", result.err)
+	t.Run("concurrent finishes record exactly one terminal outcome", func(t *testing.T) {
+		dir := tempDelegatedDir(t)
+		owner, proposal := delegatedFixture(t)
+		id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
+		now := proposal.Proposal.CreatedAt
+		mustReserveDelegatedOperation(t, dir, proposal, operationID, now)
+		type result struct {
+			record DelegatedOperation
+			err    error
 		}
-	}
-	if successes != 1 {
-		t.Fatalf("terminal outcome recorded %d times", successes)
-	}
-	record, err := LoadDelegatedOperation(dir, id)
-	if err != nil || record.FinishedAt == nil || record.Outcome == "unknown" {
-		t.Fatalf("terminal outcome missing: %#v, %v", record, err)
-	}
-	other, otherErr := MutationResult{}, ErrTargetWrite
-	if record.Outcome == "not_written" {
-		other, otherErr = MutationResult{Written: true, Durable: true}, nil
-	}
-	if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, other, otherErr, now); !errors.Is(err, ErrDelegatedOperationConflict) {
-		t.Fatalf("conflicting retry replaced outcome: %v", err)
-	}
+		results := make(chan result, 2)
+		var wg sync.WaitGroup
+		for _, written := range []bool{false, true} {
+			wg.Add(1)
+			go func(written bool) {
+				defer wg.Done()
+				mutation, mutationErr := MutationResult{}, ErrTargetWrite
+				if written {
+					mutation, mutationErr = MutationResult{Written: true, Durable: true}, nil
+				}
+				record, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, mutation, mutationErr, now)
+				results <- result{record, err}
+			}(written)
+		}
+		wg.Wait()
+		close(results)
+		successes := 0
+		for result := range results {
+			if result.err == nil {
+				successes++
+			} else if !errors.Is(result.err, ErrProposalStore) && !errors.Is(result.err, ErrDelegatedOperationConflict) {
+				t.Fatalf("unexpected finish error: %v", result.err)
+			}
+		}
+		if successes != 1 {
+			t.Fatalf("terminal outcome recorded %d times", successes)
+		}
+		record, err := LoadDelegatedOperation(dir, id)
+		if err != nil || record.FinishedAt == nil || record.Outcome == "unknown" {
+			t.Fatalf("terminal outcome missing: %#v, %v", record, err)
+		}
+	})
+
+	t.Run("conflicting retry does not replace terminal outcome", func(t *testing.T) {
+		dir := tempDelegatedDir(t)
+		owner, proposal := delegatedFixture(t)
+		id, operationID := proposal.Proposal.ID, strings.Repeat("e", 32)
+		now := proposal.Proposal.CreatedAt
+		mustReserveDelegatedOperation(t, dir, proposal, operationID, now)
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, MutationResult{Written: true, Durable: true}, nil, now); err != nil {
+			t.Fatalf("finish = %v", err)
+		}
+		record, err := LoadDelegatedOperation(dir, id)
+		if err != nil || record.FinishedAt == nil || record.Outcome == "unknown" {
+			t.Fatalf("terminal outcome missing: %#v, %v", record, err)
+		}
+		other, otherErr := MutationResult{}, ErrTargetWrite
+		if record.Outcome == "not_written" {
+			other, otherErr = MutationResult{Written: true, Durable: true}, nil
+		}
+		if _, err := FinishDelegatedOperation(dir, id, operationID, owner.ProxyInstanceID, other, otherErr, now); !errors.Is(err, ErrDelegatedOperationConflict) {
+			t.Fatalf("conflicting retry replaced outcome: %v", err)
+		}
+	})
 }
 
 func TestDelegatedReservationPrunesEligibleOutcomes(t *testing.T) {

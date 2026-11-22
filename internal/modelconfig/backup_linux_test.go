@@ -55,21 +55,7 @@ func TestBackupRetentionAndRollbackPreconditions(t *testing.T) {
 	if _, err := loadBackup(dir, first.Info.ID); !errors.Is(err, errBackupStore) {
 		t.Fatalf("oldest backup was not rotated: %v", err)
 	}
-	for _, info := range []backupInfo{second.Info, third.Info} {
-		loaded, err := loadBackup(dir, info.ID)
-		if err != nil || string(loaded.Source) != string(source) || loaded.Info != info {
-			t.Fatalf("retained backup could not be restored: %v", err)
-		}
-		path := filepath.Join(dir, backupFilename(info.ID))
-		stat, err := os.Stat(path)
-		if err != nil || stat.Mode().Perm() != 0o600 {
-			t.Fatalf("backup permissions: %v %v", stat, err)
-		}
-		public, err := json.Marshal(loaded.Info)
-		if err != nil || strings.Contains(string(public), "confidential") {
-			t.Fatalf("backup metadata exposed source: %s %v", public, err)
-		}
-	}
+	assertRetainedBackups(t, dir, source, second.Info, third.Info)
 	preview, err := PreviewDocument("local", "m", source, proposal.Settings)
 	if err != nil {
 		t.Fatal(err)
@@ -87,6 +73,29 @@ func TestBackupRetentionAndRollbackPreconditions(t *testing.T) {
 	}
 	if _, err := prepareRollback("/other", "config.yaml", "local", third, preview.candidate); !errors.Is(err, ErrProposalTarget) {
 		t.Fatalf("changed target accepted: %v", err)
+	}
+}
+
+// assertRetainedBackups verifies that the two newest backups survive rotation,
+// are intact, are permission-restricted, and do not leak source metadata in
+// their serialized info. Extracting this phase keeps the parent test's
+// cognitive complexity under the Sonar threshold.
+func assertRetainedBackups(t *testing.T, dir string, source []byte, second, third backupInfo) {
+	t.Helper()
+	for _, info := range []backupInfo{second, third} {
+		loaded, err := loadBackup(dir, info.ID)
+		if err != nil || string(loaded.Source) != string(source) || loaded.Info != info {
+			t.Fatalf("retained backup could not be restored: %v", err)
+		}
+		path := filepath.Join(dir, backupFilename(info.ID))
+		stat, err := os.Stat(path)
+		if err != nil || stat.Mode().Perm() != 0o600 {
+			t.Fatalf("backup permissions: %v %v", stat, err)
+		}
+		public, err := json.Marshal(loaded.Info)
+		if err != nil || strings.Contains(string(public), "confidential") {
+			t.Fatalf("backup metadata exposed source: %s %v", public, err)
+		}
 	}
 }
 

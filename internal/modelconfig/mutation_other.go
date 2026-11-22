@@ -2,7 +2,7 @@
 
 package modelconfig
 
-func ApplyStoredDelegatedProposal(string, string, string, string, string, string, string, int, DelegatedApplyBinding) (DelegatedOperation, bool, error) {
+func ApplyStoredDelegatedProposal(req DelegatedProposalApplyRequest) (DelegatedOperation, bool, error) {
 	return DelegatedOperation{}, false, ErrProposalStore
 }
 
@@ -10,7 +10,7 @@ func ApplyStoredProposal(string, string, string, string, string, string, int) (M
 	return MutationResult{}, ErrTargetWrite
 }
 
-func ApplyStoredCreationProposal(string, string, string, string, string, string, int, CreationArtifactBinding) (MutationResult, error) {
+func ApplyStoredCreationProposal(req CreationProposalApplyRequest) (MutationResult, error) {
 	return MutationResult{}, ErrTargetWrite
 }
 

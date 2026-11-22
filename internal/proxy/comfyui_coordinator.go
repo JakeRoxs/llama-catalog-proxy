@@ -238,6 +238,24 @@ func (c *comfyUICoordinator) reserveCompeting() (func(), error) {
 	}, nil
 }
 
+// waitForDrainLocked waits for all outstanding submissions to drain while the
+// coordinator is in the draining state. The caller must hold c.mu on entry; it
+// returns with c.mu held. It snapshots c.changed before unlocking, waits on
+// operationCtx.Done or changed, then relocks and returns whether the state is
+// still draining and the context is not canceled.
+func (c *comfyUICoordinator) waitForDrainLocked(operationCtx context.Context) bool {
+	for c.status.Submissions > 0 && c.status.State == "draining" && operationCtx.Err() == nil {
+		changed := c.changed
+		c.mu.Unlock()
+		select {
+		case <-operationCtx.Done():
+		case <-changed:
+		}
+		c.mu.Lock()
+	}
+	return c.status.State == "draining" && operationCtx.Err() == nil
+}
+
 func (c *comfyUICoordinator) release(ctx context.Context, leaseID string) (ComfyUIReleaseResult, error) {
 	c.mu.Lock()
 	for {
@@ -277,16 +295,7 @@ func (c *comfyUICoordinator) release(ctx context.Context, leaseID string) (Comfy
 	c.cancel, c.verifying = cancel, true
 	c.status.State = "draining"
 	c.signalLocked()
-	for c.status.Submissions > 0 && c.status.State == "draining" && operationCtx.Err() == nil {
-		changed := c.changed
-		c.mu.Unlock()
-		select {
-		case <-operationCtx.Done():
-		case <-changed:
-		}
-		c.mu.Lock()
-	}
-	if operationCtx.Err() != nil || c.status.State != "draining" {
+	if !c.waitForDrainLocked(operationCtx) {
 		c.status.State, c.verifying, c.cancel = "unknown", false, nil
 		c.receipt = ComfyUIReleaseResult{}
 		c.signalLocked()

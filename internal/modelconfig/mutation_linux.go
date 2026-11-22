@@ -34,26 +34,26 @@ func ApplyStoredProposal(proposalDirectory, proposalID, directory, filename, tar
 // A false reservation is a replay and never invokes the mutation.
 // If outcome persistence fails, the returned reservation remains unknown and
 // the error must be surfaced; callers must not retry the mutation.
-func ApplyStoredDelegatedProposal(proposalDirectory, operationDirectory, proposalID, operationID, directory, filename, backupDirectory string, limit int, binding DelegatedApplyBinding) (DelegatedOperation, bool, error) {
-	if !validProposalID(proposalID) || !validProposalID(operationID) {
+func ApplyStoredDelegatedProposal(req DelegatedProposalApplyRequest) (DelegatedOperation, bool, error) {
+	if !validProposalID(req.ProposalID) || !validProposalID(req.OperationID) {
 		return DelegatedOperation{}, false, ErrProposalInvalid
 	}
 	var result DelegatedOperation
 	var reserved bool
-	err := withProposalStore(proposalDirectory, func(proposals *os.Root, _ *os.File) error {
-		proposal, err := readDelegatedProposal(proposals, proposalID)
+	err := withProposalStore(req.ProposalDirectory, func(proposals *os.Root, _ *os.File) error {
+		proposal, err := readDelegatedProposal(proposals, req.ProposalID)
 		if err != nil {
 			return err
 		}
-		if proposal.ReviewRevision != binding.ReviewRevision {
+		if proposal.ReviewRevision != req.Binding.ReviewRevision {
 			return ErrDelegatedProposalBinding
 		}
-		return withProposalStore(operationDirectory, func(operations *os.Root, dir *os.File) error {
+		return withProposalStore(req.OperationDirectory, func(operations *os.Root, dir *os.File) error {
 			now := time.Now()
-			if err := ValidateDelegatedProposal(proposal, binding.Owner, binding.RequesterNode, binding.BackendID, binding.TargetID, now); err != nil {
+			if err := ValidateDelegatedProposal(proposal, req.Binding.Owner, req.Binding.RequesterNode, req.Binding.BackendID, req.Binding.TargetID, now); err != nil {
 				return err
 			}
-			result, reserved, err = reserveDelegatedOperation(operations, dir, proposal, operationID, now)
+			result, reserved, err = reserveDelegatedOperation(operations, dir, proposal, req.OperationID, now)
 			if err != nil || !reserved {
 				return err
 			}
@@ -62,15 +62,15 @@ func ApplyStoredDelegatedProposal(proposalDirectory, operationDirectory, proposa
 				if now.Before(result.AcceptedAt) {
 					return ErrDelegatedClockRollback
 				}
-				return ValidateDelegatedProposal(proposal, binding.Owner, binding.RequesterNode, binding.BackendID, binding.TargetID, now)
+				return ValidateDelegatedProposal(proposal, req.Binding.Owner, req.Binding.RequesterNode, req.Binding.BackendID, req.Binding.TargetID, now)
 			}
-			mutation, mutationErr := applyReviewedProposalChecked(directory, filename, binding.TargetID, backupDirectory, limit, proposal.Proposal, check)
+			mutation, mutationErr := applyReviewedProposalChecked(req.Target.Directory, req.Target.Filename, req.Binding.TargetID, req.BackupDirectory, req.Limit, proposal.Proposal, check)
 			outcome, outcomeErr := delegatedMutationOutcome(mutation, mutationErr)
 			if outcomeErr != nil {
 				return errors.Join(mutationErr, outcomeErr)
 			}
-			finished, finishErr := updateDelegatedOperationLocked(operations, dir, proposalID,
-				finishDelegatedOperation(operationID, binding.Owner.ProxyInstanceID, outcome, time.Now()))
+			finished, finishErr := updateDelegatedOperationLocked(operations, dir, req.ProposalID,
+				finishDelegatedOperation(req.OperationID, req.Binding.Owner.ProxyInstanceID, outcome, time.Now()))
 			if finishErr != nil {
 				return errors.Join(mutationErr, finishErr)
 			}
@@ -84,33 +84,33 @@ func ApplyStoredDelegatedProposal(proposalDirectory, operationDirectory, proposa
 // ApplyStoredCreationProposal holds the proposal and target locks through
 // replacement. The caller must enforce authorization, directory separation,
 // an exclusive edit window, and the artifact binding's lifetime.
-func ApplyStoredCreationProposal(proposalDirectory, proposalID, directory, filename, targetID, backupDirectory string, limit int, artifact CreationArtifactBinding) (MutationResult, error) {
-	if artifact.Recheck == nil {
+func ApplyStoredCreationProposal(req CreationProposalApplyRequest) (MutationResult, error) {
+	if req.Artifact.Recheck == nil {
 		return MutationResult{}, ErrProposalArtifact
 	}
 	var result MutationResult
-	err := withProposalStore(proposalDirectory, func(root *os.Root, _ *os.File) error {
-		record, err := readCreationProposal(root, proposalID)
+	err := withProposalStore(req.ProposalDirectory, func(root *os.Root, _ *os.File) error {
+		record, err := readCreationProposal(root, req.ProposalID)
 		if err != nil {
 			return err
 		}
-		if record.Proposal.ArtifactRecordID != artifact.RecordID {
+		if record.Proposal.ArtifactRecordID != req.Artifact.RecordID {
 			return ErrProposalArtifact
 		}
-		return withTargetWrite(directory, filename, func(target *targetWrite) error {
-			preview, err := revalidateCreationRecord(directory, filename, targetID, artifact.Revision, artifact.ModelPath, record, target.source)
+		return withTargetWrite(req.Target.Directory, req.Target.Filename, func(target *targetWrite) error {
+			preview, err := revalidateCreationRecord(req.Target.Directory, req.Target.Filename, req.TargetID, req.Artifact.Revision, req.Artifact.ModelPath, record, target.source)
 			if err != nil {
 				return err
 			}
-			backup, err := newBackupRecord(targetID, record.Proposal.TargetFingerprint, record.Proposal.ModelID,
+			backup, err := newBackupRecord(req.TargetID, record.Proposal.TargetFingerprint, record.Proposal.ModelID,
 				record.Proposal.ID, target.source, preview.candidate)
 			if err != nil {
 				return err
 			}
-			result, err = commitWithBackup(backupDirectory, limit, func(*os.Root) (backupRecord, []byte, error) {
+			result, err = commitWithBackup(req.BackupDirectory, req.Limit, func(*os.Root) (backupRecord, []byte, error) {
 				return backup, preview.candidate, nil
 			}, func(candidate []byte) (bool, error) {
-				if err := artifact.Recheck(); err != nil {
+				if err := req.Artifact.Recheck(); err != nil {
 					return false, err
 				}
 				return target.replace(candidate)

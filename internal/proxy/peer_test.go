@@ -33,47 +33,59 @@ func TestAuthenticatedPeerBindsIdentityToScopedCredential(t *testing.T) {
 		"node-d": {Token: managementToken, ManageSettings: true},
 	}}}
 	request := httptest.NewRequest(http.MethodGet, "https://peer.example/peer/v1/report", nil)
-	request.Header.Set("Authorization", "Bearer "+catalogToken)
-	if id, ok := authenticatedPeer(request, state, peerCatalog); !ok || id != "node-b" {
-		t.Fatalf("catalog identity = %q, %v", id, ok)
+
+	t.Run("catalog credential binds node-b and denies other scopes", func(t *testing.T) {
+		request.Header.Set("Authorization", "Bearer "+catalogToken)
+		assertPeerIdentity(t, request, state, peerCatalog, "node-b")
+		assertPeerDenied(t, request, state, peerInference)
+		assertPeerDenied(t, request, state, peerManageSettings)
+	})
+
+	t.Run("inference credential binds node-c and denies catalog", func(t *testing.T) {
+		request.Header.Set("Authorization", "Bearer "+inferenceToken)
+		assertPeerIdentity(t, request, state, peerInference, "node-c")
+		assertPeerDenied(t, request, state, peerCatalog)
+	})
+
+	t.Run("management credential binds node-d and denies catalog", func(t *testing.T) {
+		request.Header.Set("Authorization", "Bearer "+managementToken)
+		assertPeerIdentity(t, request, state, peerManageSettings, "node-d")
+		assertPeerDenied(t, request, state, peerCatalog)
+	})
+
+	t.Run("revoked grants are rejected", func(t *testing.T) {
+		request.Header.Set("Authorization", "Bearer "+managementToken)
+		state.peer.Peers["node-d"] = config.PeerGrant{Token: managementToken}
+		assertPeerDenied(t, request, state, peerManageSettings)
+
+		request.Header.Set("Authorization", "Bearer "+inferenceToken)
+		state.peer.Peers["node-c"] = config.PeerGrant{Token: inferenceToken}
+		assertPeerDenied(t, request, state, peerInference)
+	})
+
+	t.Run("ambiguous credential is rejected", func(t *testing.T) {
+		state.peer.Peers["node-c"] = config.PeerGrant{Token: catalogToken, CatalogRead: true}
+		request.Header.Set("Authorization", "Bearer "+catalogToken)
+		assertPeerDenied(t, request, state, peerCatalog)
+	})
+
+	t.Run("duplicate authorization header is rejected", func(t *testing.T) {
+		request.Header.Add("Authorization", "Bearer "+inferenceToken)
+		assertPeerDenied(t, request, state, peerCatalog)
+	})
+}
+
+func assertPeerIdentity(t *testing.T, request *http.Request, state *reloaderState, scope peerScope, wantID string) {
+	t.Helper()
+	if id, ok := authenticatedPeer(request, state, scope); !ok || id != wantID {
+		t.Fatalf("identity = %q, %v", id, ok)
 	}
-	if id, ok := authenticatedPeer(request, state, peerInference); ok || id != "" {
-		t.Fatalf("catalog credential granted inference: %q, %v", id, ok)
-	}
-	if id, ok := authenticatedPeer(request, state, peerManageSettings); ok || id != "" {
-		t.Fatalf("catalog credential granted settings management: %q, %v", id, ok)
-	}
-	request.Header.Set("Authorization", "Bearer "+inferenceToken)
-	if id, ok := authenticatedPeer(request, state, peerInference); !ok || id != "node-c" {
-		t.Fatalf("inference identity = %q, %v", id, ok)
-	}
-	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
-		t.Fatalf("inference credential granted catalog: %q, %v", id, ok)
-	}
-	request.Header.Set("Authorization", "Bearer "+managementToken)
-	if id, ok := authenticatedPeer(request, state, peerManageSettings); !ok || id != "node-d" {
-		t.Fatalf("settings management identity = %q, %v", id, ok)
-	}
-	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
-		t.Fatalf("settings management granted catalog: %q, %v", id, ok)
-	}
-	state.peer.Peers["node-d"] = config.PeerGrant{Token: managementToken}
-	if id, ok := authenticatedPeer(request, state, peerManageSettings); ok || id != "" {
-		t.Fatalf("revoked settings management accepted: %q, %v", id, ok)
-	}
-	request.Header.Set("Authorization", "Bearer "+inferenceToken)
-	state.peer.Peers["node-c"] = config.PeerGrant{Token: inferenceToken}
-	if id, ok := authenticatedPeer(request, state, peerInference); ok || id != "" {
-		t.Fatalf("revoked grant accepted: %q, %v", id, ok)
-	}
-	state.peer.Peers["node-c"] = config.PeerGrant{Token: catalogToken, CatalogRead: true}
-	request.Header.Set("Authorization", "Bearer "+catalogToken)
-	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
-		t.Fatalf("ambiguous credential accepted: %q, %v", id, ok)
-	}
-	request.Header.Add("Authorization", "Bearer "+inferenceToken)
-	if id, ok := authenticatedPeer(request, state, peerCatalog); ok || id != "" {
-		t.Fatalf("duplicate authorization accepted: %q, %v", id, ok)
+}
+
+func assertPeerDenied(t *testing.T, request *http.Request, state *reloaderState, scope peerScope) {
+	t.Helper()
+	if id, ok := authenticatedPeer(request, state, scope); ok || id != "" {
+		t.Fatalf("credential granted: %q, %v", id, ok)
 	}
 }
 
@@ -273,25 +285,17 @@ management:
 	}
 	write(token, "node-a", certPath)
 	r, returnedConfig, err := NewReloader(path, discardLogger(), nil, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoErr(t, err)
 	mutatedToken := strings.Repeat("d", 32)
 	returnedConfig.Peer.Peers["node-b"] = config.PeerGrant{Token: mutatedToken, CatalogRead: true}
 	returnedConfig.Peer.LocalBackends = append(returnedConfig.Peer.LocalBackends, "remote")
 	returnedConfig.Peer.ManagementTargets["local"] = "changed"
-	if r.state.Load().peer.ManagementTargets["local"] != "swap" {
-		t.Fatal("returned config changed active management binding")
-	}
+	assertCatalogConfigNotMutated(t, r)
 	warm := httptest.NewRecorder()
 	r.ServeHTTP(warm, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	if warm.Code != http.StatusOK {
-		t.Fatalf("warm catalog: %d", warm.Code)
-	}
+	assertRecorderStatus(t, warm, http.StatusOK)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assertNoErr(t, err)
 	server := &http.Server{Handler: r.PeerHandler(), TLSConfig: r.PeerTLSConfig()}
 	done := make(chan error, 1)
 	go func() { done <- server.ServeTLS(listener, "", "") }()
@@ -304,59 +308,25 @@ management:
 	endpoint := "https://" + listener.Addr().String() + "/peer/v1/report"
 	untrusted := &http.Client{Timeout: time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: x509.NewCertPool()}}}
 	defer untrusted.CloseIdleConnections()
-	if response, err := untrusted.Get(endpoint); err == nil {
-		_ = response.Body.Close()
-		t.Fatal("untrusted peer certificate accepted")
-	}
+	assertUntrustedClientRejected(t, untrusted, endpoint)
 	get := func(credential string) *http.Response {
 		t.Helper()
 		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoErr(t, err)
 		if credential != "" {
 			req.Header.Set("Authorization", "Bearer "+credential)
 		}
 		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assertNoErr(t, err)
 		return resp
 	}
-	for _, invalid := range []string{"", strings.Repeat("x", 32), revoked, mutatedToken} {
-		resp := get(invalid)
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("unauthorized status = %d", resp.StatusCode)
-		}
-	}
-	inference, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(endpoint, "/report")+"/inference", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inference.Header.Set("Authorization", "Bearer "+token)
-	denied, err := client.Do(inference)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = denied.Body.Close()
-	if denied.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("catalog-only peer inference status = %d", denied.StatusCode)
-	}
+	// Baseline report before any credential mutations.
 	response := get(token)
-	receipt, err := nodecontract.DecodeReport(response.Body, "node-a", time.Now())
-	_ = response.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusOK || len(receipt.Report.Observations) != 1 ||
-		receipt.Report.Observations[0].Identity.LocalID != "local-model" {
-		t.Fatalf("report = %#v, status %d", receipt.Report, response.StatusCode)
-	}
-	if receipt.Report.Capabilities["diagnostics_read"] != "enabled" || receipt.Report.Capabilities["config_write"] != "disabled" ||
-		receipt.Report.BackendReadiness != nil {
-		t.Fatal("catalog-only peer received readiness or feature not advertised")
-	}
+	receipt := assertReportOK(t, response)
+	assertCatalogCapabilities(t, receipt)
+	initial := receipt.Report.Source
+	assertAllUnauthorized(t, get, []string{"", strings.Repeat("x", 32), revoked, mutatedToken})
+	assertInferenceDenied(t, client, endpoint, token)
 	getDiagnostics := func() nodecontract.Report {
 		t.Helper()
 		resp := get(diagnosticToken)
@@ -369,105 +339,223 @@ management:
 	}
 	beforeProbes := backendRequests.Load()
 	unknown := getDiagnostics()
-	if unknown.BackendReadiness == nil || len(*unknown.BackendReadiness) != 1 ||
-		(*unknown.BackendReadiness)[0].BackendID != "local" ||
-		(*unknown.BackendReadiness)[0].Status != "unknown" || backendRequests.Load() != beforeProbes {
-		t.Fatalf("unexpected initial readiness: %#v", unknown.BackendReadiness)
-	}
+	assertInitialReadiness(t, unknown, beforeProbes, &backendRequests)
 	checkReady := func(wantHTTP int, wantStatus string) {
 		t.Helper()
 		result := httptest.NewRecorder()
 		r.ServeHTTP(result, httptest.NewRequest(http.MethodGet, "/ready", nil))
-		if result.Code != wantHTTP {
-			t.Fatalf("local readiness status=%d", result.Code)
-		}
+		assertRecorderStatus(t, result, wantHTTP)
 		before := backendRequests.Load()
 		report := getDiagnostics()
-		if report.BackendReadiness == nil || len(*report.BackendReadiness) != 1 {
-			t.Fatalf("readiness report = %#v", report.BackendReadiness)
-		}
-		item := (*report.BackendReadiness)[0]
-		if item.BackendID != "local" || item.Status != wantStatus || item.ObservedAt == nil ||
-			item.Freshness != "fresh" || backendRequests.Load() != before {
-			t.Fatalf("readiness report = %#v", item)
-		}
+		assertReadinessReport(t, report, wantStatus, before, &backendRequests)
 	}
 	checkReady(http.StatusOK, "ready")
 	unhealthy.Store(true)
 	checkReady(http.StatusServiceUnavailable, "unavailable")
-	initial := receipt.Report.Source
 	clientSide := httptest.NewRecorder()
 	misrouted := httptest.NewRequest(http.MethodGet, "/peer/v1/report", nil)
 	misrouted.Header.Set("Authorization", "Bearer "+token)
 	before := backendRequests.Load()
 	r.ServeHTTP(clientSide, misrouted)
-	if clientSide.Code != http.StatusNotFound || backendRequests.Load() != before {
-		t.Fatalf("client listener exposed peer route: %d", clientSide.Code)
-	}
+	assertMisroutedRoute(t, clientSide, before, &backendRequests)
 	plain := httptest.NewRecorder()
 	r.PeerHandler().ServeHTTP(plain, httptest.NewRequest(http.MethodGet, "/peer/v1/report", nil))
-	if plain.Code != http.StatusForbidden {
-		t.Fatalf("plaintext peer request = %d", plain.Code)
-	}
-
+	assertRecorderStatus(t, plain, http.StatusForbidden)
 	newToken := strings.Repeat("c", 32)
 	allowDiagnostics = false
 	write(newToken, "node-a", certPath)
-	if err := r.reload(); err != nil {
-		t.Fatal(err)
-	}
-	if report := getDiagnostics(); report.BackendReadiness != nil {
-		t.Fatal("revoked diagnostics grant still received readiness")
-	}
+	assertReloadOK(t, r.reload())
+	assertDiagnosticsRevoked(t, getDiagnostics())
 	old := get(token)
 	_ = old.Body.Close()
-	if old.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("old token status = %d", old.StatusCode)
-	}
+	assertStatus(t, old, http.StatusUnauthorized)
 	response = get(newToken)
-	receipt, err = nodecontract.DecodeReport(response.Body, "node-a", time.Now())
+	receipt = assertReportDecodeOnly(t, response)
+	assertReloadSourceChanged(t, receipt, initial)
+	write(newToken, "node-a", certPath+"-missing")
+	assertReloadFailed(t, r.reload())
+	write(newToken, "node-other", certPath)
+	assertReloadFailed(t, r.reload())
+	response = get(newToken)
+	receipt = assertReportDecodeOnly(t, response)
+	assertReloadSourceNotChanged(t, receipt, initial)
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("default_backend: local\nbackends:\n  local: {url: %q}\n", local.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertReloadOK(t, r.reload())
+	response = get(newToken)
+	_ = response.Body.Close()
+	assertStatus(t, response, http.StatusUnauthorized)
+	write(newToken, "node-a", certPath)
+	assertReloadOK(t, r.reload())
+	response = get(newToken)
+	receipt = assertReportDecodeOnly(t, response)
+	assertReloadSourceIncremented(t, receipt, initial)
+}
+
+func assertNoErr(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertStatus(t *testing.T, resp *http.Response, want int) {
+	t.Helper()
+	if resp.StatusCode != want {
+		t.Fatalf("unexpected status = %d", resp.StatusCode)
+	}
+}
+
+func assertRecorderStatus(t *testing.T, rec *httptest.ResponseRecorder, want int) {
+	t.Helper()
+	if rec.Code != want {
+		t.Fatalf("unexpected status = %d", rec.Code)
+	}
+}
+
+func assertCatalogConfigNotMutated(t *testing.T, r *Reloader) {
+	t.Helper()
+	if r.state.Load().peer.ManagementTargets["local"] != "swap" {
+		t.Fatal("returned config changed active management binding")
+	}
+}
+
+func assertUntrustedClientRejected(t *testing.T, untrusted *http.Client, endpoint string) {
+	t.Helper()
+	if response, err := untrusted.Get(endpoint); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("untrusted peer certificate accepted")
+	}
+}
+
+func assertAllUnauthorized(t *testing.T, get func(string) *http.Response, credentials []string) {
+	t.Helper()
+	for _, invalid := range credentials {
+		resp := get(invalid)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unauthorized status = %d", resp.StatusCode)
+		}
+	}
+}
+
+func assertInferenceDenied(t *testing.T, client *http.Client, endpoint string, token string) {
+	t.Helper()
+	inference, err := http.NewRequest(http.MethodPost, strings.TrimSuffix(endpoint, "/report")+"/inference", nil)
+	assertNoErr(t, err)
+	inference.Header.Set("Authorization", "Bearer "+token)
+	denied, err := client.Do(inference)
+	assertNoErr(t, err)
+	_ = denied.Body.Close()
+	if denied.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("catalog-only peer inference status = %d", denied.StatusCode)
+	}
+}
+
+func assertReportOK(t *testing.T, response *http.Response) nodecontract.Receipt {
+	t.Helper()
+	receipt, err := nodecontract.DecodeReport(response.Body, "node-a", time.Now())
 	_ = response.Body.Close()
 	if err != nil {
 		t.Fatal(err)
 	}
+	if response.StatusCode != http.StatusOK || len(receipt.Report.Observations) != 1 ||
+		receipt.Report.Observations[0].Identity.LocalID != "local-model" {
+		t.Fatalf("report = %#v, status %d", receipt.Report, response.StatusCode)
+	}
+	return receipt
+}
+
+// assertReportDecodeOnly decodes a peer report without requiring observations.
+// Reload-state assertions in the original code checked only status/source fields,
+// not observation content, so this helper matches that looser contract.
+func assertReportDecodeOnly(t *testing.T, response *http.Response) nodecontract.Receipt {
+	t.Helper()
+	receipt, err := nodecontract.DecodeReport(response.Body, "node-a", time.Now())
+	_ = response.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
+}
+
+func assertCatalogCapabilities(t *testing.T, receipt nodecontract.Receipt) {
+	t.Helper()
+	if receipt.Report.Capabilities["diagnostics_read"] != "enabled" || receipt.Report.Capabilities["config_write"] != "disabled" ||
+		receipt.Report.BackendReadiness != nil {
+		t.Fatal("catalog-only peer received readiness or feature not advertised")
+	}
+}
+
+func assertInitialReadiness(t *testing.T, unknown nodecontract.Report, beforeProbes int32, backendRequests *atomic.Int32) {
+	t.Helper()
+	if unknown.BackendReadiness == nil || len(*unknown.BackendReadiness) != 1 ||
+		(*unknown.BackendReadiness)[0].BackendID != "local" ||
+		(*unknown.BackendReadiness)[0].Status != "unknown" || backendRequests.Load() != beforeProbes {
+		t.Fatalf("unexpected initial readiness: %#v", unknown.BackendReadiness)
+	}
+}
+
+func assertReadinessReport(t *testing.T, report nodecontract.Report, wantStatus string, before int32, backendRequests *atomic.Int32) {
+	t.Helper()
+	if report.BackendReadiness == nil || len(*report.BackendReadiness) != 1 {
+		t.Fatalf("readiness report = %#v", report.BackendReadiness)
+	}
+	item := (*report.BackendReadiness)[0]
+	if item.BackendID != "local" || item.Status != wantStatus || item.ObservedAt == nil ||
+		item.Freshness != "fresh" || backendRequests.Load() != before {
+		t.Fatalf("readiness report = %#v", item)
+	}
+}
+
+func assertMisroutedRoute(t *testing.T, clientSide *httptest.ResponseRecorder, before int32, backendRequests *atomic.Int32) {
+	t.Helper()
+	if clientSide.Code != http.StatusNotFound || backendRequests.Load() != before {
+		t.Fatalf("client listener exposed peer route: %d", clientSide.Code)
+	}
+}
+
+func assertReloadOK(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertDiagnosticsRevoked(t *testing.T, report nodecontract.Report) {
+	t.Helper()
+	if report.BackendReadiness != nil {
+		t.Fatal("revoked diagnostics grant still received readiness")
+	}
+}
+
+func assertReloadSourceChanged(t *testing.T, receipt nodecontract.Receipt, initial nodecontract.Source) {
+	t.Helper()
 	if receipt.Report.Source.ProxyInstanceID != initial.ProxyInstanceID || receipt.Report.Source.ConfigGeneration != initial.ConfigGeneration+1 {
 		t.Fatalf("reloaded source = %#v, initial = %#v", receipt.Report.Source, initial)
 	}
-	write(newToken, "node-a", certPath+"-missing")
-	if err := r.reload(); err == nil {
-		t.Fatal("invalid TLS reload succeeded")
+}
+
+func assertReloadFailed(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("reload unexpectedly succeeded")
 	}
-	write(newToken, "node-other", certPath)
-	if err := r.reload(); err == nil {
-		t.Fatal("node identity change succeeded without restart")
+}
+
+func assertReloadSourceNotChanged(t *testing.T, receipt nodecontract.Receipt, initial nodecontract.Source) {
+	t.Helper()
+	if receipt.Report.Source.ConfigGeneration != initial.ConfigGeneration+1 {
+		t.Fatalf("failed reload changed active state: %#v", receipt.Report.Source)
 	}
-	response = get(newToken)
-	receipt, err = nodecontract.DecodeReport(response.Body, "node-a", time.Now())
-	_ = response.Body.Close()
-	if err != nil || receipt.Report.Source.ConfigGeneration != initial.ConfigGeneration+1 {
-		t.Fatalf("failed reload changed active state: %#v, %v", receipt.Report.Source, err)
-	}
-	if err := os.WriteFile(path, []byte(fmt.Sprintf("default_backend: local\nbackends:\n  local: {url: %q}\n", local.URL)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.reload(); err != nil {
-		t.Fatal(err)
-	}
-	response = get(newToken)
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("disabled peer status = %d", response.StatusCode)
-	}
-	write(newToken, "node-a", certPath)
-	if err := r.reload(); err != nil {
-		t.Fatal(err)
-	}
-	response = get(newToken)
-	receipt, err = nodecontract.DecodeReport(response.Body, "node-a", time.Now())
-	_ = response.Body.Close()
-	if err != nil || receipt.Report.Source.ConfigGeneration != initial.ConfigGeneration+3 ||
+}
+
+func assertReloadSourceIncremented(t *testing.T, receipt nodecontract.Receipt, initial nodecontract.Source) {
+	t.Helper()
+	if receipt.Report.Source.ConfigGeneration != initial.ConfigGeneration+3 ||
 		receipt.Report.Source.ProxyInstanceID != initial.ProxyInstanceID {
-		t.Fatalf("reenabled peer source = %#v, %v", receipt.Report.Source, err)
+		t.Fatalf("reenabled peer source = %#v", receipt.Report.Source)
 	}
 }
 

@@ -157,8 +157,18 @@ func (r *Reloader) runMutation(state *reloaderState, operation, id string) (mode
 						},
 					}
 					var err error
-					result, err = modelconfig.ApplyStoredCreationProposal(proposals, id, target.Directory, target.Filename,
-						targetID, backups, management.BackupStore.MaxBackups, binding)
+					result, err = modelconfig.ApplyStoredCreationProposal(modelconfig.CreationProposalApplyRequest{
+						ProposalDirectory: proposals,
+						ProposalID:        id,
+						Target: modelconfig.MutationTarget{
+							Directory: target.Directory,
+							Filename:  target.Filename,
+						},
+						TargetID:        targetID,
+						BackupDirectory: backups,
+						Limit:           management.BackupStore.MaxBackups,
+						Artifact:        binding,
+					})
 					return err
 				})
 			return result, err

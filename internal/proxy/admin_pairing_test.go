@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/auditlog"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
@@ -54,20 +55,48 @@ func TestAdminPairingInvitationRequiresRoleAndCSRFAndNeverListsCode(t *testing.T
 		reloader.ServeHTTP(response, req)
 		return response
 	}
+	requireAdminPairingRoleAndCSRF(t, post)
+	created := createAdminPairingInvitation(t, post)
+	invite := verifyInvitationPayload(t, created)
+	verifyInvitationListRedaction(t, reloader, invite)
+	verifyInvitationAuditEvent(t, audit, invite)
+	verifyInvitationAuditEndpoint(t, reloader, invite)
+}
+
+// requireAdminPairingRoleAndCSRF enforces that a view-role session cannot create
+// invitations and that an admin session without a CSRF token is rejected.
+func requireAdminPairingRoleAndCSRF(t *testing.T, post func(session, csrf string) *httptest.ResponseRecorder) {
 	if response := post("view-session", "view-csrf"); response.Code != http.StatusForbidden {
 		t.Fatalf("view role invitation status = %d", response.Code)
 	}
 	if response := post("admin-session", ""); response.Code != http.StatusForbidden {
 		t.Fatalf("missing CSRF invitation status = %d", response.Code)
 	}
+}
+
+// createAdminPairingInvitation creates an invitation with the admin session and
+// returns the HTTP response for payload verification.
+func createAdminPairingInvitation(t *testing.T, post func(session, csrf string) *httptest.ResponseRecorder) *httptest.ResponseRecorder {
 	created := post("admin-session", "admin-csrf")
 	if created.Code != http.StatusCreated {
 		t.Fatalf("create invitation = %d %s", created.Code, created.Body.String())
 	}
+	return created
+}
+
+// verifyInvitationPayload parses the invitation response and asserts the secret
+// code is present and the target node matches.
+func verifyInvitationPayload(t *testing.T, created *httptest.ResponseRecorder) federation.Invitation {
 	var invite federation.Invitation
 	if err := json.Unmarshal(created.Body.Bytes(), &invite); err != nil || invite.Code == "" || invite.NodeID != "node-b" {
 		t.Fatalf("created invitation payload = %+v, %v", invite, err)
 	}
+	return invite
+}
+
+// verifyInvitationListRedaction asserts the invitation list endpoint returns a
+// 200, omits the secret invitation code, and still includes the target node.
+func verifyInvitationListRedaction(t *testing.T, reloader *Reloader, invite federation.Invitation) {
 	list := httptest.NewRequest(http.MethodGet, "https://catalog.example/admin/api/v1/federation/invitations", nil)
 	list.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
 	listed := httptest.NewRecorder()
@@ -75,6 +104,12 @@ func TestAdminPairingInvitationRequiresRoleAndCSRFAndNeverListsCode(t *testing.T
 	if listed.Code != http.StatusOK || strings.Contains(listed.Body.String(), invite.Code) || !strings.Contains(listed.Body.String(), "node-b") {
 		t.Fatalf("invitation list exposed code or omitted target: %d %s", listed.Code, listed.Body.String())
 	}
+}
+
+// verifyInvitationAuditEvent asserts the audit store records the verified local
+// actor, target, and outcome for the invitation create, and that the invitation
+// secret is not leaked into the audit payload.
+func verifyInvitationAuditEvent(t *testing.T, audit *auditlog.Store, invite federation.Invitation) {
 	events, err := audit.ListRecent(20)
 	if err != nil {
 		t.Fatal(err)
@@ -90,6 +125,11 @@ func TestAdminPairingInvitationRequiresRoleAndCSRFAndNeverListsCode(t *testing.T
 	if !found || strings.Contains(string(auditBytes), invite.Code) {
 		t.Fatalf("verified local actor missing or invitation secret was audited: %+v", events)
 	}
+}
+
+// verifyInvitationAuditEndpoint asserts the audit events endpoint is protected,
+// returns a 200 with verified_user_subject, and does not leak the invitation code.
+func verifyInvitationAuditEndpoint(t *testing.T, reloader *Reloader, invite federation.Invitation) {
 	auditRequest := httptest.NewRequest(http.MethodGet, "https://catalog.example/admin/api/v1/audit/events?limit=20", nil)
 	auditRequest.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
 	auditResponse := httptest.NewRecorder()
@@ -155,6 +195,23 @@ func TestAdminCatalogReadGrantRequiresRoleCSRFAndPairedFingerprint(t *testing.T)
 		return response
 	}
 	base := adminPairingPath + "/catalog-grants"
+	inferenceBase := adminPairingPath + "/inference-grants"
+	assertCatalogReadGrantGating(t, request, base)
+	assertInferencePrerequisite(t, request, inferenceBase)
+	createCatalogReadGrant(t, request, base)
+	assertCatalogReadGrantListed(t, request, base)
+	createInferenceGrant(t, request, inferenceBase)
+	assertInferenceGrantListed(t, request, inferenceBase)
+	revokeInferenceGrant(t, request, inferenceBase)
+	revokeCatalogReadGrant(t, request, base)
+	assertCatalogReadGrantRevokedListed(t, request, base)
+	assertCatalogGrantAuditEvents(t, audit)
+}
+
+// assertCatalogReadGrantGating enforces that a view-role session cannot create
+// catalog-read grants, that an admin session without a CSRF token is rejected,
+// and that a grant for an unpaired node conflicts.
+func assertCatalogReadGrantGating(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, base string) {
 	if response := request(http.MethodPost, base, "viewer-session", "viewer-csrf", `{"node_id":"node-b"}`); response.Code != http.StatusForbidden {
 		t.Fatalf("viewer grant status = %d", response.Code)
 	}
@@ -164,41 +221,83 @@ func TestAdminCatalogReadGrantRequiresRoleCSRFAndPairedFingerprint(t *testing.T)
 	if response := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-c"}`); response.Code != http.StatusConflict {
 		t.Fatalf("unpaired grant status = %d %s", response.Code, response.Body.String())
 	}
-	inferenceBase := adminPairingPath + "/inference-grants"
+}
+
+// assertInferencePrerequisite asserts that creating a route-outgoing inference
+// grant is rejected with Conflict when no catalog-read grant exists for the node.
+func assertInferencePrerequisite(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, inferenceBase string) {
 	if response := request(http.MethodPost, inferenceBase, "admin-session", "admin-csrf",
 		`{"node_id":"node-b","allow_incoming_inference":false,"route_outgoing_inference":true}`); response.Code != http.StatusConflict {
 		t.Fatalf("route inference without catalog-read grant = %d %s", response.Code, response.Body.String())
 	}
+}
+
+// createCatalogReadGrant creates a catalog-read grant for node-b and asserts
+// 201 with the persisted fingerprint in the response body.
+func createCatalogReadGrant(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, base string) {
 	created := request(http.MethodPost, base, "admin-session", "admin-csrf", `{"node_id":"node-b"}`)
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), strings.Repeat("a", 64)) {
 		t.Fatalf("catalog grant create = %d %s", created.Code, created.Body.String())
 	}
+}
+
+// assertCatalogReadGrantListed asserts the catalog-read grant list returns 200
+// with current_fingerprint set.
+func assertCatalogReadGrantListed(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, base string) {
 	listed := request(http.MethodGet, base, "admin-session", "", "")
 	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"current_fingerprint":true`) {
 		t.Fatalf("catalog grant list = %d %s", listed.Code, listed.Body.String())
 	}
-	created = request(http.MethodPost, inferenceBase, "admin-session", "admin-csrf",
+}
+
+// createInferenceGrant creates an inference grant for node-b and asserts 201
+// with the routed fields in the response body.
+func createInferenceGrant(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, inferenceBase string) {
+	created := request(http.MethodPost, inferenceBase, "admin-session", "admin-csrf",
 		`{"node_id":"node-b","allow_incoming_inference":true,"route_outgoing_inference":true}`)
 	if created.Code != http.StatusCreated || !strings.Contains(created.Body.String(), `"allow_incoming_inference":true`) ||
 		!strings.Contains(created.Body.String(), `"route_outgoing_inference":true`) {
 		t.Fatalf("inference grant create = %d %s", created.Code, created.Body.String())
 	}
+}
+
+// assertInferenceGrantListed asserts the inference grant list returns 200 with
+// current_fingerprint set.
+func assertInferenceGrantListed(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, inferenceBase string) {
 	inferenceList := request(http.MethodGet, inferenceBase, "admin-session", "", "")
 	if inferenceList.Code != http.StatusOK || !strings.Contains(inferenceList.Body.String(), `"current_fingerprint":true`) {
 		t.Fatalf("inference grant list = %d %s", inferenceList.Code, inferenceList.Body.String())
 	}
+}
+
+// revokeInferenceGrant revokes the inference grant for node-b and asserts 204.
+func revokeInferenceGrant(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, inferenceBase string) {
 	inferenceRevoke := request(http.MethodDelete, inferenceBase+"/node-b", "admin-session", "admin-csrf", "")
 	if inferenceRevoke.Code != http.StatusNoContent {
 		t.Fatalf("inference grant revoke = %d %s", inferenceRevoke.Code, inferenceRevoke.Body.String())
 	}
+}
+
+// revokeCatalogReadGrant revokes the catalog-read grant for node-b and asserts 204.
+func revokeCatalogReadGrant(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, base string) {
 	revoked := request(http.MethodDelete, base+"/node-b", "admin-session", "admin-csrf", "")
 	if revoked.Code != http.StatusNoContent {
 		t.Fatalf("catalog grant revoke = %d %s", revoked.Code, revoked.Body.String())
 	}
-	listed = request(http.MethodGet, base, "admin-session", "", "")
+}
+
+// assertCatalogReadGrantRevokedListed asserts the catalog-read grant list is
+// empty after revocation.
+func assertCatalogReadGrantRevokedListed(t *testing.T, request func(method, path, session, csrf, body string) *httptest.ResponseRecorder, base string) {
+	listed := request(http.MethodGet, base, "admin-session", "", "")
 	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"grants":[]`) {
 		t.Fatalf("revoked catalog grant list = %d %s", listed.Code, listed.Body.String())
 	}
+}
+
+// assertCatalogGrantAuditEvents asserts the audit store records catalog-read and
+// inference grant create events for the verified operator acting on node-b.
+func assertCatalogGrantAuditEvents(t *testing.T, audit *auditlog.Store) {
 	events, err := audit.ListRecent(20)
 	if err != nil {
 		t.Fatal(err)
@@ -281,6 +380,15 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 		joining.ServeHTTP(response, req)
 		return response
 	}
+	assertInvitationHandshakeRejectedStableMembership(t, requestJoin, ownerStore, joiningStore)
+	assertReciprocalMembershipPersisted(t, requestJoin, invite, ownerStore, joiningStore)
+	assertNoDuplicateMembershipOnRetry(t, requestJoin, invite, ownerStore, joiningStore)
+}
+
+// assertInvitationHandshakeRejectedStableMembership sends an invalid invitation
+// join request and asserts it is rejected with BadGateway while leaving both
+// stores' memberships unchanged (zero members each).
+func assertInvitationHandshakeRejectedStableMembership(t *testing.T, requestJoin func(string) *httptest.ResponseRecorder, ownerStore, joiningStore *federation.PairingStore) {
 	if rejected := requestJoin(strings.Repeat("x", 43)); rejected.Code != http.StatusBadGateway {
 		t.Fatalf("invalid invitation response = %d %s", rejected.Code, rejected.Body.String())
 	}
@@ -289,6 +397,12 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 	if ownerErr != nil || joiningErr != nil || len(ownerMembers) != 0 || len(joiningMembers) != 0 {
 		t.Fatal("failed invitation handshake changed membership")
 	}
+}
+
+// assertReciprocalMembershipPersisted sends a valid invitation join request and
+// asserts a successful response containing the owner node id and no scopes,
+// plus that both stores now report reciprocal membership.
+func assertReciprocalMembershipPersisted(t *testing.T, requestJoin func(string) *httptest.ResponseRecorder, invite federation.Invitation, ownerStore, joiningStore *federation.PairingStore) {
 	joined := requestJoin(invite.Code)
 	if joined.Code != http.StatusOK || !strings.Contains(joined.Body.String(), `"node_id":"node-a"`) || strings.Contains(joined.Body.String(), "scopes") {
 		t.Fatalf("web join = %d %s", joined.Code, joined.Body.String())
@@ -296,11 +410,16 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 	if !ownerStore.IsMember("node-b") || !joiningStore.IsMember("node-a") {
 		t.Fatal("pairing did not persist reciprocal identity memberships")
 	}
+}
+
+// assertNoDuplicateMembershipOnRetry replays the same invitation code and
+// asserts the retry is idempotent (OK) and that no duplicate membership is created.
+func assertNoDuplicateMembershipOnRetry(t *testing.T, requestJoin func(string) *httptest.ResponseRecorder, invite federation.Invitation, ownerStore, joiningStore *federation.PairingStore) {
 	if retry := requestJoin(invite.Code); retry.Code != http.StatusOK {
 		t.Fatalf("lost-response retry was not idempotent: %d %s", retry.Code, retry.Body.String())
 	}
-	ownerMembers, ownerErr = ownerStore.ListMembers()
-	joiningMembers, joiningErr = joiningStore.ListMembers()
+	ownerMembers, ownerErr := ownerStore.ListMembers()
+	joiningMembers, joiningErr := joiningStore.ListMembers()
 	if ownerErr != nil || joiningErr != nil || len(ownerMembers) != 1 || len(joiningMembers) != 1 {
 		t.Fatal("invitation replay created duplicate membership")
 	}

@@ -41,28 +41,8 @@ func newBenchmarkRuntime(cfg config.Config, logger *slog.Logger) (*benchmarkRunt
 		return nil, err
 	}
 	if cfg.Management != nil {
-		resolved, err := filepath.EvalSymlinks(directory)
-		if err != nil {
-			return nil, errors.New("benchmark report directory could not be resolved")
-		}
-		var paths []string
-		for _, target := range cfg.Management.Targets {
-			paths = append(paths, target.Directory)
-		}
-		if cfg.Management.ProposalStore != nil {
-			paths = append(paths, cfg.Management.ProposalStore.Directory)
-		}
-		if cfg.Management.BackupStore != nil {
-			paths = append(paths, cfg.Management.BackupStore.Directory)
-		}
-		for _, path := range paths {
-			other, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return nil, errors.New("management directory could not be resolved for benchmark isolation")
-			}
-			if benchmarkContainsPath(resolved, other) || benchmarkContainsPath(other, resolved) {
-				return nil, errors.New("benchmark report directory overlaps a management directory")
-			}
+		if err := validateBenchmarkManagementDirectories(directory, cfg.Management); err != nil {
+			return nil, err
 		}
 	}
 	client, err := benchmark.NewAPIClient(cfg.Benchmark.ProxyOrigin, cfg.DiagnosticsAPIKey)
@@ -79,6 +59,39 @@ func newBenchmarkRuntime(cfg config.Config, logger *slog.Logger) (*benchmarkRunt
 func benchmarkContainsPath(parent, child string) bool {
 	relative, err := filepath.Rel(parent, child)
 	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+// validateBenchmarkManagementDirectories verifies that the benchmark report
+// directory does not overlap any management directory (targets, proposal store,
+// or backup store). It is a no-op when management is nil.
+func validateBenchmarkManagementDirectories(directory string, management *config.ManagementConfig) error {
+	if management == nil {
+		return nil
+	}
+	resolved, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		return errors.New("benchmark report directory could not be resolved")
+	}
+	var paths []string
+	for _, target := range management.Targets {
+		paths = append(paths, target.Directory)
+	}
+	if management.ProposalStore != nil {
+		paths = append(paths, management.ProposalStore.Directory)
+	}
+	if management.BackupStore != nil {
+		paths = append(paths, management.BackupStore.Directory)
+	}
+	for _, path := range paths {
+		other, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return errors.New("management directory could not be resolved for benchmark isolation")
+		}
+		if benchmarkContainsPath(resolved, other) || benchmarkContainsPath(other, resolved) {
+			return errors.New("benchmark report directory overlaps a management directory")
+		}
+	}
+	return nil
 }
 
 func (r *Reloader) serveBenchmark(w http.ResponseWriter, req *http.Request) {
@@ -205,26 +218,57 @@ func decodeBenchmarkJSON(req *http.Request, dst any) error {
 }
 
 func (r *Reloader) startBenchmarkJob(w http.ResponseWriter, req *http.Request) {
-	var input struct {
-		Backend           string               `json:"backend"`
-		Model             string               `json:"model"`
-		Temperature       *float64             `json:"temperature"`
-		TopP              *float64             `json:"top_p"`
-		MaxOutput         *int                 `json:"max_output_tokens"`
-		Repetitions       *int                 `json:"repetitions"`
-		CacheState        benchmark.CacheState `json:"cache_state"`
-		TimeBudgetSeconds *int                 `json:"time_budget_seconds"`
-		TokenBudget       *int                 `json:"token_budget"`
-		AllowInterference bool                 `json:"allow_interference"`
-	}
-	if err := decodeBenchmarkJSON(req, &input); err != nil {
+	options, err := decodeBenchmarkJobRequest(req, r.benchmark.client)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	job, err := r.benchmark.jobs.Start(options)
+	if err != nil {
+		if errors.Is(err, benchmark.ErrJobActive) {
+			http.Error(w, "benchmark job already active", http.StatusConflict)
+		} else if errors.Is(err, benchmark.ErrJobStopped) {
+			http.Error(w, "benchmark service stopped", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "invalid or unauthorized benchmark request", http.StatusBadRequest)
+		}
+		return
+	}
+	writeJSON(r.logger, w, http.StatusAccepted, job)
+}
+
+// benchmarkJobRequest is the decoded JSON body for starting a benchmark job.
+type benchmarkJobRequest struct {
+	Backend           string               `json:"backend"`
+	Model             string               `json:"model"`
+	Temperature       *float64             `json:"temperature"`
+	TopP              *float64             `json:"top_p"`
+	MaxOutput         *int                 `json:"max_output_tokens"`
+	Repetitions       *int                 `json:"repetitions"`
+	CacheState        benchmark.CacheState `json:"cache_state"`
+	TimeBudgetSeconds *int                 `json:"time_budget_seconds"`
+	TokenBudget       *int                 `json:"token_budget"`
+	AllowInterference bool                 `json:"allow_interference"`
+}
+
+// decodeBenchmarkJobRequest decodes the job request body and constructs the
+// benchmark RunOptions with defaults and validated overrides. Any returned
+// error is a client error (HTTP 400) suitable for http.Error with err.Error().
+func decodeBenchmarkJobRequest(req *http.Request, client *benchmark.APIClient) (benchmark.RunOptions, error) {
+	var input benchmarkJobRequest
+	if err := decodeBenchmarkJSON(req, &input); err != nil {
+		return benchmark.RunOptions{}, err
+	}
 	options := benchmark.RunOptions{
-		Client: r.benchmark.client, Backend: input.Backend, Model: input.Model,
-		TopP: 1, MaxOutput: 64, Repetitions: 1, CacheState: benchmark.CacheUnknown,
-		TimeBudget: benchmark.MaxRunDuration, TokenBudget: benchmark.MaxTotalTokenBudget,
+		Client:            client,
+		Backend:           input.Backend,
+		Model:             input.Model,
+		TopP:              1,
+		MaxOutput:         64,
+		Repetitions:       1,
+		CacheState:        benchmark.CacheUnknown,
+		TimeBudget:        benchmark.MaxRunDuration,
+		TokenBudget:       benchmark.MaxTotalTokenBudget,
 		AllowInterference: input.AllowInterference,
 	}
 	if input.Temperature != nil {
@@ -244,8 +288,7 @@ func (r *Reloader) startBenchmarkJob(w http.ResponseWriter, req *http.Request) {
 	}
 	if input.TimeBudgetSeconds != nil {
 		if *input.TimeBudgetSeconds < 1 || *input.TimeBudgetSeconds > int(benchmark.MaxRunDuration/time.Second) {
-			http.Error(w, "invalid time budget", http.StatusBadRequest)
-			return
+			return benchmark.RunOptions{}, errors.New("invalid time budget")
 		}
 		options.TimeBudget = time.Duration(*input.TimeBudgetSeconds) * time.Second
 	}
@@ -253,21 +296,9 @@ func (r *Reloader) startBenchmarkJob(w http.ResponseWriter, req *http.Request) {
 		options.TokenBudget = *input.TokenBudget
 	}
 	if options.MaxOutput < 1 || options.Repetitions < 1 || options.TokenBudget < 1 {
-		http.Error(w, "benchmark limits must be positive", http.StatusBadRequest)
-		return
+		return benchmark.RunOptions{}, errors.New("benchmark limits must be positive")
 	}
-	job, err := r.benchmark.jobs.Start(options)
-	if err != nil {
-		if errors.Is(err, benchmark.ErrJobActive) {
-			http.Error(w, "benchmark job already active", http.StatusConflict)
-		} else if errors.Is(err, benchmark.ErrJobStopped) {
-			http.Error(w, "benchmark service stopped", http.StatusServiceUnavailable)
-		} else {
-			http.Error(w, "invalid or unauthorized benchmark request", http.StatusBadRequest)
-		}
-		return
-	}
-	writeJSON(r.logger, w, http.StatusAccepted, job)
+	return options, nil
 }
 
 func (r *Reloader) benchmarkJob(w http.ResponseWriter, req *http.Request) {

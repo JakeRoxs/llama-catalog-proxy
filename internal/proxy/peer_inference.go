@@ -15,6 +15,11 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
 
+// peerTargetUnavailable is the error message returned when the inferred peer
+// target is unauthorized, not owned, or no longer supported. Declared once so
+// the literal is not duplicated (go:S1192).
+const peerTargetUnavailable = "peer target unavailable"
+
 type peerAddressHeadersContextKey struct{}
 
 func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) {
@@ -37,7 +42,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	}
 	id, path, instance, generation, err := peerTargetHeaders(req, state.peer.NodeID)
 	if err != nil || instance != r.instanceID || generation != state.generation {
-		http.Error(w, "peer target unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	owned := false
@@ -50,17 +55,17 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	check := req.Clone(req.Context())
 	check.URL.Path = path
 	if !owned || !isInferenceRequest(check) || strings.ContainsAny(path, "?#") {
-		http.Error(w, "peer target unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
 		return
 	}
-	contentType, params, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	contentType, params, err := mime.ParseMediaType(req.Header.Get(contentTypeHeader))
 	if err != nil || (contentType != "application/json" && contentType != "multipart/form-data") || req.Header.Get("Content-Encoding") != "" {
 		http.Error(w, "JSON or multipart request required", http.StatusUnsupportedMediaType)
 		return
 	}
 	handler, ok := state.handler.(*Handler)
 	if !ok {
-		http.Error(w, "peer target unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	if req.Body == nil {
@@ -112,7 +117,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 		}
 	}
 	if !found || r.state.Load() != state {
-		http.Error(w, "peer target unavailable", http.StatusServiceUnavailable)
+		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
 		return
 	}
 	ctx = context.WithValue(ctx, requestIDKey{}, generateRequestID())
@@ -120,7 +125,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	req = req.WithContext(ctx)
 	req.URL.Path, req.URL.RawPath, req.URL.RawQuery = path, "", ""
 	accept := req.Header.Get("Accept")
-	originalContentType := req.Header.Get("Content-Type")
+	originalContentType := req.Header.Get(contentTypeHeader)
 	addressHeaders := make(http.Header)
 	for _, name := range []string{"X-Forwarded-For", "X-Real-IP"} {
 		for _, value := range req.Header.Values(name) {
@@ -130,7 +135,7 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	req.Header = make(http.Header)
 	req.Trailer = nil
 	req.TransferEncoding = nil
-	req.Header.Set("Content-Type", originalContentType)
+	req.Header.Set(contentTypeHeader, originalContentType)
 	for name, values := range addressHeaders {
 		req.Header[name] = values
 	}

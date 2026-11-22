@@ -14,6 +14,8 @@ import (
 
 const adminManagementPath = "/admin/api/v1/management"
 
+const auditStoreUnavailableMsg = "audit store unavailable"
+
 func (r *Reloader) serveAdminManagement(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -64,7 +66,7 @@ func (r *Reloader) adminForwardSettingsGrants(w http.ResponseWriter, req *http.R
 	ownerID := query.Get("owner_node_id")
 	tx, err := r.beginAdminAudit(req, "delegation.grants.list", ownerID, "", "")
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	owner, grants, err := r.forwardDelegatedSettingsGrants(req, state, ownerID)
@@ -91,7 +93,7 @@ func (r *Reloader) adminForwardSettingsSnapshot(w http.ResponseWriter, req *http
 	}
 	tx, err := r.beginAdminAudit(req, "settings.snapshot.read", input.TargetID, input.ModelID, "")
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	owner, snapshot, err := r.forwardDelegatedSettingsSnapshot(req, state, input.OwnerNodeID,
@@ -120,7 +122,7 @@ func (r *Reloader) adminForwardSettingsPreview(w http.ResponseWriter, req *http.
 	}
 	tx, err := r.beginAdminAudit(req, "settings.preview", input.TargetID, input.ModelID, "")
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	owner, preview, err := r.forwardDelegatedSettingsPreview(req, state, input.OwnerNodeID,
@@ -135,7 +137,7 @@ func (r *Reloader) adminForwardSettingsPreview(w http.ResponseWriter, req *http.
 	writeJSON(r.logger, w, http.StatusOK, map[string]any{"owner": owner, "preview": preview})
 }
 
-func (r *Reloader) adminForwardProposal(w http.ResponseWriter, req *http.Request, state *reloaderState, recover bool) {
+func (r *Reloader) adminForwardProposal(w http.ResponseWriter, req *http.Request, state *reloaderState, recoverProposal bool) {
 	data, err := readAdminManagementJSON(req)
 	if err != nil {
 		http.Error(w, "invalid delegated settings request", http.StatusBadRequest)
@@ -149,16 +151,16 @@ func (r *Reloader) adminForwardProposal(w http.ResponseWriter, req *http.Request
 		return
 	}
 	action := "settings.proposal.create"
-	if recover {
+	if recoverProposal {
 		action = "settings.proposal.recover"
 	}
 	tx, err := r.beginAdminAudit(req, action, input.TargetID, input.Model, "")
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	var proposal modelconfig.DelegatedProposal
-	if recover {
+	if recoverProposal {
 		proposal, err = r.forwardDelegatedSettingsProposalRecovery(req, state, input)
 	} else {
 		proposal, err = r.forwardDelegatedSettingsProposal(req, state, input)
@@ -194,7 +196,7 @@ func (r *Reloader) adminForwardApply(w http.ResponseWriter, req *http.Request, s
 	}
 	tx, err := r.beginAdminAudit(req, "settings.apply", input.Review.Proposal.TargetID, input.Review.Proposal.ModelID, input.OperationID)
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	record, err := r.forwardDelegatedSettingsApply(req, state, input.Review, input.OperationID,
@@ -217,7 +219,7 @@ func (r *Reloader) adminForwardOperation(w http.ResponseWriter, req *http.Reques
 	}
 	tx, err := r.beginAdminAudit(req, "settings.operation.read", query.Get("owner_node_id"), "", query.Get("operation_id"))
 	if err != nil {
-		http.Error(w, "audit store unavailable", http.StatusServiceUnavailable)
+		http.Error(w, auditStoreUnavailableMsg, http.StatusServiceUnavailable)
 		return
 	}
 	record, err := r.forwardDelegatedOperation(req, state, query.Get("owner_node_id"), query.Get("proposal_id"), query.Get("operation_id"))

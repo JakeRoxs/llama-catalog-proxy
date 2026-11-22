@@ -114,30 +114,11 @@ func TestConstructionMakesNoRequestsAndSkipsDisabledBackends(t *testing.T) {
 	}
 }
 
-func TestRefreshNormalizesRealSchemaAndResolvesModels(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/api/metrics/activity" {
-			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		if !strings.Contains(r.URL.RawQuery, "limit=") || !strings.Contains(r.URL.RawQuery, "page=1") {
-			t.Errorf("expected bounded limit+page query, got %q", r.URL.RawQuery)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, activityPageBody(t,
-			activityEntry(1, "known-model", 200),
-			activityEntry(2, "unknown-model", 200),
-		))
-	}))
-	defer server.Close()
-
-	c := newTestCollector(t, map[string]config.Backend{
-		"backend": {URL: server.URL, Diagnostics: "llama_swap"},
-	}, WithKnownModels("known-model"))
-
-	records, err := c.Refresh(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+// checkRefreshNormalizesRealSchemaAndResolvesModels verifies the records and
+// collector state produced by TestRefreshNormalizesRealSchemaAndResolvesModels.
+// Extracted to keep the test function's cognitive complexity below the S3776
+// threshold while preserving every assertion.
+func checkRefreshNormalizesRealSchemaAndResolvesModels(t *testing.T, records []*ActivityRecord, c *ActivityCollector) {
 	if len(records) != 2 {
 		t.Fatalf("expected 2 records, got %d", len(records))
 	}
@@ -173,6 +154,33 @@ func TestRefreshNormalizesRealSchemaAndResolvesModels(t *testing.T) {
 	if c.Epoch() != 1 {
 		t.Fatalf("epoch = %d, want 1", c.Epoch())
 	}
+}
+
+func TestRefreshNormalizesRealSchemaAndResolvesModels(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/metrics/activity" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if !strings.Contains(r.URL.RawQuery, "limit=") || !strings.Contains(r.URL.RawQuery, "page=1") {
+			t.Errorf("expected bounded limit+page query, got %q", r.URL.RawQuery)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, activityPageBody(t,
+			activityEntry(1, "known-model", 200),
+			activityEntry(2, "unknown-model", 200),
+		))
+	}))
+	defer server.Close()
+
+	c := newTestCollector(t, map[string]config.Backend{
+		"backend": {URL: server.URL, Diagnostics: "llama_swap"},
+	}, WithKnownModels("known-model"))
+
+	records, err := c.Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkRefreshNormalizesRealSchemaAndResolvesModels(t, records, c)
 }
 
 func TestRawFieldsAndSecretsNotCopied(t *testing.T) {
@@ -954,12 +962,12 @@ func TestOverlappingRefreshesReturnDefensiveCopies(t *testing.T) {
 }
 
 func TestRefreshBoundsConcurrentHTTPRequests(t *testing.T) {
-	var active, max atomic.Int32
+	var active, maxActive atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		n := active.Add(1)
 		defer active.Add(-1)
-		for old := max.Load(); n > old; old = max.Load() {
-			if max.CompareAndSwap(old, n) {
+		for old := maxActive.Load(); n > old; old = maxActive.Load() {
+			if maxActive.CompareAndSwap(old, n) {
 				break
 			}
 		}
@@ -976,8 +984,8 @@ func TestRefreshBoundsConcurrentHTTPRequests(t *testing.T) {
 	if _, err := c.Refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if max.Load() > 4 {
-		t.Fatalf("max concurrent HTTP = %d, want <= 4", max.Load())
+	if maxActive.Load() > 4 {
+		t.Fatalf("maxActive concurrent HTTP = %d, want <= 4", maxActive.Load())
 	}
 }
 
@@ -1339,11 +1347,26 @@ func TestRecordJSONIncludesMetricsOmitsNil(t *testing.T) {
 	}
 }
 
+// checkMalformedMetricsCase validates one normalizeActivity malformed-metrics case.
+// It asserts the record is non-nil, the validity flag matches expectValid, and
+// then runs the provided field checks. The nilMsg and okMsg preserve the exact
+// fatal messages from the original test.
+func checkMalformedMetricsCase(t *testing.T, c *ActivityCollector, entry activityLogEntry, expectValid bool, nilMsg, okMsg string, fieldChecks func(r *ActivityRecord)) {
+	r, ok := c.normalizeActivity("backend", entry)
+	if r == nil {
+		t.Fatal(nilMsg)
+	}
+	if ok != expectValid {
+		t.Fatal(okMsg)
+	}
+	fieldChecks(r)
+}
+
 func TestMalformedMetricsDirect(t *testing.T) {
 	c := newTestCollector(t, nil)
 
 	// Negative non-sentinel -> nil, malformed.
-	r, ok := c.normalizeActivity("backend", activityLogEntry{
+	checkMalformedMetricsCase(t, c, activityLogEntry{
 		ID:             1,
 		Timestamp:      activityFixtureTime,
 		Src:            "ip:127.0.0.1",
@@ -1364,25 +1387,23 @@ func TestMalformedMetricsDirect(t *testing.T) {
 			TokensPerSecond: 2.5,
 		},
 		DurationMs: activityDuration(-10),
-	})
-	if r == nil {
-		t.Fatal("expected valid record (entry not rejected for bad metrics)")
-	}
-	if ok {
-		t.Fatal("expected metricsValid=false for negative non-sentinel metrics")
-	}
-	if r.DurationMS != nil {
-		t.Fatal("DurationMS should be nil (negative non-sentinel)")
-	}
-	if r.InputTokens != nil {
-		t.Fatal("InputTokens should be nil (negative non-sentinel)")
-	}
-	if r.OutputTokens == nil || *r.OutputTokens != 5 {
-		t.Fatalf("OutputTokens = %#v, want pointer(5)", r.OutputTokens)
-	}
+	}, false,
+		"expected valid record (entry not rejected for bad metrics)",
+		"expected metricsValid=false for negative non-sentinel metrics",
+		func(r *ActivityRecord) {
+			if r.DurationMS != nil {
+				t.Fatal("DurationMS should be nil (negative non-sentinel)")
+			}
+			if r.InputTokens != nil {
+				t.Fatal("InputTokens should be nil (negative non-sentinel)")
+			}
+			if r.OutputTokens == nil || *r.OutputTokens != 5 {
+				t.Fatalf("OutputTokens = %#v, want pointer(5)", r.OutputTokens)
+			}
+		})
 
 	// NaN/Inf -> nil, malformed.
-	r, ok = c.normalizeActivity("backend", activityLogEntry{
+	checkMalformedMetricsCase(t, c, activityLogEntry{
 		ID:             1,
 		Timestamp:      activityFixtureTime,
 		Src:            "ip:127.0.0.1",
@@ -1403,22 +1424,20 @@ func TestMalformedMetricsDirect(t *testing.T) {
 			TokensPerSecond: math.Inf(1),
 		},
 		DurationMs: activityDuration(100),
-	})
-	if r == nil {
-		t.Fatal("expected valid record (entry not rejected for bad metrics)")
-	}
-	if ok {
-		t.Fatal("expected metricsValid=false for NaN/Inf metrics")
-	}
-	if r.PromptTokensPerSecond != nil {
-		t.Fatal("PromptTokensPerSecond should be nil (NaN)")
-	}
-	if r.TokensPerSecond != nil {
-		t.Fatal("TokensPerSecond should be nil (Inf)")
-	}
+	}, false,
+		"expected valid record (entry not rejected for bad metrics)",
+		"expected metricsValid=false for NaN/Inf metrics",
+		func(r *ActivityRecord) {
+			if r.PromptTokensPerSecond != nil {
+				t.Fatal("PromptTokensPerSecond should be nil (NaN)")
+			}
+			if r.TokensPerSecond != nil {
+				t.Fatal("TokensPerSecond should be nil (Inf)")
+			}
+		})
 
 	// Rate above bound -> nil, malformed.
-	r, ok = c.normalizeActivity("backend", activityLogEntry{
+	checkMalformedMetricsCase(t, c, activityLogEntry{
 		ID:             1,
 		Timestamp:      activityFixtureTime,
 		Src:            "ip:127.0.0.1",
@@ -1439,19 +1458,17 @@ func TestMalformedMetricsDirect(t *testing.T) {
 			TokensPerSecond: 2.5,
 		},
 		DurationMs: activityDuration(100),
-	})
-	if r == nil {
-		t.Fatal("expected valid record (entry not rejected for bad metrics)")
-	}
-	if ok {
-		t.Fatal("expected metricsValid=false for rate above bound")
-	}
-	if r.PromptTokensPerSecond != nil {
-		t.Fatal("PromptTokensPerSecond should be nil (rate above bound)")
-	}
+	}, false,
+		"expected valid record (entry not rejected for bad metrics)",
+		"expected metricsValid=false for rate above bound",
+		func(r *ActivityRecord) {
+			if r.PromptTokensPerSecond != nil {
+				t.Fatal("PromptTokensPerSecond should be nil (rate above bound)")
+			}
+		})
 
 	// MaxInt64 is valid (<= saneInt64Bound).
-	r, ok = c.normalizeActivity("backend", activityLogEntry{
+	checkMalformedMetricsCase(t, c, activityLogEntry{
 		ID:             1,
 		Timestamp:      activityFixtureTime,
 		Src:            "ip:127.0.0.1",
@@ -1472,22 +1489,20 @@ func TestMalformedMetricsDirect(t *testing.T) {
 			TokensPerSecond: 2.5,
 		},
 		DurationMs: activityDuration(math.MaxInt),
-	})
-	if r == nil {
-		t.Fatal("expected valid record with MaxInt64 values")
-	}
-	if !ok {
-		t.Fatal("expected metricsValid=true for MaxInt64 values")
-	}
-	if r.InputTokens == nil || *r.InputTokens != math.MaxInt64 {
-		t.Fatalf("InputTokens = %#v, want pointer(%d)", r.InputTokens, math.MaxInt64)
-	}
-	if r.DurationMS == nil || *r.DurationMS != math.MaxInt64 {
-		t.Fatalf("DurationMS = %#v, want pointer(%d)", r.DurationMS, math.MaxInt64)
-	}
+	}, true,
+		"expected valid record with MaxInt64 values",
+		"expected metricsValid=true for MaxInt64 values",
+		func(r *ActivityRecord) {
+			if r.InputTokens == nil || *r.InputTokens != math.MaxInt64 {
+				t.Fatalf("InputTokens = %#v, want pointer(%d)", r.InputTokens, math.MaxInt64)
+			}
+			if r.DurationMS == nil || *r.DurationMS != math.MaxInt64 {
+				t.Fatalf("DurationMS = %#v, want pointer(%d)", r.DurationMS, math.MaxInt64)
+			}
+		})
 
 	// Rate at bound (1e9) is valid.
-	r, ok = c.normalizeActivity("backend", activityLogEntry{
+	checkMalformedMetricsCase(t, c, activityLogEntry{
 		ID:             1,
 		Timestamp:      activityFixtureTime,
 		Src:            "ip:127.0.0.1",
@@ -1508,13 +1523,11 @@ func TestMalformedMetricsDirect(t *testing.T) {
 			TokensPerSecond: 1e9,
 		},
 		DurationMs: activityDuration(100),
-	})
-	if r == nil {
-		t.Fatal("expected valid record with rate at bound")
-	}
-	if !ok {
-		t.Fatal("expected metricsValid=true for rate at bound")
-	}
+	}, true,
+		"expected valid record with rate at bound",
+		"expected metricsValid=true for rate at bound",
+		func(r *ActivityRecord) {
+		})
 }
 
 func TestMalformedMetricsWithCoverage(t *testing.T) {

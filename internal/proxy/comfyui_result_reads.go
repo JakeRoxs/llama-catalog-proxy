@@ -18,6 +18,7 @@ import (
 const (
 	comfyUIHistoryPath      = "/comfyui/history"
 	comfyUIViewPath         = "/comfyui/view"
+	comfyUIJobsPath         = "/comfyui/api/jobs"
 	maxComfyUIResultQuery   = 4096
 	maxComfyUIResultValue   = 2048
 	maxComfyUIPromptIDBytes = 128
@@ -35,51 +36,64 @@ func newComfyUIResultReadProxy(cfg *config.ComfyUIResultReadConfig, logger *slog
 	}
 	backend := config.Backend{URL: cfg.URL, APIKey: cfg.APIKey, Headers: cfg.Headers}
 	return &httputil.ReverseProxy{
-		Rewrite: func(request *httputil.ProxyRequest) {
-			request.SetURL(target)
-			request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, comfyUIPathPrefix)
-			if request.Out.URL.Path == "" {
-				request.Out.URL.Path = "/"
-			}
-			request.Out.URL.RawPath = ""
-			if request.In.URL.RawPath != "" {
-				// Validated userdata paths may encode a nested filename as one
-				// route parameter. Preserve that encoding for ComfyUI's router.
-				request.Out.URL.RawPath = strings.TrimPrefix(request.In.URL.RawPath, comfyUIPathPrefix)
-			}
-			request.Out.Header = comfyUIResultRequestHeaders(request.In.Header)
-			request.SetXForwarded()
-			applyBackendHeaders(request.Out.Header, backend)
-			if isComfyUIImageUpload(request.In) {
-				request.Out.Header.Set("Content-Type", request.In.Header.Get("Content-Type"))
-			}
-			if comfyUIJSONSaveKind(request.In) != "" {
-				request.Out.Header.Set("Content-Type", "application/json")
-			}
-			if websocketUpgrade(request.In.Header) {
-				request.Out.Header.Set("Connection", "Upgrade")
-				request.Out.Header.Set("Upgrade", "websocket")
-				for _, name := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"} {
-					request.Out.Header.Del(name)
-					for _, value := range request.In.Header.Values(name) {
-						request.Out.Header.Add(name, value)
-					}
+		Rewrite:        comfyUIResultRewrite(target, backend),
+		ModifyResponse: comfyUIResultModifyResponse,
+		FlushInterval:  -1,
+		ErrorHandler:   proxyErrorHandler(logger, "comfyui-results"),
+	}, nil
+}
+
+// comfyUIResultRewrite builds the ReverseProxy rewrite closure that normalizes
+// the inbound ComfyUI path, applies the whitelisted and backend headers, and
+// forwards WebSocket upgrade headers. It preserves the encoded RawPath for
+// userdata filenames while rewriting the decoded path.
+func comfyUIResultRewrite(target *url.URL, backend config.Backend) func(request *httputil.ProxyRequest) {
+	return func(request *httputil.ProxyRequest) {
+		request.SetURL(target)
+		request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, comfyUIPathPrefix)
+		if request.Out.URL.Path == "" {
+			request.Out.URL.Path = "/"
+		}
+		request.Out.URL.RawPath = ""
+		if request.In.URL.RawPath != "" {
+			// Validated userdata paths may encode a nested filename as one
+			// route parameter. Preserve that encoding for ComfyUI's router.
+			request.Out.URL.RawPath = strings.TrimPrefix(request.In.URL.RawPath, comfyUIPathPrefix)
+		}
+		request.Out.Header = comfyUIResultRequestHeaders(request.In.Header)
+		request.SetXForwarded()
+		applyBackendHeaders(request.Out.Header, backend)
+		if isComfyUIImageUpload(request.In) {
+			request.Out.Header.Set(contentTypeHeader, request.In.Header.Get(contentTypeHeader))
+		}
+		if comfyUIJSONSaveKind(request.In) != "" {
+			request.Out.Header.Set(contentTypeHeader, "application/json")
+		}
+		if websocketUpgrade(request.In.Header) {
+			request.Out.Header.Set("Connection", "Upgrade")
+			request.Out.Header.Set("Upgrade", "websocket")
+			for _, name := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"} {
+				request.Out.Header.Del(name)
+				for _, value := range request.In.Header.Values(name) {
+					request.Out.Header.Add(name, value)
 				}
 			}
-			setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
-		},
-		ModifyResponse: func(response *http.Response) error {
-			if response.Request != nil {
-				setRequestIDHeader(response.Header, requestIDFromContext(response.Request.Context()))
-			}
-			for _, name := range []string{"Authorization", "Proxy-Authenticate", "Set-Cookie", "WWW-Authenticate"} {
-				response.Header.Del(name)
-			}
-			return nil
-		},
-		FlushInterval: -1,
-		ErrorHandler:  proxyErrorHandler(logger, "comfyui-results"),
-	}, nil
+		}
+		setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
+	}
+}
+
+// comfyUIResultModifyResponse records the request ID on the proxied response
+// and strips caller credentials (Authorization, Proxy-Authenticate,
+// Set-Cookie, WWW-Authenticate) so they never leak back to the client.
+func comfyUIResultModifyResponse(response *http.Response) error {
+	if response.Request != nil {
+		setRequestIDHeader(response.Header, requestIDFromContext(response.Request.Context()))
+	}
+	for _, name := range []string{"Authorization", "Proxy-Authenticate", "Set-Cookie", "WWW-Authenticate"} {
+		response.Header.Del(name)
+	}
+	return nil
 }
 
 func newComfyUIResultReadProbe(cfg *config.ComfyUIResultReadConfig) (func(context.Context) bool, error) {
@@ -129,11 +143,7 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 		h.serveComfyUIJSONSave(writer, request, info, kind)
 		return true
 	}
-	matched, status, message := validateComfyUIFrontendRequest(request)
-	frontend := matched
-	if !matched {
-		matched, status, message = validateComfyUIResultReadRequest(request, allowOwnerHash)
-	}
+	matched, status, message, frontend := classifyComfyUIResultRead(request, allowOwnerHash)
 	if !matched {
 		return false
 	}
@@ -144,20 +154,11 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 		writeJSONError(h.logger, writer, status, message)
 		return true
 	}
-	if frontend && isComfyUIFrontendRoot(request) {
-		// Use the persistent origin when it is already alive. Only fall back to
-		// llama-swap for the initial start of a stopped service.
-		if h.comfyUIResultReadProbe == nil || !h.comfyUIResultReadProbe(request.Context()) {
-			return false
-		}
+	if !comfyUIResultReadRootAllowed(h, request, frontend) {
+		return false
 	}
 	if request.URL.Path == "/comfyui" {
-		location := "/comfyui/"
-		if request.URL.RawQuery != "" {
-			location += "?" + request.URL.RawQuery
-		}
-		http.Redirect(writer, request, location, http.StatusTemporaryRedirect)
-		return true
+		return serveComfyUIResultRedirect(writer, request)
 	}
 	slots := h.comfyUIResultSlots
 	if frontend && h.comfyUIFrontendSlots != nil {
@@ -178,6 +179,45 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 	return true
 }
 
+// classifyComfyUIResultRead runs the frontend allowlist followed by the
+// result-read allowlist when the frontend does not match. It returns whether
+// the request is allowed, the error status/message (0 when none), and whether
+// the request originated from the ComfyUI frontend.
+func classifyComfyUIResultRead(request *http.Request, allowOwnerHash bool) (matched bool, status int, message string, frontend bool) {
+	matched, status, message = validateComfyUIFrontendRequest(request)
+	frontend = matched
+	if !matched {
+		matched, status, message = validateComfyUIResultReadRequest(request, allowOwnerHash)
+	}
+	return matched, status, message, frontend
+}
+
+// comfyUIResultReadRootAllowed reports whether a frontend root request may be
+// served directly from the persistent origin. It returns false only when the
+// probe is configured and the origin is not yet alive, causing the caller to
+// fall back to llama-swap.
+func comfyUIResultReadRootAllowed(h *Handler, request *http.Request, frontend bool) bool {
+	if frontend && isComfyUIFrontendRoot(request) {
+		// Use the persistent origin when it is already alive. Only fall back to
+		// llama-swap for the initial start of a stopped service.
+		if h.comfyUIResultReadProbe == nil || !h.comfyUIResultReadProbe(request.Context()) {
+			return false
+		}
+	}
+	return true
+}
+
+// serveComfyUIResultRedirect issues a temporary redirect from the bare
+// /comfyui path to the trailing-slash frontend root.
+func serveComfyUIResultRedirect(writer http.ResponseWriter, request *http.Request) bool {
+	location := "/comfyui/"
+	if request.URL.RawQuery != "" {
+		location += "?" + request.URL.RawQuery
+	}
+	http.Redirect(writer, request, location, http.StatusTemporaryRedirect)
+	return true
+}
+
 func validateComfyUIResultReadRequest(request *http.Request, allowOwnerHash bool) (bool, int, string) {
 	if request == nil || request.URL == nil {
 		return false, 0, ""
@@ -185,7 +225,7 @@ func validateComfyUIResultReadRequest(request *http.Request, allowOwnerHash bool
 	requestPath := request.URL.Path
 	// Normalize only verified core API aliases for classification. Preserve the
 	// original URL when forwarding to ComfyUI.
-	if strings.HasPrefix(requestPath, "/comfyui/api/") && !strings.HasPrefix(requestPath, "/comfyui/api/jobs") {
+	if strings.HasPrefix(requestPath, "/comfyui/api/") && !strings.HasPrefix(requestPath, comfyUIJobsPath) {
 		requestPath = "/comfyui/" + strings.TrimPrefix(requestPath, "/comfyui/api/")
 	}
 	kind := ""
@@ -195,7 +235,7 @@ func validateComfyUIResultReadRequest(request *http.Request, allowOwnerHash bool
 			return false, 0, ""
 		}
 		kind = "status"
-	case requestPath == "/comfyui/api/jobs" || strings.HasPrefix(requestPath, "/comfyui/api/jobs/"):
+	case requestPath == comfyUIJobsPath || strings.HasPrefix(requestPath, comfyUIJobsPath+"/"):
 		if request.Method != http.MethodGet {
 			return false, 0, ""
 		}
@@ -242,8 +282,8 @@ func validateComfyUIResultReadRequest(request *http.Request, allowOwnerHash bool
 		return true, 0, ""
 	}
 	if kind == "jobs" {
-		if requestPath != "/comfyui/api/jobs" {
-			if !validComfyUIPromptID(strings.TrimPrefix(requestPath, "/comfyui/api/jobs/")) || len(query) != 0 {
+		if requestPath != comfyUIJobsPath {
+			if !validComfyUIPromptID(strings.TrimPrefix(requestPath, comfyUIJobsPath+"/")) || len(query) != 0 {
 				return true, http.StatusBadRequest, "invalid ComfyUI job status path or query"
 			}
 			return true, 0, ""

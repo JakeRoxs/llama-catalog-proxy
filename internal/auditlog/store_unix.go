@@ -211,49 +211,53 @@ func (s *Store) appendEvent(event Event) error {
 		if err != nil || len(line)+1 > MaxEventBytes || totalBytes+int64(len(line)+1) > MaxBytes {
 			return ErrCapacity
 		}
-		name := auditFilename(event.At)
-		if info, err := s.root.Stat(name); err == nil {
-			if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size()+int64(len(line)+1) > MaxDayFileBytes {
-				return ErrCapacity
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return ErrUnavailable
-		}
-		file, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
-		if err != nil {
-			return ErrUnavailable
-		}
-		if err := file.Chmod(0o600); err != nil {
-			_ = file.Close()
-			s.failed = true
-			return ErrUnavailable
-		}
-		data := append(line, '\n')
-		written, writeErr := file.Write(data)
-		if writeErr == nil && written != len(data) {
-			writeErr = io.ErrShortWrite
-		}
-		if writeErr == nil {
-			writeErr = file.Sync()
-		}
-		closeErr := file.Close()
-		if writeErr != nil || closeErr != nil {
-			s.failed = true
-			return ErrUnavailable
-		}
-		directory, err := s.root.Open(".")
-		if err != nil {
-			s.failed = true
-			return ErrUnavailable
-		}
-		err = directory.Sync()
-		_ = directory.Close()
-		if err != nil {
-			s.failed = true
-			return ErrUnavailable
-		}
-		return nil
+		return s.appendEventToFile(event, line)
 	})
+}
+
+func (s *Store) appendEventToFile(event Event, line []byte) error {
+	name := auditFilename(event.At)
+	if info, err := s.root.Stat(name); err == nil {
+		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size()+int64(len(line)+1) > MaxDayFileBytes {
+			return ErrCapacity
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return ErrUnavailable
+	}
+	file, err := s.root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return ErrUnavailable
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		s.failed = true
+		return ErrUnavailable
+	}
+	data := append(line, '\n')
+	written, writeErr := file.Write(data)
+	if writeErr == nil && written != len(data) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil {
+		s.failed = true
+		return ErrUnavailable
+	}
+	directory, err := s.root.Open(".")
+	if err != nil {
+		s.failed = true
+		return ErrUnavailable
+	}
+	err = directory.Sync()
+	_ = directory.Close()
+	if err != nil {
+		s.failed = true
+		return ErrUnavailable
+	}
+	return nil
 }
 
 func (s *Store) scan(now time.Time, prune bool) ([]Event, int64, error) {

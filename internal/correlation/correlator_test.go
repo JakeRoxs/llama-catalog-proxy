@@ -51,6 +51,40 @@ func assertSizeConsistent(t *testing.T, c *Correlator) {
 	}
 }
 
+// runConcurrentReaders launches n goroutines that each query the correlator
+// and validate the returned records, sending any validation errors to the
+// returned channel. The channel is buffered with capacity n so readers never
+// block on sending. Callers must drain exactly n values from the channel.
+//
+// maxRecords is the per-reader expected result bound:
+//   - expectCount >= 0: each reader asserts len(result) == expectCount exactly
+//     (pre-registered, query-only workloads).
+//   - expectCount < 0: each reader asserts len(result) <= maxRecords (upper
+//     bound, appropriate when reads overlap with in-flight writes).
+func runConcurrentReaders(t *testing.T, c *Correlator, n, maxRecords, expectCount int) <-chan error {
+	t.Helper()
+	done := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			result := c.Query(QueryFilter{})
+			if expectCount >= 0 {
+				if len(result) != expectCount {
+					done <- errors.New("unexpected result count")
+				}
+			} else if len(result) > maxRecords {
+				done <- errors.New("unexpected result count")
+			}
+			for _, r := range result {
+				if r.RequestID == "" {
+					done <- errors.New("empty request ID")
+				}
+			}
+			done <- nil
+		}()
+	}
+	return done
+}
+
 func TestCorrelatorBasicRegistrationAndCorrelation(t *testing.T) {
 	c := newTestCorrelator(t)
 
@@ -410,20 +444,10 @@ func TestCorrelatorConcurrentQueries(t *testing.T) {
 		c.RegisterRequest("req-"+string(rune('1'+i)), "backend-A", "model-1", fixtureTime.Add(time.Duration(i)*time.Minute))
 	}
 
-	done := make(chan error, 10)
-	for i := 0; i < 10; i++ {
-		go func() {
-			result := c.Query(QueryFilter{})
-			if len(result) != 10 {
-				done <- &concurrentError{msg: "unexpected result count"}
-			}
-			done <- nil
-		}()
-	}
+	done := runConcurrentReaders(t, c, 10, 10, 10)
 
 	for i := 0; i < 10; i++ {
-		err := <-done
-		if err != nil {
+		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -451,21 +475,7 @@ func TestCorrelatorConcurrentWritesAndReads(t *testing.T) {
 	}
 
 	// Concurrent reads overlapping with writes.
-	done := make(chan error, 20)
-	for i := 0; i < 20; i++ {
-		go func() {
-			result := c.Query(QueryFilter{})
-			if len(result) < 0 || len(result) > 20 {
-				done <- errors.New("unexpected result count")
-			}
-			for _, r := range result {
-				if r.RequestID == "" {
-					done <- errors.New("empty request ID")
-				}
-			}
-			done <- nil
-		}()
-	}
+	done := runConcurrentReaders(t, c, 20, 20, -1)
 
 	// Wait for all writes to complete.
 	wg.Wait()
@@ -476,6 +486,7 @@ func TestCorrelatorConcurrentWritesAndReads(t *testing.T) {
 		t.Fatalf("expected 20 results after writes, got %d", len(result))
 	}
 
+	// Verify no concurrent reader reported errors.
 	for i := 0; i < 20; i++ {
 		if err := <-done; err != nil {
 			t.Fatal(err)
@@ -887,12 +898,4 @@ func TestCorrelatorSizeConsistency(t *testing.T) {
 	if c2.Stats()["record_count"] != 1 {
 		t.Fatalf("expected 1 record after count eviction, got %d", c2.Stats()["record_count"])
 	}
-}
-
-type concurrentError struct {
-	msg string
-}
-
-func (e *concurrentError) Error() string {
-	return e.msg
 }

@@ -21,6 +21,10 @@ var (
 
 const maxDownloadRedirects = 8
 
+// hfHost is the canonical Hugging Face Hub host used to construct resolve URLs
+// and to decide whether to forward credentials on redirects.
+const hfHost = "huggingface.co"
+
 // DownloadArtifact stages a single Hub resolve response. token is never included
 // in the result or returned errors. Duration bounds the whole operation.
 func DownloadArtifact(ctx context.Context, options StageOptions, duration time.Duration, token string) (StageResult, error) {
@@ -109,7 +113,7 @@ func (r *downloadReader) Read(buffer []byte) (int, error) {
 
 func (r *downloadReader) open() error {
 	current := &url.URL{
-		Scheme: "https", Host: "huggingface.co",
+		Scheme: "https", Host: hfHost,
 		Path: "/" + r.source.Repository + "/resolve/" + r.source.Revision + "/" + r.source.Filename,
 	}
 	sendToken := true
@@ -128,33 +132,59 @@ func (r *downloadReader) open() error {
 		}
 		switch response.StatusCode {
 		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-			next, locationErr := response.Location()
-			closeErr := response.Body.Close()
-			if closeErr != nil {
-				return ErrDownloadTransport
+			var nextURL *url.URL
+			var redirectErr error
+			nextURL, sendToken, redirectErr = redirectDecision(response, redirects, maxDownloadRedirects, sendToken, hfHost)
+			if redirectErr != nil {
+				return redirectErr
 			}
-			if locationErr != nil || redirects >= maxDownloadRedirects || !trustedDownloadURL(next) {
-				return ErrDownloadRedirect
-			}
-			if !strings.EqualFold(next.Hostname(), "huggingface.co") {
-				sendToken = false
-			}
-			current = next
+			current = nextURL
 		case http.StatusOK:
-			encoding := response.Header.Get("Content-Encoding")
-			if response.ContentLength <= 0 || response.Header.Get("Content-Range") != "" ||
-				(encoding != "" && !strings.EqualFold(encoding, "identity")) {
-				return closeDownloadResponse(response, ErrDownloadResponse)
+			body, expected, err := validateDownloadResponse(response, r.maxBytes)
+			if err != nil {
+				return err
 			}
-			if response.ContentLength > r.maxBytes {
-				return closeDownloadResponse(response, ErrStageTooLarge)
-			}
-			r.body, r.expected = response.Body, response.ContentLength
+			r.body, r.expected = body, expected
 			return nil
 		default:
 			return closeDownloadResponse(response, ErrDownloadResponse)
 		}
 	}
+}
+
+// redirectDecision evaluates a redirect response and decides whether to follow it.
+// It closes the response body. On success it returns the next URL and whether the
+// bearer token should be forwarded to the next request. A token is dropped once a
+// redirect leaves the Hugging Face host and is never re-added on later redirects.
+func redirectDecision(response *http.Response, redirects, maxRedirects int, sendToken bool, host string) (*url.URL, bool, error) {
+	next, locationErr := response.Location()
+	closeErr := response.Body.Close()
+	if closeErr != nil {
+		return nil, sendToken, ErrDownloadTransport
+	}
+	if locationErr != nil || redirects >= maxRedirects || !trustedDownloadURL(next) {
+		return nil, sendToken, ErrDownloadRedirect
+	}
+	if !strings.EqualFold(next.Hostname(), host) {
+		sendToken = false
+	}
+	return next, sendToken, nil
+}
+
+// validateDownloadResponse validates a successful response's metadata and returns
+// its body and expected length. On any validation failure the response body is
+// closed and the original error is joined with ErrDownloadTransport when the close
+// itself fails.
+func validateDownloadResponse(response *http.Response, maxBytes int64) (io.ReadCloser, int64, error) {
+	encoding := response.Header.Get("Content-Encoding")
+	if response.ContentLength <= 0 || response.Header.Get("Content-Range") != "" ||
+		(encoding != "" && !strings.EqualFold(encoding, "identity")) {
+		return nil, 0, closeDownloadResponse(response, ErrDownloadResponse)
+	}
+	if response.ContentLength > maxBytes {
+		return nil, 0, closeDownloadResponse(response, ErrStageTooLarge)
+	}
+	return response.Body, response.ContentLength, nil
 }
 
 func closeDownloadResponse(response *http.Response, err error) error {
@@ -174,7 +204,7 @@ func trustedDownloadURL(u *url.URL) bool {
 		return false
 	}
 	switch host {
-	case "huggingface.co", "cas-bridge.xethub.hf.co",
+	case hfHost, "cas-bridge.xethub.hf.co",
 		"cas-server.xethub.hf.co", "cas-server.xethub-eu.hf.co",
 		"transfer.xethub.hf.co", "transfer.xethub-eu.hf.co",
 		"us.aws.cdn.hf.co", "us.gcp.cdn.hf.co", "cdn-lfs-us-1.hf.co",

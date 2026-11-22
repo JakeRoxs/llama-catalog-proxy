@@ -130,51 +130,73 @@ func TestLifecycleCollectRealSchemaMapsStates(t *testing.T) {
 		byRef[report.Models[i].ModelRef] = &report.Models[i]
 	}
 	// Verify states are mapped strictly from the source finite enum.
-	ready := byRef[modelRef("backend", "ready-model")]
-	if ready == nil || ready.State != lifecycleStateReady {
-		t.Fatalf("ready model: %#v", ready)
+	ready := lifecycleModelByRef(t, byRef, "backend", "ready-model", lifecycleStateReady)
+	_ = lifecycleModelByRef(t, byRef, "backend", "starting-model", lifecycleStateStarting)
+	_ = lifecycleModelByRef(t, byRef, "backend", "stopping-model", lifecycleStateStopping)
+	// ReadySince is nil because /running does not expose a ready time; the
+	// remaining lifecycle/attribution fields are asserted on the ready model.
+	lifecycleModelFields(t, ready)
+	// Report-level attribution fields, bounds, coverage, truncation, counts.
+	lifecycleReportFields(t, report)
+	// Backend state is enabled with complete coverage.
+	lifecycleBackendStateFields(t, report.BackendStates["backend"], 3, "complete")
+}
+
+// lifecycleModelByRef looks up a model by its opaque reference and asserts it
+// is present with the state strictly mapped from the source finite enum.
+func lifecycleModelByRef(t *testing.T, byRef map[string]*LifecycleModel, backendID, modelID, wantState string) *LifecycleModel {
+	t.Helper()
+	m := byRef[modelRef(backendID, modelID)]
+	if m == nil || m.State != wantState {
+		t.Fatalf("%s model: %#v", modelID, m)
 	}
-	starting := byRef[modelRef("backend", "starting-model")]
-	if starting == nil || starting.State != lifecycleStateStarting {
-		t.Fatalf("starting model: %#v", starting)
-	}
-	stopping := byRef[modelRef("backend", "stopping-model")]
-	if stopping == nil || stopping.State != lifecycleStateStopping {
-		t.Fatalf("stopping model: %#v", stopping)
-	}
+	return m
+}
+
+// lifecycleModelFields asserts the model-level fields always serialized for a
+// /running observation: ReadySince nil, ObservedAt set to the fixture clock,
+// BackendID, Epoch, and the four attribution markers.
+func lifecycleModelFields(t *testing.T, m *LifecycleModel) {
+	t.Helper()
 	// ReadySince is nil because /running does not expose a ready time.
-	if ready.ReadySince != nil {
-		t.Fatalf("ReadySince should be nil when source does not expose it, got %v", ready.ReadySince)
+	if m.ReadySince != nil {
+		t.Fatalf("ReadySince should be nil when source does not expose it, got %v", m.ReadySince)
 	}
 	// ObservedAt is local collection time (set by the collector's clock,
 	// not a source timestamp). The mock clock returns the fixture time.
-	if ready.ObservedAt.IsZero() {
-		t.Fatalf("ObservedAt should be non-zero local collection time, got %v", ready.ObservedAt)
+	if m.ObservedAt.IsZero() {
+		t.Fatalf("ObservedAt should be non-zero local collection time, got %v", m.ObservedAt)
 	}
-	if !ready.ObservedAt.Equal(lifecycleFixtureTime) {
-		t.Fatalf("ObservedAt = %v, want fixture time %v", ready.ObservedAt, lifecycleFixtureTime)
+	if !m.ObservedAt.Equal(lifecycleFixtureTime) {
+		t.Fatalf("ObservedAt = %v, want fixture time %v", m.ObservedAt, lifecycleFixtureTime)
 	}
 	// BackendID is the configured ID.
-	if ready.BackendID != "backend" {
-		t.Fatalf("BackendID = %q, want %q", ready.BackendID, "backend")
+	if m.BackendID != "backend" {
+		t.Fatalf("BackendID = %q, want %q", m.BackendID, "backend")
 	}
 	// Epoch is the caller-supplied local epoch.
-	if ready.Epoch != 1 {
-		t.Fatalf("Epoch = %d, want 1", ready.Epoch)
+	if m.Epoch != 1 {
+		t.Fatalf("Epoch = %d, want 1", m.Epoch)
 	}
 	// Attribution fields are always serialized.
-	if ready.UpstreamGeneration != lifecycleUpstreamGenerationUnknown {
-		t.Fatalf("upstream_generation = %q", ready.UpstreamGeneration)
+	if m.UpstreamGeneration != lifecycleUpstreamGenerationUnknown {
+		t.Fatalf("upstream_generation = %q", m.UpstreamGeneration)
 	}
-	if ready.AliasResolution != lifecycleAliasResolutionUnsupported {
-		t.Fatalf("alias_resolution = %q", ready.AliasResolution)
+	if m.AliasResolution != lifecycleAliasResolutionUnsupported {
+		t.Fatalf("alias_resolution = %q", m.AliasResolution)
 	}
-	if ready.RequestIDMapping != lifecycleRequestIDMappingUnsupported {
-		t.Fatalf("request_id_mapping = %q", ready.RequestIDMapping)
+	if m.RequestIDMapping != lifecycleRequestIDMappingUnsupported {
+		t.Fatalf("request_id_mapping = %q", m.RequestIDMapping)
 	}
-	if ready.ModelExecutionAttribution != lifecycleModelExecutionAttributionUnverified {
-		t.Fatalf("model_execution_attribution = %q", ready.ModelExecutionAttribution)
+	if m.ModelExecutionAttribution != lifecycleModelExecutionAttributionUnverified {
+		t.Fatalf("model_execution_attribution = %q", m.ModelExecutionAttribution)
 	}
+}
+
+// lifecycleReportFields asserts the report-level attribution fields, bounds,
+// coverage, truncation, and total model count.
+func lifecycleReportFields(t *testing.T, report LifecycleReport) {
+	t.Helper()
 	// Report-level attribution fields.
 	if report.UpstreamGenerationUnknown != lifecycleUpstreamGenerationUnknown {
 		t.Fatalf("report upstream_generation = %q", report.UpstreamGenerationUnknown)
@@ -204,16 +226,19 @@ func TestLifecycleCollectRealSchemaMapsStates(t *testing.T) {
 	if report.TotalModels != 3 {
 		t.Fatalf("total_models = %d, want 3", report.TotalModels)
 	}
-	// Backend state is enabled with complete coverage.
-	st := report.BackendStates["backend"]
+}
+
+// lifecycleBackendStateFields asserts the backend state, coverage, and row count.
+func lifecycleBackendStateFields(t *testing.T, st LifecycleBackendState, wantRows int, wantCoverage string) {
+	t.Helper()
 	if st.State != lifecycleEnabledState {
 		t.Fatalf("backend state = %q, want enabled", st.State)
 	}
-	if st.Coverage != "complete" {
-		t.Fatalf("backend coverage = %q, want complete", st.Coverage)
+	if st.Coverage != wantCoverage {
+		t.Fatalf("backend coverage = %q, want %q", st.Coverage, wantCoverage)
 	}
-	if st.Rows != 3 {
-		t.Fatalf("backend rows = %d, want 3", st.Rows)
+	if st.Rows != wantRows {
+		t.Fatalf("backend rows = %d, want %d", st.Rows, wantRows)
 	}
 }
 

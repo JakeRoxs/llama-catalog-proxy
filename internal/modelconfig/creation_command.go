@@ -119,29 +119,26 @@ func quoteModelPath(model string) (string, error) {
 	return "'" + model + "'", nil
 }
 
+// creationEnvironment validates and normalizes device environment entries.
 func creationEnvironment(values []string) ([]string, error) {
+	return validDeviceList(values)
+}
+
+// validDeviceList validates up to four unique device environment entries and
+// returns them unchanged. Each entry must be a supported NAME=devices pair.
+func validDeviceList(values []string) ([]string, error) {
 	if len(values) > 4 {
 		return nil, errors.New("unsupported device environment")
 	}
 	seen := make(map[string]bool)
 	result := make([]string, 0, len(values))
 	for _, value := range values {
-		name, devices, ok := strings.Cut(value, "=")
-		if !ok || seen[name] || (name != "CUDA_VISIBLE_DEVICES" && name != "HIP_VISIBLE_DEVICES" &&
-			name != "ROCR_VISIBLE_DEVICES" && name != "GGML_CUDA_VISIBLE_DEVICES") || len(devices) > 256 {
+		name, _, err := validDeviceEnvironmentEntry(value)
+		if err != nil {
 			return nil, errors.New("unsupported device environment")
 		}
-		if devices != "-1" {
-			for _, device := range strings.Split(devices, ",") {
-				if device == "" {
-					return nil, errors.New("unsupported device environment")
-				}
-				for _, c := range device {
-					if c < '0' || c > '9' {
-						return nil, errors.New("unsupported device environment")
-					}
-				}
-			}
+		if seen[name] {
+			return nil, errors.New("unsupported device environment")
 		}
 		seen[name] = true
 		result = append(result, value)
@@ -149,33 +146,48 @@ func creationEnvironment(values []string) ([]string, error) {
 	return result, nil
 }
 
+// validDeviceEnvironmentEntry parses a single NAME=devices entry. It validates
+// the allowed device variable name, the device list length, and that each
+// device is a non-negative decimal identifier (or -1 for all devices).
+func validDeviceEnvironmentEntry(value string) (name, devices string, err error) {
+	name, devices, ok := strings.Cut(value, "=")
+	if !ok {
+		return "", "", errors.New("unsupported device environment")
+	}
+	switch name {
+	case "CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "GGML_CUDA_VISIBLE_DEVICES":
+	default:
+		return "", "", errors.New("unsupported device environment")
+	}
+	if len(devices) > 256 {
+		return "", "", errors.New("unsupported device environment")
+	}
+	if devices != "-1" {
+		for _, device := range strings.Split(devices, ",") {
+			if device == "" {
+				return "", "", errors.New("unsupported device environment")
+			}
+			for _, c := range device {
+				if c < '0' || c > '9' {
+					return "", "", errors.New("unsupported device environment")
+				}
+			}
+		}
+	}
+	return name, devices, nil
+}
+
+// creationTemplate orchestrates template command processing: it tokenizes the
+// command, parses the supported options, then rewrites the model token with the
+// requested model path.
 func creationTemplate(command, model string, env []string) (CreationCommandReview, error) {
 	tokens, err := tokenizeCommand(command)
 	if err != nil || path.Base(tokens[0].text) != "llama-server" {
 		return CreationCommandReview{}, errors.New("unsupported template command")
 	}
-	seen := make(map[string]bool)
-	var options []CreationOption
-	var modelToken commandToken
-	for i := 1; i < len(tokens); i++ {
-		option, ok := commandOptions[tokens[i].text]
-		if !ok || seen[option.name] {
-			return CreationCommandReview{}, errors.New("unsupported or duplicate template option")
-		}
-		seen[option.name] = true
-		if !option.hasValue {
-			options = append(options, CreationOption{Name: option.name, Value: "enabled"})
-			continue
-		}
-		i++
-		if i >= len(tokens) || !validCreationValue(option.name, tokens[i].text) {
-			return CreationCommandReview{}, errors.New("unsupported template option value")
-		}
-		if option.name == "model" {
-			modelToken = tokens[i]
-		} else {
-			options = append(options, CreationOption{Name: option.name, Value: tokens[i].text})
-		}
+	options, modelToken, seen, err := parseTemplateOptions(tokens)
+	if err != nil {
+		return CreationCommandReview{}, err
 	}
 	if !seen["model"] || !seen["port"] {
 		return CreationCommandReview{}, errors.New("template requires a model and dynamic port")
@@ -185,6 +197,36 @@ func creationTemplate(command, model string, env []string) (CreationCommandRevie
 		return CreationCommandReview{}, errors.New("command exceeds size limit")
 	}
 	return CreationCommandReview{Options: options, DeviceEnvironment: env, command: rewritten}, nil
+}
+
+// parseTemplateOptions walks the command tokens after the executable and
+// collects supported options. It rejects unknown or duplicate options and
+// invalid values, and locates the model token for replacement.
+func parseTemplateOptions(tokens []commandToken) ([]CreationOption, commandToken, map[string]bool, error) {
+	seen := make(map[string]bool)
+	var options []CreationOption
+	var modelToken commandToken
+	for i := 1; i < len(tokens); i++ {
+		option, ok := commandOptions[tokens[i].text]
+		if !ok || seen[option.name] {
+			return nil, commandToken{}, nil, errors.New("unsupported or duplicate template option")
+		}
+		seen[option.name] = true
+		if !option.hasValue {
+			options = append(options, CreationOption{Name: option.name, Value: "enabled"})
+			continue
+		}
+		i++
+		if i >= len(tokens) || !validCreationValue(option.name, tokens[i].text) {
+			return nil, commandToken{}, nil, errors.New("unsupported template option value")
+		}
+		if option.name == "model" {
+			modelToken = tokens[i]
+		} else {
+			options = append(options, CreationOption{Name: option.name, Value: tokens[i].text})
+		}
+	}
+	return options, modelToken, seen, nil
 }
 
 func validCreationValue(name, value string) bool {
