@@ -109,6 +109,22 @@ func (c *comfyUICoordinator) assumeInitialStopped() error {
 	return nil
 }
 
+// assumeLeaseStopped handles an already active lease whose ComfyUI service is
+// now unavailable before /free could be requested. It recovers competing model
+// admission only when the verifier proved no release operation was sent.
+func (c *comfyUICoordinator) assumeLeaseStopped(leaseID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if leaseID == "" || c.status.LeaseID != leaseID || c.status.State != "unknown" || c.verifying ||
+		c.status.Submissions != 0 || c.status.Competing != 0 {
+		return errComfyUIAdmissionBlocked
+	}
+	c.status.State = "released"
+	c.receipt = ComfyUIReleaseResult{State: "stopped"}
+	c.signalLocked()
+	return nil
+}
+
 func (c *comfyUICoordinator) beginLease() (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

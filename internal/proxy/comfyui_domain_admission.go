@@ -80,7 +80,11 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 		case "active", "draining", "releasing":
 			ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
 			defer cancel()
-			if _, err := coordinator.release(ctx, state.LeaseID); err != nil || ctx.Err() != nil {
+			_, releaseErr := coordinator.release(ctx, state.LeaseID)
+			if errors.Is(releaseErr, errComfyUIServiceUnavailable) {
+				releaseErr = coordinator.assumeLeaseStopped(state.LeaseID)
+			}
+			if releaseErr != nil || ctx.Err() != nil {
 				return nil, false
 			}
 		case "released":

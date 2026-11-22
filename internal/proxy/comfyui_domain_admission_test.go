@@ -156,6 +156,47 @@ func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {
 	}
 }
 
+func TestLlamaSwapModelStartRecoversWhenActiveComfyUIIsStopped(t *testing.T) {
+	var verifications, schedulerCalls atomic.Int32
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		if verifications.Add(1) == 1 {
+			return confirmedCoordinatorEvidence(), nil
+		}
+		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIServiceUnavailable
+	})
+	if _, err := c.reconcileInitial(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	leaseID, finishPrompt, err := c.admitPrompt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.activate(leaseID); err != nil {
+		t.Fatal(err)
+	}
+	finishPrompt()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		schedulerCalls.Add(1)
+		if state := c.snapshot(); state.State != "released" || state.Competing != 1 {
+			t.Errorf("model start reached scheduler without a stopped ComfyUI handoff: %+v", state)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+	h := newHandler(t, baseConfig(backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/GLM-4.7-Flash-30B-A3B/", nil))
+	if w.Code != http.StatusAccepted || schedulerCalls.Load() != 1 || verifications.Load() != 2 || c.snapshot().State != "released" {
+		t.Fatalf("model start recovery: status=%d scheduler=%d verifications=%d state=%+v", w.Code, schedulerCalls.Load(), verifications.Load(), c.snapshot())
+	}
+}
+
 func TestComfyUIRootBootstrapsThroughSchedulerWhenPersistentServiceIsStopped(t *testing.T) {
 	var schedulerCalls atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
