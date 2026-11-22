@@ -113,6 +113,7 @@ type Handler struct {
 	backendEndpoints           map[string]string
 	comfyUIJobs                *comfyUIJobTracker
 	comfyUIResultReadProxy     *httputil.ReverseProxy
+	comfyUIResultReadProbe     func(context.Context) bool
 	comfyUIResultSlots         chan struct{}
 	comfyUIWebSocketSlots      chan struct{}
 	comfyUIFrontendSlots       chan struct{}
@@ -164,6 +165,7 @@ type handlerDependencies struct {
 	backendEndpoints       map[string]string
 	comfyUIJobs            *comfyUIJobTracker
 	comfyUIResultReadProxy *httputil.ReverseProxy
+	comfyUIResultReadProbe func(context.Context) bool
 	backendAdmission       func(*http.Request, string) (func(), bool)
 }
 
@@ -196,8 +198,13 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 	pathRoutes := buildPathRoutes(cfg.PathRoutes)
 	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
 	var resultReadProxy *httputil.ReverseProxy
+	var resultReadProbe func(context.Context) bool
 	if cfg.Peer != nil && cfg.Peer.ComfyUIResultRead != nil {
 		resultReadProxy, err = newComfyUIResultReadProxy(cfg.Peer.ComfyUIResultRead, logger)
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+		resultReadProbe, err = newComfyUIResultReadProbe(cfg.Peer.ComfyUIResultRead)
 		if err != nil {
 			return handlerDependencies{}, err
 		}
@@ -233,7 +240,8 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 	return handlerDependencies{
 		catalog: catalogService, proxies: proxies, modelRoutes: routes, pathRoutes: pathRoutes,
 		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs, comfyUIResultReadProxy: resultReadProxy,
-		backendAdmission: backendAdmission,
+		comfyUIResultReadProbe: resultReadProbe,
+		backendAdmission:       backendAdmission,
 	}, nil
 }
 
@@ -365,6 +373,7 @@ func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagno
 		backendEndpoints:       dependencies.backendEndpoints,
 		comfyUIJobs:            dependencies.comfyUIJobs,
 		comfyUIResultReadProxy: dependencies.comfyUIResultReadProxy,
+		comfyUIResultReadProbe: dependencies.comfyUIResultReadProbe,
 		maxJSONBody:            cfg.MaxJSONBody,
 		diagnostics:            diagnostics,
 		modelDiagnostics:       modelDiagnostics,

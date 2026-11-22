@@ -1303,7 +1303,9 @@ aliases (for example `/comfyui/api/queue` and `/comfyui/api/history`) are suppor
 were verified against installed ComfyUI source; there is no core `/health` handler in that snapshot.
 System stats indicate server responsiveness and device metrics, not GPU-lease readiness.
 
-The same target serves the UI root (`/comfyui/`, with a redirect from `/comfyui`), `index.html`,
+The same target serves the UI root (`/comfyui/`, with a redirect from `/comfyui`) and `index.html`
+directly when the persistent origin responds to a lightweight queue probe. If the origin is stopped or
+unavailable, the root falls back through the scheduler to start the service. The target also serves
 `favicon.ico`, `user.css`, `materialdesignicons.min.css`, and supported static file types under
 `assets/`, `scripts/`, `extensions/`, `locales/`, `fonts/`, and `templates/` directly. Named GET metadata
 routes (`features`, `extensions`, `embeddings`, `models`, `models/<folder>`, `object_info`,
@@ -1387,8 +1389,9 @@ the request or release operation.
 
 The coordinator applies to requests under the `/comfyui` scheduler path and recognized llama-swap
 model-dispatch routes, including model inference endpoints, model-specific GET endpoints such as
-`GET /props`, and `/upstream/{model}/...`. ComfyUI prompts and its scheduler-routed UI root acquire or
-reuse the ComfyUI lease; recognized model-dispatch requests release it before forwarding. Other
+`GET /props`, and `/upstream/{model}/...`. ComfyUI scheduler-path requests acquire or reuse the lease;
+the UI root is served directly without a model-state transition when its persistent origin is already
+available. Recognized model-dispatch requests release the lease before forwarding. Other
 traffic, including the llama-swap UI/static files, read-only status APIs, and management/control
 endpoints, passes through without lease transitions. Keep the classifier aligned with the deployed
 llama-swap model route table: newly added or custom model-loading routes are not automatically gated.

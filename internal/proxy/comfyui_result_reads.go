@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
@@ -20,6 +22,8 @@ const (
 	maxComfyUIResultValue   = 2048
 	maxComfyUIPromptIDBytes = 128
 )
+
+const comfyUIRootProbeTimeout = 2 * time.Second
 
 func newComfyUIResultReadProxy(cfg *config.ComfyUIResultReadConfig, logger *slog.Logger) (*httputil.ReverseProxy, error) {
 	if cfg == nil {
@@ -78,6 +82,41 @@ func newComfyUIResultReadProxy(cfg *config.ComfyUIResultReadConfig, logger *slog
 	}, nil
 }
 
+func newComfyUIResultReadProbe(cfg *config.ComfyUIResultReadConfig) (func(context.Context) bool, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	target, err := url.Parse(cfg.URL)
+	if err != nil {
+		return nil, fmt.Errorf("parse ComfyUI result-read probe target: %w", err)
+	}
+	queueURL := endpointURL(target, "/queue")
+	backend := config.Backend{URL: cfg.URL, APIKey: cfg.APIKey, Headers: cfg.Headers}
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+		Timeout:   comfyUIRootProbeTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return func(parent context.Context) bool {
+		ctx, cancel := context.WithTimeout(parent, comfyUIRootProbeTimeout)
+		defer cancel()
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, queueURL.String(), nil)
+		if err != nil {
+			return false
+		}
+		request.Header.Set("Accept", "application/json")
+		applyBackendHeaders(request.Header, backend)
+		response, err := client.Do(request)
+		if err != nil {
+			return false
+		}
+		_ = response.Body.Close()
+		return true
+	}, nil
+}
+
 func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *http.Request, info *routeInfo, allowOwnerHash bool) bool {
 	if h.comfyUIResultReadProxy == nil {
 		return false
@@ -106,9 +145,11 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 		return true
 	}
 	if frontend && isComfyUIFrontendRoot(request) {
-		// Bootstrap the persistent service through llama-swap. Once started, the
-		// rest of the allowlisted frontend and result reads use the direct target.
-		return false
+		// Use the persistent origin when it is already alive. Only fall back to
+		// llama-swap for the initial start of a stopped service.
+		if h.comfyUIResultReadProbe == nil || !h.comfyUIResultReadProbe(request.Context()) {
+			return false
+		}
 	}
 	if request.URL.Path == "/comfyui" {
 		location := "/comfyui/"

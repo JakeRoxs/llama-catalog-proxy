@@ -199,8 +199,8 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 			t.Fatal(err)
 		}
 		_ = root.Body.Close()
-		if root.StatusCode != http.StatusAccepted || schedulerCalls.Load() != beforeRoot+1 {
-			t.Fatalf("peer=%v UI root did not start through scheduler: status=%d calls=%d", viaPeer, root.StatusCode, schedulerCalls.Load())
+		if root.StatusCode != http.StatusOK || schedulerCalls.Load() != beforeRoot {
+			t.Fatalf("peer=%v running UI root should use persistent origin: status=%d calls=%d", viaPeer, root.StatusCode, schedulerCalls.Load())
 		}
 		noRedirectClient := *server.Client()
 		noRedirectClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -246,12 +246,12 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 		}
 		server.Close()
 	}
-	if schedulerCalls.Load() != 2 {
-		t.Fatalf("UI root triggered %d scheduler requests; want one per route", schedulerCalls.Load())
+	if schedulerCalls.Load() != 0 {
+		t.Fatalf("running UI requests unexpectedly hit scheduler: calls=%d", schedulerCalls.Load())
 	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", strings.NewReader(`{}`)))
-	if response.Code != http.StatusAccepted || schedulerCalls.Load() != 3 {
+	if response.Code != http.StatusAccepted || schedulerCalls.Load() != 1 {
 		t.Fatal("generation no longer uses scheduler")
 	}
 }
@@ -263,6 +263,10 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 		"/api/history/job-1": `{"job-1":{}}`, "/view?filename=output.png": "image fixture",
 	}
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/queue" {
+			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
+			return
+		}
 		if body, ok := responses[r.URL.RequestURI()]; ok && r.Method == http.MethodGet {
 			_, _ = io.WriteString(w, body)
 			return
@@ -308,8 +312,8 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 	if pageURL.Path != "/comfyui/" || body != page {
 		t.Fatalf("unexpected page or redirect: %s %q", pageURL.Path, body)
 	}
-	if schedulerCalls.Load() != 1 {
-		t.Fatalf("initial UI page did not go through scheduler: %d", schedulerCalls.Load())
+	if schedulerCalls.Load() != 0 {
+		t.Fatalf("running ComfyUI UI root unnecessarily loaded through scheduler: %d", schedulerCalls.Load())
 	}
 	for _, target := range []string{"assets/app.js", "api/history/job-1", "view?filename=output.png"} {
 		ref, err := url.Parse(target)
@@ -329,15 +333,15 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 	for _, target := range []string{"/comfyui/assets/app.js", "/comfyui/api/history/job-1", "/comfyui/view?filename=output.png"} {
 		get(proxyServer.URL+target, http.StatusBadGateway)
 	}
-	if schedulerCalls.Load() != 2 {
-		t.Fatalf("expected only UI root startup requests through scheduler: %d", schedulerCalls.Load())
+	if schedulerCalls.Load() != 1 {
+		t.Fatalf("unavailable ComfyUI root did not fall back exactly once: %d", schedulerCalls.Load())
 	}
 	res, err := client.Post(proxyServer.URL+"/comfyui/api/prompt", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusAccepted || schedulerCalls.Load() != 3 {
+	if res.StatusCode != http.StatusAccepted || schedulerCalls.Load() != 2 {
 		t.Fatalf("generation status=%d scheduler calls=%d", res.StatusCode, schedulerCalls.Load())
 	}
 }
