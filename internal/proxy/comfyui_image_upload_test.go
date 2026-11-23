@@ -80,6 +80,10 @@ func TestComfyUIImageUploadMultipartValidation(t *testing.T) {
 func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 	var uploadCalls, schedulerCalls atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Method == http.MethodGet && req.URL.Path == "/queue" {
+			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
+			return
+		}
 		uploadCalls.Add(1)
 		if req.Method != http.MethodPost || (req.URL.Path != "/upload/image" && req.URL.Path != "/api/upload/image") {
 			t.Errorf("unexpected upload request %s %s", req.Method, req.URL.Path)

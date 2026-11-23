@@ -114,7 +114,9 @@ type Handler struct {
 	backendEndpoints           map[string]string
 	comfyUIJobs                *comfyUIJobTracker
 	comfyUIResultReadProxy     *httputil.ReverseProxy
-	comfyUIResultReadProbe     func(context.Context) bool
+	comfyUIResultReadProbe     func(context.Context) error
+	comfyUIStartMu             sync.Mutex
+	comfyUIStart               *comfyUIStartAttempt
 	comfyUIResultSlots         chan struct{}
 	comfyUIWebSocketSlots      chan struct{}
 	comfyUIFrontendSlots       chan struct{}
@@ -166,7 +168,7 @@ type handlerDependencies struct {
 	backendEndpoints       map[string]string
 	comfyUIJobs            *comfyUIJobTracker
 	comfyUIResultReadProxy *httputil.ReverseProxy
-	comfyUIResultReadProbe func(context.Context) bool
+	comfyUIResultReadProbe func(context.Context) error
 	backendAdmission       func(*http.Request, string) (func(), bool)
 }
 
@@ -199,7 +201,7 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 	pathRoutes := buildPathRoutes(cfg.PathRoutes)
 	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
 	var resultReadProxy *httputil.ReverseProxy
-	var resultReadProbe func(context.Context) bool
+	var resultReadProbe func(context.Context) error
 	if cfg.Peer != nil && cfg.Peer.ComfyUIResultRead != nil {
 		resultReadProxy, err = newComfyUIResultReadProxy(cfg.Peer.ComfyUIResultRead, logger)
 		if err != nil {

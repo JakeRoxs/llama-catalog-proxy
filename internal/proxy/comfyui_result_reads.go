@@ -50,36 +50,49 @@ func newComfyUIResultReadProxy(cfg *config.ComfyUIResultReadConfig, logger *slog
 func comfyUIResultRewrite(target *url.URL, backend config.Backend) func(request *httputil.ProxyRequest) {
 	return func(request *httputil.ProxyRequest) {
 		request.SetURL(target)
-		request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, comfyUIPathPrefix)
-		if request.Out.URL.Path == "" {
-			request.Out.URL.Path = "/"
-		}
-		request.Out.URL.RawPath = ""
-		if request.In.URL.RawPath != "" {
-			// Validated userdata paths may encode a nested filename as one
-			// route parameter. Preserve that encoding for ComfyUI's router.
-			request.Out.URL.RawPath = strings.TrimPrefix(request.In.URL.RawPath, comfyUIPathPrefix)
-		}
+		rewriteComfyUIResultPath(request)
 		request.Out.Header = comfyUIResultRequestHeaders(request.In.Header)
 		request.SetXForwarded()
 		applyBackendHeaders(request.Out.Header, backend)
-		if isComfyUIImageUpload(request.In) {
-			request.Out.Header.Set(contentTypeHeader, request.In.Header.Get(contentTypeHeader))
-		}
-		if comfyUIJSONSaveKind(request.In) != "" {
-			request.Out.Header.Set(contentTypeHeader, "application/json")
-		}
-		if websocketUpgrade(request.In.Header) {
-			request.Out.Header.Set("Connection", "Upgrade")
-			request.Out.Header.Set("Upgrade", "websocket")
-			for _, name := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"} {
-				request.Out.Header.Del(name)
-				for _, value := range request.In.Header.Values(name) {
-					request.Out.Header.Add(name, value)
-				}
-			}
-		}
+		applyComfyUIResultSpecialHeaders(request)
 		setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
+	}
+}
+
+func rewriteComfyUIResultPath(request *httputil.ProxyRequest) {
+	request.Out.URL.Path = strings.TrimPrefix(request.In.URL.Path, comfyUIPathPrefix)
+	if request.Out.URL.Path == "" {
+		request.Out.URL.Path = "/"
+	}
+	request.Out.URL.RawPath = ""
+	if request.In.URL.RawPath != "" {
+		// Validated userdata paths may encode a nested filename as one
+		// route parameter. Preserve that encoding for ComfyUI's router.
+		request.Out.URL.RawPath = strings.TrimPrefix(request.In.URL.RawPath, comfyUIPathPrefix)
+	}
+}
+
+func applyComfyUIResultSpecialHeaders(request *httputil.ProxyRequest) {
+	headers := request.Out.Header
+	if isComfyUIImageUpload(request.In) {
+		headers.Set(contentTypeHeader, request.In.Header.Get(contentTypeHeader))
+	}
+	if comfyUIJSONSaveKind(request.In) != "" {
+		headers.Set(contentTypeHeader, "application/json")
+	}
+	if websocketUpgrade(request.In.Header) {
+		copyComfyUIWebSocketHeaders(headers, request.In.Header)
+	}
+}
+
+func copyComfyUIWebSocketHeaders(target, source http.Header) {
+	target.Set("Connection", "Upgrade")
+	target.Set("Upgrade", "websocket")
+	for _, name := range []string{"Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol", "Sec-WebSocket-Extensions"} {
+		target.Del(name)
+		for _, value := range source.Values(name) {
+			target.Add(name, value)
+		}
 	}
 }
 
@@ -96,7 +109,7 @@ func comfyUIResultModifyResponse(response *http.Response) error {
 	return nil
 }
 
-func newComfyUIResultReadProbe(cfg *config.ComfyUIResultReadConfig) (func(context.Context) bool, error) {
+func newComfyUIResultReadProbe(cfg *config.ComfyUIResultReadConfig) (func(context.Context) error, error) {
 	if cfg == nil {
 		return nil, nil
 	}
@@ -113,21 +126,21 @@ func newComfyUIResultReadProbe(cfg *config.ComfyUIResultReadConfig) (func(contex
 			return http.ErrUseLastResponse
 		},
 	}
-	return func(parent context.Context) bool {
+	return func(parent context.Context) error {
 		ctx, cancel := context.WithTimeout(parent, comfyUIRootProbeTimeout)
 		defer cancel()
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, queueURL.String(), nil)
 		if err != nil {
-			return false
+			return err
 		}
 		request.Header.Set("Accept", "application/json")
 		applyBackendHeaders(request.Header, backend)
 		response, err := client.Do(request)
 		if err != nil {
-			return false
+			return err
 		}
 		_ = response.Body.Close()
-		return true
+		return nil
 	}, nil
 }
 
@@ -135,6 +148,49 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 	if h.comfyUIResultReadProxy == nil {
 		return false
 	}
+	if h.serveComfyUIResultReadEarly(writer, request, info, allowOwnerHash) {
+		return true
+	}
+	matched, _, _, frontend := classifyComfyUIResultRead(request, allowOwnerHash)
+	if !matched {
+		return false
+	}
+	return h.serveMatchedComfyUIResultRead(writer, request, info, frontend)
+}
+
+func (h *Handler) serveMatchedComfyUIResultRead(writer http.ResponseWriter, request *http.Request, info *routeInfo, frontend bool) bool {
+	if !comfyUIResultReadRootAllowed(h, request, frontend) {
+		return false
+	}
+	if request.URL.Path == "/comfyui" {
+		return serveComfyUIResultRedirect(writer, request)
+	}
+	slots := comfyUIResultSlots(h, request, frontend)
+	release, ok := acquireComfyUIResultSlot(h, writer, slots)
+	if !ok {
+		return true
+	}
+	defer release()
+	*info = routeInfo{backendID: "comfyui-results", kind: routeInfoKindPath}
+	if frontend && isComfyUIObjectInfo(request.URL.Path) && !h.ensureComfyUIStarted(writer, request) {
+		return true
+	}
+	h.comfyUIResultReadProxy.ServeHTTP(writer, request)
+	return true
+}
+
+func comfyUIResultSlots(h *Handler, request *http.Request, frontend bool) chan struct{} {
+	if websocketUpgrade(request.Header) {
+		return h.comfyUIWebSocketSlots
+	}
+	if frontend && h.comfyUIFrontendSlots != nil {
+		return h.comfyUIFrontendSlots
+	}
+	return h.comfyUIResultSlots
+}
+
+// serveComfyUIResultReadEarly handles cases that do not proceed to proxying.
+func (h *Handler) serveComfyUIResultReadEarly(writer http.ResponseWriter, request *http.Request, info *routeInfo, allowOwnerHash bool) bool {
 	if h.comfyUIImageUploadMaxBytes > 0 && isComfyUIImageUpload(request) {
 		h.serveComfyUIImageUpload(writer, request, info)
 		return true
@@ -143,40 +199,32 @@ func (h *Handler) serveComfyUIResultRead(writer http.ResponseWriter, request *ht
 		h.serveComfyUIJSONSave(writer, request, info, kind)
 		return true
 	}
-	matched, status, message, frontend := classifyComfyUIResultRead(request, allowOwnerHash)
+	matched, status, message, _ := classifyComfyUIResultRead(request, allowOwnerHash)
 	if !matched {
 		return false
 	}
 	if status != 0 {
-		if status == http.StatusMethodNotAllowed {
-			writer.Header().Set("Allow", "GET")
-		}
-		writeJSONError(h.logger, writer, status, message)
+		writeComfyUIResultReadError(h, writer, status, message)
 		return true
 	}
-	if !comfyUIResultReadRootAllowed(h, request, frontend) {
-		return false
+	return false
+}
+
+func writeComfyUIResultReadError(h *Handler, writer http.ResponseWriter, status int, message string) {
+	if status == http.StatusMethodNotAllowed {
+		writer.Header().Set("Allow", "GET")
 	}
-	if request.URL.Path == "/comfyui" {
-		return serveComfyUIResultRedirect(writer, request)
-	}
-	slots := h.comfyUIResultSlots
-	if frontend && h.comfyUIFrontendSlots != nil {
-		slots = h.comfyUIFrontendSlots
-	}
-	if websocketUpgrade(request.Header) {
-		slots = h.comfyUIWebSocketSlots
-	}
+	writeJSONError(h.logger, writer, status, message)
+}
+
+func acquireComfyUIResultSlot(h *Handler, writer http.ResponseWriter, slots chan struct{}) (func(), bool) {
 	select {
 	case slots <- struct{}{}:
-		defer func() { <-slots }()
+		return func() { <-slots }, true
 	default:
 		writeJSONError(h.logger, writer, http.StatusServiceUnavailable, "ComfyUI result service busy")
-		return true
+		return nil, false
 	}
-	*info = routeInfo{backendID: "comfyui-results", kind: routeInfoKindPath}
-	h.comfyUIResultReadProxy.ServeHTTP(writer, request)
-	return true
 }
 
 // classifyComfyUIResultRead runs the frontend allowlist followed by the
@@ -200,7 +248,7 @@ func comfyUIResultReadRootAllowed(h *Handler, request *http.Request, frontend bo
 	if frontend && isComfyUIFrontendRoot(request) {
 		// Use the persistent origin when it is already alive. Only fall back to
 		// llama-swap for the initial start of a stopped service.
-		if h.comfyUIResultReadProbe == nil || !h.comfyUIResultReadProbe(request.Context()) {
+		if h.comfyUIResultReadProbe == nil || h.comfyUIResultReadProbe(request.Context()) != nil {
 			return false
 		}
 	}
@@ -222,163 +270,251 @@ func validateComfyUIResultReadRequest(request *http.Request, allowOwnerHash bool
 	if request == nil || request.URL == nil {
 		return false, 0, ""
 	}
-	requestPath := request.URL.Path
+	requestPath, kind, ok := classifyComfyUIResultPath(request.URL.Path)
+	if !ok {
+		return false, 0, ""
+	}
+	if request.Method != http.MethodGet && (kind == "status" || kind == "jobs") {
+		return false, 0, ""
+	}
+	if status, message := validateComfyUIResultReadMetadata(request, requestPath, kind); status != 0 {
+		return comfyUIResultReadError(status, message)
+	}
+	if len(request.URL.RawQuery) > maxComfyUIResultQuery {
+		return comfyUIResultReadError(http.StatusBadRequest, "ComfyUI result query is too long")
+	}
+	query, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil {
+		return comfyUIResultReadError(http.StatusBadRequest, "invalid ComfyUI result query")
+	}
+	return validateComfyUIResultQuery(requestPath, kind, query, request.URL.ForceQuery, allowOwnerHash)
+}
+
+func validateComfyUIResultReadMetadata(request *http.Request, requestPath, kind string) (int, string) {
+	if request.Method != http.MethodGet {
+		return http.StatusMethodNotAllowed, "ComfyUI result reads allow only GET"
+	}
+	if request.Body != nil && request.Body != http.NoBody || request.ContentLength > 0 || len(request.TransferEncoding) != 0 {
+		return http.StatusBadRequest, "ComfyUI result reads do not accept request bodies"
+	}
+	if request.URL.RawPath != "" && !validComfyUIResultPathEncoding(request.URL.RawPath) {
+		return http.StatusBadRequest, "invalid ComfyUI result path encoding"
+	}
+	if path.Clean(request.URL.Path) != request.URL.Path || strings.ContainsAny(requestPath, "\\?#\x00") {
+		return http.StatusBadRequest, "invalid ComfyUI result path"
+	}
+	return validateComfyUIResultPathItem(requestPath, kind)
+}
+
+func classifyComfyUIResultPath(requestPath string) (string, string, bool) {
 	// Normalize only verified core API aliases for classification. Preserve the
 	// original URL when forwarding to ComfyUI.
 	if strings.HasPrefix(requestPath, "/comfyui/api/") && !strings.HasPrefix(requestPath, comfyUIJobsPath) {
 		requestPath = "/comfyui/" + strings.TrimPrefix(requestPath, "/comfyui/api/")
 	}
-	kind := ""
 	switch {
 	case requestPath == "/comfyui/prompt" || requestPath == "/comfyui/queue" || requestPath == "/comfyui/system_stats":
-		if request.Method != http.MethodGet {
-			return false, 0, ""
-		}
-		kind = "status"
+		return requestPath, "status", true
 	case requestPath == comfyUIJobsPath || strings.HasPrefix(requestPath, comfyUIJobsPath+"/"):
-		if request.Method != http.MethodGet {
-			return false, 0, ""
-		}
-		kind = "jobs"
+		return requestPath, "jobs", true
 	case requestPath == comfyUIHistoryPath || strings.HasPrefix(requestPath, comfyUIHistoryPath+"/"):
-		kind = "history"
+		return requestPath, "history", true
 	case requestPath == comfyUIViewPath || strings.HasPrefix(requestPath, comfyUIViewPath+"/"):
-		kind = "view"
+		return requestPath, "view", true
 	default:
-		return false, 0, ""
+		return requestPath, "", false
 	}
-	if request.Method != http.MethodGet {
-		return true, http.StatusMethodNotAllowed, "ComfyUI result reads allow only GET"
-	}
-	if request.Body != nil && request.Body != http.NoBody || request.ContentLength > 0 || len(request.TransferEncoding) != 0 {
-		return true, http.StatusBadRequest, "ComfyUI result reads do not accept request bodies"
-	}
-	if request.URL.RawPath != "" && !validComfyUIResultPathEncoding(request.URL.RawPath) {
-		return true, http.StatusBadRequest, "invalid ComfyUI result path encoding"
-	}
-	if path.Clean(request.URL.Path) != request.URL.Path || strings.ContainsAny(requestPath, "\\?#\x00") {
-		return true, http.StatusBadRequest, "invalid ComfyUI result path"
-	}
+}
+
+func comfyUIResultReadError(status int, message string) (bool, int, string) {
+	return true, status, message
+}
+
+func validateComfyUIResultPathItem(requestPath, kind string) (int, string) {
 	if kind == "history" && requestPath != comfyUIHistoryPath {
 		promptID := strings.TrimPrefix(requestPath, comfyUIHistoryPath+"/")
 		if !validComfyUIPromptID(promptID) {
-			return true, http.StatusNotFound, "ComfyUI history item not found"
+			return http.StatusNotFound, "ComfyUI history item not found"
 		}
 	}
 	if kind == "view" && requestPath != comfyUIViewPath {
-		return true, http.StatusNotFound, "ComfyUI result file not found"
+		return http.StatusNotFound, "ComfyUI result file not found"
 	}
-	if len(request.URL.RawQuery) > maxComfyUIResultQuery {
-		return true, http.StatusBadRequest, "ComfyUI result query is too long"
-	}
-	query, err := url.ParseQuery(request.URL.RawQuery)
-	if err != nil {
-		return true, http.StatusBadRequest, "invalid ComfyUI result query"
-	}
+	return 0, ""
+}
+
+func validateComfyUIResultQuery(requestPath, kind string, query url.Values, forceQuery, allowOwnerHash bool) (bool, int, string) {
 	if kind == "status" {
-		if len(query) != 0 || request.URL.ForceQuery {
+		if len(query) != 0 || forceQuery {
 			return true, http.StatusBadRequest, "ComfyUI status reads do not accept query parameters"
 		}
 		return true, 0, ""
 	}
 	if kind == "jobs" {
-		if requestPath != comfyUIJobsPath {
-			if !validComfyUIPromptID(strings.TrimPrefix(requestPath, comfyUIJobsPath+"/")) || len(query) != 0 {
-				return true, http.StatusBadRequest, "invalid ComfyUI job status path or query"
-			}
-			return true, 0, ""
-		}
-		for key, values := range query {
-			if len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
-				return true, http.StatusBadRequest, "invalid ComfyUI jobs query"
-			}
-			value := values[0]
-			switch key {
-			case "limit", "offset":
-				number, err := strconv.Atoi(value)
-				if err != nil || number < 0 || (key == "limit" && (number == 0 || number > 1000)) {
-					return true, http.StatusBadRequest, "invalid ComfyUI jobs pagination"
-				}
-			case "status":
-				for _, status := range strings.Split(value, ",") {
-					switch status {
-					case "pending", "in_progress", "completed", "failed", "cancelled":
-					default:
-						return true, http.StatusBadRequest, "invalid ComfyUI job status"
-					}
-				}
-			case "sort_by":
-				if value != "created_at" && value != "execution_duration" {
-					return true, http.StatusBadRequest, "invalid ComfyUI jobs sort field"
-				}
-			case "sort_order":
-				if value != "asc" && value != "desc" {
-					return true, http.StatusBadRequest, "invalid ComfyUI jobs sort order"
-				}
-			case "workflow_id":
-				if !validComfyUIPromptID(value) {
-					return true, http.StatusBadRequest, "invalid ComfyUI workflow ID"
-				}
-			default:
-				return true, http.StatusBadRequest, "unsupported ComfyUI jobs query"
-			}
-		}
-		return true, 0, ""
+		return validateComfyUIJobsQuery(requestPath, query)
 	}
 	if kind == "history" {
-		if requestPath != comfyUIHistoryPath && len(query) != 0 {
-			return true, http.StatusBadRequest, "history item path cannot contain query parameters"
-		}
-		for key, values := range query {
-			if (key != "prompt_id" && key != "max_items" && key != "offset") || len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
-				return true, http.StatusBadRequest, "unsupported ComfyUI history query"
-			}
-			if key == "prompt_id" && !validComfyUIPromptID(values[0]) {
-				return true, http.StatusBadRequest, "invalid ComfyUI prompt ID"
-			}
-			if key == "max_items" {
-				limit, err := strconv.Atoi(values[0])
-				if err != nil || limit < 1 || limit > 1000 {
-					return true, http.StatusBadRequest, "invalid ComfyUI history limit"
-				}
-			}
-			if key == "offset" {
-				offset, err := strconv.Atoi(values[0])
-				if err != nil || offset < -1 {
-					return true, http.StatusBadRequest, "invalid ComfyUI history offset"
-				}
-			}
+		return validateComfyUIHistoryQuery(requestPath, query)
+	}
+	return validateComfyUIViewQuery(query, allowOwnerHash)
+}
+
+func validateComfyUIJobsQuery(requestPath string, query url.Values) (bool, int, string) {
+	if requestPath != comfyUIJobsPath {
+		if !validComfyUIPromptID(strings.TrimPrefix(requestPath, comfyUIJobsPath+"/")) || len(query) != 0 {
+			return comfyUIResultReadError(http.StatusBadRequest, "invalid ComfyUI job status path or query")
 		}
 		return true, 0, ""
 	}
-	allowed := map[string]bool{"filename": true, "subfolder": true, "type": true, "format": true}
+	for key, values := range query {
+		if len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
+			return comfyUIResultReadError(http.StatusBadRequest, "invalid ComfyUI jobs query")
+		}
+		if status, message := validateComfyUIJobQueryValue(key, values[0]); status != 0 {
+			return comfyUIResultReadError(status, message)
+		}
+	}
+	return true, 0, ""
+}
+
+func validateComfyUIJobQueryValue(key, value string) (int, string) {
+	switch key {
+	case "limit", "offset":
+		if !validComfyUIJobPagination(key, value) {
+			return http.StatusBadRequest, "invalid ComfyUI jobs pagination"
+		}
+	case "status":
+		if !validComfyUIJobStatuses(value) {
+			return http.StatusBadRequest, "invalid ComfyUI job status"
+		}
+	case "sort_by":
+		if value != "created_at" && value != "execution_duration" {
+			return http.StatusBadRequest, "invalid ComfyUI jobs sort field"
+		}
+	case "sort_order":
+		if value != "asc" && value != "desc" {
+			return http.StatusBadRequest, "invalid ComfyUI jobs sort order"
+		}
+	case "workflow_id":
+		if !validComfyUIPromptID(value) {
+			return http.StatusBadRequest, "invalid ComfyUI workflow ID"
+		}
+	default:
+		return http.StatusBadRequest, "unsupported ComfyUI jobs query"
+	}
+	return 0, ""
+}
+
+func validComfyUIJobPagination(key, value string) bool {
+	number, err := strconv.Atoi(value)
+	if err != nil || number < 0 {
+		return false
+	}
+	if key == "limit" && (number == 0 || number > 1000) {
+		return false
+	}
+	return true
+}
+
+func validComfyUIJobStatuses(value string) bool {
+	for _, status := range strings.Split(value, ",") {
+		switch status {
+		case "pending", "in_progress", "completed", "failed", "cancelled":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func validateComfyUIHistoryQuery(requestPath string, query url.Values) (bool, int, string) {
+	if requestPath != comfyUIHistoryPath && len(query) != 0 {
+		return comfyUIResultReadError(http.StatusBadRequest, "history item path cannot contain query parameters")
+	}
+	for key, values := range query {
+		if !validComfyUIHistoryKey(key) || len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
+			return comfyUIResultReadError(http.StatusBadRequest, "unsupported ComfyUI history query")
+		}
+		if status, message := validateComfyUIHistoryValue(key, values[0]); status != 0 {
+			return comfyUIResultReadError(status, message)
+		}
+	}
+	return true, 0, ""
+}
+
+func validComfyUIHistoryKey(key string) bool {
+	return key == "prompt_id" || key == "max_items" || key == "offset"
+}
+
+func validateComfyUIHistoryValue(key, value string) (int, string) {
+	switch key {
+	case "prompt_id":
+		if !validComfyUIPromptID(value) {
+			return http.StatusBadRequest, "invalid ComfyUI prompt ID"
+		}
+	case "max_items":
+		limit, err := strconv.Atoi(value)
+		if err != nil || limit < 1 || limit > 1000 {
+			return http.StatusBadRequest, "invalid ComfyUI history limit"
+		}
+	case "offset":
+		offset, err := strconv.Atoi(value)
+		if err != nil || offset < -1 {
+			return http.StatusBadRequest, "invalid ComfyUI history offset"
+		}
+	}
+	return 0, ""
+}
+
+func validateComfyUIViewQuery(query url.Values, allowOwnerHash bool) (bool, int, string) {
+	filename, status, message := validateComfyUIViewQueryValues(query)
+	if status != 0 {
+		return comfyUIResultReadError(status, message)
+	}
+	if !validComfyUIOutputFilename(filename) {
+		return comfyUIResultReadError(http.StatusBadRequest, "invalid ComfyUI output filename")
+	}
+	if !allowOwnerHash && strings.HasPrefix(strings.ToLower(filename), "blake3:") {
+		return comfyUIResultReadError(http.StatusForbidden, "ComfyUI hash filenames require a verified caller identity")
+	}
+	return true, 0, ""
+}
+
+func validateComfyUIViewQueryValues(query url.Values) (string, int, string) {
 	filename := ""
 	for key, values := range query {
-		if !allowed[key] || len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
-			return true, http.StatusBadRequest, "unsupported ComfyUI view query"
+		if !validComfyUIViewKey(key) || len(values) != 1 || len(values[0]) > maxComfyUIResultValue {
+			return "", http.StatusBadRequest, "unsupported ComfyUI view query"
 		}
 		value := values[0]
 		switch key {
 		case "filename":
 			filename = value
 		case "subfolder":
-			if value != "" && (strings.HasPrefix(value, "/") || strings.ContainsAny(value, "\\\x00") ||
-				path.Clean(value) != value || value == ".." || strings.HasPrefix(value, "../")) {
-				return true, http.StatusBadRequest, "invalid ComfyUI output subfolder"
+			if !validComfyUIOutputSubfolder(value) {
+				return "", http.StatusBadRequest, "invalid ComfyUI output subfolder"
 			}
 		case "type":
 			if value != "" && value != "output" {
-				return true, http.StatusForbidden, "ComfyUI result reads are limited to output files"
+				return "", http.StatusForbidden, "ComfyUI result reads are limited to output files"
 			}
 		}
 	}
-	if filename == "" || filename == "." || filename == ".." || path.Base(filename) != filename || strings.ContainsAny(filename, "\\\x00") {
-		return true, http.StatusBadRequest, "invalid ComfyUI output filename"
-	}
-	if !allowOwnerHash && strings.HasPrefix(strings.ToLower(filename), "blake3:") {
-		return true, http.StatusForbidden, "ComfyUI hash filenames require a verified caller identity"
-	}
-	return true, 0, ""
+	return filename, 0, ""
+}
+
+func validComfyUIOutputFilename(filename string) bool {
+	return filename != "" && filename != "." && filename != ".." &&
+		path.Base(filename) == filename && !strings.ContainsAny(filename, "\\\x00")
+}
+
+func validComfyUIViewKey(key string) bool {
+	return key == "filename" || key == "subfolder" || key == "type" || key == "format"
+}
+
+func validComfyUIOutputSubfolder(value string) bool {
+	return value == "" || (!strings.HasPrefix(value, "/") && !strings.ContainsAny(value, "\\\x00") &&
+		path.Clean(value) == value && value != ".." && !strings.HasPrefix(value, "../"))
 }
 
 func validComfyUIResultPathEncoding(rawPath string) bool {
