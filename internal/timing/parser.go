@@ -22,35 +22,44 @@ type metadataParser struct {
 
 func (p *metadataParser) feed(chunk []byte) (meaningful, answer bool) {
 	if p.mode == "json" {
-		if p.partial {
-			return
-		}
-		if len(chunk) > maxEventBytes-len(p.body) {
-			p.partial = true
-			clear(p.body)
-			p.body = nil
-			return
-		}
-		p.body = append(p.body, chunk...)
-		return
+		return p.feedJSON(chunk)
 	}
 	if p.mode != "sse" {
 		return
 	}
+	return p.feedSSE(chunk)
+}
+
+// feedJSON accumulates a JSON body chunk until the event is complete or the
+// size cap is exceeded. Once partial, later chunks are ignored.
+func (p *metadataParser) feedJSON(chunk []byte) (meaningful, answer bool) {
+	if p.partial {
+		return
+	}
+	if len(chunk) > maxEventBytes-len(p.body) {
+		p.partial = true
+		clear(p.body)
+		p.body = nil
+		return
+	}
+	p.body = append(p.body, chunk...)
+	return
+}
+
+// feedSSE iterates SSE framing bytes, folding CRLF via the previousCR carry,
+// applying line/event size caps and the dropping state, and aggregating the
+// endLine outcome into meaningful/answer.
+func (p *metadataParser) feedSSE(chunk []byte) (meaningful, answer bool) {
 	for _, c := range chunk {
-		if p.previousCR {
-			p.previousCR = false
-			if c == '\n' {
-				continue
-			}
+		lineEnd, skip := p.sseLineEnd(c)
+		if skip {
+			continue
 		}
-		if c == '\r' || c == '\n' {
+		if lineEnd {
 			m, a := p.endLine()
 			meaningful = meaningful || m
 			answer = answer || a
-			if c == '\r' {
-				p.previousCR = true
-			}
+			p.previousCR = c == '\r'
 			continue
 		}
 		p.lineSize++
@@ -68,6 +77,20 @@ func (p *metadataParser) feed(chunk []byte) (meaningful, answer bool) {
 		}
 	}
 	return
+}
+
+// sseLineEnd resolves CR carry-over for one SSE framing byte. It reports
+// whether c ends the current line (lineEnd) and whether c must be skipped
+// because it is the '\n' of a pending CRLF pair (skip). A pending CR is
+// cleared here; feedSSE re-arms it for a lone '\r' line end.
+func (p *metadataParser) sseLineEnd(c byte) (lineEnd, skip bool) {
+	if p.previousCR {
+		p.previousCR = false
+		if c == '\n' {
+			return false, true
+		}
+	}
+	return c == '\r' || c == '\n', false
 }
 
 // endEvent finalizes a completed SSE event. It detects the [DONE] terminal
@@ -155,16 +178,117 @@ func mergeFloat(dst **float64, v any) {
 	}
 }
 
-func (p *metadataParser) parse(data []byte, streamed bool) (meaningful, answer bool) {
+// decodeEventRoot decodes exactly one JSON object from data with UseNumber and
+// verifies there is no trailing JSON. On any decode failure, a nil root, or
+// trailing content the event is partial and a nil root is returned.
+func decodeEventRoot(data []byte) (root map[string]any, partial bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
-	var root map[string]any
 	if dec.Decode(&root) != nil || root == nil {
-		p.partial = true
-		return
+		return nil, true
 	}
 	var extra any
 	if dec.Decode(&extra) != io.EOF {
+		return nil, true
+	}
+	return root, false
+}
+
+// mergeUsage merges a decoded usage object into p.usage. It marks recognized
+// and preserves any earlier valid value when a later field is invalid.
+func (p *metadataParser) mergeUsage(u map[string]any) {
+	p.recognized = true
+	mergeInt(&p.usage.PromptTokens, u["prompt_tokens"])
+	mergeInt(&p.usage.CompletionTokens, u["completion_tokens"])
+	mergeInt(&p.usage.TotalTokens, u["total_tokens"])
+	mergeInt(&p.usage.CachedTokens, obj(u["prompt_tokens_details"])["cached_tokens"])
+	mergeInt(&p.usage.ReasoningTokens, obj(u["completion_tokens_details"])["reasoning_tokens"])
+}
+
+// mergeTimings merges a decoded timings object into p.timings. It merges
+// numeric values but does not itself mark recognized.
+func (p *metadataParser) mergeTimings(t map[string]any) {
+	mergeFloat(&p.timings.PromptMS, t["prompt_ms"])
+	mergeFloat(&p.timings.PredictedMS, t["predicted_ms"])
+	mergeInt(&p.timings.PromptN, t["prompt_n"])
+	mergeInt(&p.timings.PredictedN, t["predicted_n"])
+}
+
+// deltaContent reports whether a streamed choice delta carries answer-bearing
+// content (content/text). It returns true only when meaningful AND answer.
+func deltaContent(delta, choice map[string]any) bool {
+	return present(delta["content"]) || present(choice["text"])
+}
+
+// deltaReasoning reports whether a streamed choice delta carries reasoning.
+func deltaReasoning(delta map[string]any) bool {
+	return present(delta["reasoning_content"]) || present(delta["reasoning"])
+}
+
+// deltaToolCalls reports whether a streamed choice delta carries tool calls.
+func deltaToolCalls(delta map[string]any) bool {
+	if tools, ok := delta["tool_calls"].([]any); ok {
+		for _, raw := range tools {
+			fn := obj(obj(raw)["function"])
+			if present(fn["name"]) || present(fn["arguments"]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deltaFunctionCall reports whether a streamed choice delta carries a function call.
+func deltaFunctionCall(delta map[string]any) bool {
+	fn := obj(delta["function_call"])
+	return present(fn["name"]) || present(fn["arguments"])
+}
+
+// parseChoices inspects the choices array of a decoded event. It marks
+// recognized, applies terminal/truncated finish_reason handling, and, for
+// streamed events, inspects content/reasoning/tool/function-call deltas to
+// return (meaningful, answer). It preserves the return pair order.
+func (p *metadataParser) parseChoices(choices []any, streamed bool) (meaningful, answer bool) {
+	p.recognized = true
+	for _, raw := range choices {
+		choice := obj(raw)
+		if reason, ok := choice["finish_reason"].(string); ok {
+			switch reason {
+			case "stop", "length", "tool_calls", "function_call", "content_filter":
+				// A choice may finish before other choices or a terminal usage
+				// event. SSE completion requires its explicit [DONE] boundary.
+				if !streamed {
+					p.terminal = true
+				}
+				p.usage.FinishReason = reason
+				if reason == "length" {
+					p.truncated = true
+				}
+			}
+		}
+		if streamed {
+			delta := obj(choice["delta"])
+			if deltaContent(delta, choice) {
+				meaningful = true
+				answer = true
+			}
+			if deltaReasoning(delta) {
+				meaningful = true
+			}
+			if deltaToolCalls(delta) {
+				meaningful = true
+			}
+			if deltaFunctionCall(delta) {
+				meaningful = true
+			}
+		}
+	}
+	return
+}
+
+func (p *metadataParser) parse(data []byte, streamed bool) (meaningful, answer bool) {
+	root, partial := decodeEventRoot(data)
+	if partial {
 		p.partial = true
 		return
 	}
@@ -172,60 +296,13 @@ func (p *metadataParser) parse(data []byte, streamed bool) (meaningful, answer b
 		p.partial = true
 	}
 	if u := obj(root["usage"]); u != nil {
-		p.recognized = true
-		mergeInt(&p.usage.PromptTokens, u["prompt_tokens"])
-		mergeInt(&p.usage.CompletionTokens, u["completion_tokens"])
-		mergeInt(&p.usage.TotalTokens, u["total_tokens"])
-		mergeInt(&p.usage.CachedTokens, obj(u["prompt_tokens_details"])["cached_tokens"])
-		mergeInt(&p.usage.ReasoningTokens, obj(u["completion_tokens_details"])["reasoning_tokens"])
+		p.mergeUsage(u)
 	}
 	if t := obj(root["timings"]); t != nil {
-		mergeFloat(&p.timings.PromptMS, t["prompt_ms"])
-		mergeFloat(&p.timings.PredictedMS, t["predicted_ms"])
-		mergeInt(&p.timings.PromptN, t["prompt_n"])
-		mergeInt(&p.timings.PredictedN, t["predicted_n"])
+		p.mergeTimings(t)
 	}
 	if choices, ok := root["choices"].([]any); ok {
-		p.recognized = true
-		for _, raw := range choices {
-			choice := obj(raw)
-			if reason, ok := choice["finish_reason"].(string); ok {
-				switch reason {
-				case "stop", "length", "tool_calls", "function_call", "content_filter":
-					// A choice may finish before other choices or a terminal usage
-					// event. SSE completion requires its explicit [DONE] boundary.
-					if !streamed {
-						p.terminal = true
-					}
-					p.usage.FinishReason = reason
-					if reason == "length" {
-						p.truncated = true
-					}
-				}
-			}
-			if streamed {
-				delta := obj(choice["delta"])
-				if present(delta["content"]) || present(choice["text"]) {
-					meaningful = true
-					answer = true
-				}
-				if present(delta["reasoning_content"]) || present(delta["reasoning"]) {
-					meaningful = true
-				}
-				if tools, ok := delta["tool_calls"].([]any); ok {
-					for _, t := range tools {
-						fn := obj(obj(t)["function"])
-						if present(fn["name"]) || present(fn["arguments"]) {
-							meaningful = true
-						}
-					}
-				}
-				fn := obj(delta["function_call"])
-				if present(fn["name"]) || present(fn["arguments"]) {
-					meaningful = true
-				}
-			}
-		}
+		meaningful, answer = p.parseChoices(choices, streamed)
 	}
 	return
 }

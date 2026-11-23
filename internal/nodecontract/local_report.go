@@ -34,6 +34,142 @@ func (h *observationHeap) Pop() any {
 	return last
 }
 
+// localReportBuilder accumulates a local report during the backend/cache visit
+// phase. Backend visits bind the current backend identity and freshness; model
+// visits dedupe identities and maintain the capped top-K observation heap.
+type localReportBuilder struct {
+	source          Source
+	generatedAt     time.Time
+	freshnessWindow time.Duration
+	selected        map[string]bool
+
+	report            Report
+	seenBackends      map[string]bool
+	seenModels        map[ModelIdentity]bool
+	observations      observationHeap
+	availableBackends int
+	truncated         bool
+	backendID         string
+	freshness         string
+	fetchedAt         time.Time
+}
+
+func newLocalReportBuilder(source Source, generatedAt time.Time, freshnessWindow time.Duration, selected map[string]bool) *localReportBuilder {
+	b := &localReportBuilder{
+		source:          source,
+		generatedAt:     generatedAt,
+		freshnessWindow: freshnessWindow,
+		selected:        selected,
+	}
+	b.report = Report{
+		ProtocolVersion:  Version{Major: 1, Minor: 0},
+		RequiredFeatures: []string{},
+		Source:           source,
+		GeneratedAt:      generatedAt,
+		Capabilities: Capabilities{
+			"catalog_read": "enabled", "diagnostics_read": "disabled", "federation_exchange": "disabled",
+			"artifact_read": "disabled", "artifact_write": "disabled", "config_write": "disabled",
+		},
+		Coverage:     "complete",
+		Observations: []Observation{},
+	}
+	b.seenBackends = make(map[string]bool, len(selected))
+	b.seenModels = make(map[ModelIdentity]bool)
+	b.observations = make(observationHeap, 0, MaxObservations)
+	return b
+}
+
+// visitBackend is the backend visit callback. It binds the current backend and
+// records freshness/staleness evidence without emitting observations.
+func (b *localReportBuilder) visitBackend(id string, at time.Time) error {
+	b.backendID, b.fetchedAt = id, at
+	if !b.selected[id] || b.seenBackends[id] {
+		return errors.New("unexpected or duplicate selected backend cache")
+	}
+	b.seenBackends[id] = true
+	if at.IsZero() {
+		b.report.Coverage = "partial"
+		return nil
+	}
+	b.availableBackends++
+	b.freshness = "fresh"
+	if at.After(b.generatedAt) {
+		b.freshness = "unknown"
+		b.report.Coverage = "partial"
+	} else if b.generatedAt.Sub(at) > b.freshnessWindow {
+		b.freshness = "stale"
+		b.report.Coverage = "partial"
+	}
+	return nil
+}
+
+// visitModel is the model visit callback. It dedupes model identities and
+// maintains the capped observation heap.
+func (b *localReportBuilder) visitModel(id string, aliases []string) error {
+	if b.fetchedAt.IsZero() {
+		return nil
+	}
+	if id == "" || !(provenance.ModelIdentity{
+		BackendID: b.backendID, LocalID: id, PublicID: id,
+	}).Valid() {
+		b.report.Coverage = "partial"
+		return nil
+	}
+	identity := ModelIdentity{OwnerNodeID: b.source.NodeID, BackendID: b.backendID, LocalID: id}
+	if b.seenModels[identity] {
+		return errors.New("ambiguous duplicate local model identity")
+	}
+	observedAt := b.fetchedAt
+	expiresAt := b.fetchedAt.Add(b.freshnessWindow)
+	observation := Observation{
+		Identity:   identity,
+		State:      "supported",
+		ObservedAt: &observedAt,
+		ExpiresAt:  &expiresAt,
+		Aliases:    append([]string(nil), aliases...),
+		Freshness:  b.freshness,
+		Coverage:   "unknown",
+	}
+	if len(b.observations) == MaxObservations {
+		b.truncated = true
+		largest := b.observations[0].Identity
+		if identity.BackendID > largest.BackendID ||
+			(identity.BackendID == largest.BackendID && identity.LocalID >= largest.LocalID) {
+			return nil
+		}
+		delete(b.seenModels, heap.Pop(&b.observations).(Observation).Identity)
+	}
+	b.seenModels[identity] = true
+	heap.Push(&b.observations, observation)
+	return nil
+}
+
+// finalize applies coverage precedence, sorts observations, and emits the report.
+func (b *localReportBuilder) finalize() (Report, error) {
+	if len(b.seenBackends) != len(b.selected) {
+		b.report.Coverage = "partial"
+	}
+	if len(b.selected) > 0 {
+		if b.availableBackends == 0 {
+			b.report.Coverage = "unknown"
+		} else {
+			b.report.Coverage = "partial"
+		}
+		b.report.Observations = b.observations
+	}
+	sort.Slice(b.report.Observations, func(i, j int) bool {
+		a, b := b.report.Observations[i].Identity, b.report.Observations[j].Identity
+		if a.BackendID != b.BackendID {
+			return a.BackendID < b.BackendID
+		}
+		return a.LocalID < b.LocalID
+	})
+	if b.truncated {
+		b.report.Coverage = "truncated"
+	}
+	return finishLocalReport(b.report)
+}
+
 // LocalReport projects explicitly selected backend caches without issuing
 // upstream requests. Callers must establish ownership of selected backends.
 func LocalReport(source Source, localBackends []string, caches []catalog.BackendModel, generatedAt time.Time, freshnessWindow time.Duration) (Report, error) {
@@ -81,105 +217,11 @@ func localReport(source Source, localBackends []string, generatedAt time.Time, f
 		}
 		selected[id] = true
 	}
-
-	report := Report{
-		ProtocolVersion:  Version{Major: 1, Minor: 0},
-		RequiredFeatures: []string{},
-		Source:           source,
-		GeneratedAt:      generatedAt,
-		Capabilities: Capabilities{
-			"catalog_read": "enabled", "diagnostics_read": "disabled", "federation_exchange": "disabled",
-			"artifact_read": "disabled", "artifact_write": "disabled", "config_write": "disabled",
-		},
-		Coverage:     "complete",
-		Observations: []Observation{},
-	}
-	seenBackends := make(map[string]bool, len(selected))
-	seenModels := make(map[ModelIdentity]bool)
-	observations := make(observationHeap, 0, MaxObservations)
-	availableBackends := 0
-	truncated := false
-	var backendID, freshness string
-	var fetchedAt time.Time
-	err := visit(selected, func(id string, at time.Time) error {
-		backendID, fetchedAt = id, at
-		if !selected[id] || seenBackends[id] {
-			return errors.New("unexpected or duplicate selected backend cache")
-		}
-		seenBackends[id] = true
-		if at.IsZero() {
-			report.Coverage = "partial"
-			return nil
-		}
-		availableBackends++
-		freshness = "fresh"
-		if at.After(generatedAt) {
-			freshness = "unknown"
-			report.Coverage = "partial"
-		} else if generatedAt.Sub(at) > freshnessWindow {
-			freshness = "stale"
-			report.Coverage = "partial"
-		}
-		return nil
-	}, func(id string, aliases []string) error {
-		if fetchedAt.IsZero() {
-			return nil
-		}
-		if id == "" || !(provenance.ModelIdentity{
-			BackendID: backendID, LocalID: id, PublicID: id,
-		}).Valid() {
-			report.Coverage = "partial"
-			return nil
-		}
-		identity := ModelIdentity{OwnerNodeID: source.NodeID, BackendID: backendID, LocalID: id}
-		if seenModels[identity] {
-			return errors.New("ambiguous duplicate local model identity")
-		}
-		observedAt := fetchedAt
-		expiresAt := fetchedAt.Add(freshnessWindow)
-		observation := Observation{
-			Identity: identity, State: "supported", ObservedAt: &observedAt, ExpiresAt: &expiresAt,
-			Aliases: append([]string(nil), aliases...), Freshness: freshness, Coverage: "unknown",
-		}
-		if len(observations) == MaxObservations {
-			truncated = true
-			largest := observations[0].Identity
-			if identity.BackendID > largest.BackendID ||
-				(identity.BackendID == largest.BackendID && identity.LocalID >= largest.LocalID) {
-				return nil
-			}
-			delete(seenModels, heap.Pop(&observations).(Observation).Identity)
-		}
-		seenModels[identity] = true
-		heap.Push(&observations, observation)
-		return nil
-	})
-	if err != nil {
+	b := newLocalReportBuilder(source, generatedAt, freshnessWindow, selected)
+	if err := visit(selected, b.visitBackend, b.visitModel); err != nil {
 		return Report{}, err
 	}
-	if len(seenBackends) != len(selected) {
-		report.Coverage = "partial"
-	}
-	if len(selected) > 0 {
-		if availableBackends == 0 {
-			report.Coverage = "unknown"
-		} else {
-			// BackendModels does not expose whether catalog rows were discarded.
-			report.Coverage = "partial"
-		}
-		report.Observations = observations
-	}
-	sort.Slice(report.Observations, func(i, j int) bool {
-		a, b := report.Observations[i].Identity, report.Observations[j].Identity
-		if a.BackendID != b.BackendID {
-			return a.BackendID < b.BackendID
-		}
-		return a.LocalID < b.LocalID
-	})
-	if truncated {
-		report.Coverage = "truncated"
-	}
-	return finishLocalReport(report)
+	return b.finalize()
 }
 
 // AddBackendReadiness adds authorized, cache-only health-check evidence.

@@ -126,40 +126,61 @@ func readOwnerGrants(root *os.Root) ([]OwnerGrant, error) {
 	}
 	grants := make([]OwnerGrant, 0, len(entries))
 	for _, entry := range entries {
-		name := entry.Name()
-		if !strings.HasPrefix(name, "owner-grant-") || !strings.HasSuffix(name, ".json") || entry.IsDir() {
-			return nil, ErrOwnerGrantStore
-		}
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > maxOwnerGrantRecordBytes {
-			return nil, ErrOwnerGrantStore
-		}
-		file, err := root.Open(name)
+		grant, err := readOwnerGrantFile(root, entry)
 		if err != nil {
-			return nil, ErrOwnerGrantStore
-		}
-		data, readErr := io.ReadAll(io.LimitReader(file, maxOwnerGrantRecordBytes+1))
-		closeErr := file.Close()
-		if readErr != nil || closeErr != nil || len(data) > maxOwnerGrantRecordBytes {
-			return nil, ErrOwnerGrantStore
-		}
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.DisallowUnknownFields()
-		var grant OwnerGrant
-		if decoder.Decode(&grant) != nil || decoder.Decode(new(any)) != io.EOF || !ValidOwnerGrant(grant) || name != ownerGrantFilename(grant.ID) {
 			return nil, ErrOwnerGrantStore
 		}
 		grants = append(grants, grant)
 	}
+	if err := validateOwnerGrantSet(grants); err != nil {
+		return nil, ErrOwnerGrantStore
+	}
+	return grants, nil
+}
+
+// readOwnerGrantFile validates a single directory entry as an owner grant record:
+// exact prefix/suffix, non-directory, regular 0600 file within the size cap, then
+// opens, reads (<= limit+1 bytes), closes, strictly decodes one JSON value with
+// unknown fields rejected, and binds the filename to the grant ID.
+func readOwnerGrantFile(root *os.Root, entry os.DirEntry) (OwnerGrant, error) {
+	name := entry.Name()
+	if !strings.HasPrefix(name, "owner-grant-") || !strings.HasSuffix(name, ".json") || entry.IsDir() {
+		return OwnerGrant{}, ErrOwnerGrantStore
+	}
+	info, err := entry.Info()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > maxOwnerGrantRecordBytes {
+		return OwnerGrant{}, ErrOwnerGrantStore
+	}
+	file, err := root.Open(name)
+	if err != nil {
+		return OwnerGrant{}, ErrOwnerGrantStore
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxOwnerGrantRecordBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || len(data) > maxOwnerGrantRecordBytes {
+		return OwnerGrant{}, ErrOwnerGrantStore
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var grant OwnerGrant
+	if decoder.Decode(&grant) != nil || decoder.Decode(new(any)) != io.EOF || !ValidOwnerGrant(grant) || name != ownerGrantFilename(grant.ID) {
+		return OwnerGrant{}, ErrOwnerGrantStore
+	}
+	return grant, nil
+}
+
+// validateOwnerGrantSet sorts grants by ID and rejects any pair that overlaps on
+// the same requester/action/backend/target+model scope.
+func validateOwnerGrantSet(grants []OwnerGrant) error {
 	sort.Slice(grants, func(i, j int) bool { return grants[i].ID < grants[j].ID })
 	for i := range grants {
 		for j := 0; j < i; j++ {
 			if ownerGrantsOverlap(grants[i], grants[j]) {
-				return nil, ErrOwnerGrantStore
+				return ErrOwnerGrantStore
 			}
 		}
 	}
-	return grants, nil
+	return nil
 }
 
 func ownerGrantsOverlap(a, b OwnerGrant) bool {

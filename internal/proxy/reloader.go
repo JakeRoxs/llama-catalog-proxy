@@ -101,18 +101,7 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 	if err != nil {
 		return nil, config.Config{}, err
 	}
-	r := &Reloader{
-		path:               path,
-		interval:           defaultWatchInterval,
-		logger:             logger,
-		onReload:           onReload,
-		peerSlots:          make(chan struct{}, 8),
-		peerInferenceSlots: make(chan struct{}, 8),
-		peerPathSlots:      make(chan struct{}, 4),
-		managementSlots:    make(chan struct{}, 2),
-		peerWake:           make(chan struct{}, 1),
-		stop:               make(chan struct{}),
-	}
+	r := newReloader(path, logger, onReload)
 	initialized := false
 	defer func() {
 		if !initialized && r.pairingStore != nil {
@@ -125,54 +114,111 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 			_ = r.auditStore.Close()
 		}
 	}()
-	r.benchmark, err = newBenchmarkRuntime(cfg, logger)
+	if err := r.setupBenchmarkAndAdmin(cfg, logger); err != nil {
+		return nil, config.Config{}, err
+	}
+	peerCert, err := r.setupPeer(cfg)
 	if err != nil {
 		return nil, config.Config{}, err
+	}
+	managementCert, err := r.setupManagement(cfg)
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	state, err := r.createReloaderState(cfg, handler, peerCert, managementCert)
+	if err != nil {
+		return nil, config.Config{}, err
+	}
+	if err := r.finalizeReloaderState(cfg, state); err != nil {
+		return nil, config.Config{}, err
+	}
+	initialized = true
+	return r, cfg, nil
+}
+
+// newReloader allocates the Reloader struct with its channels and returns it.
+func newReloader(path string, logger *slog.Logger, onReload func(config.Config)) *Reloader {
+	return &Reloader{
+		path:               path,
+		interval:           defaultWatchInterval,
+		logger:             logger,
+		onReload:           onReload,
+		peerSlots:          make(chan struct{}, 8),
+		peerInferenceSlots: make(chan struct{}, 8),
+		peerPathSlots:      make(chan struct{}, 4),
+		managementSlots:    make(chan struct{}, 2),
+		peerWake:           make(chan struct{}, 1),
+		stop:               make(chan struct{}),
+	}
+}
+
+// setupBenchmarkAndAdmin creates the benchmark runtime and admin auth, and
+// records the management UI configuration. It fails fast on the first error.
+func (r *Reloader) setupBenchmarkAndAdmin(cfg config.Config, logger *slog.Logger) error {
+	var err error
+	r.benchmark, err = newBenchmarkRuntime(cfg, logger)
+	if err != nil {
+		return err
 	}
 	r.adminAuth, err = newAdminAuth(cfg.ManagementUI, logger, http.DefaultClient)
 	if err != nil {
-		return nil, config.Config{}, err
+		return err
 	}
 	r.managementUIConfig = cfg.ManagementUI
-	var certificate *tls.Certificate
-	if cfg.Peer != nil {
-		id := make([]byte, 16)
-		if _, err := rand.Read(id); err != nil {
-			return nil, config.Config{}, fmt.Errorf("generate proxy instance identity: %w", err)
-		}
-		r.instanceID = hex.EncodeToString(id)
-		r.peerListen, r.peerNodeID = cfg.Peer.Listen, cfg.Peer.NodeID
-		if cfg.Peer.Discovery != nil {
-			discoveryConfig := *cfg.Peer.Discovery
-			r.peerDiscovery = &discoveryConfig
-		}
-		certificate, err = loadPeerCertificate(cfg.Peer)
+	return nil
+}
+
+// setupPeer configures the peer identity, certificate, and stores. It returns
+// the peer certificate (nil when no peer is configured). On failure, stores
+// already opened are closed by the caller's !initialized defer backstop.
+func (r *Reloader) setupPeer(cfg config.Config) (*tls.Certificate, error) {
+	if cfg.Peer == nil {
+		return nil, nil
+	}
+	id := make([]byte, 16)
+	if _, err := rand.Read(id); err != nil {
+		return nil, fmt.Errorf("generate proxy instance identity: %w", err)
+	}
+	r.instanceID = hex.EncodeToString(id)
+	r.peerListen, r.peerNodeID = cfg.Peer.Listen, cfg.Peer.NodeID
+	if cfg.Peer.Discovery != nil {
+		discoveryConfig := *cfg.Peer.Discovery
+		r.peerDiscovery = &discoveryConfig
+	}
+	certificate, err := loadPeerCertificate(cfg.Peer)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Peer.FederationID != "" {
+		r.peerFederationID = cfg.Peer.FederationID
+		r.peerMembershipDir = cfg.Peer.MembershipDirectory
+		r.pairingStore, err = federation.OpenPairingStore(cfg.Peer.MembershipDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
 		if err != nil {
-			return nil, config.Config{}, err
-		}
-		if cfg.Peer.FederationID != "" {
-			r.peerFederationID = cfg.Peer.FederationID
-			r.peerMembershipDir = cfg.Peer.MembershipDirectory
-			r.pairingStore, err = federation.OpenPairingStore(cfg.Peer.MembershipDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
-			if err != nil {
-				return nil, config.Config{}, fmt.Errorf("open peer membership store: %w", err)
-			}
-		}
-		if cfg.Peer.Discovery != nil && cfg.Peer.Discovery.Enabled {
-			r.peerCatalogGrantDir = cfg.Peer.CatalogGrantDirectory
-			r.catalogGrantStore, err = federation.OpenCatalogGrantStore(cfg.Peer.CatalogGrantDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
-			if err != nil {
-				return nil, config.Config{}, fmt.Errorf("open peer catalog grant store: %w", err)
-			}
-		}
-		if cfg.Peer.AuditDirectory != "" {
-			r.peerAuditDir = cfg.Peer.AuditDirectory
-			r.auditStore, err = auditlog.Open(cfg.Peer.AuditDirectory, cfg.Peer.NodeID)
-			if err != nil {
-				return nil, config.Config{}, fmt.Errorf("open peer audit store: %w", err)
-			}
+			return nil, fmt.Errorf("open peer membership store: %w", err)
 		}
 	}
+	if cfg.Peer.Discovery != nil && cfg.Peer.Discovery.Enabled {
+		r.peerCatalogGrantDir = cfg.Peer.CatalogGrantDirectory
+		r.catalogGrantStore, err = federation.OpenCatalogGrantStore(cfg.Peer.CatalogGrantDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
+		if err != nil {
+			return nil, fmt.Errorf("open peer catalog grant store: %w", err)
+		}
+	}
+	if cfg.Peer.AuditDirectory != "" {
+		r.peerAuditDir = cfg.Peer.AuditDirectory
+		r.auditStore, err = auditlog.Open(cfg.Peer.AuditDirectory, cfg.Peer.NodeID)
+		if err != nil {
+			return nil, fmt.Errorf("open peer audit store: %w", err)
+		}
+	}
+	return certificate, nil
+}
+
+// setupManagement configures the management listener, delegated stores, and
+// loads the management TLS certificate. It returns the management certificate
+// (nil when no management is configured).
+func (r *Reloader) setupManagement(cfg config.Config) (*tls.Certificate, error) {
+	var err error
 	var managementCertificate *tls.Certificate
 	if cfg.Management != nil {
 		r.managementListen = cfg.Management.Listen
@@ -182,65 +228,51 @@ func NewReloader(path string, logger *slog.Logger, onReload func(config.Config),
 		}
 		managementCertificate, err = loadManagementCertificate(cfg.Management)
 		if err != nil {
-			return nil, config.Config{}, err
+			return nil, err
 		}
 	}
+	return managementCertificate, nil
+}
+
+// createReloaderState builds the replacement state via makeReloaderState,
+// wires the catalog grant store, and stores the state.
+func (r *Reloader) createReloaderState(cfg config.Config, handler http.Handler, peerCert, managementCert *tls.Certificate) (*reloaderState, error) {
 	state, err := makeReloaderState(cfg, reloaderStateOptions{
 		handler:               handler,
 		generation:            1,
-		certificate:           certificate,
-		managementCertificate: managementCertificate,
+		certificate:           peerCert,
+		managementCertificate: managementCert,
 		reservePeer:           r.peerListen != "",
 		pairingStore:          r.pairingStore,
 		auditStore:            r.auditStore,
 	})
 	if err != nil {
-		if r.pairingStore != nil {
-			_ = r.pairingStore.Close()
-		}
-		if r.catalogGrantStore != nil {
-			_ = r.catalogGrantStore.Close()
-		}
-		if r.auditStore != nil {
-			_ = r.auditStore.Close()
-		}
-		return nil, config.Config{}, err
+		return nil, err
 	}
 	state.catalogGrantStore = r.catalogGrantStore
 	r.state.Store(state)
-	digest, err := configDigest(path)
+	return state, nil
+}
+
+// finalizeReloaderState computes the config digest, records it, and creates
+// the ingestion runtime. On failure it cancels the peer context and closes
+// the peer clients before returning; the caller's !initialized defer closes
+// the stores.
+func (r *Reloader) finalizeReloaderState(cfg config.Config, state *reloaderState) error {
+	digest, err := configDigest(r.path)
 	if err != nil {
 		state.peerCancel()
 		closePeerClients(state.peerClients)
-		if r.pairingStore != nil {
-			_ = r.pairingStore.Close()
-		}
-		if r.catalogGrantStore != nil {
-			_ = r.catalogGrantStore.Close()
-		}
-		if r.auditStore != nil {
-			_ = r.auditStore.Close()
-		}
-		return nil, config.Config{}, err
+		return err
 	}
 	r.lastHash = digest
 	r.ingestion, err = newIngestionRuntime(cfg)
 	if err != nil {
 		state.peerCancel()
 		closePeerClients(state.peerClients)
-		if r.pairingStore != nil {
-			_ = r.pairingStore.Close()
-		}
-		if r.catalogGrantStore != nil {
-			_ = r.catalogGrantStore.Close()
-		}
-		if r.auditStore != nil {
-			_ = r.auditStore.Close()
-		}
-		return nil, config.Config{}, err
+		return err
 	}
-	initialized = true
-	return r, cfg, nil
+	return nil
 }
 
 func (r *Reloader) SetWatchInterval(interval time.Duration) {
@@ -334,47 +366,81 @@ func (r *Reloader) closeManagedStores() {
 }
 
 func (r *Reloader) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	if r.benchmark != nil && (request.URL.Path == "/benchmark" || strings.HasPrefix(request.URL.Path, "/benchmark/")) {
-		r.serveBenchmark(writer, request)
+	if r.serveBenchmarkRoute(writer, request) {
 		return
 	}
-	if request.URL.Path == "/admin" || strings.HasPrefix(request.URL.Path, "/admin/") {
-		if r.adminAuth == nil {
-			http.NotFound(writer, request)
-			return
-		}
-		if request.URL.Path == "/admin/api/v1/overview" {
-			r.serveAdminOverview(writer, request)
-			return
-		}
-		if request.URL.Path == "/admin/api/v1/activity" {
-			r.serveAdminActivity(writer, request)
-			return
-		}
-		if request.URL.Path == adminAuditPath {
-			r.serveAdminAuditEvents(writer, request)
-			return
-		}
-		if request.URL.Path == adminManagementPath || strings.HasPrefix(request.URL.Path, adminManagementPath+"/") {
-			r.serveAdminManagement(writer, request)
-			return
-		}
-		if request.URL.Path == adminPairingPath || strings.HasPrefix(request.URL.Path, adminPairingPath+"/") {
-			r.serveAdminPairing(writer, request)
-			return
-		}
-		r.adminAuth.ServeHTTP(writer, request)
+	if r.serveAdminRoute(writer, request) {
 		return
 	}
-	if r.peerListen != "" && (request.URL.Path == "/peer" || strings.HasPrefix(request.URL.Path, "/peer/")) {
-		http.NotFound(writer, request)
-		return
-	}
-	if r.managementListen != "" && (request.URL.Path == "/management" || strings.HasPrefix(request.URL.Path, "/management/")) {
-		http.NotFound(writer, request)
+	if r.serveReservedListenerRoute(writer, request) {
 		return
 	}
 	r.state.Load().handler.ServeHTTP(writer, request)
+}
+
+// serveBenchmarkRoute handles /benchmark and /benchmark/* when a benchmark
+// runtime is configured. It returns true when the request was handled; a nil
+// benchmark leaves the route unmatched so ServeHTTP falls through.
+func (r *Reloader) serveBenchmarkRoute(writer http.ResponseWriter, request *http.Request) bool {
+	if r.benchmark == nil {
+		return false
+	}
+	if request.URL.Path != "/benchmark" && !strings.HasPrefix(request.URL.Path, "/benchmark/") {
+		return false
+	}
+	r.serveBenchmark(writer, request)
+	return true
+}
+
+// serveAdminRoute handles /admin and /admin/* routes. It returns true when
+// the request was handled. A nil adminAuth results in a 404 for any admin
+// prefix; otherwise the named admin API routes dispatch to their handlers and
+// the remainder falls through to adminAuth.
+func (r *Reloader) serveAdminRoute(writer http.ResponseWriter, request *http.Request) bool {
+	if request.URL.Path != "/admin" && !strings.HasPrefix(request.URL.Path, "/admin/") {
+		return false
+	}
+	if r.adminAuth == nil {
+		http.NotFound(writer, request)
+		return true
+	}
+	switch request.URL.Path {
+	case "/admin/api/v1/overview":
+		r.serveAdminOverview(writer, request)
+		return true
+	case "/admin/api/v1/activity":
+		r.serveAdminActivity(writer, request)
+		return true
+	case adminAuditPath:
+		r.serveAdminAuditEvents(writer, request)
+		return true
+	}
+	if request.URL.Path == adminManagementPath || strings.HasPrefix(request.URL.Path, adminManagementPath+"/") {
+		r.serveAdminManagement(writer, request)
+		return true
+	}
+	if request.URL.Path == adminPairingPath || strings.HasPrefix(request.URL.Path, adminPairingPath+"/") {
+		r.serveAdminPairing(writer, request)
+		return true
+	}
+	r.adminAuth.ServeHTTP(writer, request)
+	return true
+}
+
+// serveReservedListenerRoute 404s requests to the reserved /peer and
+// /management prefixes when the corresponding listener is enabled. It returns
+// true when the request was handled; otherwise the request falls through to
+// the current state handler.
+func (r *Reloader) serveReservedListenerRoute(writer http.ResponseWriter, request *http.Request) bool {
+	if r.peerListen != "" && (request.URL.Path == "/peer" || strings.HasPrefix(request.URL.Path, "/peer/")) {
+		http.NotFound(writer, request)
+		return true
+	}
+	if r.managementListen != "" && (request.URL.Path == "/management" || strings.HasPrefix(request.URL.Path, "/management/")) {
+		http.NotFound(writer, request)
+		return true
+	}
+	return false
 }
 
 func (r *Reloader) watch() {
@@ -414,13 +480,90 @@ func (r *Reloader) reload() error {
 	if err != nil {
 		return err
 	}
+	if err := r.validateReloadConfiguration(cfg); err != nil {
+		return err
+	}
+	peerCert, managementCert, handler, err := r.buildReloadHandler(cfg)
+	if err != nil {
+		return err
+	}
+	if err := r.commitReloadState(cfg, handler, &reloadCertificates{
+		peer:       peerCert,
+		management: managementCert,
+	}); err != nil {
+		return err
+	}
+	if r.onReload != nil {
+		r.onReload(cfg)
+	}
+	r.logger.Info("configuration reloaded", "default_backend", cfg.DefaultBackend, "backends", len(cfg.Backends))
+	return nil
+}
+
+// reloadCertificates bundles the peer and management TLS certificates loaded
+// for a reload. commitReloadState installs them into the replacement state
+// under the lifecycle lock.
+type reloadCertificates struct {
+	peer       *tls.Certificate
+	management *tls.Certificate
+}
+
+// validateReloadConfiguration performs every restart-required comparison and
+// ingestion-directory validation in the exact order required by the reload
+// lifecycle. It returns the first error, preserving the original error messages
+// and order, and mutates no state. Certificate loading and handler
+// construction are deferred to buildReloadHandler; the lifecycle lock is
+// acquired only by commitReloadState.
+func (r *Reloader) validateReloadConfiguration(cfg config.Config) error {
+	if err := r.validateBenchmark(cfg); err != nil {
+		return err
+	}
+	if err := r.validateManagementUI(cfg); err != nil {
+		return err
+	}
+	if err := r.validatePeerDiscovery(cfg); err != nil {
+		return err
+	}
+	if err := r.validateCatalogGrantDirectory(cfg); err != nil {
+		return err
+	}
+	if err := r.validateDelegatedStoresAndIngestion(cfg); err != nil {
+		return err
+	}
+	if err := r.validateIngestionDirectories(cfg); err != nil {
+		return err
+	}
+	if err := r.validatePeerListener(cfg); err != nil {
+		return err
+	}
+	if err := r.validateManagementListener(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateBenchmark returns an error when the benchmark configuration or its
+// diagnostics credential would require a restart to change.
+func (r *Reloader) validateBenchmark(cfg config.Config) error {
 	if (cfg.Benchmark == nil) != (r.benchmark == nil) ||
 		cfg.Benchmark != nil && (*cfg.Benchmark != r.benchmark.config || cfg.DiagnosticsAPIKey != r.benchmark.diagnosticsKey) {
 		return errors.New("changing benchmark configuration or its diagnostics credential requires a restart")
 	}
+	return nil
+}
+
+// validateManagementUI returns an error when management_ui authentication
+// would require a restart to change.
+func (r *Reloader) validateManagementUI(cfg config.Config) error {
 	if !reflect.DeepEqual(cfg.ManagementUI, r.managementUIConfig) {
 		return errors.New("changing management_ui authentication requires a restart")
 	}
+	return nil
+}
+
+// validatePeerDiscovery returns an error when peer discovery configuration
+// would require a restart to change.
+func (r *Reloader) validatePeerDiscovery(cfg config.Config) error {
 	var peerDiscovery *config.PeerDiscoveryConfig
 	if cfg.Peer != nil {
 		peerDiscovery = cfg.Peer.Discovery
@@ -428,6 +571,12 @@ func (r *Reloader) reload() error {
 	if !reflect.DeepEqual(peerDiscovery, r.peerDiscovery) {
 		return errors.New("changing peer discovery configuration requires a restart")
 	}
+	return nil
+}
+
+// validateCatalogGrantDirectory returns an error when the peer catalog grant
+// directory would require a restart to change.
+func (r *Reloader) validateCatalogGrantDirectory(cfg config.Config) error {
 	var catalogGrantDirectory string
 	if cfg.Peer != nil {
 		catalogGrantDirectory = cfg.Peer.CatalogGrantDirectory
@@ -435,6 +584,12 @@ func (r *Reloader) reload() error {
 	if catalogGrantDirectory != r.peerCatalogGrantDir {
 		return errors.New("changing peer catalog grant directory requires a restart")
 	}
+	return nil
+}
+
+// validateDelegatedStoresAndIngestion returns an error when delegated store
+// directories or the ingestion configuration would require a restart to change.
+func (r *Reloader) validateDelegatedStoresAndIngestion(cfg config.Config) error {
 	var ingestionConfig *config.IngestionConfig
 	if cfg.Management != nil {
 		ingestionConfig = cfg.Management.Ingestion
@@ -447,69 +602,112 @@ func (r *Reloader) reload() error {
 		ingestionConfig != nil && *ingestionConfig != r.ingestion.config {
 		return errors.New("changing ingestion configuration requires a restart")
 	}
-	if ingestionConfig != nil {
-		if err := validateIngestionDirectories(cfg.Management, cfg.Benchmark); err != nil {
-			return err
-		}
-	}
-	var certificate *tls.Certificate
-	if cfg.Peer != nil {
-		if r.peerListen == "" || cfg.Peer.Listen != r.peerListen || cfg.Peer.NodeID != r.peerNodeID {
-			return errors.New("enabling peer listener or changing its address or node ID requires a restart")
-		}
-		if cfg.Peer.FederationID != r.peerFederationID || cfg.Peer.MembershipDirectory != r.peerMembershipDir ||
-			cfg.Peer.AuditDirectory != r.peerAuditDir || cfg.Peer.CatalogGrantDirectory != r.peerCatalogGrantDir {
-			return errors.New("changing peer federation identity or protected state directories requires a restart")
-		}
-		certificate, err = loadPeerCertificate(cfg.Peer)
-		if err != nil {
-			return err
-		}
-	}
-	var managementCertificate *tls.Certificate
+	return nil
+}
+
+// validateIngestionDirectories validates the ingestion directories when an
+// ingestion configuration is present. It is a no-op when ingestion is disabled.
+func (r *Reloader) validateIngestionDirectories(cfg config.Config) error {
+	var ingestionConfig *config.IngestionConfig
 	if cfg.Management != nil {
-		if r.managementListen == "" || cfg.Management.Listen != r.managementListen {
-			return errors.New("enabling or changing the management listener requires a restart")
-		}
-		managementCertificate, err = loadManagementCertificate(cfg.Management)
+		ingestionConfig = cfg.Management.Ingestion
+	}
+	if ingestionConfig == nil {
+		return nil
+	}
+	if err := validateIngestionDirectories(cfg.Management, cfg.Benchmark); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validatePeerListener returns an error when the peer listener address or node
+// ID, or protected peer state directories, would require a restart to change.
+func (r *Reloader) validatePeerListener(cfg config.Config) error {
+	if cfg.Peer == nil {
+		return nil
+	}
+	if r.peerListen == "" || cfg.Peer.Listen != r.peerListen || cfg.Peer.NodeID != r.peerNodeID {
+		return errors.New("enabling peer listener or changing its address or node ID requires a restart")
+	}
+	if cfg.Peer.FederationID != r.peerFederationID || cfg.Peer.MembershipDirectory != r.peerMembershipDir ||
+		cfg.Peer.AuditDirectory != r.peerAuditDir || cfg.Peer.CatalogGrantDirectory != r.peerCatalogGrantDir {
+		return errors.New("changing peer federation identity or protected state directories requires a restart")
+	}
+	return nil
+}
+
+// validateManagementListener returns an error when the management listener
+// would require a restart to enable or change.
+func (r *Reloader) validateManagementListener(cfg config.Config) error {
+	if cfg.Management == nil {
+		return nil
+	}
+	if r.managementListen == "" || cfg.Management.Listen != r.managementListen {
+		return errors.New("enabling or changing the management listener requires a restart")
+	}
+	return nil
+}
+
+// buildReloadHandler loads the peer and management TLS certificates (if any),
+// creates the diagnostics/model diagnostics/provenance services, and
+// constructs the HTTP handler for the new configuration. It returns the
+// certificates and handler so commitReloadState can install them under the
+// lifecycle lock.
+func (r *Reloader) buildReloadHandler(cfg config.Config) (peerCert, managementCert *tls.Certificate, handler http.Handler, err error) {
+	if cfg.Peer != nil {
+		peerCert, err = loadPeerCertificate(cfg.Peer)
 		if err != nil {
-			return err
+			return
+		}
+	}
+	if cfg.Management != nil {
+		managementCert, err = loadManagementCertificate(cfg.Management)
+		if err != nil {
+			return
 		}
 	}
 	diagnosticsService, err := diagnostics.New(cfg.Backends)
 	if err != nil {
-		return err
+		return
 	}
 	modelDiagnosticsService := modeldiagnostics.New()
 	provenanceService := provenance.New()
 	// The legacy timing prototype argument is accepted for signature
 	// compatibility but is ignored: per-request observers are created in
 	// ServeHTTP only when request_observation is enabled.
-	handler, err := New(cfg, r.logger, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
+	handler, err = New(cfg, r.logger, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
 	if err != nil {
-		return err
+		return
 	}
+	return
+}
+
+// commitReloadState installs the replacement state under lifecycleMu. The
+// caller holds no locks. It checks stopped/generation overflow, builds the
+// replacement state, swaps it in, cancels the old peer context, closes the
+// old peer clients, and signals the peer watcher. Old state is left immutable
+// and old clients are closed only after the swap.
+func (r *Reloader) commitReloadState(cfg config.Config, handler http.Handler, certs *reloadCertificates) error {
 	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
 	if r.stopped {
-		r.lifecycleMu.Unlock()
 		return errors.New("configuration reloader stopped")
 	}
 	old := r.state.Load()
 	if old.generation == ^uint64(0) {
-		r.lifecycleMu.Unlock()
 		return errors.New("configuration generation exhausted")
 	}
 	state, err := makeReloaderState(cfg, reloaderStateOptions{
 		handler:               handler,
 		generation:            old.generation + 1,
-		certificate:           certificate,
-		managementCertificate: managementCertificate,
+		certificate:           certs.peer,
+		managementCertificate: certs.management,
 		reservePeer:           r.peerListen != "",
 		pairingStore:          r.pairingStore,
 		auditStore:            r.auditStore,
 	})
 	if err != nil {
-		r.lifecycleMu.Unlock()
 		return err
 	}
 	state.catalogGrantStore = r.catalogGrantStore
@@ -520,11 +718,6 @@ func (r *Reloader) reload() error {
 	case r.peerWake <- struct{}{}:
 	default:
 	}
-	r.lifecycleMu.Unlock()
-	if r.onReload != nil {
-		r.onReload(cfg)
-	}
-	r.logger.Info("configuration reloaded", "default_backend", cfg.DefaultBackend, "backends", len(cfg.Backends))
 	return nil
 }
 

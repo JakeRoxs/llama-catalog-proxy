@@ -634,6 +634,50 @@ func TestBuildForgedIdentityRejected(t *testing.T) {
 	}
 }
 
+// TestBuildInvalidOrMismatchedIdentityReturnsUnknownFieldsOnly verifies that an
+// invalid identity or a model ID that does not match the requested identity
+// returns exactly the fixed unknown-fields schema: declared-metadata and build
+// fields are not declared/verified, they remain unknown. This preserves the
+// pre-refactor field presence for invalid/nonmatching IDs.
+func TestBuildInvalidOrMismatchedIdentityReturnsUnknownFieldsOnly(t *testing.T) {
+	validIdentity := ModelIdentity{PublicID: "model", BackendID: "default", LocalID: "model"}
+	// Invalid identity: public ID does not compose from prefix + local ID.
+	forgedIdentity := ModelIdentity{PublicID: "forged/public", BackendID: "default", LocalID: "public", Prefix: "other/"}
+
+	// Invalid identity yields no fields at all.
+	prov := Build(forgedIdentity, map[string]any{"id": "public", "context_length": 8192}, nil)
+	if len(prov.Fields) != 0 {
+		t.Fatalf("Build with invalid identity should return no fields, got %d", len(prov.Fields))
+	}
+
+	// Mismatched model ID (valid identity, wrong catalog id) yields exactly the
+	// fixed unknown-fields schema. Declared-metadata and build fields remain
+	// unknown (not declared/verified) and no extra keys are present.
+	prov = Build(validIdentity, map[string]any{"id": "different", "context_length": 8192}, nil)
+	if prov.Identity.LocalID != validIdentity.LocalID {
+		t.Fatalf("requested identity should remain separately represented: %#v", prov.Identity)
+	}
+	if len(prov.Fields) != len(unknownFields) {
+		t.Fatalf("field count = %d, want %d (unknownFields only)", len(prov.Fields), len(unknownFields))
+	}
+	for _, name := range unknownFields {
+		requireUnknown(t, &prov, name)
+	}
+	// Declared metadata must not be declared; build must not be verified.
+	for _, name := range declaredMetadataFields {
+		f := prov.Fields[name]
+		if f.Verification != Unknown || f.Value != nil || f.Source != sourceUnknown || !f.ObservedAt.IsZero() {
+			t.Fatalf("declared field %s should be unknown, got %#v", name, f)
+		}
+	}
+	for _, name := range []string{"build_version", "build_commit", "build_date"} {
+		f := prov.Fields[name]
+		if f.Verification != Unknown || f.Value != nil || f.Source != sourceUnknown || !f.ObservedAt.IsZero() {
+			t.Fatalf("build field %s should be unknown, got %#v", name, f)
+		}
+	}
+}
+
 func TestIdentityByteBound(t *testing.T) {
 	identity := ModelIdentity{PublicID: "model", BackendID: strings.Repeat("é", 129), LocalID: "model"}
 	if identity.Valid() {

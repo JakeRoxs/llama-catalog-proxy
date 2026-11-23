@@ -12,7 +12,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -154,17 +153,13 @@ func replaceOperationRecord(root *os.Root, dir *os.File, name string, data []byt
 		return ErrProposalStore
 	}
 	temp := delegatedOperationTempPrefix + hex.EncodeToString(id[:]) + ".tmp"
-	file, err := root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	file, cleanup, err := openDelegatedStoreTemp(root, dir, temp)
 	if err != nil {
 		return ErrProposalStore
 	}
 	defer func() {
-		if err := root.Remove(temp); err == nil {
-			if err := dir.Sync(); err != nil {
-				result = errors.Join(result, ErrProposalStore)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			result = errors.Join(result, ErrProposalStore)
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			result = errors.Join(result, cleanupErr)
 		}
 	}()
 	writeErr := file.Chmod(0o600)

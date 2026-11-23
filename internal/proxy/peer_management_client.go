@@ -33,26 +33,11 @@ const (
 // forwardDelegatedOperation is an internal read-only transport foundation.
 // The owner endpoint and receiving management route are not registered yet.
 func (r *Reloader) forwardDelegatedOperation(req *http.Request, state *reloaderState, owner, proposalID, operationID string) (modelconfig.DelegatedOperation, error) {
-	if req == nil || req.TLS == nil || state == nil {
-		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
-	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
-	default:
-		return modelconfig.DelegatedOperation{}, errDelegationBusy
-	}
-	r.lifecycleMu.Lock()
-	defer r.lifecycleMu.Unlock()
-	if r.stopped || r.state.Load() != state {
-		return modelconfig.DelegatedOperation{}, errDelegationChanged
-	}
-	if !r.delegatedCallerAuthorized(req, state) {
-		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
-	}
-	if err := req.Context().Err(); err != nil {
+	release, err := r.beginDelegatedRequest(req, state)
+	if err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}
+	defer release()
 	if !modelconfig.ValidDelegatedOperationID(proposalID) || !modelconfig.ValidDelegatedOperationID(operationID) {
 		return modelconfig.DelegatedOperation{}, modelconfig.ErrProposalInvalid
 	}
@@ -111,47 +96,83 @@ func decodeDelegatedPeerJSON(response *http.Response, dst any) error {
 	return nil
 }
 
-// Creation can persist a review even if its response is lost. No request is
-// automatically retried, and the owner-generated ID may then be unavailable.
-func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
+// beginDelegatedRequest performs the shared guarded preamble for delegated
+// management forwarding: nil/TLS/state guard, management slot reservation,
+// lifecycle locking, stopped/current-state check, caller authorization, and
+// request context check. On success it returns a release function; the caller
+// must defer it and holds the lifecycle lock and slot across the transport
+// calls and response validation that follow. On every error the helper itself
+// unlocks the lifecycle and returns the slot, so the caller never leaks them.
+func (r *Reloader) beginDelegatedRequest(req *http.Request, state *reloaderState) (func(), error) {
 	if req == nil || req.TLS == nil || state == nil {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+		return nil, errDelegationUnauthorized
 	}
 	select {
 	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
 	default:
-		return modelconfig.DelegatedProposal{}, errDelegationBusy
+		return nil, errDelegationBusy
 	}
 	r.lifecycleMu.Lock()
-	defer r.lifecycleMu.Unlock()
 	if r.stopped || r.state.Load() != state {
-		return modelconfig.DelegatedProposal{}, errDelegationChanged
+		r.lifecycleMu.Unlock()
+		<-r.managementSlots
+		return nil, errDelegationChanged
 	}
 	if !r.delegatedCallerAuthorized(req, state) {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
+		r.lifecycleMu.Unlock()
+		<-r.managementSlots
+		return nil, errDelegationUnauthorized
 	}
 	if err := req.Context().Err(); err != nil {
-		return modelconfig.DelegatedProposal{}, err
+		r.lifecycleMu.Unlock()
+		<-r.managementSlots
+		return nil, err
 	}
+	return func() {
+		r.lifecycleMu.Unlock()
+		<-r.managementSlots
+	}, nil
+}
+
+// buildDelegatedSettingsRequest builds the shared outbound delegated settings
+// request: it validates the target peer and management client, marshals and
+// bounds the input payload, and constructs the POST request with the
+// delegated transport headers. It returns the client and request; the caller
+// executes the request and releases the delegation lock/slot itself.
+func buildDelegatedSettingsRequest(req *http.Request, state *reloaderState, input delegatedSettingsRequest, path string) (*peerClient, *http.Request, error) {
 	if state.peer == nil || input.Owner.NodeID == state.peer.NodeID {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+		return nil, nil, errDelegationPeerUnavailable
 	}
 	client := state.peerClients[input.Owner.NodeID]
 	if client == nil || !client.routeManagement || client.id != input.Owner.NodeID {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+		return nil, nil, errDelegationPeerUnavailable
 	}
 	payload, err := json.Marshal(input)
 	if err != nil || len(payload) > maxBenchmarkJSONBytes {
-		return modelconfig.DelegatedProposal{}, modelconfig.ErrDelegatedProposalInvalid
+		return nil, nil, modelconfig.ErrDelegatedProposalInvalid
 	}
-	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost, client.origin+peerSettingsProposalPath, bytes.NewReader(payload))
+	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost, client.origin+path, bytes.NewReader(payload))
 	if err != nil {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+		return nil, nil, errDelegationPeerUnavailable
 	}
 	remote.Header.Set("Authorization", bearerPrefix+client.token)
 	remote.Header.Set(contentTypeHeader, jsonMediaType)
 	remote.Header.Set("Accept", jsonMediaType)
+	return client, remote, nil
+}
+
+// Creation can persist a review even if its response is lost. No request is
+// automatically retried, and the owner-generated ID may then be unavailable.
+func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
+	release, err := r.beginDelegatedRequest(req, state)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, err
+	}
+	defer release()
+	client, remote, err := buildDelegatedSettingsRequest(req, state, input, peerSettingsProposalPath)
+	if err != nil {
+		return modelconfig.DelegatedProposal{}, err
+	}
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationProposalUnknown
@@ -430,45 +451,15 @@ func validateDelegatedOperationResponse(record modelconfig.DelegatedOperation, r
 // operation or authorize a write. Each successful owner lookup appends a
 // bounded audit event, so transport failure is reported without auto-retry.
 func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, state *reloaderState, input delegatedSettingsRequest) (modelconfig.DelegatedProposal, error) {
-	if req == nil || req.TLS == nil || state == nil {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
-	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
-	default:
-		return modelconfig.DelegatedProposal{}, errDelegationBusy
-	}
-	r.lifecycleMu.Lock()
-	defer r.lifecycleMu.Unlock()
-	if r.stopped || r.state.Load() != state {
-		return modelconfig.DelegatedProposal{}, errDelegationChanged
-	}
-	if !r.delegatedCallerAuthorized(req, state) {
-		return modelconfig.DelegatedProposal{}, errDelegationUnauthorized
-	}
-	if err := req.Context().Err(); err != nil {
+	release, err := r.beginDelegatedRequest(req, state)
+	if err != nil {
 		return modelconfig.DelegatedProposal{}, err
 	}
-	if state.peer == nil || input.Owner.NodeID == state.peer.NodeID {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
-	}
-	client := state.peerClients[input.Owner.NodeID]
-	if client == nil || !client.routeManagement || client.id != input.Owner.NodeID {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
-	}
-	payload, err := json.Marshal(input)
-	if err != nil || len(payload) > maxBenchmarkJSONBytes {
-		return modelconfig.DelegatedProposal{}, modelconfig.ErrDelegatedProposalInvalid
-	}
-	remote, err := http.NewRequestWithContext(req.Context(), http.MethodPost,
-		client.origin+peerSettingsProposalRecoveryPath, bytes.NewReader(payload))
+	defer release()
+	client, remote, err := buildDelegatedSettingsRequest(req, state, input, peerSettingsProposalRecoveryPath)
 	if err != nil {
-		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
+		return modelconfig.DelegatedProposal{}, err
 	}
-	remote.Header.Set("Authorization", bearerPrefix+client.token)
-	remote.Header.Set(contentTypeHeader, jsonMediaType)
-	remote.Header.Set("Accept", jsonMediaType)
 	response, err := client.client.Do(remote)
 	if err != nil {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerUnavailable
@@ -497,26 +488,11 @@ func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, s
 // The supplied review is not authorization. The owner reloads its stored
 // proposal and rechecks every binding before any write.
 func (r *Reloader) forwardDelegatedSettingsApply(req *http.Request, state *reloaderState, review modelconfig.DelegatedProposal, operationID string, acknowledgeReview, acknowledgeDisruption, acknowledgeExclusiveWindow bool) (modelconfig.DelegatedOperation, error) {
-	if req == nil || req.TLS == nil || state == nil {
-		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
-	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
-	default:
-		return modelconfig.DelegatedOperation{}, errDelegationBusy
-	}
-	r.lifecycleMu.Lock()
-	defer r.lifecycleMu.Unlock()
-	if r.stopped || r.state.Load() != state {
-		return modelconfig.DelegatedOperation{}, errDelegationChanged
-	}
-	if !r.delegatedCallerAuthorized(req, state) {
-		return modelconfig.DelegatedOperation{}, errDelegationUnauthorized
-	}
-	if err := req.Context().Err(); err != nil {
+	release, err := r.beginDelegatedRequest(req, state)
+	if err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}
+	defer release()
 	if err := validateDelegatedApplyReview(review, operationID, state, acknowledgeReview, acknowledgeDisruption, acknowledgeExclusiveWindow); err != nil {
 		return modelconfig.DelegatedOperation{}, err
 	}

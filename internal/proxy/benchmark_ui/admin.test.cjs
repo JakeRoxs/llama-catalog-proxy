@@ -44,6 +44,33 @@ function textOf(node) {
   return [node.textContent, ...node.children.flatMap(textOf)].filter(Boolean).join(" ");
 }
 
+// Shared fetch stub for the catalog-read and inference grant UI tests. It records every
+// request in `calls` in order, serves the shared session/overview/invitations/grants/
+// catalog/inference/audit fixtures, uses the supplied members payload, and answers POST
+// mutation requests with the same grant response. Unmatched URLs fall back to the prior
+// default grant response so existing dashboard rendering behavior is preserved.
+function adminGrantFetch(calls, membersResponse) {
+  const responses = {
+    "/admin/api/v1/session": { subject: "operator", roles: ["view", "administer_federation"], csrf_token: "csrf" },
+    "/admin/api/v1/overview": { node_id: "node-a", updated_at: "2026-11-16T00:00:00Z", models: [], peers: [], request_summary_state: "not_configured" },
+    "/admin/api/v1/federation/invitations": { state: "available", invitations: [] },
+    "/admin/api/v1/federation/catalog-grants": { state: "available", grants: [] },
+    "/admin/api/v1/federation/inference-grants": { state: "available", grants: [] },
+    "/admin/api/v1/federation/grants": { state: "not_configured", grants: [] },
+    "/admin/api/v1/audit/events?limit=50": { state: "available", events: [] },
+  };
+  return async (url, options = {}) => {
+    calls.push({ url, options });
+    if (url === "/admin/api/v1/federation/members") {
+      return { ok: true, status: 200, json: async () => membersResponse };
+    }
+    if (options && options.method === "POST") {
+      return { ok: true, status: 200, json: async () => ({ grant: { node_id: "node-b" } }) };
+    }
+    return { ok: true, status: 200, json: async () => responses[url] ?? { grant: { node_id: "node-b" } } };
+  };
+}
+
 test("admin dashboard uses OIDC session and renders only the safe overview fields", async () => {
   const calls = [];
   const responses = {
@@ -124,25 +151,7 @@ test("admin dashboard does not query sensitive endpoints", async () => {
 
 test("catalog-read grant UI requires explicit confirmation and uses CSRF-protected API", async () => {
   const calls = [];
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, options });
-    const response = url === "/admin/api/v1/session"
-      ? { subject: "operator", roles: ["view", "administer_federation"], csrf_token: "csrf" }
-      : url === "/admin/api/v1/overview"
-        ? { node_id: "node-a", updated_at: "2026-11-16T00:00:00Z", models: [], peers: [], request_summary_state: "not_configured" }
-        : url === "/admin/api/v1/federation/members"
-          ? { state: "available", members: [{ node_id: "node-b", certificate_sha256: "a".repeat(64), paired_at: "2026-11-16T00:00:00Z" }] }
-          : url === "/admin/api/v1/federation/invitations"
-            ? { state: "available", invitations: [] }
-            : url === "/admin/api/v1/federation/catalog-grants"
-              ? { state: "available", grants: [] }
-              : url === "/admin/api/v1/federation/grants"
-                ? { state: "not_configured", grants: [] }
-                : url === "/admin/api/v1/audit/events?limit=50"
-                  ? { state: "available", events: [] }
-                  : { grant: { node_id: "node-b" } };
-    return { ok: true, status: 200, json: async () => response };
-  };
+  const fetchImpl = adminGrantFetch(calls, { state: "available", members: [{ node_id: "node-b", certificate_sha256: "a".repeat(64), paired_at: "2026-11-16T00:00:00Z" }] });
   const { elements } = createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   elements.set("catalog-read-node", new Element("input"));
@@ -160,27 +169,7 @@ test("catalog-read grant UI requires explicit confirmation and uses CSRF-protect
 
 test("inference grant UI submits independent directions with CSRF protection", async () => {
   const calls = [];
-  const fetchImpl = async (url, options = {}) => {
-    calls.push({ url, options });
-    const response = url === "/admin/api/v1/session"
-      ? { subject: "operator", roles: ["view", "administer_federation"], csrf_token: "csrf" }
-      : url === "/admin/api/v1/overview"
-        ? { node_id: "node-a", updated_at: "2026-11-16T00:00:00Z", models: [], peers: [], request_summary_state: "not_configured" }
-        : url === "/admin/api/v1/federation/members"
-          ? { state: "available", members: [{ node_id: "node-b" }] }
-          : url === "/admin/api/v1/federation/invitations"
-            ? { state: "available", invitations: [] }
-            : url === "/admin/api/v1/federation/catalog-grants"
-              ? { state: "available", grants: [] }
-              : url === "/admin/api/v1/federation/inference-grants"
-                ? { state: "available", grants: [] }
-                : url === "/admin/api/v1/federation/grants"
-                  ? { state: "not_configured", grants: [] }
-                  : url === "/admin/api/v1/audit/events?limit=50"
-                    ? { state: "available", events: [] }
-                    : { grant: { node_id: "node-b" } };
-    return { ok: true, status: 200, json: async () => response };
-  };
+  const fetchImpl = adminGrantFetch(calls, { state: "available", members: [{ node_id: "node-b" }] });
   const { elements } = createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   elements.set("inference-grant-node", new Element("input"));

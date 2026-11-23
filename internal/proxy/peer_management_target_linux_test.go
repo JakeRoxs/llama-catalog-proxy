@@ -139,17 +139,7 @@ func TestPeerSettingsGrantSnapshotAndPreviewAreOwnerScopedAndSanitized(t *testin
 		t.Fatal(err)
 	}
 	defer members.Close()
-	if _, err := members.AddMember("node-b", peerCertificateFingerprint(clientLeaf), time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	grant := modelconfig.OwnerGrant{
-		ID: "0123456789abcdef0123456789abcdef", RequesterNodeID: "node-b", Action: "manage_settings",
-		BackendID: "backend-a", TargetID: "target-a", ModelIDs: []string{"model-a"},
-		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), ApprovedBy: "oidc_admin",
-	}
-	if err := modelconfig.CreateOwnerGrant(dirs["grants"], grant); err != nil {
-		t.Fatal(err)
-	}
+	grant := createPeerOwnerGrantFixture(t, members, dirs["grants"], clientLeaf)
 	audit := newTestAuditStore(t, "owner")
 	owner := &Reloader{peerSlots: make(chan struct{}, 8), instanceID: strings.Repeat("a", 32), auditStore: audit}
 	owner.state.Store(&reloaderState{

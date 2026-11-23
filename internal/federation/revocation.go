@@ -48,7 +48,11 @@ func CRLPolicyTime(crls []*x509.RevocationList, maxAge time.Duration, now time.T
 	return status
 }
 
-func LoadCRLs(path string, maxAge time.Duration) ([]*x509.RevocationList, error) {
+// readCRLFile opens, reads (bounded by maxCRLBundleSize+1), and closes the CRL
+// file at path. It returns ErrPairingStore on open/read/close failure, empty
+// input, or input exceeding the maximum bundle size. File close/error order is
+// preserved: close is always attempted and both read and close errors are checked.
+func readCRLFile(path string) ([]byte, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, ErrPairingStore
@@ -58,31 +62,64 @@ func LoadCRLs(path string, maxAge time.Duration) ([]*x509.RevocationList, error)
 	if readErr != nil || closeErr != nil || len(data) == 0 || len(data) > maxCRLBundleSize {
 		return nil, ErrPairingStore
 	}
+	return data, nil
+}
+
+// validateNoCriticalExtensions returns ErrPairingStore when any CRL top-level
+// extension or any revoked-certificate-entry extension is marked critical.
+func validateNoCriticalExtensions(crl *x509.RevocationList) error {
+	for _, extension := range crl.Extensions {
+		if extension.Critical {
+			return ErrPairingStore
+		}
+	}
+	for _, entry := range crl.RevokedCertificateEntries {
+		for _, extension := range entry.Extensions {
+			if extension.Critical {
+				return ErrPairingStore
+			}
+		}
+	}
+	return nil
+}
+
+// parseCRLBlock decodes a single PEM block, verifies its type and headers,
+// parses the revocation list, rejects critical extensions, and validates
+// freshness against maxAge using the current clock. It returns the parsed CRL
+// and the unparsed remainder of the input.
+func parseCRLBlock(remaining []byte, maxAge time.Duration) (*x509.RevocationList, []byte, error) {
+	block, rest := pem.Decode(remaining)
+	if block == nil || block.Type != "X509 CRL" || len(block.Headers) != 0 {
+		return nil, nil, ErrPairingStore
+	}
+	crl, err := x509.ParseRevocationList(block.Bytes)
+	if err != nil || crl.Number == nil || crl.ThisUpdate.IsZero() || crl.NextUpdate.IsZero() {
+		return nil, nil, ErrPairingStore
+	}
+	if err := validateNoCriticalExtensions(crl); err != nil {
+		return nil, nil, err
+	}
+	if err := ValidateCRLFreshness(crl, maxAge, time.Now()); err != nil {
+		return nil, nil, ErrPairingStore
+	}
+	return crl, rest, nil
+}
+
+// LoadCRLs reads a PEM bundle of revocation lists from path and returns the
+// parsed lists. File reading, per-block parsing, freshness, critical-extension,
+// and count limits are delegated to pure helpers; LoadCRLs owns iteration,
+// ordering, and the 64-list cap.
+func LoadCRLs(path string, maxAge time.Duration) ([]*x509.RevocationList, error) {
+	data, err := readCRLFile(path)
+	if err != nil {
+		return nil, err
+	}
 	var crls []*x509.RevocationList
 	remaining := bytes.TrimSpace(data)
 	for len(remaining) > 0 {
-		block, rest := pem.Decode(remaining)
-		if block == nil || block.Type != "X509 CRL" || len(block.Headers) != 0 {
-			return nil, ErrPairingStore
-		}
-		crl, err := x509.ParseRevocationList(block.Bytes)
-		if err != nil || crl.Number == nil || crl.ThisUpdate.IsZero() || crl.NextUpdate.IsZero() {
-			return nil, ErrPairingStore
-		}
-		for _, extension := range crl.Extensions {
-			if extension.Critical {
-				return nil, ErrPairingStore
-			}
-		}
-		for _, entry := range crl.RevokedCertificateEntries {
-			for _, extension := range entry.Extensions {
-				if extension.Critical {
-					return nil, ErrPairingStore
-				}
-			}
-		}
-		if err := ValidateCRLFreshness(crl, maxAge, time.Now()); err != nil {
-			return nil, ErrPairingStore
+		crl, rest, err := parseCRLBlock(remaining, maxAge)
+		if err != nil {
+			return nil, err
 		}
 		crls = append(crls, crl)
 		if len(crls) > 64 {
@@ -107,6 +144,33 @@ func ValidateCRLFreshness(crl *x509.RevocationList, maxAge time.Duration, now ti
 	return nil
 }
 
+// selectCRLForIssuer returns the CRL issued by (and signed by) issuer with the
+// highest Number. Two CRLs with the same Number but different Raw content are
+// an error; identical duplicates keep the first-seen CRL.
+func selectCRLForIssuer(crls []*x509.RevocationList, issuer *x509.Certificate) (*x509.RevocationList, error) {
+	var selected *x509.RevocationList
+	for _, crl := range crls {
+		if !bytes.Equal(crl.RawIssuer, issuer.RawSubject) || crl.CheckSignatureFrom(issuer) != nil {
+			continue
+		}
+		if selected == nil || crl.Number.Cmp(selected.Number) > 0 {
+			selected = crl
+		} else if crl.Number.Cmp(selected.Number) == 0 && !bytes.Equal(crl.Raw, selected.Raw) {
+			return nil, ErrPairingStore
+		}
+	}
+	return selected, nil
+}
+
+// verifyCertificateAgainstCRL returns ErrPairingStore when no CRL was selected,
+// the selected CRL is not fresh, or the certificate serial is revoked.
+func verifyCertificateAgainstCRL(selected *x509.RevocationList, certificate *x509.Certificate, maxAge time.Duration, now time.Time) error {
+	if selected == nil || ValidateCRLFreshness(selected, maxAge, now) != nil || isCertificateRevoked(selected, certificate.SerialNumber) {
+		return ErrPairingStore
+	}
+	return nil
+}
+
 func VerifyCertificateRevocation(chains [][]*x509.Certificate, crls []*x509.RevocationList, maxAge time.Duration, now time.Time) error {
 	if len(chains) == 0 || len(crls) == 0 {
 		return ErrPairingStore
@@ -117,18 +181,11 @@ func VerifyCertificateRevocation(chains [][]*x509.Certificate, crls []*x509.Revo
 		}
 		for index := 0; index < len(chain)-1; index++ {
 			certificate, issuer := chain[index], chain[index+1]
-			var selected *x509.RevocationList
-			for _, crl := range crls {
-				if !bytes.Equal(crl.RawIssuer, issuer.RawSubject) || crl.CheckSignatureFrom(issuer) != nil {
-					continue
-				}
-				if selected == nil || crl.Number.Cmp(selected.Number) > 0 {
-					selected = crl
-				} else if crl.Number.Cmp(selected.Number) == 0 && !bytes.Equal(crl.Raw, selected.Raw) {
-					return ErrPairingStore
-				}
+			selected, err := selectCRLForIssuer(crls, issuer)
+			if err != nil {
+				return ErrPairingStore
 			}
-			if selected == nil || ValidateCRLFreshness(selected, maxAge, now) != nil || isCertificateRevoked(selected, certificate.SerialNumber) {
+			if err := verifyCertificateAgainstCRL(selected, certificate, maxAge, now); err != nil {
 				return ErrPairingStore
 			}
 		}

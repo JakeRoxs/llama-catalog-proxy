@@ -40,68 +40,99 @@ func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, stat
 		writeProposalError(w, modelconfig.ErrProposalStore)
 		return
 	}
+	if r.serveProposalSpecialRoutes(w, req, state, directory) {
+		return
+	}
+	r.serveProposalListGetDelete(w, req, state, directory)
+}
+
+// serveProposalSpecialRoutes handles the create, creation, catalog, and verify
+// routes for the proposals resource. It returns true when a response was written.
+func (r *Reloader) serveProposalSpecialRoutes(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) bool {
+	const base = "/management/v1/proposals"
 	if req.URL.Path == base && req.Method == http.MethodPost {
 		r.createProposal(w, req, state, directory)
-		return
+		return true
 	}
 	if req.URL.Path == base+"/creation" {
 		r.serveCreation(w, req, state, true)
-		return
+		return true
 	}
 	if strings.HasPrefix(req.URL.Path, base+"/") && strings.HasSuffix(req.URL.Path, "/catalog") {
 		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, base+"/"), "/catalog")
 		r.serveCreationCatalog(w, req, state, directory, id)
-		return
+		return true
 	}
 	if strings.HasPrefix(req.URL.Path, base+"/") && strings.HasSuffix(req.URL.Path, "/verify") && req.Method == http.MethodPost {
 		if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
 			http.Error(w, "verification does not accept a request body", http.StatusBadRequest)
-			return
+			return true
 		}
 		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, base+"/"), "/verify")
 		r.verifyProposal(w, state, directory, id)
-		return
+		return true
 	}
-	var result any
-	var err error
+	return false
+}
+
+// serveProposalListGetDelete responds to GET list, GET/DELETE by id, and returns
+// 405 for anything else. It returns true when a response was written.
+func (r *Reloader) serveProposalListGetDelete(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) bool {
+	const base = "/management/v1/proposals"
 	if req.URL.Path == base && req.Method == http.MethodGet {
-		var ids []string
-		ids, err = modelconfig.ListProposals(directory)
-		result = struct {
-			IDs []string `json:"ids"`
-		}{IDs: ids}
-	} else if strings.HasPrefix(req.URL.Path, base+"/") &&
-		(req.Method == http.MethodGet || req.Method == http.MethodDelete) {
-		id := strings.TrimPrefix(req.URL.Path, base+"/")
-		if req.Method == http.MethodGet {
-			result, err = modelconfig.LoadStoredProposal(directory, id)
-		} else {
-			r.lifecycleMu.Lock()
-			if r.stopped || r.state.Load() != state {
-				r.lifecycleMu.Unlock()
-				http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
-				return
-			}
-			err = modelconfig.DeleteProposal(directory, id)
-			r.lifecycleMu.Unlock()
+		ids, err := modelconfig.ListProposals(directory)
+		if err != nil {
+			writeProposalError(w, err)
+			return true
 		}
-	} else {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		if r.state.Load() != state {
+			http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
+			return true
+		}
+		writeJSON(r.logger, w, http.StatusOK, struct {
+			IDs []string `json:"ids"`
+		}{IDs: ids})
+		return true
 	}
+	if strings.HasPrefix(req.URL.Path, base+"/") && (req.Method == http.MethodGet || req.Method == http.MethodDelete) {
+		id := strings.TrimPrefix(req.URL.Path, base+"/")
+		return r.serveProposalGetDelete(w, req, state, directory, id)
+	}
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return true
+}
+
+// serveProposalGetDelete loads or deletes a single proposal by id. It returns
+// true when a response was written. The lifecycle lock and stale-state recheck
+// are held for the duration of the delete operation.
+func (r *Reloader) serveProposalGetDelete(w http.ResponseWriter, req *http.Request, state *reloaderState, directory, id string) bool {
+	if req.Method == http.MethodGet {
+		result, err := modelconfig.LoadStoredProposal(directory, id)
+		if err != nil {
+			writeProposalError(w, err)
+			return true
+		}
+		if r.state.Load() != state {
+			http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
+			return true
+		}
+		writeJSON(r.logger, w, http.StatusOK, result)
+		return true
+	}
+	r.lifecycleMu.Lock()
+	if r.stopped || r.state.Load() != state {
+		r.lifecycleMu.Unlock()
+		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
+		return true
+	}
+	err := modelconfig.DeleteProposal(directory, id)
+	r.lifecycleMu.Unlock()
 	if err != nil {
 		writeProposalError(w, err)
-		return
+		return true
 	}
-	if req.Method != http.MethodDelete && r.state.Load() != state {
-		http.Error(w, managementConfigChangedMsg, http.StatusServiceUnavailable)
-		return
-	}
-	if req.Method == http.MethodDelete {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	writeJSON(r.logger, w, http.StatusOK, result)
+	w.WriteHeader(http.StatusNoContent)
+	return true
 }
 
 func (r *Reloader) verifyProposal(w http.ResponseWriter, state *reloaderState, directory, id string) {
@@ -217,23 +248,38 @@ func pathWithin(parent, child string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func (r *Reloader) createProposal(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) {
+// readManagementJSONBody guards and reads the request body for management JSON
+// requests. It enforces the application/json content type, rejects a non-empty
+// Content-Encoding header, reads at most maxManagementRequest+1 bytes, and
+// writes the exact HTTP errors used by the proposal and creation-catalog
+// handlers. The returned bool is false when an error response was already
+// written and the caller must return. validateManagementJSON is intentionally
+// not applied here; callers apply it in their own positions/conditions.
+func readManagementJSONBody(w http.ResponseWriter, req *http.Request) ([]byte, bool) {
 	contentType, _, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
 	if err != nil || contentType != "application/json" || req.Header.Get("Content-Encoding") != "" {
 		http.Error(w, "JSON request required", http.StatusUnsupportedMediaType)
-		return
+		return nil, false
 	}
 	if req.Body == nil {
 		http.Error(w, "request body required", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	data, err := io.ReadAll(io.LimitReader(req.Body, maxManagementRequest+1))
 	if err != nil {
 		http.Error(w, "request could not be read", http.StatusBadRequest)
-		return
+		return nil, false
 	}
 	if len(data) > maxManagementRequest {
 		http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+		return nil, false
+	}
+	return data, true
+}
+
+func (r *Reloader) createProposal(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) {
+	data, ok := readManagementJSONBody(w, req)
+	if !ok {
 		return
 	}
 	if err := validateManagementJSON(data); err != nil {

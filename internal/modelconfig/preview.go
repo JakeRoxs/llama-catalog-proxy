@@ -202,40 +202,80 @@ func commandSourceRange(data []byte, node *yaml.Node) (int, int, error) {
 	if node.Line < 1 || node.Column < 1 || strings.ContainsAny(node.Value, "\r\n") {
 		return 0, 0, errors.New("unsupported command scalar")
 	}
-	lineStart := 0
-	for line := 1; line < node.Line; line++ {
-		i := bytes.IndexByte(data[lineStart:], '\n')
-		if i < 0 {
-			return 0, 0, errors.New("invalid YAML source location")
-		}
-		lineStart += i + 1
+	lineStart, err := sourceLineStart(data, node.Line)
+	if err != nil {
+		return 0, 0, err
 	}
-	offset := lineStart
-	for column := 1; column < node.Column; column++ {
+	offset, err := sourceColumnOffset(data, lineStart, node.Column)
+	if err != nil {
+		return 0, 0, err
+	}
+	quote, err := scalarQuote(node.Style)
+	if err != nil {
+		return 0, 0, err
+	}
+	start, end, err := validateScalarBytes(data, offset, quote, node.Value)
+	if err != nil {
+		return 0, 0, err
+	}
+	return start, end, nil
+}
+
+// sourceLineStart returns the byte offset of the start of the given 1-based line
+// by scanning for newlines. It preserves the original bytes.IndexByte line scan.
+func sourceLineStart(data []byte, line int) (int, error) {
+	lineStart := 0
+	for i := 1; i < line; i++ {
+		n := bytes.IndexByte(data[lineStart:], '\n')
+		if n < 0 {
+			return 0, errors.New("invalid YAML source location")
+		}
+		lineStart += n + 1
+	}
+	return lineStart, nil
+}
+
+// sourceColumnOffset advances offset by the given 1-based column, counting each
+// UTF-8 rune as one column. It preserves the original UTF-8 rune column behavior.
+func sourceColumnOffset(data []byte, offset, column int) (int, error) {
+	for i := 1; i < column; i++ {
 		if offset >= len(data) || data[offset] == '\n' {
-			return 0, 0, errors.New("invalid YAML source location")
+			return 0, errors.New("invalid YAML source location")
 		}
 		_, size := utf8.DecodeRune(data[offset:])
 		offset += size
 	}
-	quote := byte(0)
-	switch node.Style {
+	return offset, nil
+}
+
+// scalarQuote returns the opening quote byte for the given YAML scalar style.
+// Plain style (0) returns 0. Unsupported styles return an error.
+func scalarQuote(style yaml.Style) (byte, error) {
+	switch style {
 	case 0:
+		return 0, nil
 	case yaml.SingleQuotedStyle:
-		quote = '\''
+		return '\'', nil
 	case yaml.DoubleQuotedStyle:
-		quote = '"'
+		return '"', nil
 	default:
-		return 0, 0, errors.New("unsupported command scalar style")
+		return 0, errors.New("unsupported command scalar style")
 	}
+}
+
+// validateScalarBytes checks that the scalar bytes at offset match value exactly
+// and that the closing quote (when quoted) or delimiter (when plain) is present.
+// It returns the byte offset just after the opening quote and just after the
+// scalar value.
+func validateScalarBytes(data []byte, offset int, quote byte, value string) (int, int, error) {
 	if quote != 0 {
 		if offset >= len(data) || data[offset] != quote {
 			return 0, 0, errors.New("unsupported command scalar")
 		}
 		offset++
 	}
-	end := offset + len(node.Value)
-	if end > len(data) || !bytes.Equal(data[offset:end], []byte(node.Value)) {
+	end := offset + len(value)
+	if end > len(data) || !bytes.Equal(data[offset:end], []byte(value)) {
 		return 0, 0, errors.New("command scalar requires unsupported decoding")
 	}
 	if quote != 0 {

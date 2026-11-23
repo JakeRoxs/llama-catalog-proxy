@@ -73,43 +73,76 @@ func NewEventID() (string, error) {
 }
 
 func ValidateEvent(event Event) error {
+	if err := validateRequiredFields(event); err != nil {
+		return err
+	}
+	if err := validateOptionalFields(event); err != nil {
+		return err
+	}
+	if err := validatePrincipal(event); err != nil {
+		return err
+	}
+	return validatePhaseOutcome(event)
+}
+
+func validateRequiredFields(event Event) error {
 	if !identity.ValidNodeID(event.LocalNodeID) || !validAuditID(event.ID) || event.At.IsZero() ||
 		!validAuditAction(event.Action) || !validAuditOutcome(event.Outcome) || event.AssertedUserSubject != "" ||
 		len(event.VerifiedUserSubject) > 256 || len(event.IdentityIssuer) > 256 || len(event.LocalAccount) > 128 ||
 		len(event.Role) > 64 || len(event.TargetID) > 128 || len(event.ModelID) > 256 || len(event.CorrelationID) > 64 {
 		return ErrInvalid
 	}
-	if event.RequesterNodeID != "" && !identity.ValidNodeID(event.RequesterNodeID) {
+	return nil
+}
+
+func validateOptionalFields(event Event) error {
+	if event.RequesterNodeID != "" && !identity.ValidNodeID(event.RequesterNodeID) ||
+		event.TargetID != "" && !identity.ValidNodeID(event.TargetID) ||
+		event.ModelID != "" && !identity.ValidModelComponent(event.ModelID) ||
+		event.CorrelationID != "" && !validAuditID(event.CorrelationID) {
 		return ErrInvalid
 	}
-	if event.TargetID != "" && !identity.ValidNodeID(event.TargetID) {
-		return ErrInvalid
-	}
-	if event.ModelID != "" && !identity.ValidModelComponent(event.ModelID) {
-		return ErrInvalid
-	}
-	if event.CorrelationID != "" && !validAuditID(event.CorrelationID) {
-		return ErrInvalid
-	}
+	return nil
+}
+
+func validatePrincipal(event Event) error {
 	switch event.PrincipalType {
 	case "oidc":
-		if event.UserIdentityState != "verified_local" || event.VerifiedUserSubject == "" || event.IdentityIssuer == "" || event.LocalAccount != "" {
-			return ErrInvalid
-		}
+		return validateOIDC(event)
 	case "local_cli":
-		if event.UserIdentityState != "local_process" || event.LocalAccount == "" || event.VerifiedUserSubject != "" || event.IdentityIssuer != "" {
-			return ErrInvalid
-		}
+		return validateLocalCLI(event)
 	case "delegation_token", "machine_token", "peer_node", "unknown":
-		if event.UserIdentityState != "unknown" || event.VerifiedUserSubject != "" || event.IdentityIssuer != "" || event.LocalAccount != "" {
-			return ErrInvalid
-		}
-		if event.PrincipalType == "peer_node" && event.RequesterNodeID == "" {
-			return ErrInvalid
-		}
+		return validateTokenOrPeer(event)
 	default:
 		return ErrInvalid
 	}
+}
+
+func validateOIDC(event Event) error {
+	if event.UserIdentityState != "verified_local" || event.VerifiedUserSubject == "" || event.IdentityIssuer == "" || event.LocalAccount != "" {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validateLocalCLI(event Event) error {
+	if event.UserIdentityState != "local_process" || event.LocalAccount == "" || event.VerifiedUserSubject != "" || event.IdentityIssuer != "" {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validateTokenOrPeer(event Event) error {
+	if event.UserIdentityState != "unknown" || event.VerifiedUserSubject != "" || event.IdentityIssuer != "" || event.LocalAccount != "" {
+		return ErrInvalid
+	}
+	if event.PrincipalType == "peer_node" && event.RequesterNodeID == "" {
+		return ErrInvalid
+	}
+	return nil
+}
+
+func validatePhaseOutcome(event Event) error {
 	if event.Phase != "started" && event.Phase != "completed" && event.Phase != "event" {
 		return ErrInvalid
 	}

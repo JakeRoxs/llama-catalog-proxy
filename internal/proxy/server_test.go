@@ -297,6 +297,38 @@ func TestPathRoutePreservesRequestAndAppliesBackendCredentials(t *testing.T) {
 	}
 }
 
+func assertRawWebSocketEcho(t *testing.T, proxyURL string, path string, failOnHeaderRead bool) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyURL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.WriteString(connection, "GET "+path+" HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
+		t.Fatalf("upgrade status = %q, error = %v", status, err)
+	}
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			if failOnHeaderRead {
+				t.Fatal(readErr)
+			}
+			break
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	_, _ = io.WriteString(connection, "ping\n")
+	if echo, readErr := reader.ReadString('\n'); readErr != nil || echo != "echo:ping\n" {
+		t.Fatalf("websocket tunnel response = %q, error = %v", echo, readErr)
+	}
+}
+
 func TestPathRouteProxiesWebSocketUpgrade(t *testing.T) {
 	backendPath := make(chan string, 1)
 	comfyServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -324,31 +356,7 @@ func TestPathRouteProxiesWebSocketUpgrade(t *testing.T) {
 	proxyServer := httptest.NewServer(newHandler(t, cfg))
 	defer proxyServer.Close()
 
-	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyServer.URL, "http://"), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = io.WriteString(connection, "GET /comfyui/ws HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(connection)
-	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
-		t.Fatalf("upgrade status = %q, error = %v", status, err)
-	}
-	for {
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	_, _ = io.WriteString(connection, "ping\n")
-	if echo, readErr := reader.ReadString('\n'); readErr != nil || echo != "echo:ping\n" {
-		t.Fatalf("websocket tunnel response = %q, error = %v", echo, readErr)
-	}
+	assertRawWebSocketEcho(t, proxyServer.URL, "/comfyui/ws", true)
 	if path := <-backendPath; path != "/comfyui/ws" {
 		t.Fatalf("backend path = %q", path)
 	}

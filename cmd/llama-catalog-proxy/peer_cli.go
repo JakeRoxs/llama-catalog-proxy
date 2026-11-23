@@ -120,22 +120,17 @@ func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 }
 
 func runPeerInviteCreate(args []string, stdout, stderr io.Writer) error {
-	flags := peerFlags("peer invite create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
-	nodeID := flags.String(peerNodeIDFlag, "", "expected node ID to invite")
-	if err := parsePeerFlags(flags, args); err != nil {
+	configPath, nodeID, err := parsePeerNodeIDArgs("peer invite create", "expected node ID to invite", args, stderr)
+	if err != nil {
 		return err
 	}
-	if *nodeID == "" {
-		return errors.New("--node-id is required")
-	}
-	return withPeerCLIAudit(*configPath, "pairing.invitation.create", *nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		store, err := openConfiguredPairingStore(*configPath)
+	return withPeerCLIAudit(configPath, "pairing.invitation.create", nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
+		store, err := openConfiguredPairingStore(configPath)
 		if err != nil {
 			return "", "", "", err
 		}
 		defer store.Close()
-		invite, err := store.CreateInvitation(*nodeID, time.Now())
+		invite, err := store.CreateInvitation(nodeID, time.Now())
 		if err != nil {
 			return "", "", "", err
 		}
@@ -164,26 +159,21 @@ func runPeerInviteList(args []string, stdout, stderr io.Writer) error {
 }
 
 func runPeerInviteRevoke(args []string, stdout, stderr io.Writer) error {
-	flags := peerFlags("peer invite revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
-	nodeID := flags.String(peerNodeIDFlag, "", "expected node ID whose invitation to cancel")
-	if err := parsePeerFlags(flags, args); err != nil {
+	configPath, nodeID, err := parsePeerNodeIDArgs("peer invite revoke", "expected node ID whose invitation to cancel", args, stderr)
+	if err != nil {
 		return err
 	}
-	if *nodeID == "" {
-		return errors.New("--node-id is required")
-	}
-	return withPeerCLIAudit(*configPath, "pairing.invitation.revoke", *nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		store, err := openConfiguredPairingStore(*configPath)
+	return withPeerCLIAudit(configPath, "pairing.invitation.revoke", nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
+		store, err := openConfiguredPairingStore(configPath)
 		if err != nil {
 			return "", "", "", err
 		}
 		defer store.Close()
-		if err := store.RemoveInvitation(*nodeID); err != nil {
+		if err := store.RemoveInvitation(nodeID); err != nil {
 			return "", "", "", err
 		}
 		_, err = io.WriteString(out, "invitation canceled\n")
-		return *nodeID, "", "", err
+		return nodeID, "", "", err
 	})
 }
 
@@ -208,26 +198,21 @@ func runPeerMembersList(args []string, stdout, stderr io.Writer) error {
 }
 
 func runPeerMemberRevoke(args []string, stdout, stderr io.Writer) error {
-	flags := peerFlags("peer members revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
-	nodeID := flags.String(peerNodeIDFlag, "", "paired node ID to revoke")
-	if err := parsePeerFlags(flags, args); err != nil {
+	configPath, nodeID, err := parsePeerNodeIDArgs("peer members revoke", "paired node ID to revoke", args, stderr)
+	if err != nil {
 		return err
 	}
-	if *nodeID == "" {
-		return errors.New("--node-id is required")
-	}
-	return withPeerCLIAudit(*configPath, "pairing.member.revoke", *nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		store, err := openConfiguredPairingStore(*configPath)
+	return withPeerCLIAudit(configPath, "pairing.member.revoke", nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
+		store, err := openConfiguredPairingStore(configPath)
 		if err != nil {
 			return "", "", "", err
 		}
 		defer store.Close()
-		if err := store.RemoveMember(*nodeID, time.Now()); err != nil {
+		if err := store.RemoveMember(nodeID, time.Now()); err != nil {
 			return "", "", "", err
 		}
 		_, err = io.WriteString(out, "membership revoked; re-pairing requires a newly issued identity certificate\n")
-		return *nodeID, "", "", err
+		return nodeID, "", "", err
 	})
 }
 
@@ -591,6 +576,23 @@ func parsePeerFlags(flags *flag.FlagSet, args []string) error {
 		return errors.New("unexpected positional argument")
 	}
 	return nil
+}
+
+// parsePeerNodeIDArgs parses the shared peer subcommand setup for commands that
+// require a --config path and a --node-id. It returns the resolved config path,
+// node ID, and any parse or validation error. The action name is used for the
+// flag set and usage output; the node ID help text is preserved per command.
+func parsePeerNodeIDArgs(action, nodeIDHelpText string, args []string, stderr io.Writer) (configPath, nodeID string, err error) {
+	flags := peerFlags(action, stderr)
+	configPathVar := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
+	nodeIDVar := flags.String(peerNodeIDFlag, "", nodeIDHelpText)
+	if err := parsePeerFlags(flags, args); err != nil {
+		return "", "", err
+	}
+	if *nodeIDVar == "" {
+		return "", "", errors.New("--node-id is required")
+	}
+	return *configPathVar, *nodeIDVar, nil
 }
 
 func finishPeerCommand(err error) error {

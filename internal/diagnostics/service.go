@@ -149,6 +149,22 @@ func (s *Service) All(ctx context.Context) ([]Snapshot, error) {
 	return results, nil
 }
 
+// snapshotMode describes the decision returned by beginSnapshotRefresh.
+type snapshotMode int
+
+const (
+	// snapshotCached means the backend is disabled or still within its
+	// backoff/TTL window; the caller should snapshot the cache. beginSnapshotRefresh
+	// returns with b.mu held for this mode.
+	snapshotCached snapshotMode = iota
+	// snapshotWait means another goroutine is refreshing; the caller should wait
+	// on the returned busy channel. beginSnapshotRefresh releases b.mu.
+	snapshotWait
+	// snapshotOwner means no refresh is in flight; the caller should probe and
+	// commit. beginSnapshotRefresh creates b.busy and releases b.mu.
+	snapshotOwner
+)
+
 // Snapshot coalesces concurrent refreshes. Canceled callers do not poison the
 // cache; a waiting caller may retry with its own context after a canceled owner.
 func (s *Service) Snapshot(ctx context.Context, id string) (Snapshot, error) {
@@ -160,61 +176,134 @@ func (s *Service) Snapshot(ctx context.Context, id string) (Snapshot, error) {
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
-		b.mu.Lock()
-		if b.config.Diagnostics == "" || s.now().Before(b.next) {
-			result := s.snapshot(id, b)
-			b.mu.Unlock()
+		result, retry, err := s.refreshOnce(ctx, id, b)
+		if err != nil {
+			return Snapshot{}, err
+		}
+		if !retry {
 			return result, nil
 		}
-		if b.busy != nil {
-			busy := b.busy
-			b.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return Snapshot{}, ctx.Err()
-			case <-busy:
-				continue
-			}
-		}
-		b.busy = make(chan struct{})
+	}
+}
+
+// refreshOnce performs a single snapshot refresh decision. Entry and exit are
+// with b.mu not held. For snapshotCached beginSnapshotRefresh returns with b.mu
+// held; the caller snapshots the cache and unlocks exactly once before return.
+// For snapshotWait the lock is already released and the busy channel captured;
+// the caller waits and reports retry so the top-level loop re-decides. For
+// snapshotOwner the caller probes all operations outside the lock and commits
+// through finishSnapshotRefresh. A non-retryable terminal error is returned as-is.
+func (s *Service) refreshOnce(ctx context.Context, id string, b *backend) (Snapshot, bool, error) {
+	mode, busy := s.beginSnapshotRefresh(b)
+	switch mode {
+	case snapshotCached:
+		result := s.snapshot(id, b)
 		b.mu.Unlock()
+		return result, false, nil
+	case snapshotWait:
+		if err := waitForSnapshotRefresh(ctx, busy); err != nil {
+			return Snapshot{}, false, err
+		}
+		return Snapshot{}, true, nil
+	case snapshotOwner:
 		observations := make(map[string]Observation, len(operations))
 		for _, op := range operations {
 			observations[op.name] = s.probe(ctx, b, op.name, op.path)
 		}
-		b.mu.Lock()
-		if ctx.Err() == nil {
-			failed := false
-			for name, current := range observations {
-				bad := current.State == Unavailable || current.State == Unknown || current.State == Unauthorized
-				failed = failed || bad
-				previous := b.cache[name]
-				if (current.State == Unavailable || current.State == Unknown) &&
-					(previous.State == Supported || previous.State == Disabled) && s.now().Before(previous.ExpiresAt) {
-					previous.LastAttemptAt, previous.LastAttemptState = current.LastAttemptAt, current.State
-					previous.HTTPStatus, previous.Reason = current.HTTPStatus, current.Reason
-					b.cache[name] = previous
-				} else {
-					b.cache[name] = current
-				}
-			}
-			if failed {
-				b.fails = min(b.fails+1, 7)
-				b.next = s.now().Add(min(time.Second<<uint(b.fails-1), time.Minute))
-			} else {
-				b.fails = 0
-				b.next = s.now().Add(s.ttl)
-			}
+		result, err := s.finishSnapshotRefresh(ctx, id, b, observations)
+		if err != nil {
+			return Snapshot{}, false, err
 		}
+		return result, false, nil
+	}
+	return Snapshot{}, false, errors.New("unknown snapshot refresh mode")
+}
+
+// beginSnapshotRefresh decides, under b.mu, whether the caller should use the
+// cached snapshot, wait for an in-flight refresh, or become the owner. For
+// snapshotCached b.mu is held on return (the caller unlocks after snapshotting);
+// for snapshotWait and snapshotOwner b.mu is released and b.busy is captured or
+// created. The owner must probe before calling finishSnapshotRefresh.
+func (s *Service) beginSnapshotRefresh(b *backend) (snapshotMode, chan struct{}) {
+	b.mu.Lock()
+	if b.config.Diagnostics == "" || s.now().Before(b.next) {
+		return snapshotCached, nil
+	}
+	if b.busy != nil {
+		busy := b.busy
+		b.mu.Unlock()
+		return snapshotWait, busy
+	}
+	b.busy = make(chan struct{})
+	b.mu.Unlock()
+	return snapshotOwner, nil
+}
+
+// waitForSnapshotRefresh waits for an in-flight refresh to release its busy
+// channel. It returns ctx.Err() when the caller is canceled before the refresh
+// completes, so waiting callers never block past their own context.
+func waitForSnapshotRefresh(ctx context.Context, busy chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-busy:
+		return nil
+	}
+}
+
+// isFailedState reports whether a probe observation counts toward the backend
+// failure budget and backoff.
+func isFailedState(state State) bool {
+	return state == Unavailable || state == Unknown || state == Unauthorized
+}
+
+// preserveFreshCache reports whether a failed observation should be merged into
+// a fresh cached Supported/Disabled observation instead of replacing it.
+func preserveFreshCache(current, previous Observation, now time.Time) bool {
+	return (current.State == Unavailable || current.State == Unknown) &&
+		(previous.State == Supported || previous.State == Disabled) &&
+		now.Before(previous.ExpiresAt)
+}
+
+// finishSnapshotRefresh commits probe observations under the backend lock,
+// closes the busy channel, and snapshots the cache. The caller is the owner;
+// b.mu is not held on entry and is released before return. When the context is
+// canceled, observations are not applied but the busy channel is still released
+// and the context error is returned.
+func (s *Service) finishSnapshotRefresh(ctx context.Context, id string, b *backend, observations map[string]Observation) (Snapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := ctx.Err(); err != nil {
 		close(b.busy)
 		b.busy = nil
-		result := s.snapshot(id, b)
-		b.mu.Unlock()
-		if err := ctx.Err(); err != nil {
-			return Snapshot{}, err
-		}
-		return result, nil
+		return Snapshot{}, err
 	}
+	failed := false
+	for name, current := range observations {
+		failed = failed || isFailedState(current.State)
+		previous := b.cache[name]
+		if preserveFreshCache(current, previous, s.now()) {
+			previous.LastAttemptAt, previous.LastAttemptState = current.LastAttemptAt, current.State
+			previous.HTTPStatus, previous.Reason = current.HTTPStatus, current.Reason
+			b.cache[name] = previous
+		} else {
+			b.cache[name] = current
+		}
+	}
+	if failed {
+		b.fails = min(b.fails+1, 7)
+		b.next = s.now().Add(min(time.Second<<uint(b.fails-1), time.Minute))
+	} else {
+		b.fails = 0
+		b.next = s.now().Add(s.ttl)
+	}
+	close(b.busy)
+	b.busy = nil
+	result := s.snapshot(id, b)
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	return result, nil
 }
 
 // Called with the backend lock held; returned values never alias cached data.

@@ -830,6 +830,338 @@ func (h *Handler) serveDiagnosticsBackends(w http.ResponseWriter, r *http.Reques
 	writeDiagnosticsResponse(w, http.StatusOK, map[string]any{"backends": snapshots})
 }
 
+// diagnosticError carries an HTTP status and a fixed response message for a
+// diagnostics API failure. It never leaks request details, raw errors, or
+// credentials. Helpers return it so the caller owns the response mapping.
+type diagnosticError struct {
+	status  int
+	message string
+}
+
+func (e *diagnosticError) Error() string { return e.message }
+
+// modelsQueryArgs holds the validated and normalized query arguments for the
+// /diagnostics/v1/models endpoint.
+type modelsQueryArgs struct {
+	limit   int
+	cursor  string
+	backend string
+	model   string
+	status  string
+}
+
+// diagnosticsQueryArgs holds the validated and normalized query arguments
+// shared by the /diagnostics/v1/requests and /diagnostics/v1/summary
+// endpoints.
+type diagnosticsQueryArgs struct {
+	since     time.Time
+	until     time.Time
+	backend   string
+	status    string
+	requestID string
+	cursor    string
+	limit     int
+}
+
+// diagnosticsQueryPolicy captures endpoint-specific defaults/caps/zero-limit
+// behavior for the requests and summary query parsers and page helpers.
+type diagnosticsQueryPolicy struct {
+	// defaultLimit is the default page size when limit is omitted.
+	defaultLimit int
+	// maxLimit is the maximum allowed page size.
+	maxLimit int
+	// zeroAsEmpty reports whether a limit of zero is accepted as an empty
+	// page rather than defaulted to the page size.
+	zeroAsEmpty bool
+	// includeCursor reports whether the cursor is passed through to QueryPage.
+	includeCursor bool
+	// tooLargeStatus is the HTTP status returned when the QueryPage result
+	// exceeds the cap (400 for requests, 413 for summary).
+	tooLargeStatus int
+	// checkTooLargeFirst reports whether ErrSnapshotTooLarge is checked before
+	// ErrSnapshotExpired/ErrSnapshotNotFound, preserving each endpoint's
+	// existing error-check order.
+	checkTooLargeFirst bool
+}
+
+var (
+	// diagnosticsRequestsPolicy is the endpoint-specific policy for the
+	// /diagnostics/v1/requests endpoint: default limit 50, max 100, zero
+	// accepted as an empty page, cursor passed to QueryPage, too-large maps to
+	// 400, and expired/not-found is checked before too-large.
+	diagnosticsRequestsPolicy = diagnosticsQueryPolicy{
+		defaultLimit:       defaultDiagnosticQueryLimit,
+		maxLimit:           maxDiagnosticQueryLimit,
+		zeroAsEmpty:        true,
+		includeCursor:      true,
+		tooLargeStatus:     http.StatusBadRequest,
+		checkTooLargeFirst: false,
+	}
+	// diagnosticsSummaryPolicy is the endpoint-specific policy for the
+	// /diagnostics/v1/summary endpoint: default limit 1000, max 1000, zero
+	// accepted as an empty page, no cursor passed to QueryPage, too-large maps
+	// to 413, and too-large is checked before expired/not-found.
+	diagnosticsSummaryPolicy = diagnosticsQueryPolicy{
+		defaultLimit:       maxDiagnosticSummaryLimit,
+		maxLimit:           maxDiagnosticSummaryLimit,
+		zeroAsEmpty:        true,
+		includeCursor:      false,
+		tooLargeStatus:     http.StatusRequestEntityTooLarge,
+		checkTooLargeFirst: true,
+	}
+)
+
+// isContextTimeout reports whether err is a context deadline exceeded or
+// cancellation error.
+func isContextTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	return errors.Is(err, context.Canceled)
+}
+
+// validateCursorLength rejects a cursor that exceeds the bounded byte length.
+func validateCursorLength(cursor string) *diagnosticError {
+	if cursor == "" {
+		return nil
+	}
+	if len(cursor) > modelSnapshotCursorMaxLen {
+		return &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrCursorTooLong}
+	}
+	return nil
+}
+
+// validQueryFilterValue reports whether a nonempty query filter value is valid
+// UTF-8 and no longer than the maximum query parameter length.
+func validQueryFilterValue(v string) bool {
+	if len(v) > maxQueryParamLength {
+		return false
+	}
+	return utf8.ValidString(v)
+}
+
+// validateQueryFilters validates the string query filters. It returns a
+// diagnosticError when any nonempty filter is invalid UTF-8 or too long.
+func validateQueryFilters(backend, model, status string) *diagnosticError {
+	for _, v := range []string{backend, model, status} {
+		if v != "" {
+			if !validQueryFilterValue(v) {
+				return &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidFilterValue}
+			}
+		}
+	}
+	return nil
+}
+
+// validateStatusFilter reports whether the status filter is in the finite
+// accepted set derived from typed ModelSnapshot.Lifecycle.CurrentState.
+func validateStatusFilter(statusFilter string) *diagnosticError {
+	if statusFilter == "" {
+		return nil
+	}
+	if !validModelStatus[statusFilter] {
+		return &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidStatusFilter}
+	}
+	return nil
+}
+
+// parseQueryLimit parses the limit query parameter, clamping to the allowed
+// range and defaulting to the page size.
+func parseQueryLimit(limitParam string) (int, *diagnosticError) {
+	limit := modelSnapshotPageSize
+	if limitParam == "" {
+		return limit, nil
+	}
+	l, err := strconv.Atoi(limitParam)
+	if err != nil {
+		return 0, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidLimit}
+	}
+	if l < 0 {
+		return 0, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidLimit}
+	}
+	if l > maxDiagnosticQueryLimit {
+		l = maxDiagnosticQueryLimit
+	}
+	if l == 0 {
+		l = modelSnapshotPageSize
+	}
+	return l, nil
+}
+
+// validateDiagnosticsModelsQuery validates and normalizes the query
+// parameters for the /diagnostics/v1/models endpoint. It performs no data
+// refresh. On success it returns the normalized arguments. On failure it
+// returns a diagnosticError the caller maps to a response.
+func (h *Handler) validateDiagnosticsModelsQuery(r *http.Request) (modelsQueryArgs, *diagnosticError) {
+	backendFilter := r.URL.Query().Get("backend")
+	modelFilter := r.URL.Query().Get("model")
+	statusFilter := r.URL.Query().Get("status")
+	cursor := r.URL.Query().Get("cursor")
+	offset := r.URL.Query().Get("offset")
+	limitParam := r.URL.Query().Get("limit")
+
+	// Reject duplicate query parameters.
+	if err := rejectDuplicateQueryParams(r.URL.Query(), "backend", "model", "status", "cursor", "offset", "limit"); err != nil {
+		return modelsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrDuplicateQueryParam}
+	}
+
+	// Reject offset: the opaque cursor is the only pagination mechanism.
+	if offset != "" {
+		return modelsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: "offset unsupported"}
+	}
+
+	// Validate cursor length.
+	if diagErr := validateCursorLength(cursor); diagErr != nil {
+		return modelsQueryArgs{}, diagErr
+	}
+
+	// Validate string filters (bounded valid UTF-8).
+	if diagErr := validateQueryFilters(backendFilter, modelFilter, statusFilter); diagErr != nil {
+		return modelsQueryArgs{}, diagErr
+	}
+
+	// Validate status filter against the finite exact set derived from
+	// typed ModelSnapshot.Lifecycle.CurrentState.
+	if diagErr := validateStatusFilter(statusFilter); diagErr != nil {
+		return modelsQueryArgs{}, diagErr
+	}
+
+	// Validate backend filter against configured backends.
+	if diagErr := h.validateBackendFilter(backendFilter); diagErr != nil {
+		return modelsQueryArgs{}, diagErr
+	}
+
+	// Validate limit.
+	limit, err := parseQueryLimit(limitParam)
+	if err != nil {
+		return modelsQueryArgs{}, err
+	}
+
+	return modelsQueryArgs{limit: limit, cursor: cursor, backend: backendFilter, model: modelFilter, status: statusFilter}, nil
+}
+
+// parseDiagnosticsQuery is the shared query parser for the requests and
+// summary endpoints. It performs the common validations once, delegating
+// endpoint-specific defaults/caps/zero-limit behavior to the policy. It
+// performs no data refresh. On success it returns the normalized arguments.
+// On failure it returns a diagnosticError the caller maps to a response.
+func (h *Handler) parseDiagnosticsQuery(r *http.Request, policy diagnosticsQueryPolicy) (diagnosticsQueryArgs, *diagnosticError) {
+	values := r.URL.Query()
+
+	// Reject duplicate query parameters.
+	if err := rejectDuplicateQueryParams(values, "since", "until", "backend", "model", "status", "requestid", "cursor", "limit"); err != nil {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrDuplicateQueryParam}
+	}
+
+	// Model filter on proxy request records cannot be attributed because the
+	// correlation record ModelID is intentionally blank. A nonempty model
+	// filter returns explicit 501.
+	if modelFilter := values.Get("model"); modelFilter != "" {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusNotImplemented, message: "model_attribution_unsupported"}
+	}
+
+	// Derive effective time bounds. Missing bounds default to a 24h window
+	// ending at now. Reject any future bound and any window > 24h.
+	since, until, err := parseDiagnosticsTimeRange(values.Get("since"), values.Get("until"), time.Now())
+	if err != nil {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: err.Error()}
+	}
+
+	// Validate string filters (bounded valid UTF-8).
+	backendFilter := values.Get("backend")
+	statusFilter := values.Get("status")
+	requestIDFilter := values.Get("requestid")
+	if backendFilter != "" && (len(backendFilter) > maxQueryParamLength || !utf8.ValidString(backendFilter)) {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidFilterValue}
+	}
+	if statusFilter != "" && (len(statusFilter) > maxQueryParamLength || !utf8.ValidString(statusFilter)) {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidFilterValue}
+	}
+	if requestIDFilter != "" && (len(requestIDFilter) > maxQueryParamLength || !utf8.ValidString(requestIDFilter)) {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidFilterValue}
+	}
+
+	// Validate cursor length.
+	cursor := values.Get("cursor")
+	if cursor != "" && len(cursor) > maxCursorLength {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrCursorTooLong}
+	}
+
+	// Validate limit.
+	limit, diagErr := parseDiagnosticsQueryLimit(values.Get("limit"), policy)
+	if diagErr != nil {
+		return diagnosticsQueryArgs{}, diagErr
+	}
+
+	// Validate backend filter: must be a configured backend.
+	if backendFilter != "" {
+		if _, ok := h.proxies[backendFilter]; !ok {
+			return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: "unknown backend filter"}
+		}
+	}
+
+	// Validate status filter: finite union of Correlation transport enums.
+	if statusFilter != "" && !validTransportStatus(statusFilter) {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidStatusFilter}
+	}
+
+	// Validate requestID filter format/bounds.
+	if requestIDFilter != "" && !validRequestID(requestIDFilter) {
+		return diagnosticsQueryArgs{}, &diagnosticError{status: http.StatusBadRequest, message: "invalid request id filter"}
+	}
+
+	return diagnosticsQueryArgs{
+		since:     since,
+		until:     until,
+		backend:   backendFilter,
+		status:    statusFilter,
+		requestID: requestIDFilter,
+		cursor:    cursor,
+		limit:     limit,
+	}, nil
+}
+
+// parseDiagnosticsQueryLimit parses the limit query parameter, clamping to the
+// configured max. The default and zero handling are policy-driven.
+func parseDiagnosticsQueryLimit(limitParam string, policy diagnosticsQueryPolicy) (int, *diagnosticError) {
+	limit := policy.defaultLimit
+	if limitParam == "" {
+		return limit, nil
+	}
+	l, err := strconv.Atoi(limitParam)
+	if err != nil || l < 0 {
+		return 0, &diagnosticError{status: http.StatusBadRequest, message: diagnosticsErrInvalidLimit}
+	}
+	if l > policy.maxLimit {
+		l = policy.maxLimit
+	}
+	if l == 0 && !policy.zeroAsEmpty {
+		l = policy.defaultLimit
+	}
+	return l, nil
+}
+
+// parseDiagnosticsRequestsQuery validates and normalizes the query
+// parameters for the /diagnostics/v1/requests endpoint. It performs no data
+// refresh. On success it returns the normalized arguments. On failure it
+// returns a diagnosticError the caller maps to a response. The model filter
+// is attributed 501 because proxy-only records carry no model identity.
+func (h *Handler) parseDiagnosticsRequestsQuery(r *http.Request) (diagnosticsQueryArgs, *diagnosticError) {
+	return h.parseDiagnosticsQuery(r, diagnosticsRequestsPolicy)
+}
+
+// validateBackendFilter reports whether the backend filter names a
+// configured backend.
+func (h *Handler) validateBackendFilter(backendFilter string) *diagnosticError {
+	if backendFilter == "" {
+		return nil
+	}
+	if _, ok := h.proxies[backendFilter]; !ok {
+		return &diagnosticError{status: http.StatusBadRequest, message: "invalid backend filter"}
+	}
+	return nil
+}
+
 // serveDiagnosticsModels returns the unified, sanitized model diagnostics
 // snapshots. It uses the cached catalog source (BackendModels) only and never
 // issues upstream /v1/models or /show requests. Model snapshots are produced
@@ -851,143 +1183,64 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Validate query parameters first: no data refresh on invalid query.
-	backendFilter := r.URL.Query().Get("backend")
-	modelFilter := r.URL.Query().Get("model")
-	statusFilter := r.URL.Query().Get("status")
-	cursor := r.URL.Query().Get("cursor")
-	offset := r.URL.Query().Get("offset")
-	limitParam := r.URL.Query().Get("limit")
-
-	// Reject duplicate query parameters.
-	if err := rejectDuplicateQueryParams(r.URL.Query(), "backend", "model", "status", "cursor", "offset", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
-		return
-	}
-
-	// Reject offset: the opaque cursor is the only pagination mechanism.
-	if offset != "" {
-		writeDiagnosticsError(w, http.StatusBadRequest, "offset unsupported")
-		return
-	}
-
-	// Validate cursor length.
-	if cursor != "" && len(cursor) > modelSnapshotCursorMaxLen {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
-		return
-	}
-
-	// Validate string filters (bounded valid UTF-8).
-	for _, v := range []string{backendFilter, modelFilter, statusFilter} {
-		if v != "" {
-			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
-				return
-			}
-		}
-	}
-
-	// Validate status filter against the finite exact set derived from
-	// typed ModelSnapshot.Lifecycle.CurrentState.
-	if statusFilter != "" && !validModelStatus[statusFilter] {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
-		return
-	}
-
-	// Validate backend filter against configured backends.
-	if backendFilter != "" {
-		if _, ok := h.proxies[backendFilter]; !ok {
-			writeDiagnosticsError(w, http.StatusBadRequest, "invalid backend filter")
-			return
-		}
-	}
-
-	// Validate limit.
-	limit := modelSnapshotPageSize
-	if limitParam != "" {
-		l, err := strconv.Atoi(limitParam)
-		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
-			return
-		}
-		if l > maxDiagnosticQueryLimit {
-			l = maxDiagnosticQueryLimit
-		}
-		if l == 0 {
-			l = modelSnapshotPageSize
-		}
-		limit = l
-	}
-
-	// Bound all requests. Cursor resumes have a concurrency cap but deliberately
-	// bypass the collector refresh rate because they perform no upstream work.
-	var release func()
-	var err error
-	if cursor != "" {
-		release, err = h.acquireDiagnosticSlot(ctx)
-	} else {
-		release, err = h.diagnoseRateLimit(ctx)
-	}
+	args, err := h.validateDiagnosticsModelsQuery(r)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-			return
-		}
-		if err == errDiagnosticsBusy {
-			writeDiagnosticsError(w, http.StatusTooManyRequests, diagnosticsErrDiagnosticsTemporarilyUnavailable)
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
+		writeDiagnosticsError(w, err.status, err.message)
 		return
+	}
+
+	// Admit the request. Cursor resumes bypass the per-second refresh rate
+	// limit but still consume a semaphore slot.
+	var release func()
+	var limErr error
+	if args.cursor != "" {
+		release, limErr = h.acquireDiagnosticSlot(ctx)
+	} else {
+		release, limErr = h.diagnoseRateLimit(ctx)
+	}
+	if limErr != nil {
+		if h.handleDiagnosticsLimiterError(w, limErr) {
+			return
+		}
 	}
 	defer release()
 
-	// Early cursor-resume branch: resume from the stored frozen snapshot
-	// only. No collectors, network, or refresh on continuation. This
-	// guarantees frozen cursor pagination never hits upstream even during
-	// an outage and preserves the initial generated_at and coverage.
-	if cursor != "" {
-		if h.modelSnapshotPages == nil {
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "model snapshot pager not configured")
-			return
-		}
-		filterDigest := modelFilterDigest(backendFilter, modelFilter, statusFilter, limit)
-		h.pagerMu.Lock()
-		page, err := h.modelSnapshotPages.resumeSnapshot(cursor, limit, filterDigest)
-		h.pagerMu.Unlock()
-		if err != nil {
-			if errors.Is(err, errSnapshotExpired) {
-				writeDiagnosticsError(w, http.StatusGone, "snapshot expired")
-				return
-			}
-			if errors.Is(err, errSnapshotNotFound) {
-				writeDiagnosticsError(w, http.StatusNotFound, "snapshot not found")
-				return
-			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
-			return
-		}
-		writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
-			"generated_at": page.GeneratedAt.Format(time.RFC3339),
-			"coverage":     page.Coverage,
-			"models":       page.Records,
-			"cursor":       page.Cursor,
-		})
+	// Early cursor-resume branch: no collectors, no upstream work.
+	if args.cursor != "" {
+		h.resumeDiagnosticsModelsPage(w, args)
 		return
 	}
 
-	// Get cached catalog models only. No upstream /v1/models or /show calls.
-	backendModels := h.catalog.BackendModels()
+	// Collect diagnostics inputs (catalog + collectors + snapshot projection).
+	inputs, err := h.collectDiagnosticsModelInputs(ctx, args)
+	if err != nil {
+		writeDiagnosticsError(w, err.status, err.message)
+		return
+	}
 
-	// Resolve model aliases against the cached backend catalog before any
-	// collection. Alias values are used only for matching; snapshots continue to
-	// expose canonical identities and never return raw alias metadata.
+	// Filter typed snapshots by backend/model/status.
+	filtered := filterDiagnosticsModels(inputs.modelSnaps, inputs.modelFilterIDs, args.backend, args.model, args.status)
+
+	// Unknown model filter: return 400 without echoing the raw ID.
+	if diagErr := unknownModelFilterError(args.model, filtered, inputs.modelSnaps, inputs.modelFilterIDs); diagErr != nil {
+		writeDiagnosticsError(w, diagErr.status, diagErr.message)
+		return
+	}
+
+	// Coverage from cached catalog and diagnostics capability state.
+	coverage := h.calculateDiagnosticsModelCoverage(inputs.backendModels, inputs.snapshots)
+
+	// Page (direct return when the result fits, otherwise snapshot store).
+	h.pageDiagnosticsModels(w, filtered, inputs.resolvedModelID, coverage, args)
+}
+
+// resolveModelFilterIDs resolves the model filter against the cached catalog,
+// returning the set of canonical public IDs and, when exactly one matches,
+// the resolved model ID.
+func resolveModelFilterIDs(backendModels []catalog.BackendModel, backendFilter, modelFilter string) (map[string]struct{}, string) {
 	modelFilterIDs := map[string]struct{}{}
 	if modelFilter != "" {
 		modelFilterIDs = catalogModelFilterIDs(backendModels, backendFilter, modelFilter)
-		if len(modelFilterIDs) == 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, "model not found")
-			return
-		}
 	}
 	resolvedModelID := ""
 	if len(modelFilterIDs) == 1 {
@@ -995,110 +1248,163 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 			resolvedModelID = id
 		}
 	}
+	return modelFilterIDs, resolvedModelID
+}
+
+// modelFilterMatched reports whether any collected snapshot carries a public
+// ID present in the model filter ID set.
+func modelFilterMatched(modelSnaps []*modeldiagnostics.ModelSnapshot, modelFilterIDs map[string]struct{}) bool {
+	for _, snap := range modelSnaps {
+		if _, ok := modelFilterIDs[snap.Identity.PublicID]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// filterDiagnosticsModels filters typed model snapshots by backend, model,
+// and status. Public ID collisions across backends cannot bleed because each
+// snapshot carries its own lifecycle state.
+func filterDiagnosticsModels(modelSnaps []*modeldiagnostics.ModelSnapshot, modelFilterIDs map[string]struct{}, backendFilter, modelFilter, statusFilter string) []*modeldiagnostics.ModelSnapshot {
+	filtered := make([]*modeldiagnostics.ModelSnapshot, 0)
+	for _, snap := range modelSnaps {
+		if backendFilter != "" {
+			if snap.Identity.BackendID != backendFilter {
+				continue
+			}
+		}
+		if modelFilter != "" {
+			if _, ok := modelFilterIDs[snap.Identity.PublicID]; !ok {
+				continue
+			}
+		}
+		if statusFilter != "" {
+			if snap.Lifecycle.CurrentState != statusFilter {
+				continue
+			}
+		}
+		filtered = append(filtered, snap)
+	}
+	return filtered
+}
+
+// unknownModelFilterError returns a diagnosticError when the model filter is
+// nonempty but no collected snapshot matches any filtered model ID.
+func unknownModelFilterError(modelFilter string, filtered []*modeldiagnostics.ModelSnapshot, modelSnaps []*modeldiagnostics.ModelSnapshot, modelFilterIDs map[string]struct{}) *diagnosticError {
+	if modelFilter == "" {
+		return nil
+	}
+	if len(filtered) != 0 {
+		return nil
+	}
+	if modelFilterMatched(modelSnaps, modelFilterIDs) {
+		return nil
+	}
+	return &diagnosticError{status: http.StatusBadRequest, message: "model not found"}
+}
+
+// handleDiagnosticsLimiterError maps a limiter or semaphore error to a
+// diagnostics response. It returns true when a response was written.
+func (h *Handler) handleDiagnosticsLimiterError(w http.ResponseWriter, err error) bool {
+	if isContextTimeout(err) {
+		writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
+		return true
+	}
+	if err == errDiagnosticsBusy {
+		writeDiagnosticsError(w, http.StatusTooManyRequests, diagnosticsErrDiagnosticsTemporarilyUnavailable)
+		return true
+	}
+	writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
+	return true
+}
+
+// mapDiagnosticsServiceError maps a diagnostics service error to a
+// diagnosticError. Context cancellations become 504; all other failures
+// become 503 with a generic message.
+func mapDiagnosticsServiceError(err error) *diagnosticError {
+	if isContextTimeout(err) {
+		return &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+	}
+	return &diagnosticError{status: http.StatusServiceUnavailable, message: "diagnostics snapshot failed"}
+}
+
+// snapshotErrorFromErr maps a SnapshotWithSources error to a diagnosticError.
+// Context cancellations become 504; all other failures become 503 with the
+// model snapshot failed message.
+func snapshotErrorFromErr(err error) *diagnosticError {
+	if isContextTimeout(err) {
+		return &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+	}
+	return &diagnosticError{status: http.StatusServiceUnavailable, message: diagnosticsErrModelSnapshotFailed}
+}
+
+// diagnosticsModelInputs holds the bounded source inputs for model snapshot
+// production.
+type diagnosticsModelInputs struct {
+	backendModels   []catalog.BackendModel
+	snapshots       []diagnostics.Snapshot
+	modelSnaps      []*modeldiagnostics.ModelSnapshot
+	modelFilterIDs  map[string]struct{}
+	resolvedModelID string
+}
+
+// collectDiagnosticsModelInputs collects diagnostics snapshots and the
+// collector outputs, then builds typed model snapshots via
+// SnapshotWithSources. It resolves model aliases against the cached catalog.
+// All collector errors are mapped to diagnostics errors.
+func (h *Handler) collectDiagnosticsModelInputs(ctx context.Context, args modelsQueryArgs) (*diagnosticsModelInputs, *diagnosticError) {
+	// Get cached catalog models only. No upstream /v1/models or /show calls.
+	backendModels := h.catalog.BackendModels()
+
+	// Resolve model aliases against the cached backend catalog before any
+	// collection. Alias values are used only for matching.
+	modelFilterIDs, resolvedModelID := resolveModelFilterIDs(backendModels, args.backend, args.model)
 
 	// Collect diagnostics snapshots (read-only, on-demand).
 	snapshots, err := h.diagnostics.All(ctx)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "diagnostics snapshot failed")
-		return
+		return nil, mapDiagnosticsServiceError(err)
 	}
 
-	// Collect activity snapshots. The epoch is captured by Refresh and reused
-	// by all subsequent collectors so the collection scope is consistent.
+	var epoch int64 = 1
 	var activities []*correlation.ActivityRecord
 	var backendStates map[string]correlation.BackendState
 	if h.activityCollector != nil {
-		actRecords, err := h.activityCollector.Refresh(ctx)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-				return
-			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "activity collection failed")
-			return
+		act, bs, collectorEpoch, diagErr := h.collectActivityInputs(ctx)
+		if diagErr != nil {
+			return nil, diagErr
 		}
-		activities = actRecords
-		stats := h.activityCollector.Stats()
-		if bs, ok := stats["backend_states"].(map[string]correlation.BackendState); ok {
-			backendStates = bs
-		}
+		activities = act
+		backendStates = bs
+		epoch = collectorEpoch
 	}
 
-	epoch := int64(1)
-	if h.activityCollector != nil {
-		epoch = h.activityCollector.Epoch()
-	}
-
-	// Collect alias edges and resolve activity identities.
 	var identities []correlation.ActivityModelIdentity
 	if h.aliasCollector != nil {
-		report, err := h.aliasCollector.Collect(ctx, epoch)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-				return
-			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "alias collection failed")
-			return
-		}
-		identities, err = correlation.ResolveActivityAliases(activities, report)
-		if err != nil {
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "alias resolution failed")
-			return
+		var diagErr *diagnosticError
+		identities, diagErr = h.collectAliasInputs(ctx, epoch, activities)
+		if diagErr != nil {
+			return nil, diagErr
 		}
 	}
 
-	// Collect GPU samples and associate with activities using the default
-	// association window.
 	var deviceAssociations []correlation.ActivityDeviceAssociation
 	var gpuReport *correlation.GPUReport
 	if h.gpuCollector != nil {
-		report, err := h.gpuCollector.Collect(ctx, epoch)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-				return
-			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "GPU collection failed")
-			return
+		var diagErr *diagnosticError
+		deviceAssociations, gpuReport, diagErr = h.collectGPUInputs(ctx, epoch, activities)
+		if diagErr != nil {
+			return nil, diagErr
 		}
-		gpuReport = &report
-		// Convert GPUSample to TimedDeviceSample for association.
-		var samples []correlation.TimedDeviceSample
-		for _, s := range report.Samples {
-			samples = append(samples, correlation.TimedDeviceSample{
-				BackendID: s.BackendID,
-				Epoch:     s.Epoch,
-				DeviceID:  s.DeviceID,
-				Timestamp: s.Timestamp,
-			})
-		}
-		assocs, err := correlation.AssociateActivities(activities, samples, correlation.DefaultAssociationWindow())
-		if err != nil {
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "GPU association failed")
-			return
-		}
-		deviceAssociations = assocs
 	}
 
-	// Collect lifecycle snapshots and link current lifecycle to catalog models
-	// via the modeldiagnostics projection.
 	var lifecycleReport *correlation.LifecycleReport
 	if h.lifecycleCollector != nil {
-		report, err := h.lifecycleCollector.Collect(ctx, epoch)
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-				writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-				return
-			}
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "lifecycle collection failed")
-			return
+		var diagErr *diagnosticError
+		lifecycleReport, diagErr = h.collectLifecycleInputs(ctx, epoch)
+		if diagErr != nil {
+			return nil, diagErr
 		}
-		lifecycleReport = &report
 	}
 
 	// Build bounded source inputs. SnapshotWithSources validates bounds before
@@ -1119,58 +1425,122 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 
 	modelSnaps, err := h.modelDiagnostics.SnapshotWithSources(ctx, mdBackendModels, mdSnapshots, sources)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
-		return
+		return nil, snapshotErrorFromErr(err)
 	}
 
-	// Apply filters against typed snapshots. No raw catalog maps are returned.
-	// Status filter is based on each typed ModelSnapshot.Lifecycle.CurrentState
-	// (loaded/unloaded/ready/starting/stopping/unknown); public ID collisions
-	// across backends cannot bleed because each snapshot carries its own state.
-	filtered := make([]*modeldiagnostics.ModelSnapshot, 0)
-	for _, snap := range modelSnaps {
-		if backendFilter != "" && snap.Identity.BackendID != backendFilter {
-			continue
-		}
-		if modelFilter != "" {
-			if _, ok := modelFilterIDs[snap.Identity.PublicID]; !ok {
-				continue
-			}
-		}
-		if statusFilter != "" {
-			if snap.Lifecycle.CurrentState != statusFilter {
-				continue
-			}
-		}
-		filtered = append(filtered, snap)
-	}
+	return &diagnosticsModelInputs{
+		backendModels:   backendModels,
+		snapshots:       snapshots,
+		modelSnaps:      modelSnaps,
+		modelFilterIDs:  modelFilterIDs,
+		resolvedModelID: resolvedModelID,
+	}, nil
+}
 
-	// Unknown model filter: return 400 without echoing the raw ID.
-	if modelFilter != "" && len(filtered) == 0 {
-		found := false
-		for _, snap := range modelSnaps {
-			if _, ok := modelFilterIDs[snap.Identity.PublicID]; ok {
-				found = true
-				break
-			}
-		}
-		if !found {
-			writeDiagnosticsError(w, http.StatusBadRequest, "model not found")
-			return
-		}
+// collectActivityInputs refreshes activity snapshots. When no activity
+// collector is configured it returns empty inputs and epoch 1.
+func (h *Handler) collectActivityInputs(ctx context.Context) ([]*correlation.ActivityRecord, map[string]correlation.BackendState, int64, *diagnosticError) {
+	if h.activityCollector == nil {
+		return nil, nil, 1, nil
 	}
+	actRecords, err := h.activityCollector.Refresh(ctx)
+	if err != nil {
+		if isContextTimeout(err) {
+			return nil, nil, 0, &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+		}
+		return nil, nil, 0, &diagnosticError{status: http.StatusServiceUnavailable, message: "activity collection failed"}
+	}
+	var backendStates map[string]correlation.BackendState
+	stats := h.activityCollector.Stats()
+	if bs, ok := stats["backend_states"].(map[string]correlation.BackendState); ok {
+		backendStates = bs
+	}
+	return actRecords, backendStates, h.activityCollector.Epoch(), nil
+}
 
-	// Determine coverage. Coverage is unknown only when no configured backend
-	// has a cached catalog (all FetchedAt zero). It is partial when any
-	// configured backend lacks a cache, any fetched backend's diagnostics
-	// capability state is stale/unavailable/unauthorized/unknown, or any
-	// configured backend has no cached model entry. Disabled capability state
-	// is expected and is not a failure.
-	coverage := "complete"
+// collectAliasInputs collects alias edges and resolves activity identities.
+func (h *Handler) collectAliasInputs(ctx context.Context, epoch int64, activities []*correlation.ActivityRecord) ([]correlation.ActivityModelIdentity, *diagnosticError) {
+	if h.aliasCollector == nil {
+		return nil, nil
+	}
+	report, err := h.aliasCollector.Collect(ctx, epoch)
+	if err != nil {
+		if isContextTimeout(err) {
+			return nil, &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+		}
+		return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "alias collection failed"}
+	}
+	identities, err := correlation.ResolveActivityAliases(activities, report)
+	if err != nil {
+		return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "alias resolution failed"}
+	}
+	return identities, nil
+}
+
+// collectGPUInputs collects GPU samples and associates them with activities
+// using the default association window.
+func (h *Handler) collectGPUInputs(ctx context.Context, epoch int64, activities []*correlation.ActivityRecord) ([]correlation.ActivityDeviceAssociation, *correlation.GPUReport, *diagnosticError) {
+	if h.gpuCollector == nil {
+		return nil, nil, nil
+	}
+	report, err := h.gpuCollector.Collect(ctx, epoch)
+	if err != nil {
+		if isContextTimeout(err) {
+			return nil, nil, &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+		}
+		return nil, nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "GPU collection failed"}
+	}
+	gpuReport := &report
+	var samples []correlation.TimedDeviceSample
+	for _, s := range report.Samples {
+		samples = append(samples, correlation.TimedDeviceSample{
+			BackendID: s.BackendID,
+			Epoch:     s.Epoch,
+			DeviceID:  s.DeviceID,
+			Timestamp: s.Timestamp,
+		})
+	}
+	assocs, err := correlation.AssociateActivities(activities, samples, correlation.DefaultAssociationWindow())
+	if err != nil {
+		return nil, nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "GPU association failed"}
+	}
+	return assocs, gpuReport, nil
+}
+
+// collectLifecycleInputs collects lifecycle snapshots.
+func (h *Handler) collectLifecycleInputs(ctx context.Context, epoch int64) (*correlation.LifecycleReport, *diagnosticError) {
+	if h.lifecycleCollector == nil {
+		return nil, nil
+	}
+	report, err := h.lifecycleCollector.Collect(ctx, epoch)
+	if err != nil {
+		if isContextTimeout(err) {
+			return nil, &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+		}
+		return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "lifecycle collection failed"}
+	}
+	return &report, nil
+}
+
+// calculateDiagnosticsModelCoverage determines the coverage string from the
+// cached catalog and diagnostics capability state.
+func (h *Handler) calculateDiagnosticsModelCoverage(backendModels []catalog.BackendModel, snapshots []diagnostics.Snapshot) string {
+	cacheCoverage := h.cacheCoverage(backendModels)
+	if cacheCoverage == "unknown" {
+		return "unknown"
+	}
+	if cacheCoverage == "partial" {
+		return "partial"
+	}
+	if h.capabilityCoverage(backendModels, snapshots) == "partial" {
+		return "partial"
+	}
+	return "complete"
+}
+
+// cacheCoverage reports unknown when no configured backend has a cached
+// catalog, partial when any configured backend lacks a cache, else complete.
+func (h *Handler) cacheCoverage(backendModels []catalog.BackendModel) string {
 	configured := make(map[string]bool, len(h.proxies))
 	for id := range h.proxies {
 		configured[id] = true
@@ -1181,69 +1551,78 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 			fetched[bm.BackendID] = true
 		}
 	}
-	// Any configured backend without a cache downgrades coverage.
-	anyUnfetched := false
-	for id := range configured {
-		if !fetched[id] {
-			anyUnfetched = true
-			break
+	unfetched := 0
+	for backendID := range configured {
+		if !fetched[backendID] {
+			unfetched++
 		}
 	}
-	if anyUnfetched {
-		allUnfetched := true
-		for id := range configured {
-			if fetched[id] {
-				allUnfetched = false
-				break
-			}
+	if unfetched == 0 {
+		return "complete"
+	}
+	if unfetched == len(configured) {
+		return "unknown"
+	}
+	return "partial"
+}
+
+// backendDowngradesCoverage reports whether a fetched, configured backend
+// downgrades coverage to partial due to a stale or non-expected diagnostics
+// capability state, or no cached model entries. Disabled and Unsupported
+// states are expected.
+func (h *Handler) backendDowngradesCoverage(bm catalog.BackendModel, snapByBackend map[string]diagnostics.Snapshot) bool {
+	if time.Since(bm.FetchedAt) > modelStaleAge {
+		return true
+	}
+	snap, ok := snapByBackend[bm.BackendID]
+	if !ok {
+		return true
+	}
+	for _, obs := range snap.Capabilities {
+		switch obs.State {
+		case diagnostics.Disabled, diagnostics.Unsupported:
+			// Expected: backend does not expose this capability.
+		case diagnostics.Unavailable, diagnostics.Unauthorized, diagnostics.Unknown:
+			return true
 		}
-		if allUnfetched {
-			coverage = "unknown"
-		} else {
-			coverage = "partial"
+		if obs.Stale {
+			return true
 		}
 	}
-	// For fetched backends, check diagnostics capability states and model
-	// entries. Disabled is expected; stale/unavailable/unauthorized/unknown
-	// downgrade to partial. A backend with no cached model entry also
-	// downgrades to partial.
+	return len(bm.Models) == 0
+}
+
+// capabilityCoverage returns partial when any fetched, configured backend has
+// a stale or non-expected diagnostics capability state, or no cached model
+// entries. Disabled and Unsupported states are expected. Otherwise complete.
+func (h *Handler) capabilityCoverage(backendModels []catalog.BackendModel, snapshots []diagnostics.Snapshot) string {
+	configured := make(map[string]bool, len(h.proxies))
+	for id := range h.proxies {
+		configured[id] = true
+	}
 	snapByBackend := make(map[string]diagnostics.Snapshot, len(snapshots))
 	for _, snap := range snapshots {
 		snapByBackend[snap.Backend] = snap
 	}
 	for _, bm := range backendModels {
-		if !configured[bm.BackendID] || bm.FetchedAt.IsZero() {
+		if !configured[bm.BackendID] {
 			continue
 		}
-		// Per-backend cached fetch older than modelStaleAge is stale.
-		if time.Since(bm.FetchedAt) > modelStaleAge {
-			coverage = "partial"
-		}
-		snap, ok := snapByBackend[bm.BackendID]
-		if !ok {
-			coverage = "partial"
+		if bm.FetchedAt.IsZero() {
 			continue
 		}
-		for _, obs := range snap.Capabilities {
-			switch obs.State {
-			case diagnostics.Disabled:
-				// Expected: backend does not expose this capability.
-			case diagnostics.Unsupported:
-				// Expected: backend does not expose this capability.
-			case diagnostics.Unavailable, diagnostics.Unauthorized, diagnostics.Unknown:
-				coverage = "partial"
-			}
-			if obs.Stale {
-				coverage = "partial"
-			}
-		}
-		if len(bm.Models) == 0 {
-			coverage = "partial"
+		if h.backendDowngradesCoverage(bm, snapByBackend) {
+			return "partial"
 		}
 	}
+	return "complete"
+}
 
+// pageDiagnosticsModels writes the models response, paging through the
+// immutable snapshot store when the result exceeds the page size.
+func (h *Handler) pageDiagnosticsModels(w http.ResponseWriter, filtered []*modeldiagnostics.ModelSnapshot, resolvedModelID string, coverage string, args modelsQueryArgs) {
 	// Direct return when result fits in one page (no cursor).
-	if len(filtered) <= limit {
+	if len(filtered) <= args.limit {
 		if filtered == nil {
 			filtered = []*modeldiagnostics.ModelSnapshot{}
 		}
@@ -1265,11 +1644,11 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	filterDigest := modelFilterDigest(backendFilter, modelFilter, statusFilter, limit)
+	filterDigest := modelFilterDigest(args.backend, args.model, args.status, args.limit)
 
 	h.pagerMu.Lock()
 	var page modelSnapshotPageResponse
-	page, err = h.modelSnapshotPages.createSnapshot(filtered, limit, filterDigest)
+	page, err := h.modelSnapshotPages.createSnapshot(filtered, args.limit, filterDigest)
 	h.pagerMu.Unlock()
 
 	if err != nil {
@@ -1287,7 +1666,7 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 
 	body := map[string]any{
 		"generated_at": page.GeneratedAt.Format(time.RFC3339),
-		"coverage":     page.Coverage,
+		"coverage":     coverage,
 		"models":       page.Records,
 		"cursor":       page.Cursor,
 	}
@@ -1295,6 +1674,37 @@ func (h *Handler) serveDiagnosticsModels(w http.ResponseWriter, r *http.Request)
 		body["resolved_model_id"] = resolvedModelID
 	}
 	writeDiagnosticsResponse(w, http.StatusOK, body)
+}
+
+// resumeDiagnosticsModelsPage resumes a frozen snapshot page from the cursor.
+// It performs no collectors or network access, so it works during an outage.
+func (h *Handler) resumeDiagnosticsModelsPage(w http.ResponseWriter, args modelsQueryArgs) {
+	if h.modelSnapshotPages == nil {
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, "model snapshot pager not configured")
+		return
+	}
+	filterDigest := modelFilterDigest(args.backend, args.model, args.status, args.limit)
+	h.pagerMu.Lock()
+	page, err := h.modelSnapshotPages.resumeSnapshot(args.cursor, args.limit, filterDigest)
+	h.pagerMu.Unlock()
+	if err != nil {
+		if errors.Is(err, errSnapshotExpired) {
+			writeDiagnosticsError(w, http.StatusGone, "snapshot expired")
+			return
+		}
+		if errors.Is(err, errSnapshotNotFound) {
+			writeDiagnosticsError(w, http.StatusNotFound, "snapshot not found")
+			return
+		}
+		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrModelSnapshotFailed)
+		return
+	}
+	writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
+		"generated_at": page.GeneratedAt.Format(time.RFC3339),
+		"coverage":     page.Coverage,
+		"models":       page.Records,
+		"cursor":       page.Cursor,
+	})
 }
 
 // snapByBackend returns true if a diagnostics snapshot exists for the backend.
@@ -1402,135 +1812,33 @@ func snapshotsToPointers(snaps []diagnostics.Snapshot) []*diagnostics.Snapshot {
 }
 
 // serveDiagnosticsRequests returns a cursor-paged list of proxy-only request
-// history records. Requires request_history to be enabled.
+// history records. Requires request_history to be enabled. It is a thin
+// orchestrator: history-disabled is checked before query parsing, query
+// validation is delegated to parseDiagnosticsRequestsQuery (no data refresh
+// on invalid query), and rate limiting/semaphore/QueryPage is delegated to
+// queryDiagnosticsHistory.
 func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), diagnosticRequestTimeout)
 	defer cancel()
 
-	// If history is nil, return 503 history_disabled.
+	// If history is nil, return 503 history_disabled. Checked before query
+	// parsing so an invalid query never triggers a history refresh.
 	if h.history == nil {
 		writeDiagnosticsError(w, http.StatusServiceUnavailable, "history_disabled")
 		return
 	}
 
 	// Validate query parameters first: no data refresh on invalid query.
-	sinceParam := r.URL.Query().Get("since")
-	untilParam := r.URL.Query().Get("until")
-	backendFilter := r.URL.Query().Get("backend")
-	modelFilter := r.URL.Query().Get("model")
-	statusFilter := r.URL.Query().Get("status")
-	requestIDFilter := r.URL.Query().Get("requestid")
-	cursor := r.URL.Query().Get("cursor")
-	limitParam := r.URL.Query().Get("limit")
-
-	// Reject duplicate query parameters.
-	if err := rejectDuplicateQueryParams(r.URL.Query(), "since", "until", "backend", "model", "status", "requestid", "cursor", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
+	args, diagErr := h.parseDiagnosticsRequestsQuery(r)
+	if diagErr != nil {
+		writeDiagnosticsError(w, diagErr.status, diagErr.message)
 		return
 	}
 
-	// Model filter on proxy request records cannot be attributed because the
-	// correlation record ModelID is intentionally blank (the upstream activity
-	// carries no X-Request-ID). A nonempty model filter returns explicit 501.
-	if modelFilter != "" {
-		writeDiagnosticsError(w, http.StatusNotImplemented, "model_attribution_unsupported")
-		return
-	}
-
-	// Derive effective time bounds. Missing bounds default to a 24h window
-	// ending at now. Reject any future bound and any window > 24h. The
-	// normalized effective times are used for the query and any digest.
-	since, until, err := parseDiagnosticsTimeRange(sinceParam, untilParam, time.Now())
-	if err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	// Validate string filters (bounded valid UTF-8).
-	for _, v := range []string{backendFilter, statusFilter, requestIDFilter} {
-		if v != "" {
-			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
-				return
-			}
-		}
-	}
-
-	// Validate cursor length.
-	if cursor != "" && len(cursor) > maxCursorLength {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
-		return
-	}
-
-	// Validate limit.
-	limit := defaultDiagnosticQueryLimit
-	if limitParam != "" {
-		l, err := strconv.Atoi(limitParam)
-		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
-			return
-		}
-		if l > maxDiagnosticQueryLimit {
-			l = maxDiagnosticQueryLimit
-		}
-		limit = l
-	}
-
-	// Validate backend filter: must be a configured backend.
-	if backendFilter != "" {
-		if _, ok := h.proxies[backendFilter]; !ok {
-			writeDiagnosticsError(w, http.StatusBadRequest, "unknown backend filter")
-			return
-		}
-	}
-
-	// Validate status filter: finite union of Correlation transport enums.
-	if statusFilter != "" && !validTransportStatus(statusFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
-		return
-	}
-
-	// Validate requestID filter format/bounds.
-	if requestIDFilter != "" && !validRequestID(requestIDFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, "invalid request id filter")
-		return
-	}
-
-	// Rate limit and semaphore.
-	release, err := h.diagnoseRateLimit(ctx)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
-		return
-	}
-	defer release()
-
-	// Build filter and query the correlator for a stable, mutation-free page.
-	filter := correlation.QueryFilter{
-		TimeStart: since,
-		TimeEnd:   until,
-		BackendID: backendFilter,
-		// ModelID is intentionally blank: proxy-only records do not carry
-		// model identity, so a model filter is not attributable.
-		ModelID:   "",
-		Status:    statusFilter,
-		RequestID: requestIDFilter,
-	}
-	pageReq := correlation.PageRequest{Cursor: cursor, Limit: limit}
-	page, err := h.history.QueryPage(filter, pageReq)
-	if err != nil {
-		if errors.Is(err, correlation.ErrSnapshotExpired) || errors.Is(err, correlation.ErrSnapshotNotFound) {
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "snapshot expired or not found")
-			return
-		}
-		if errors.Is(err, correlation.ErrSnapshotTooLarge) {
-			writeDiagnosticsError(w, http.StatusBadRequest, "too_large")
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "query failed")
+	// Query history through the rate limiter and semaphore.
+	page, diagErr := h.queryDiagnosticsHistory(ctx, args)
+	if diagErr != nil {
+		writeDiagnosticsError(w, diagErr.status, diagErr.message)
 		return
 	}
 
@@ -1541,6 +1849,71 @@ func (h *Handler) serveDiagnosticsRequests(w http.ResponseWriter, r *http.Reques
 		response["cursor"] = page.Cursor
 	}
 	writeDiagnosticsResponse(w, http.StatusOK, response)
+}
+
+// queryDiagnosticsPage admits the request through the rate limiter and
+// semaphore, then queries the correlator for a stable, mutation-free page. It
+// maps rate-limit and query errors to diagnosticErrors. includeCursor controls
+// whether the cursor is passed to QueryPage. tooLargeStatus is the HTTP status
+// returned when the result exceeds the cap. checkTooLargeFirst controls the
+// error-check order: when true, ErrSnapshotTooLarge is checked before
+// ErrSnapshotExpired/ErrSnapshotNotFound. The caller owns the response
+// mapping.
+func (h *Handler) queryDiagnosticsPage(ctx context.Context, args diagnosticsQueryArgs, includeCursor bool, tooLargeStatus int, checkTooLargeFirst bool) (*correlation.PageResponse, *diagnosticError) {
+	// Rate limit and semaphore. Context timeout/cancellation maps to 504;
+	// semaphore unavailability maps to 503.
+	release, err := h.diagnoseRateLimit(ctx)
+	if err != nil {
+		if isContextTimeout(err) {
+			return nil, &diagnosticError{status: http.StatusGatewayTimeout, message: diagnosticsErrDiagnosticsRequestTimedOut}
+		}
+		return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: diagnosticsErrDiagnosticsTemporarilyUnavailable}
+	}
+	defer release()
+
+	// Build filter and query the correlator for a stable, mutation-free page.
+	filter := correlation.QueryFilter{
+		TimeStart: args.since,
+		TimeEnd:   args.until,
+		BackendID: args.backend,
+		// ModelID is intentionally blank: proxy-only records do not carry
+		// model identity, so a model filter is not attributable.
+		ModelID:   "",
+		Status:    args.status,
+		RequestID: args.requestID,
+	}
+	pageReq := correlation.PageRequest{Limit: args.limit}
+	if includeCursor {
+		pageReq.Cursor = args.cursor
+	}
+	page, err := h.history.QueryPage(filter, pageReq)
+	if err != nil {
+		if checkTooLargeFirst {
+			if errors.Is(err, correlation.ErrSnapshotTooLarge) {
+				return nil, &diagnosticError{status: tooLargeStatus, message: "too_large"}
+			}
+			if errors.Is(err, correlation.ErrSnapshotExpired) || errors.Is(err, correlation.ErrSnapshotNotFound) {
+				return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "snapshot expired or not found"}
+			}
+		} else {
+			if errors.Is(err, correlation.ErrSnapshotExpired) || errors.Is(err, correlation.ErrSnapshotNotFound) {
+				return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "snapshot expired or not found"}
+			}
+			if errors.Is(err, correlation.ErrSnapshotTooLarge) {
+				return nil, &diagnosticError{status: tooLargeStatus, message: "too_large"}
+			}
+		}
+		return nil, &diagnosticError{status: http.StatusServiceUnavailable, message: "query failed"}
+	}
+	return &page, nil
+}
+
+// queryDiagnosticsHistory admits the request through the rate limiter and
+// semaphore, then queries the correlator for a stable, mutation-free page. It
+// maps rate-limit and query errors to diagnosticErrors. The caller owns the
+// response mapping.
+func (h *Handler) queryDiagnosticsHistory(ctx context.Context, args diagnosticsQueryArgs) (*correlation.PageResponse, *diagnosticError) {
+	return h.queryDiagnosticsPage(ctx, args, diagnosticsRequestsPolicy.includeCursor, diagnosticsRequestsPolicy.tooLargeStatus, diagnosticsRequestsPolicy.checkTooLargeFirst)
 }
 
 // serveDiagnosticsRequestByID returns a single proxy-only request history
@@ -1586,150 +1959,66 @@ func (h *Handler) serveDiagnosticsRequestByID(w http.ResponseWriter, r *http.Req
 
 // serveDiagnosticsSummary aggregates proxy-only request history: count,
 // outcomes by HTTP transport status, and duration from ProxyObservation.
-// Pages through a single bounded QueryPage; exceeds cap returns too_large.
+// Pages through a single bounded QueryPage; exceeds cap returns too_large. It
+// is a thin orchestrator: history-disabled is checked before query parsing,
+// query validation is delegated to parseDiagnosticsSummaryQuery (no data
+// refresh on invalid query), and rate limiting/semaphore/QueryPage is
+// delegated to queryDiagnosticsSummary.
 func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), diagnosticRequestTimeout)
 	defer cancel()
 
-	// If history is nil, return 503 history_disabled.
+	// If history is nil, return 503 history_disabled. Checked before query
+	// parsing so an invalid query never triggers a history refresh.
 	if h.history == nil {
 		writeDiagnosticsError(w, http.StatusServiceUnavailable, "history_disabled")
 		return
 	}
 
 	// Validate query parameters first: no data refresh on invalid query.
-	sinceParam := r.URL.Query().Get("since")
-	untilParam := r.URL.Query().Get("until")
-	backendFilter := r.URL.Query().Get("backend")
-	modelFilter := r.URL.Query().Get("model")
-	statusFilter := r.URL.Query().Get("status")
-	requestIDFilter := r.URL.Query().Get("requestid")
-	cursor := r.URL.Query().Get("cursor")
-	limitParam := r.URL.Query().Get("limit")
-
-	// Reject duplicate query parameters.
-	if err := rejectDuplicateQueryParams(r.URL.Query(), "since", "until", "backend", "model", "status", "requestid", "cursor", "limit"); err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrDuplicateQueryParam)
+	args, diagErr := h.parseDiagnosticsSummaryQuery(r)
+	if diagErr != nil {
+		writeDiagnosticsError(w, diagErr.status, diagErr.message)
 		return
 	}
 
-	// Model filter on proxy request records cannot be attributed because the
-	// correlation record ModelID is intentionally blank.
-	if modelFilter != "" {
-		writeDiagnosticsError(w, http.StatusNotImplemented, "model_attribution_unsupported")
+	// Query history through the rate limiter and semaphore.
+	page, diagErr := h.queryDiagnosticsSummary(ctx, args)
+	if diagErr != nil {
+		writeDiagnosticsError(w, diagErr.status, diagErr.message)
 		return
 	}
 
-	// Parse and validate time range. Missing since defaults to now-24h,
-	// missing until defaults to now. Future bounds, reversed ranges, and
-	// ranges exceeding 24h are rejected.
-	now := time.Now()
-	since, until, err := parseDiagnosticsTimeRange(sinceParam, untilParam, now)
-	if err != nil {
-		writeDiagnosticsError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	writeDiagnosticsResponse(w, http.StatusOK, summarizeDiagnosticsRecords(page.Records))
+}
 
-	// Validate string filters (bounded valid UTF-8).
-	for _, v := range []string{backendFilter, statusFilter, requestIDFilter} {
-		if v != "" {
-			if len(v) > maxQueryParamLength || !utf8.ValidString(v) {
-				writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidFilterValue)
-				return
-			}
-		}
-	}
+// parseDiagnosticsSummaryQuery validates and normalizes the query parameters
+// for the /diagnostics/v1/summary endpoint. It performs no data refresh. On
+// success it returns the normalized arguments. On failure it returns a
+// diagnosticError the caller maps to a response.
+func (h *Handler) parseDiagnosticsSummaryQuery(r *http.Request) (diagnosticsQueryArgs, *diagnosticError) {
+	return h.parseDiagnosticsQuery(r, diagnosticsSummaryPolicy)
+}
 
-	// Validate cursor length.
-	if cursor != "" && len(cursor) > maxCursorLength {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrCursorTooLong)
-		return
-	}
+// queryDiagnosticsSummary admits the request through the rate limiter and
+// semaphore, then queries the correlator for a stable, mutation-free page. It
+// maps rate-limit and query errors to diagnosticErrors. The caller owns the
+// response mapping.
+func (h *Handler) queryDiagnosticsSummary(ctx context.Context, args diagnosticsQueryArgs) (*correlation.PageResponse, *diagnosticError) {
+	return h.queryDiagnosticsPage(ctx, args, diagnosticsSummaryPolicy.includeCursor, diagnosticsSummaryPolicy.tooLargeStatus, diagnosticsSummaryPolicy.checkTooLargeFirst)
+}
 
-	// Validate limit.
-	limit := maxDiagnosticSummaryLimit
-	if limitParam != "" {
-		l, err := strconv.Atoi(limitParam)
-		if err != nil || l < 0 {
-			writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidLimit)
-			return
-		}
-		if l > maxDiagnosticSummaryLimit {
-			l = maxDiagnosticSummaryLimit
-		}
-		limit = l
-	}
-
-	// Validate backend filter: must be a configured backend.
-	if backendFilter != "" {
-		if _, ok := h.proxies[backendFilter]; !ok {
-			writeDiagnosticsError(w, http.StatusBadRequest, "unknown backend filter")
-			return
-		}
-	}
-
-	// Validate status filter: finite union of Correlation transport enums.
-	if statusFilter != "" && !validTransportStatus(statusFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, diagnosticsErrInvalidStatusFilter)
-		return
-	}
-
-	// Validate requestID filter format/bounds.
-	if requestIDFilter != "" && !validRequestID(requestIDFilter) {
-		writeDiagnosticsError(w, http.StatusBadRequest, "invalid request id filter")
-		return
-	}
-
-	// Rate limit and semaphore.
-	release, err := h.diagnoseRateLimit(ctx)
-	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			writeDiagnosticsError(w, http.StatusGatewayTimeout, diagnosticsErrDiagnosticsRequestTimedOut)
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, diagnosticsErrDiagnosticsTemporarilyUnavailable)
-		return
-	}
-	defer release()
-
-	// Single bounded QueryPage with filters; ErrSnapshotTooLarge means more
-	// than cap.
-	filter := correlation.QueryFilter{
-		TimeStart: since,
-		TimeEnd:   until,
-		BackendID: backendFilter,
-		// ModelID is intentionally blank: proxy-only records do not carry
-		// model identity, so a model filter is not attributable.
-		ModelID:   "",
-		Status:    statusFilter,
-		RequestID: requestIDFilter,
-	}
-	pageReq := correlation.PageRequest{Limit: limit}
-	page, err := h.history.QueryPage(filter, pageReq)
-	if err != nil {
-		if errors.Is(err, correlation.ErrSnapshotTooLarge) {
-			writeDiagnosticsError(w, http.StatusRequestEntityTooLarge, "too_large")
-			return
-		}
-		if errors.Is(err, correlation.ErrSnapshotExpired) || errors.Is(err, correlation.ErrSnapshotNotFound) {
-			writeDiagnosticsError(w, http.StatusServiceUnavailable, "snapshot expired or not found")
-			return
-		}
-		writeDiagnosticsError(w, http.StatusServiceUnavailable, "query failed")
-		return
-	}
-
-	// Aggregate count/outcomes/duration via only allowlisted typed
-	// ProxyObservation. Distinguish HTTP transport status (record.Status)
-	// from generation outcome (ProxyObservation.GenerationOutcome) and
-	// duration sample count. HTTP 200 is never inferred as generation
-	// success.
-	count := len(page.Records)
+// summarizeDiagnosticsRecords aggregates count/outcomes/generation_outcomes/
+// duration mean/p50/sample count from typed ProxyObservation only. HTTP 200 is
+// never inferred as generation success. duration_ms carries sample_count even
+// when there are no durations and mean/p50 only when samples exist.
+func summarizeDiagnosticsRecords(records []*correlation.CorrelationRecord) map[string]any {
+	count := len(records)
 	outcomes := make(map[string]int)
 	generationOutcomes := make(map[string]int)
 	var durations []float64
 	durationSampleCount := 0
-	for _, rec := range page.Records {
+	for _, rec := range records {
 		outcomes[rec.Status]++
 		if rec.ProxyObservation != nil {
 			if rec.ProxyObservation.GenerationOutcome != "" {
@@ -1761,13 +2050,13 @@ func (h *Handler) serveDiagnosticsSummary(w http.ResponseWriter, r *http.Request
 		}
 	}
 
-	writeDiagnosticsResponse(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"count":                 count,
 		"outcomes":              outcomes,
 		"generation_outcomes":   generationOutcomes,
 		"duration_ms":           durationMS,
 		"duration_sample_count": durationSampleCount,
-	})
+	}
 }
 
 func sumFloat64(values []float64) float64 {

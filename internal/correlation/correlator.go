@@ -433,6 +433,9 @@ func (c *Correlator) AttachObservation(requestID string, summary timing.Summary)
 
 // CorrelateActivity links an upstream activity event to a request.
 // Empty or oversized request/activity IDs are dropped rather than synthesized.
+// The caller holds c.mu. Orphan RequestTime equals activityTime so age-based
+// retention does not immediately evict it. Phase is "activity_only" and status
+// is "unmatched" for orphans.
 func (c *Correlator) CorrelateActivity(activityID, requestID string, activityTime time.Time, metadata map[string]any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -441,39 +444,79 @@ func (c *Correlator) CorrelateActivity(activityID, requestID string, activityTim
 		return
 	}
 
-	record, ok := c.records[requestID]
-	if !ok {
-		// Activity without matching request; retain as orphan with a
-		// non-zero RequestTime so age-based retention does not immediately
-		// evict it.
-		record = &CorrelationRecord{
-			RequestID:    requestID,
-			ActivityID:   activityID,
-			ActivityTime: activityTime,
-			RequestTime:  activityTime,
-			Phase:        "activity_only",
-			Status:       "unmatched",
-		}
-		sanitized := sanitizeMetadata(metadata)
-		if len(sanitized) > 0 {
-			record.Metadata = sanitized
-		}
-		c.records[requestID] = record
-		c.totalSize += int64(estimateRecordSize(record))
-		// Index for reverse lookups.
-		if activityID != "" {
-			c.activityIndex[activityID] = append(c.activityIndex[activityID], requestID)
-		}
+	if record, ok := c.records[requestID]; ok {
+		c.updateMatchedActivityRecord(record, activityID, activityTime, metadata)
 		c.evictLocked()
 		return
 	}
 
+	c.createOrphanActivityRecord(requestID, activityID, activityTime, metadata)
+}
+
+// createOrphanActivityRecord creates a retained orphan record for an activity
+// without a matching request. It is called under the caller-held mutex. Orphan
+// RequestTime equals activityTime so age-based retention does not immediately
+// evict it. Phase is "activity_only" and status is "unmatched". Metadata is
+// sanitized and retained when non-empty. The record is indexed by activity ID
+// for reverse lookups. Eviction is applied before returning.
+func (c *Correlator) createOrphanActivityRecord(requestID, activityID string, activityTime time.Time, metadata map[string]any) {
+	record := &CorrelationRecord{
+		RequestID:    requestID,
+		ActivityID:   activityID,
+		ActivityTime: activityTime,
+		RequestTime:  activityTime,
+		Phase:        "activity_only",
+		Status:       "unmatched",
+	}
+	sanitized := sanitizeMetadata(metadata)
+	if len(sanitized) > 0 {
+		record.Metadata = sanitized
+	}
+	c.records[requestID] = record
+	c.totalSize += int64(estimateRecordSize(record))
+	// Index for reverse lookups.
+	if activityID != "" {
+		c.activityIndex[activityID] = append(c.activityIndex[activityID], requestID)
+	}
+	c.evictLocked()
+}
+
+// updateMatchedActivityRecord updates an existing record with a new activity
+// event. It is called under the caller-held mutex. It removes the old activity
+// index association if the ActivityID changes, updates the record fields,
+// sanitizes and merges metadata, extracts status, adjusts totalSize, and
+// re-indexes the activity ID. It does not evict; the caller calls evictLocked.
+func (c *Correlator) updateMatchedActivityRecord(record *CorrelationRecord, activityID string, activityTime time.Time, metadata map[string]any) {
 	// Remove old activity index association if ActivityID changes.
+	c.removeActivityIndexAssociation(record, activityID)
+
+	oldSize := estimateRecordSize(record)
+
+	record.ActivityID = activityID
+	record.ActivityTime = activityTime
+
+	// Sanitize and merge metadata.
+	sanitized := c.mergeSanitizedMetadata(record, metadata)
+
+	// Extract status from sanitized metadata only (validated against enum).
+	c.extractStatusFromMetadata(record, sanitized)
+
+	newSize := estimateRecordSize(record)
+	c.totalSize += int64(newSize - oldSize)
+
+	// Index activity ID -> request IDs for reverse lookups (dedup).
+	c.addActivityIndexEntry(activityID, record.RequestID)
+}
+
+// removeActivityIndexAssociation removes the record's request ID from the old
+// activity index entry when the ActivityID changes. It is a no-op when the
+// ActivityID is empty or unchanged. Caller must hold the mutex.
+func (c *Correlator) removeActivityIndexAssociation(record *CorrelationRecord, activityID string) {
 	if record.ActivityID != "" && record.ActivityID != activityID {
 		oldIdx := c.activityIndex[record.ActivityID]
 		filtered := make([]string, 0, len(oldIdx))
 		for _, id := range oldIdx {
-			if id != requestID {
+			if id != record.RequestID {
 				filtered = append(filtered, id)
 			}
 		}
@@ -483,13 +526,12 @@ func (c *Correlator) CorrelateActivity(activityID, requestID string, activityTim
 			c.activityIndex[record.ActivityID] = filtered
 		}
 	}
+}
 
-	oldSize := estimateRecordSize(record)
-
-	record.ActivityID = activityID
-	record.ActivityTime = activityTime
-
-	// Sanitize and merge metadata.
+// mergeSanitizedMetadata sanitizes the metadata and merges allowed entries into
+// the record's metadata map. It returns the sanitized map so callers can
+// extract status from it. Caller must hold the mutex.
+func (c *Correlator) mergeSanitizedMetadata(record *CorrelationRecord, metadata map[string]any) map[string]any {
 	sanitized := sanitizeMetadata(metadata)
 	if len(sanitized) > 0 {
 		if record.Metadata == nil {
@@ -499,18 +541,22 @@ func (c *Correlator) CorrelateActivity(activityID, requestID string, activityTim
 			record.Metadata[k] = v
 		}
 	}
+	return sanitized
+}
 
-	// Extract status from sanitized metadata only (validated against enum).
+// extractStatusFromMetadata extracts the transport status from sanitized
+// metadata only, validating against the enum. Caller must hold the mutex.
+func (c *Correlator) extractStatusFromMetadata(record *CorrelationRecord, sanitized map[string]any) {
 	if s, ok := sanitized["status"]; ok {
 		if sStr, ok := s.(string); ok && transportStatusEnum[sStr] {
 			record.Status = sStr
 		}
 	}
+}
 
-	newSize := estimateRecordSize(record)
-	c.totalSize += int64(newSize - oldSize)
-
-	// Index activity ID -> request IDs for reverse lookups (dedup).
+// addActivityIndexEntry adds requestID to the activity index for activityID
+// with dedup. It is a no-op when activityID is empty. Caller must hold the mutex.
+func (c *Correlator) addActivityIndexEntry(activityID, requestID string) {
 	if activityID != "" {
 		existing := c.activityIndex[activityID]
 		found := false
@@ -524,8 +570,21 @@ func (c *Correlator) CorrelateActivity(activityID, requestID string, activityTim
 			c.activityIndex[activityID] = append(existing, requestID)
 		}
 	}
+}
 
-	c.evictLocked()
+// pageEnd computes the exclusive end index for a page starting at offset with
+// the given limit, clamping to total. It handles integer overflow (end < offset
+// means overflow) and clamps end to total. Callers validate offset bounds
+// before calling and clamp negative offsets to zero.
+func pageEnd(offset, limit, total int) int {
+	end := offset + limit
+	if end < offset { // overflow check
+		end = total
+	}
+	if end > total {
+		end = total
+	}
+	return end
 }
 
 // defensive copies; mutating them does not affect internal state. Age-based
@@ -569,13 +628,7 @@ func (c *Correlator) Query(filter QueryFilter) []*CorrelationRecord {
 	if offset >= len(result) {
 		return []*CorrelationRecord{}
 	}
-	end := offset + limit
-	if end < offset { // overflow check
-		end = len(result)
-	}
-	if end > len(result) {
-		end = len(result)
-	}
+	end := pageEnd(offset, limit, len(result))
 	return result[offset:end]
 }
 
@@ -640,19 +693,26 @@ func (c *Correlator) evictLocked() {
 	c.evictSizeLocked()
 }
 
+// oldestRecordsLocked returns all records sorted oldest-first by RequestTime,
+// then by RequestID for a deterministic tie-break. Caller must hold the mutex.
+func (c *Correlator) oldestRecordsLocked() []*CorrelationRecord {
+	records := make([]*CorrelationRecord, 0, len(c.records))
+	for _, r := range c.records {
+		records = append(records, r)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].RequestTime.Equal(records[j].RequestTime) {
+			return records[i].RequestID < records[j].RequestID
+		}
+		return records[i].RequestTime.Before(records[j].RequestTime)
+	})
+	return records
+}
+
 // evictCountLocked applies count-based retention. Caller must hold the mutex.
 func (c *Correlator) evictCountLocked() {
 	if c.retentionCount > 0 && len(c.records) > c.retentionCount {
-		records := make([]*CorrelationRecord, 0, len(c.records))
-		for _, r := range c.records {
-			records = append(records, r)
-		}
-		sort.Slice(records, func(i, j int) bool {
-			if records[i].RequestTime.Equal(records[j].RequestTime) {
-				return records[i].RequestID < records[j].RequestID
-			}
-			return records[i].RequestTime.Before(records[j].RequestTime)
-		})
+		records := c.oldestRecordsLocked()
 		toEvict := len(records) - c.retentionCount
 		for i := 0; i < toEvict; i++ {
 			c.evictRecordLocked(records[i])
@@ -675,16 +735,7 @@ func (c *Correlator) evictAgeLocked() {
 // evictSizeLocked applies size-based retention. Caller must hold the mutex.
 func (c *Correlator) evictSizeLocked() {
 	if c.retentionSize > 0 && c.totalSize > c.retentionSize {
-		records := make([]*CorrelationRecord, 0, len(c.records))
-		for _, r := range c.records {
-			records = append(records, r)
-		}
-		sort.Slice(records, func(i, j int) bool {
-			if records[i].RequestTime.Equal(records[j].RequestTime) {
-				return records[i].RequestID < records[j].RequestID
-			}
-			return records[i].RequestTime.Before(records[j].RequestTime)
-		})
+		records := c.oldestRecordsLocked()
 		for i := 0; i < len(records) && c.totalSize > c.retentionSize; i++ {
 			r := records[i]
 			c.evictRecordLocked(r) // subtracts totalSize internally
@@ -1007,13 +1058,7 @@ func (c *Correlator) snapshotPage(randomID string, offset, pageSize int, storeSe
 		}, nil
 	}
 
-	end := offset + pageSize
-	if end < offset { // overflow check
-		end = len(snapshot.records)
-	}
-	if end > len(snapshot.records) {
-		end = len(snapshot.records)
-	}
+	end := pageEnd(offset, pageSize, len(snapshot.records))
 
 	// Clone page records for defensive output.
 	page := make([]*CorrelationRecord, 0, end-offset)

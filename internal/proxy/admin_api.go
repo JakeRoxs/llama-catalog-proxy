@@ -79,20 +79,31 @@ type adminActivity struct {
 	Updated time.Time            `json:"updated_at"`
 }
 
-func (r *Reloader) serveAdminOverview(w http.ResponseWriter, req *http.Request) {
+// adminAPIGetGuard applies the shared read-only admin API guard. Cache-Control
+// and nosniff headers are always set, then GET-only, session, and role checks
+// run in method->session->role order. It returns true when the request is
+// authorized to proceed; otherwise an error response has already been written.
+func (r *Reloader) adminAPIGetGuard(w http.ResponseWriter, req *http.Request) bool {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if req.Method != http.MethodGet || req.URL.RawQuery != "" || req.URL.RawPath != "" {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+		return false
 	}
 	if _, ok := r.adminAuth.sessionForRequest(req); !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return false
 	}
 	if _, ok := r.adminAuth.RequireRole(req, "view"); !ok {
 		http.Error(w, "forbidden", http.StatusForbidden)
+		return false
+	}
+	return true
+}
+
+func (r *Reloader) serveAdminOverview(w http.ResponseWriter, req *http.Request) {
+	if !r.adminAPIGetGuard(w, req) {
 		return
 	}
 	state := r.state.Load()
@@ -105,19 +116,51 @@ func (r *Reloader) serveAdminOverview(w http.ResponseWriter, req *http.Request) 
 		http.Error(w, "dashboard data unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	models, ok := fetchModelSummaries(handler, req)
+	if !ok {
+		http.Error(w, "model catalog unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	now := time.Now()
+	overview := adminOverview{
+		Models:              models,
+		Peers:               []adminPeerSummary{},
+		Updated:             now.UTC(),
+		RequestSummaryState: "not_configured",
+		FederationPolicy:    adminFederationPolicySummary{State: "not_configured", PeerCRLs: []adminPeerCRLSummary{}},
+	}
+	if state.peer != nil {
+		overview.NodeID = state.peer.NodeID
+		if state.peer.FederationID != "" {
+			overview.FederationPolicy = summarizeFederationCRLs(state, now)
+		}
+	}
+	if state.peerCache != nil {
+		overview.Peers = constructPeerSummaries(state)
+	}
+	if handler.diagnosticsAPIKey != "" {
+		summary, state := fetchRequestSummary(handler)
+		overview.RequestSummary = summary
+		overview.RequestSummaryState = state
+	}
+	writeJSON(r.logger, w, http.StatusOK, overview)
+}
+
+// fetchModelSummaries returns the model catalog summaries sorted by ID, skipping
+// records that fail to unmarshal or carry an empty ID. A false ok means the
+// catalog could not be fetched or decoded.
+func fetchModelSummaries(handler *Handler, req *http.Request) ([]adminModelSummary, bool) {
 	ctx, cancel := context.WithTimeout(req.Context(), handler.catalogTimeout)
 	defer cancel()
 	catalogResponse, _, err := handler.modelCatalog(ctx, make(http.Header))
 	if err != nil {
-		http.Error(w, "model catalog unavailable", http.StatusServiceUnavailable)
-		return
+		return nil, false
 	}
 	var envelope struct {
 		Data []json.RawMessage `json:"data"`
 	}
 	if err := json.Unmarshal(catalogResponse.Body, &envelope); err != nil {
-		http.Error(w, "model catalog unavailable", http.StatusServiceUnavailable)
-		return
+		return nil, false
 	}
 	models := make([]adminModelSummary, 0, len(envelope.Data))
 	for _, raw := range envelope.Data {
@@ -132,73 +175,95 @@ func (r *Reloader) serveAdminOverview(w http.ResponseWriter, req *http.Request) 
 		models = append(models, adminModelSummary{ID: model.ID, Object: model.Object, OwnedBy: model.OwnedBy})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
-	now := time.Now()
-	overview := adminOverview{
-		Models: models, Peers: []adminPeerSummary{}, Updated: now.UTC(), RequestSummaryState: "not_configured",
-		FederationPolicy: adminFederationPolicySummary{State: "not_configured", PeerCRLs: []adminPeerCRLSummary{}},
-	}
-	if state.peer != nil {
-		overview.NodeID = state.peer.NodeID
-		if state.peer.FederationID != "" {
-			overview.FederationPolicy = summarizeFederationCRLs(state, now)
-		}
-	}
+	return models, true
+}
+
+// constructPeerSummaries builds peer summaries from the peer cache views,
+// applying identity-store lookup, configured scopes, and readiness defaults.
+func constructPeerSummaries(state *reloaderState) []adminPeerSummary {
+	peers := []adminPeerSummary{}
 	if state.peerCache != nil {
 		views, _ := state.peerCache.views(time.Now(), "")
 		for _, view := range views {
 			peer := adminPeerSummary{
-				NodeID: view.NodeID, Status: view.Status, ReceivedAt: view.ReceivedAt,
-				IdentityState: "not_configured", AuthorizationState: "not_configured",
-				ConfiguredScopes: []string{}, ModelReadinessState: "unknown",
+				NodeID:              view.NodeID,
+				Status:              view.Status,
+				ReceivedAt:          view.ReceivedAt,
+				IdentityState:       peerIdentityState(state, view),
+				AuthorizationState:  "not_configured",
+				ConfiguredScopes:    []string{},
+				ModelReadinessState: "unknown",
 			}
 			if state.peer != nil {
-				if state.peer.FederationID != "" {
-					if state.pairingStore == nil {
-						peer.IdentityState = "unavailable"
-					} else {
-						member, paired, err := state.pairingStore.LookupMember(view.NodeID)
-						switch {
-						case err != nil:
-							peer.IdentityState = "unavailable"
-						case !paired:
-							peer.IdentityState = "not_paired"
-						case member.NodeID != "":
-							peer.IdentityState = "paired"
-						}
-					}
-				} else {
-					peer.IdentityState = "legacy_bearer"
-				}
 				if grant, ok := state.peer.Peers[view.NodeID]; ok {
 					peer.ConfiguredScopes = configuredPeerScopes(grant)
-					if len(peer.ConfiguredScopes) == 0 {
-						peer.AuthorizationState = "no_scopes"
-					} else {
-						peer.AuthorizationState = "scopes_configured"
-					}
+					peer.AuthorizationState = peerAuthorizationState(grant, true)
 				}
 			}
-			overview.Peers = append(overview.Peers, peer)
+			peers = append(peers, peer)
 		}
 	}
-	if handler.diagnosticsAPIKey != "" {
-		internalRequest := httptest.NewRequest(http.MethodGet, "http://internal/diagnostics/v1/summary", nil)
-		internalRequest.Header.Set("Authorization", "Bearer "+handler.diagnosticsAPIKey)
-		recorder := httptest.NewRecorder()
-		handler.serveDiagnosticsAPI(recorder, internalRequest, &routeInfo{kind: routeInfoKindLocal})
-		if recorder.Code == http.StatusOK {
-			var summary adminRequestSummary
-			if json.Unmarshal(recorder.Body.Bytes(), &summary) == nil {
-				overview.RequestSummary = &summary
-				overview.RequestSummaryState = "available"
-			} else {
-				overview.RequestSummaryState = "unavailable"
-			}
-		} else if recorder.Code == http.StatusServiceUnavailable {
-			overview.RequestSummaryState = "unavailable"
-		}
+	return peers
+}
+
+// peerIdentityState reports the peer membership identity state from the pairing
+// store, defaulting to not_configured or legacy_bearer when not federated.
+func peerIdentityState(state *reloaderState, view peerView) string {
+	if state.peer == nil {
+		return "not_configured"
 	}
-	writeJSON(r.logger, w, http.StatusOK, overview)
+	if state.peer.FederationID == "" {
+		return "legacy_bearer"
+	}
+	if state.pairingStore == nil {
+		return "unavailable"
+	}
+	member, paired, err := state.pairingStore.LookupMember(view.NodeID)
+	switch {
+	case err != nil:
+		return "unavailable"
+	case !paired:
+		return "not_paired"
+	case member.NodeID != "":
+		return "paired"
+	}
+	return "not_configured"
+}
+
+// peerAuthorizationState reports the peer authorization state derived from the
+// configured grant scopes.
+func peerAuthorizationState(grant config.PeerGrant, ok bool) string {
+	if !ok {
+		return "not_configured"
+	}
+	scopes := configuredPeerScopes(grant)
+	if len(scopes) == 0 {
+		return "no_scopes"
+	}
+	return "scopes_configured"
+}
+
+// fetchRequestSummary queries the local diagnostics summary endpoint and returns
+// the parsed summary together with the request-summary state to assign:
+// status 503 -> unavailable; status 200 + valid JSON -> available; status 200
+// + invalid JSON -> unavailable; every other status -> not_configured.
+func fetchRequestSummary(handler *Handler) (*adminRequestSummary, string) {
+	internalRequest := httptest.NewRequest(http.MethodGet, "http://internal/diagnostics/v1/summary", nil)
+	internalRequest.Header.Set("Authorization", "Bearer "+handler.diagnosticsAPIKey)
+	recorder := httptest.NewRecorder()
+	handler.serveDiagnosticsAPI(recorder, internalRequest, &routeInfo{kind: routeInfoKindLocal})
+	switch recorder.Code {
+	case http.StatusServiceUnavailable:
+		return nil, "unavailable"
+	case http.StatusOK:
+		var summary adminRequestSummary
+		if json.Unmarshal(recorder.Body.Bytes(), &summary) != nil {
+			return nil, "unavailable"
+		}
+		return &summary, "available"
+	default:
+		return nil, "not_configured"
+	}
 }
 
 func configuredPeerScopes(grant config.PeerGrant) []string {
@@ -255,19 +320,7 @@ func summarizeCRLTime(crls []*x509.RevocationList, maxAge time.Duration, now tim
 }
 
 func (r *Reloader) serveAdminActivity(w http.ResponseWriter, req *http.Request) {
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if req.Method != http.MethodGet || req.URL.RawQuery != "" || req.URL.RawPath != "" {
-		w.Header().Set("Allow", http.MethodGet)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if _, ok := r.adminAuth.sessionForRequest(req); !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
-	}
-	if _, ok := r.adminAuth.RequireRole(req, "view"); !ok {
-		http.Error(w, "forbidden", http.StatusForbidden)
+	if !r.adminAPIGetGuard(w, req) {
 		return
 	}
 	state := r.state.Load()

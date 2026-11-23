@@ -386,19 +386,16 @@ func (c *ActivityCollector) buildActivityRequest(ctx context.Context, b *backend
 // classifyActivityStatus maps an HTTP status to the backend state/reason and
 // whether collection should stop. A 200 continues; every other status stops
 // with a documented state/reason. Redirects are refused (never followed) and
-// reported as redirect_refused rather than followed.
+// reported as redirect_refused rather than followed. It delegates to the
+// shared classifyBackendStatus, supplying the activity collector's state
+// strings.
 func classifyActivityStatus(code int) (state, reason string, stop bool) {
-	switch {
-	case code == http.StatusUnauthorized || code == http.StatusForbidden:
-		return "unauthorized", "authorization_required", true
-	case code == http.StatusNotFound || code == http.StatusMethodNotAllowed:
-		return "unsupported", "not_available", true
-	case code >= 300 && code < 400:
-		return "unknown", "redirect_refused", true
-	case code != http.StatusOK:
-		return "unavailable", "http_error", true
-	}
-	return "", "", false
+	return classifyBackendStatus(code, backendStatusLabels{
+		unauthorized: "unauthorized",
+		unsupported:  "unsupported",
+		unknown:      "unknown",
+		unavailable:  "unavailable",
+	})
 }
 
 var (

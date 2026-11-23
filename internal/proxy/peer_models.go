@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
@@ -76,46 +77,75 @@ func (c *peerCache) catalogModels(now time.Time) []peerCatalogModel {
 	defer c.mu.RUnlock()
 	var models []peerCatalogModel
 	for _, entry := range c.entries {
-		if entry.receipt == nil {
-			continue
-		}
-		age := now.Sub(entry.receipt.ReceivedAt)
-		if age < 0 || age > peerRetention {
-			continue
-		}
-		localIDCounts := make(map[string]int, len(entry.receipt.Report.Observations))
-		for _, observation := range entry.receipt.Report.Observations {
-			if observation.State == "supported" {
-				localIDCounts[observation.Identity.LocalID]++
-			}
-		}
-		status := "stale"
-		if entry.lastError == "" && age <= peerFreshAge {
-			status = "fresh"
-		}
-		for _, obs := range entry.receipt.Report.Observations {
-			if obs.State != "supported" {
-				continue
-			}
-			publicID := peerPublicID(obs.Identity)
-			if entry.routeInference && localIDCounts[obs.Identity.LocalID] == 1 {
-				publicID = peerRouteID(obs.Identity)
-			}
-			model := peerCatalogModel{
-				ID: publicID, Object: "model", OwnedBy: obs.Identity.OwnerNodeID,
-				CatalogProxy: peerCatalogProvenance{
-					Identity: obs.Identity, ObservedAt: obs.ObservedAt, Freshness: obs.Freshness,
-					Coverage: obs.Coverage, ReceiptStatus: status,
-				},
-			}
-			if len(obs.Aliases) > 0 {
-				model.Meta = map[string]any{"llamaswap": map[string]any{"aliases": obs.Aliases}}
-			}
-			models = append(models, model)
-		}
+		models = append(models, catalogModelsForEntry(now, entry)...)
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	return models
+}
+
+// catalogModelsForEntry builds the supported-observation catalog models for one
+// peer cache entry. It is pure/read-only and must be invoked while
+// peerCache.mu is held.
+func catalogModelsForEntry(now time.Time, entry peerCacheEntry) []peerCatalogModel {
+	if entry.receipt == nil {
+		return nil
+	}
+	age := now.Sub(entry.receipt.ReceivedAt)
+	if age < 0 || age > peerRetention {
+		return nil
+	}
+	localIDCounts := localSupportedIDCounts(entry.receipt.Report.Observations)
+	status := entryReceiptStatus(entry.lastError, age)
+	models := make([]peerCatalogModel, 0, len(entry.receipt.Report.Observations))
+	for _, obs := range entry.receipt.Report.Observations {
+		if obs.State != "supported" {
+			continue
+		}
+		models = append(models, peerCatalogModelFromObservation(obs, entry.routeInference, localIDCounts, status))
+	}
+	return models
+}
+
+// localSupportedIDCounts counts supported observations keyed by their LocalID.
+func localSupportedIDCounts(observations []nodecontract.Observation) map[string]int {
+	counts := make(map[string]int, len(observations))
+	for _, observation := range observations {
+		if observation.State == "supported" {
+			counts[observation.Identity.LocalID]++
+		}
+	}
+	return counts
+}
+
+// entryReceiptStatus reports "fresh" only when the receipt has no error and is
+// within the freshness window; otherwise "stale".
+func entryReceiptStatus(lastError string, age time.Duration) string {
+	status := "stale"
+	if lastError == "" && age <= peerFreshAge {
+		status = "fresh"
+	}
+	return status
+}
+
+// peerCatalogModelFromObservation converts one supported observation into a
+// catalog model. routeInference selects the peer route ID only when the local
+// ID occurs exactly once among supported observations.
+func peerCatalogModelFromObservation(obs nodecontract.Observation, routeInference bool, localIDCounts map[string]int, status string) peerCatalogModel {
+	publicID := peerPublicID(obs.Identity)
+	if routeInference && localIDCounts[obs.Identity.LocalID] == 1 {
+		publicID = peerRouteID(obs.Identity)
+	}
+	model := peerCatalogModel{
+		ID: publicID, Object: "model", OwnedBy: obs.Identity.OwnerNodeID,
+		CatalogProxy: peerCatalogProvenance{
+			Identity: obs.Identity, ObservedAt: obs.ObservedAt, Freshness: obs.Freshness,
+			Coverage: obs.Coverage, ReceiptStatus: status,
+		},
+	}
+	if len(obs.Aliases) > 0 {
+		model.Meta = map[string]any{"llamaswap": map[string]any{"aliases": obs.Aliases}}
+	}
+	return model
 }
 
 func (c *peerCache) modelForRoute(nodeID, backendID, modelID string) (nodecontract.ModelIdentity, bool) {
@@ -176,19 +206,46 @@ func (c *peerCache) freshModel(id nodecontract.ModelIdentity, now time.Time) (no
 }
 
 func (h *Handler) mergePeerCatalog(response catalog.Response) (catalog.Response, error) {
-	var root map[string]json.RawMessage
-	if err := json.Unmarshal(response.Body, &root); err != nil {
-		return catalog.Response{}, err
-	}
-	var local []json.RawMessage
-	if err := json.Unmarshal(root["data"], &local); err != nil {
+	root, local, err := decodeCatalogResponse(response.Body)
+	if err != nil {
 		return catalog.Response{}, err
 	}
 	peerModels := h.peerCache.catalogModels(time.Now())
-	peerIDs := make(map[string]struct{}, len(peerModels))
-	for _, model := range peerModels {
-		peerIDs[model.ID] = struct{}{}
+	peerIDs := peerModelIDs(peerModels)
+	reservedPrefixes := reservedPeerPrefixes(h)
+	combined, err := filterLocalRows(local, peerIDs, reservedPrefixes, h.logger)
+	if err != nil {
+		return catalog.Response{}, err
 	}
+	return marshalPeerCatalog(root, combined, peerModels, response)
+}
+
+// decodeCatalogResponse parses the catalog response body into its root object
+// and the local data array.
+func decodeCatalogResponse(body []byte) (map[string]json.RawMessage, []json.RawMessage, error) {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil {
+		return nil, nil, err
+	}
+	var local []json.RawMessage
+	if err := json.Unmarshal(root["data"], &local); err != nil {
+		return nil, nil, err
+	}
+	return root, local, nil
+}
+
+// peerModelIDs returns the set of public IDs exposed by the peer catalog models.
+func peerModelIDs(peerModels []peerCatalogModel) map[string]struct{} {
+	ids := make(map[string]struct{}, len(peerModels))
+	for _, model := range peerModels {
+		ids[model.ID] = struct{}{}
+	}
+	return ids
+}
+
+// reservedPeerPrefixes returns the route-inference peer namespace prefixes that
+// must be reserved and excluded from the local catalog rows.
+func reservedPeerPrefixes(h *Handler) []string {
 	reservedRoutes := make(map[string]struct{}, len(h.peerRouteAliases)+len(h.peerClients))
 	for id := range h.peerRouteAliases {
 		client := h.peerClients[id]
@@ -201,39 +258,54 @@ func (h *Handler) mergePeerCatalog(response catalog.Response) (catalog.Response,
 			reservedRoutes[id] = struct{}{}
 		}
 	}
-	peerPrefixes := make([]string, 0, len(reservedRoutes))
+	prefixes := make([]string, 0, len(reservedRoutes))
 	for id := range reservedRoutes {
-		peerPrefixes = append(peerPrefixes, id+"/")
+		prefixes = append(prefixes, id+"/")
 	}
+	return prefixes
+}
+
+// hasPeerRoutePrefix reports whether id begins with any of the reserved peer
+// route prefixes.
+func hasPeerRoutePrefix(id string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(id, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// filterLocalRows keeps local catalog rows that do not conflict with the
+// reserved peer namespace, are not already represented by a peer model, and
+// logs a warning for reserved-namespace conflicts.
+func filterLocalRows(local []json.RawMessage, peerIDs map[string]struct{}, reservedPrefixes []string, logger *slog.Logger) ([]json.RawMessage, error) {
 	combined := make([]json.RawMessage, 0, len(local))
 	for _, item := range local {
 		var model struct {
 			ID string `json:"id"`
 		}
 		if err := json.Unmarshal(item, &model); err != nil {
-			return catalog.Response{}, err
+			return nil, err
 		}
 		if strings.HasPrefix(model.ID, peerModelPrefix) {
-			h.logger.Warn("local catalog model conflicts with reserved peer namespace")
+			logger.Warn("local catalog model conflicts with reserved peer namespace")
 			continue
 		}
-		ownedByPeerRoute := false
-		for _, prefix := range peerPrefixes {
-			if strings.HasPrefix(model.ID, prefix) {
-				ownedByPeerRoute = true
-				break
-			}
-		}
-		if ownedByPeerRoute {
+		if hasPeerRoutePrefix(model.ID, reservedPrefixes) {
 			continue
 		}
 		if _, duplicate := peerIDs[model.ID]; duplicate {
-			// When inference is explicitly routed through the peer, prefer the owner-verified model
-			// identity over the legacy static backend entry with the same public prefix.
 			continue
 		}
 		combined = append(combined, item)
 	}
+	return combined, nil
+}
+
+// marshalPeerCatalog appends the peer models to the combined rows, marshals the
+// full root preserving all other fields, and stores the result on the response.
+func marshalPeerCatalog(root map[string]json.RawMessage, combined []json.RawMessage, peerModels []peerCatalogModel, response catalog.Response) (catalog.Response, error) {
 	for _, model := range peerModels {
 		data, err := json.Marshal(model)
 		if err != nil {

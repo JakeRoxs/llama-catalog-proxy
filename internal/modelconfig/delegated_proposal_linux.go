@@ -14,7 +14,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
@@ -216,32 +215,44 @@ func ListExpiredOrphanedDelegatedProposals(proposalDirectory, operationDirectory
 	}
 	var candidates []DelegatedProposalCleanupCandidate
 	err := withDelegatedProposalStores(proposalDirectory, operationDirectory, func(proposals *os.Root, proposalDir *os.File, operations *os.Root, operationDir *os.File) error {
-		operationIDs, err := delegatedOperationProposalIDsReadOnly(operations, operationDir)
-		if err != nil {
-			return err
-		}
-		ids, err := delegatedProposalNames(proposals, proposalDir)
-		if err != nil {
-			return err
-		}
-		for _, id := range ids {
-			proposal, err := readDelegatedProposal(proposals, id)
-			if err != nil {
-				return err
-			}
-			if now.Before(proposal.ExpiresAt) || operationIDs[id] {
-				continue
-			}
-			candidates = append(candidates, DelegatedProposalCleanupCandidate{
-				ProposalID: id, RequesterNode: proposal.RequesterNode,
-				BackendID: proposal.BackendID, ModelID: proposal.Proposal.ModelID,
-				ExpiresAt: proposal.ExpiresAt,
-			})
-		}
-		return nil
+		var err error
+		candidates, err = listExpiredOrphanedDelegatedProposalsCandidates(proposals, proposalDir, operations, operationDir, now)
+		return err
 	})
 	if err != nil {
 		return nil, err
+	}
+	return candidates, nil
+}
+
+// listExpiredOrphanedDelegatedProposalsCandidates returns the expired orphan
+// candidates visible inside the locked stores. It inventories the operation
+// store read-only and never mutates either store.
+func listExpiredOrphanedDelegatedProposalsCandidates(proposals *os.Root, proposalDir *os.File, operations *os.Root, operationDir *os.File, now time.Time) ([]DelegatedProposalCleanupCandidate, error) {
+	operationIDs, err := delegatedOperationProposalIDsReadOnly(operations, operationDir)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := delegatedProposalNames(proposals, proposalDir)
+	if err != nil {
+		return nil, err
+	}
+	var candidates []DelegatedProposalCleanupCandidate
+	for _, id := range ids {
+		proposal, err := readDelegatedProposal(proposals, id)
+		if err != nil {
+			return nil, err
+		}
+		if now.Before(proposal.ExpiresAt) || operationIDs[id] {
+			continue
+		}
+		candidates = append(candidates, DelegatedProposalCleanupCandidate{
+			ProposalID:    id,
+			RequesterNode: proposal.RequesterNode,
+			BackendID:     proposal.BackendID,
+			ModelID:       proposal.Proposal.ModelID,
+			ExpiresAt:     proposal.ExpiresAt,
+		})
 	}
 	return candidates, nil
 }
@@ -254,6 +265,51 @@ func CleanupExpiredOrphanedDelegatedProposals(proposalDirectory, operationDirect
 	if now.IsZero() || len(proposalIDs) > MaxProposals {
 		return nil, ErrProposalInvalid
 	}
+	ids, err := normalizeCleanupCandidateIDs(proposalIDs)
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return []string{}, nil
+	}
+
+	var removed []string
+	err = withDelegatedProposalStores(proposalDirectory, operationDirectory, func(proposals *os.Root, proposalDir *os.File, operations *os.Root, operationDir *os.File) error {
+		if _, err := readDelegatedProposalRecoveryAudit(proposals, delegatedProposalAuditFilename); err != nil {
+			return err
+		}
+		eligible, err := validateCleanupEligibility(proposals, proposalDir, operations, operationDir, ids, now)
+		if err != nil {
+			return err
+		}
+		auditEvents := collectCleanupAuditEvents(eligible)
+		if len(auditEvents) != 0 {
+			if err = appendDelegatedProposalRecoveryAudit(proposals, proposalDir, auditEvents); err != nil {
+				return err
+			}
+		}
+		toRemove, err := removeCleanupProposals(proposals, proposalDir, eligible)
+		if err != nil {
+			return err
+		}
+		removed = append(removed, toRemove...)
+		if len(removed) != 0 {
+			if err = proposalDir.Sync(); err != nil {
+				return ErrProposalStore
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
+// normalizeCleanupCandidateIDs validates, deduplicates, and sorts the requested
+// proposal IDs. An invalid ID or an oversized request is rejected before any
+// store access.
+func normalizeCleanupCandidateIDs(proposalIDs []string) ([]string, error) {
 	ids := make([]string, 0, len(proposalIDs))
 	seen := make(map[string]bool, len(proposalIDs))
 	for _, id := range proposalIDs {
@@ -266,64 +322,54 @@ func CleanupExpiredOrphanedDelegatedProposals(proposalDirectory, operationDirect
 		}
 	}
 	sort.Strings(ids)
-	if len(ids) == 0 {
-		return []string{}, nil
-	}
+	return ids, nil
+}
 
-	var removed []string
-	err := withDelegatedProposalStores(proposalDirectory, operationDirectory, func(proposals *os.Root, proposalDir *os.File, operations *os.Root, operationDir *os.File) error {
-		if _, err := readDelegatedProposalRecoveryAudit(proposals, delegatedProposalAuditFilename); err != nil {
-			return err
-		}
-		operationIDs, err := delegatedOperationProposalIDsReadOnly(operations, operationDir)
-		if err != nil {
-			return err
-		}
-		for _, id := range ids {
-			proposal, err := readDelegatedProposal(proposals, id)
-			if errors.Is(err, ErrProposalNotFound) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if now.Before(proposal.ExpiresAt) || operationIDs[id] {
-				return ErrDelegatedProposalCleanup
-			}
-		}
-		var toRemove []string
-		var auditEvents []DelegatedProposalRecoveryAudit
-		for _, id := range ids {
-			proposal, err := readDelegatedProposal(proposals, id)
-			if errors.Is(err, ErrProposalNotFound) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			toRemove = append(toRemove, id)
-			auditEvents = append(auditEvents, proposal.RecoveryAudit...)
-		}
-		if len(auditEvents) != 0 {
-			if err := appendDelegatedProposalRecoveryAudit(proposals, proposalDir, auditEvents); err != nil {
-				return err
-			}
-		}
-		for _, id := range toRemove {
-			if err := proposals.Remove(delegatedProposalFilename(id)); err != nil {
-				return ErrProposalStore
-			}
-			removed = append(removed, id)
-		}
-		if len(removed) != 0 {
-			if err := proposalDir.Sync(); err != nil {
-				return ErrProposalStore
-			}
-		}
-		return nil
-	})
+// validateCleanupEligibility returns the named proposals that are expired and
+// have no operation record. Missing proposals are treated as already cleaned.
+// The operation store is inspected read-only and no writes occur.
+func validateCleanupEligibility(proposals *os.Root, proposalDir *os.File, operations *os.Root, operationDir *os.File, ids []string, now time.Time) ([]DelegatedProposal, error) {
+	operationIDs, err := delegatedOperationProposalIDsReadOnly(operations, operationDir)
 	if err != nil {
 		return nil, err
+	}
+	eligible := make([]DelegatedProposal, 0, len(ids))
+	for _, id := range ids {
+		proposal, err := readDelegatedProposal(proposals, id)
+		if errors.Is(err, ErrProposalNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if now.Before(proposal.ExpiresAt) || operationIDs[id] {
+			return nil, ErrDelegatedProposalCleanup
+		}
+		eligible = append(eligible, proposal)
+	}
+	return eligible, nil
+}
+
+// collectCleanupAuditEvents gathers the recovery audit of each proposal still
+// present for durable recording before removal.
+func collectCleanupAuditEvents(proposals []DelegatedProposal) []DelegatedProposalRecoveryAudit {
+	var events []DelegatedProposalRecoveryAudit
+	for _, proposal := range proposals {
+		events = append(events, proposal.RecoveryAudit...)
+	}
+	return events
+}
+
+// removeCleanupProposals removes the eligible proposal files and returns the
+// removed IDs in sorted order. Removal failures map to ErrProposalStore so the
+// caller aborts before syncing a partially removed directory.
+func removeCleanupProposals(root *os.Root, dir *os.File, eligible []DelegatedProposal) ([]string, error) {
+	removed := make([]string, 0, len(eligible))
+	for _, proposal := range eligible {
+		if err := root.Remove(delegatedProposalFilename(proposal.Proposal.ID)); err != nil {
+			return nil, ErrProposalStore
+		}
+		removed = append(removed, proposal.Proposal.ID)
 	}
 	return removed, nil
 }
@@ -494,17 +540,13 @@ func replaceDelegatedProposalFile(root *os.Root, dir *os.File, name string, data
 		return ErrProposalStore
 	}
 	temp := ".delegated-" + hex.EncodeToString(random[:]) + ".tmp"
-	file, err := root.OpenFile(temp, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	file, cleanup, err := openDelegatedStoreTemp(root, dir, temp)
 	if err != nil {
 		return ErrProposalStore
 	}
 	defer func() {
-		if err := root.Remove(temp); err == nil {
-			if err := dir.Sync(); err != nil {
-				result = errors.Join(result, ErrProposalStore)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
-			result = errors.Join(result, ErrProposalStore)
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			result = errors.Join(result, cleanupErr)
 		}
 	}()
 	written, writeErr := file.Write(data)

@@ -151,41 +151,45 @@ func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadG
 	}, nil
 }
 
+func verifyDiscoveredPeerConnection(state *reloaderState, nodeID string, inference bool, connection tls.ConnectionState) error {
+	if len(connection.VerifiedChains) == 0 || len(connection.PeerCertificates) == 0 {
+		return errors.New("peer server identity unavailable")
+	}
+	if federation.VerifyCertificateRevocation(connection.VerifiedChains, state.peerClientCRLs,
+		state.peer.RevocationMaxAge(), time.Now()) != nil {
+		return errors.New("peer server certificate is revoked or CRL is stale")
+	}
+	serverCertificate := connection.PeerCertificates[0]
+	serverNodeID, err := federation.PeerIdentityNodeID(serverCertificate, state.peer.FederationID)
+	if err != nil || serverNodeID != nodeID {
+		return errors.New("peer server identity mismatch")
+	}
+	member, paired, err := state.pairingStore.LookupMember(serverNodeID)
+	if err != nil || !paired || member.Fingerprint != federation.CertificateFingerprint(serverCertificate) {
+		return errors.New("peer is not paired with this certificate")
+	}
+	var allowed bool
+	if inference {
+		allowed, err = state.catalogGrantStore.AllowsOutgoingInference(serverNodeID, member.Fingerprint)
+	} else {
+		allowed, err = state.catalogGrantStore.AllowsCatalogRead(serverNodeID, member.Fingerprint)
+	}
+	if err != nil || !allowed {
+		if inference {
+			return errors.New("peer has no active route_inference grant")
+		}
+		return errors.New("peer has no active catalog_read grant")
+	}
+	return nil
+}
+
 func newDiscoveredPeerTransport(state *reloaderState, nodeID string, inference bool) *http.Transport {
 	return &http.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12, RootCAs: state.peerClientCAs,
 			Certificates: []tls.Certificate{*state.certificate},
 			VerifyConnection: func(connection tls.ConnectionState) error {
-				if len(connection.VerifiedChains) == 0 || len(connection.PeerCertificates) == 0 {
-					return errors.New("peer server identity unavailable")
-				}
-				if federation.VerifyCertificateRevocation(connection.VerifiedChains, state.peerClientCRLs,
-					state.peer.RevocationMaxAge(), time.Now()) != nil {
-					return errors.New("peer server certificate is revoked or CRL is stale")
-				}
-				serverCertificate := connection.PeerCertificates[0]
-				serverNodeID, err := federation.PeerIdentityNodeID(serverCertificate, state.peer.FederationID)
-				if err != nil || serverNodeID != nodeID {
-					return errors.New("peer server identity mismatch")
-				}
-				member, paired, err := state.pairingStore.LookupMember(serverNodeID)
-				if err != nil || !paired || member.Fingerprint != federation.CertificateFingerprint(serverCertificate) {
-					return errors.New("peer is not paired with this certificate")
-				}
-				var allowed bool
-				if inference {
-					allowed, err = state.catalogGrantStore.AllowsOutgoingInference(serverNodeID, member.Fingerprint)
-				} else {
-					allowed, err = state.catalogGrantStore.AllowsCatalogRead(serverNodeID, member.Fingerprint)
-				}
-				if err != nil || !allowed {
-					if inference {
-						return errors.New("peer has no active route_inference grant")
-					}
-					return errors.New("peer has no active catalog_read grant")
-				}
-				return nil
+				return verifyDiscoveredPeerConnection(state, nodeID, inference, connection)
 			},
 		},
 		DisableCompression: true, DisableKeepAlives: true,

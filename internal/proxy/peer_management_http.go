@@ -338,14 +338,8 @@ func (r *Reloader) servePeerDelegatedSettingsSnapshot(w http.ResponseWriter, req
 	}
 	defer func() { <-r.peerSlots }()
 	var input delegatedSettingsTargetRequest
-	if err := decodeBenchmarkJSON(req, &input); err != nil {
-		http.Error(w, "invalid settings snapshot request", http.StatusBadRequest)
-		return
-	}
-	requester, _ := authenticatedPeer(req, state, peerManageSettings)
-	target, err := r.authorizedDelegatedSettingsTarget(state, requester, input.BackendID, input.TargetID, input.ModelID)
-	if err != nil {
-		writeDelegatedOperationError(w, err)
+	requester, target, ok := r.decodeAndAuthorizeDelegatedSettingsTarget(w, req, state, &input, "invalid settings snapshot request")
+	if !ok {
 		return
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.snapshot.read", input.TargetID, input.ModelID, "")
@@ -375,14 +369,8 @@ func (r *Reloader) servePeerDelegatedSettingsPreview(w http.ResponseWriter, req 
 	}
 	defer func() { <-r.peerSlots }()
 	var input delegatedSettingsPreviewRequest
-	if err := decodeBenchmarkJSON(req, &input); err != nil {
-		http.Error(w, "invalid settings preview request", http.StatusBadRequest)
-		return
-	}
-	requester, _ := authenticatedPeer(req, state, peerManageSettings)
-	target, err := r.authorizedDelegatedSettingsTarget(state, requester, input.BackendID, input.TargetID, input.ModelID)
-	if err != nil {
-		writeDelegatedOperationError(w, err)
+	requester, target, ok := r.decodeAndAuthorizeDelegatedSettingsTarget(w, req, state, &input, "invalid settings preview request")
+	if !ok {
 		return
 	}
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, requester, "settings.preview", input.TargetID, input.ModelID, "")
@@ -421,6 +409,42 @@ func (r *Reloader) authorizedDelegatedSettingsTarget(state *reloaderState, reque
 		return config.ManagementTarget{}, errDelegationUnauthorized
 	}
 	return target, nil
+}
+
+// decodeAndAuthorizeDelegatedSettingsTarget decodes a delegated settings target
+// request, authenticates the peer, and authorizes the target. It preserves the
+// per-route malformed-message string, writes the exact 400/authorization
+// response on failure, and returns the requester, authorized target, and
+// whether the caller may continue.
+func (r *Reloader) decodeAndAuthorizeDelegatedSettingsTarget(w http.ResponseWriter, req *http.Request, state *reloaderState, dst any, invalidMessage string) (requester string, target config.ManagementTarget, ok bool) {
+	if err := decodeBenchmarkJSON(req, dst); err != nil {
+		http.Error(w, invalidMessage, http.StatusBadRequest)
+		return "", config.ManagementTarget{}, false
+	}
+	requester, ok = authenticatedPeer(req, state, peerManageSettings)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return "", config.ManagementTarget{}, false
+	}
+	backendID, targetID, modelID := delegatedSettingsTargetFields(dst)
+	target, err := r.authorizedDelegatedSettingsTarget(state, requester, backendID, targetID, modelID)
+	if err != nil {
+		writeDelegatedOperationError(w, err)
+		return "", config.ManagementTarget{}, false
+	}
+	return requester, target, true
+}
+
+// delegatedSettingsTargetFields extracts the backend, target, and model IDs from
+// a decoded delegated settings target request of either supported shape.
+func delegatedSettingsTargetFields(dst any) (backendID, targetID, modelID string) {
+	switch v := dst.(type) {
+	case *delegatedSettingsTargetRequest:
+		return v.BackendID, v.TargetID, v.ModelID
+	case *delegatedSettingsPreviewRequest:
+		return v.BackendID, v.TargetID, v.ModelID
+	}
+	return "", "", ""
 }
 
 // This internal handler is not registered on the peer listener.
@@ -503,6 +527,26 @@ func requireReviewAcknowledgements(req *http.Request, review bool) error {
 	return nil
 }
 
+// acquireOwnerBackupManagement validates the owner-backed management state and
+// acquires a management slot. On success it returns the state and a release
+// closure the caller must defer; on failure it writes the response and returns
+// ok=false. The slot is released exactly once by the returned closure.
+func (r *Reloader) acquireOwnerBackupManagement(w http.ResponseWriter, req *http.Request) (state *reloaderState, release func(), ok bool) {
+	state = r.state.Load()
+	if state == nil || state.management == nil || state.management.BackupStore == nil ||
+		!managementBearerAuthorized(req, state.management.BackupStore.Token) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return nil, nil, false
+	}
+	select {
+	case r.managementSlots <- struct{}{}:
+		return state, func() { <-r.managementSlots }, true
+	default:
+		http.Error(w, "management service busy", http.StatusServiceUnavailable)
+		return nil, nil, false
+	}
+}
+
 // Owner review acknowledges an unknown outcome without resolving it or permitting retry.
 // This handler is intentionally not registered on the management listener.
 func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http.Request) {
@@ -543,19 +587,11 @@ func (r *Reloader) serveOwnerDelegatedOperation(w http.ResponseWriter, req *http
 		http.Error(w, errRequestBodyNotAllowed, http.StatusBadRequest)
 		return
 	}
-	state := r.state.Load()
-	if state == nil || state.management == nil || state.management.BackupStore == nil ||
-		!managementBearerAuthorized(req, state.management.BackupStore.Token) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	state, release, ok := r.acquireOwnerBackupManagement(w, req)
+	if !ok {
 		return
 	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
-	default:
-		http.Error(w, "management service busy", http.StatusServiceUnavailable)
-		return
-	}
+	defer release()
 	if err := requireReviewAcknowledgements(req, review); err != nil {
 		http.Error(w, "review and no-retry acknowledgements required", http.StatusBadRequest)
 		return
@@ -599,19 +635,11 @@ func (r *Reloader) serveOwnerDelegatedProposals(w http.ResponseWriter, req *http
 		http.Error(w, errRequestBodyNotAllowed, http.StatusBadRequest)
 		return
 	}
-	state := r.state.Load()
-	if state == nil || state.management == nil || state.management.BackupStore == nil ||
-		!managementBearerAuthorized(req, state.management.BackupStore.Token) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	state, release, ok := r.acquireOwnerBackupManagement(w, req)
+	if !ok {
 		return
 	}
-	select {
-	case r.managementSlots <- struct{}{}:
-		defer func() { <-r.managementSlots }()
-	default:
-		http.Error(w, "management service busy", http.StatusServiceUnavailable)
-		return
-	}
+	defer release()
 	var proposalIDs []string
 	if cleanup {
 		var input struct {

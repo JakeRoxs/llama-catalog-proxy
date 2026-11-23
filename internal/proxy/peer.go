@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/nodecontract"
 )
@@ -46,24 +47,30 @@ func (r *Reloader) PeerTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
-			state := r.state.Load()
-			if state == nil || state.certificate == nil {
-				return nil, errors.New("peer listener disabled")
-			}
-			config := &tls.Config{
-				MinVersion:   tls.VersionTLS12,
-				Certificates: []tls.Certificate{*state.certificate},
-			}
-			if state.peer != nil && state.peer.FederationID != "" {
-				if state.peerClientCAs == nil {
-					return nil, errors.New("peer client CA unavailable")
-				}
-				config.ClientAuth = tls.RequireAndVerifyClientCert
-				config.ClientCAs = state.peerClientCAs
-			}
-			return config, nil
+			return peerTLSClientConfig(r.state.Load())
 		},
 	}
+}
+
+// peerTLSClientConfig returns the TLS configuration for a peer handshake using
+// the currently installed certificate. It preserves the exact TLS 1.2 minimum,
+// certificate selection, and mutual TLS guard behavior of the inline closure.
+func peerTLSClientConfig(state *reloaderState) (*tls.Config, error) {
+	if state == nil || state.certificate == nil {
+		return nil, errors.New("peer listener disabled")
+	}
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{*state.certificate},
+	}
+	if state.peer != nil && state.peer.FederationID != "" {
+		if state.peerClientCAs == nil {
+			return nil, errors.New("peer client CA unavailable")
+		}
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+		config.ClientCAs = state.peerClientCAs
+	}
+	return config, nil
 }
 
 // PeerHandler serves only explicitly authorized peer protocol operations.
@@ -279,9 +286,16 @@ func delegatedSettingsEnabled(state *reloaderState) bool {
 		state.management.DelegatedStore == nil {
 		return false
 	}
-	for backendID, targetID := range state.peer.ManagementTargets {
-		if slices.Contains(state.peer.LocalBackends, backendID) {
-			if _, ok := state.management.Targets[targetID]; ok {
+	return hasConfiguredDelegatedManagementTarget(state.peer, state.management)
+}
+
+// hasConfiguredDelegatedManagementTarget reports whether a local backend is
+// bound to a configured management target, which is the condition under which
+// delegated settings management is advertised.
+func hasConfiguredDelegatedManagementTarget(peer *config.PeerConfig, management *config.ManagementConfig) bool {
+	for backendID, targetID := range peer.ManagementTargets {
+		if slices.Contains(peer.LocalBackends, backendID) {
+			if _, ok := management.Targets[targetID]; ok {
 				return true
 			}
 		}

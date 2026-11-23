@@ -480,3 +480,127 @@ func TestPreviewRecordedCreationBindsRecordAndConfiguredPath(t *testing.T) {
 		t.Fatalf("missing artifact accepted: %v", err)
 	}
 }
+
+// TestCreationCatalogPreFetchStateChangedReturns503 verifies the refactor
+// regression: when the management configuration changed while the request was
+// in flight, the pre-fetch state-change check must return 503 with the exact
+// error body instead of an empty default 200, and the catalog fetch must not
+// be invoked.
+func TestCreationCatalogPreFetchStateChangedReturns503(t *testing.T) {
+	models, records, proposals, backups, targetDir := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.Chmod(records, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(proposals, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(backups, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("fixture only")
+	if err := os.WriteFile(filepath.Join(models, "model.gguf"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := "secret: confidential\nmodels:\n  old: {cmd: 'llama-server --port ${PORT} -m /models/old.gguf'}\n"
+	target := config.ManagementTarget{Directory: targetDir, Filename: "config.yaml"}
+	if err := os.WriteFile(filepath.Join(targetDir, target.Filename), []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	sum := sha256.Sum256(data)
+	record := ingestion.Record{Version: 1, Job: ingestion.JobStatus{
+		ID: "ingest-00000000000000000000000000000001", State: "succeeded",
+		Source:    ingestion.Source{Repository: "owner/repo", Filename: "model.gguf", Revision: "main"},
+		StartedAt: now, CompletedAt: now.Add(time.Second),
+		Result: ingestion.StageResult{Publication: ingestion.PublicationPublished, Durability: "confirmed",
+			Bytes: int64(len(data)), SHA256: hex.EncodeToString(sum[:]), Integrity: "calculated_unverified",
+			Metadata: &ingestion.GGUFMetadata{}},
+	}}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(records, record.Job.ID+".json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := ingestion.NewPersistentJobManager(context.Background(), "", records, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer manager.Stop()
+	ctx := int32(4096)
+	input := modelconfig.CreationCommandInput{Executable: "llama-server", Settings: modelconfig.CommandSettings{ContextSize: &ctx}}
+	previewReq := recordedCreationPreviewRequest{
+		jobs:           manager,
+		modelDirectory: models,
+		target:         target,
+		targetID:       "local",
+		modelID:        "new",
+		templateID:     "",
+		recordID:       record.Job.ID,
+		input:          input,
+	}
+	got, err := previewRecordedCreation(previewReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := storeRecordedCreation(storeRecordedCreationRequest{
+		previewRequest:           previewReq,
+		store:                    proposals,
+		expectedRevision:         got.Preview.Revision,
+		expectedArtifactRevision: got.Artifact.Revision,
+		expectedReviewRevision:   got.ReviewRevision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Catalog backend that records whether it was contacted. The pre-fetch
+	// state-change check must short-circuit before fetchCatalogSnapshot, so
+	// modelCatalog (and thus this backend) must never be called.
+	var backendCalled atomic.Bool
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		backendCalled.Store(true)
+		http.Error(w, "unexpected", http.StatusBadRequest)
+	}))
+	defer backend.Close()
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogService := catalog.New([]catalog.Backend{{ID: "selected", URL: backendURL, Prefix: "local/", Default: true, APIKey: "token"}},
+		backend.Client(), time.Nanosecond, time.Second, time.Second, discardLogger())
+	handler := &Handler{
+		catalog:        catalogService,
+		catalogTimeout: time.Second,
+		logger:         discardLogger(),
+	}
+	mgmt := &config.ManagementConfig{
+		ProposalStore: &config.ProposalStoreConfig{Directory: proposals, Token: strings.Repeat("p", 32)},
+		BackupStore:   &config.BackupStoreConfig{Directory: backups, MaxBackups: 4},
+		Targets:       map[string]config.ManagementTarget{"local": target},
+	}
+	// stateCurrent is the live reloader state; stateOld is a stale snapshot
+	// passed to the request. They are distinct pointers so stateChanged reports
+	// a change even though their contents are identical.
+	stateCurrent := &reloaderState{handler: handler, management: mgmt}
+	stateOld := &reloaderState{handler: handler, management: mgmt}
+	reloader := &Reloader{logger: discardLogger()}
+	reloader.state.Store(stateCurrent)
+
+	req := httptest.NewRequest(http.MethodPost, "/management/v1/proposals/"+proposal.ID+"/catalog",
+		strings.NewReader(`{"backend_id":"selected"}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	reloader.serveCreationCatalog(w, req, stateOld, proposals, proposal.ID)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), managementConfigChangedMsg) {
+		t.Fatalf("expected %q body, got %s", managementConfigChangedMsg, w.Body.String())
+	}
+	if backendCalled.Load() {
+		t.Fatal("catalog fetch was called despite state change")
+	}
+}

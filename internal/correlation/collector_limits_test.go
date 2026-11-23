@@ -80,22 +80,15 @@ func TestCollectorLimitsMultiBackendRetention(t *testing.T) {
 	}
 }
 
-func TestCollectorNoRawSecretNotPrinted(t *testing.T) {
-	secret := "SUPER-SECRET-VALUE"
-	pipeReader, pipeWriter, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("os.Pipe failed: %v", err)
-	}
-	defer pipeReader.Close()
-	defer pipeWriter.Close()
-	oldOut := os.Stdout
-	os.Stdout = pipeWriter
-	defer func() { os.Stdout = oldOut }()
-
+// assertMalformedActivityPage starts an httptest server serving the given body,
+// runs the collector Refresh, and asserts the malformed page yields zero records
+// and leaves the backend in the unknown state. The server is closed when the
+// helper returns.
+func assertMalformedActivityPage(t *testing.T, body string) {
+	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// Invalid JSON exercises the decoder-error path that once printed bodies.
-		fmt.Fprint(w, `{"data":`+secret+`}`)
+		fmt.Fprint(w, body)
 	}))
 	defer server.Close()
 
@@ -112,6 +105,22 @@ func TestCollectorNoRawSecretNotPrinted(t *testing.T) {
 	if c.backendState["backend"].State != "unknown" {
 		t.Fatalf("expected unknown state, got %#v", c.backendState["backend"])
 	}
+}
+
+func TestCollectorNoRawSecretNotPrinted(t *testing.T) {
+	secret := "SUPER-SECRET-VALUE"
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe failed: %v", err)
+	}
+	defer pipeReader.Close()
+	defer pipeWriter.Close()
+	oldOut := os.Stdout
+	os.Stdout = pipeWriter
+	defer func() { os.Stdout = oldOut }()
+
+	assertMalformedActivityPage(t, `{"data":`+secret+`}`)
+
 	pipeWriter.Close()
 	out, _ := io.ReadAll(pipeReader)
 	if len(out) != 0 {

@@ -679,24 +679,7 @@ func TestWithClientRedirectsStillRefused(t *testing.T) {
 func TestMalformedPageRejected(t *testing.T) {
 	for _, body := range []string{`{}`, `{"data":null}`, `not json`, `{"data":[]} trailing`} {
 		t.Run(fmt.Sprintf("body-%d", len(body)), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				fmt.Fprint(w, body)
-			}))
-			defer server.Close()
-			c := newTestCollector(t, map[string]config.Backend{
-				"backend": {URL: server.URL, Diagnostics: "llama_swap"},
-			})
-			records, err := c.Refresh(context.Background())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(records) != 0 {
-				t.Fatalf("expected 0 records on malformed page, got %d", len(records))
-			}
-			if c.backendState["backend"].State != "unknown" {
-				t.Fatalf("expected unknown state, got %#v", c.backendState["backend"])
-			}
+			assertMalformedActivityPage(t, body)
 		})
 	}
 }

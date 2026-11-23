@@ -74,17 +74,7 @@ func TestCreateDelegatedProposalRechecksDurableGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer members.Close()
-	if _, err := members.AddMember("node-b", peerCertificateFingerprint(clientLeaf), time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	grant := modelconfig.OwnerGrant{
-		ID: "0123456789abcdef0123456789abcdef", RequesterNodeID: "node-b", Action: "manage_settings",
-		BackendID: "backend-a", TargetID: "target-a", ModelIDs: []string{"model-a"},
-		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour), ApprovedBy: "oidc_admin",
-	}
-	if err := modelconfig.CreateOwnerGrant(directories["grants"], grant); err != nil {
-		t.Fatal(err)
-	}
+	grant := createPeerOwnerGrantFixture(t, members, directories["grants"], clientLeaf)
 	audit := newTestAuditStore(t, "owner")
 	peer := &config.PeerConfig{
 		NodeID: "owner", FederationID: "lab.example", LocalBackends: []string{"backend-a"},
