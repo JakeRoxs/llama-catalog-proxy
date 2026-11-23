@@ -42,9 +42,9 @@ func runPeerConfigPlan(args []string, stdout, stderr io.Writer) error {
 		return errors.New("peer federation is not configured")
 	}
 	plan := peerConfigPlan{
-		LocalNodeID: cfg.Peer.NodeID,
+		LocalNodeID:  cfg.Peer.NodeID,
 		FederationID: cfg.Peer.FederationID,
-		Peers:       []peerHandoffPlan{},
+		Peers:        []peerHandoffPlan{},
 	}
 	for _, nodeID := range sortedPeerIDs(cfg.Peer.Peers) {
 		plan.Peers = append(plan.Peers, newPeerHandoffPlan(nodeID, cfg.Peer.Peers[nodeID], cfg.Peer.NodeID))
