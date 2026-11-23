@@ -164,7 +164,11 @@ func (r *Reloader) servePeerPath(w http.ResponseWriter, req *http.Request) {
 	}
 	forwarded := req.Clone(req.Context())
 	forwarded.URL.Path = requestPath
-	forwarded.URL.RawPath = escapedPath
+	// An unescaped peer path should look like an ordinary HTTP request to admission checks.
+	forwarded.URL.RawPath = ""
+	if escapedPath != requestPath {
+		forwarded.URL.RawPath = escapedPath
+	}
 	forwarded.Header = peerPathBackendHeaders(req.Header)
 	forwarded.Host = ""
 	if service == "comfyui" && handler.serveComfyUIResultRead(w, forwarded, &routeInfo{}, false) {

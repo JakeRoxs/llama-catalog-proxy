@@ -193,6 +193,33 @@ func TestFederatedComfyUIPathServicePreservesHTTPAndWebSocket(t *testing.T) {
 	assertOwnerOutage(t, f)
 }
 
+func TestFederatedComfyUIPromptUsesOwnerLeaseAdmission(t *testing.T) {
+	f := newFederationFixture(t, t.Context())
+	defer f.teardown()
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		return confirmedCoordinatorEvidence(), nil
+	})
+	admit, err := newComfyUIDomainAdmission(coordinator, []string{"comfyui"}, "comfyui", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.owner.state.Load().handler.(*Handler).backendAdmission = admit
+
+	for _, path := range []string{"/comfyui/prompt", "/comfyui/api/prompt"} {
+		w := httptest.NewRecorder()
+		f.requester.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"prompt":{}}`)))
+		if w.Code != http.StatusCreated || w.Body.String() != "comfy accepted" {
+			t.Fatalf("peer POST %s: status=%d body=%q", path, w.Code, w.Body.String())
+		}
+		if state := coordinator.snapshot(); state.State != "active" || state.Submissions != 0 {
+			t.Fatalf("peer POST %s did not activate and finish its lease reservation: %+v", path, state)
+		}
+	}
+	if f.directFallback.Load() != 0 {
+		t.Fatal("peer prompt reached the requester fallback")
+	}
+}
+
 // assertHTTPForwarding verifies the HTTP peer path forwards the exact request
 // semantics (method, path, query, body, Origin preserved; Cookie stripped;
 // Authorization rewritten to the owner backend key) and does not fall back.
