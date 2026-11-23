@@ -30,6 +30,7 @@ func comfyUIWebSocketTestKey() string {
 var comfyUIFrontendEndpoints = []string{
 	"/assets/app.js?v=1", "/extensions/custom/ui.js", "/api/features", "/object_info",
 	"/api/i18n", "/api/global_subgraphs", "/api/node_replacements",
+	"/api/experiment/models", "/api/experiment/models/checkpoints",
 	"/api/global_subgraphs/" + strings.Repeat("a", 64),
 	"/api/jobs?status=completed,failed,cancelled&limit=64&offset=0",
 	"/user.css", "/materialdesignicons.min.css", "/fonts/materialdesignicons-webfont.woff2?v=7.4.47",
@@ -50,14 +51,17 @@ func TestComfyUIFrontendAllowlist(t *testing.T) {
 		"/comfyui/assets/font.woff2", "/comfyui/favicon.ico", "/comfyui/features",
 		"/comfyui/api/features", "/comfyui/extensions", "/comfyui/embeddings",
 		"/comfyui/models/checkpoints", "/comfyui/object_info", "/comfyui/api/object_info/LoadImage",
+		"/comfyui/experiment/models", "/comfyui/experiment/models/checkpoints",
 	})
 	assertUnsafeFrontendRoutesRejected(t, []string{
 		"/comfyui/assets/../secret.js", "/comfyui/assets/.secret.js", "/comfyui/assets/file.py",
 		"/comfyui/models/folder/extra", "/comfyui/features?user_id=other", "/comfyui/assets%2fapp.js",
+		"/comfyui/api/experiment/models?dir=other", "/comfyui/api/experiment/models/checkpoints%2fother",
 	})
 	assertNonFrontendRoutesRejected(t, []string{
 		"/comfyui/prompt", "/comfyui/custom/load_model", "/comfyui/health", "/comfyui/free",
 		"/settings", "/api/settings", "/userdata/workflows%2Fexample.json",
+		"/comfyui/api/experiment/models/preview/checkpoints/0/model.webp",
 	})
 	assertGenerationBypassRejected(t)
 	assertWebSocketAllowed(t)

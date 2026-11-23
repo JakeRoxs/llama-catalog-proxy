@@ -18,6 +18,19 @@ type comfyUILeaseActivation struct {
 // newComfyUIDomainAdmission coordinates ComfyUI requests and known model-dispatch
 // routes. Other backend traffic passes through without lease transitions.
 func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []string, promptBackend string, releaseTimeout time.Duration) (func(*http.Request, string) (func(), bool), error) {
+	managed, err := managedComfyUIBackends(backendIDs)
+	if err != nil {
+		return nil, err
+	}
+	if coordinator == nil || !managed[promptBackend] || releaseTimeout <= 0 || releaseTimeout > 30*time.Minute {
+		return nil, errors.New("invalid ComfyUI admission domain")
+	}
+	return func(req *http.Request, backendID string) (func(), bool) {
+		return admitComfyUIDomainRequest(coordinator, managed, promptBackend, releaseTimeout, req, backendID)
+	}, nil
+}
+
+func managedComfyUIBackends(backendIDs []string) (map[string]bool, error) {
 	managed := make(map[string]bool, len(backendIDs))
 	for _, id := range backendIDs {
 		if id == "" || managed[id] {
@@ -25,80 +38,123 @@ func newComfyUIDomainAdmission(coordinator *comfyUICoordinator, backendIDs []str
 		}
 		managed[id] = true
 	}
-	if coordinator == nil || !managed[promptBackend] || releaseTimeout <= 0 || releaseTimeout > 30*time.Minute {
-		return nil, errors.New("invalid ComfyUI admission domain")
+	return managed, nil
+}
+
+func admitComfyUIDomainRequest(
+	coordinator *comfyUICoordinator,
+	managed map[string]bool,
+	promptBackend string,
+	releaseTimeout time.Duration,
+	req *http.Request,
+	backendID string,
+) (func(), bool) {
+	if !managed[backendID] {
+		return nil, true
 	}
-	return func(req *http.Request, backendID string) (func(), bool) {
-		if !managed[backendID] {
-			return nil, true
+	if req == nil || req.URL == nil || req.URL.RawPath != "" || req.Context().Err() != nil {
+		return nil, false
+	}
+	prompt := isComfyPromptRequest(req)
+	comfyUIRequest, modelRequest := isComfyUIDomainRoute(req)
+	if !comfyUIRequest && !modelRequest {
+		return nil, true
+	}
+	if !validComfyUIBackend(comfyUIRequest, prompt, req, backendID, promptBackend) {
+		return nil, false
+	}
+	state, ok := ensureComfyUIAdmissionState(coordinator, req, releaseTimeout)
+	if !ok {
+		return nil, false
+	}
+	if comfyUIRequest {
+		return admitComfyUIPrompt(coordinator, req, state)
+	}
+	return admitCompetingModelRequest(coordinator, req, releaseTimeout)
+}
+
+func isComfyUIDomainRoute(req *http.Request) (bool, bool) {
+	// The llama-swap UI starts comfyui_auto through the generic model route.
+	comfyUIStart := req.Method == http.MethodGet && req.URL.Path == "/upstream/comfyui_auto/"
+	comfyUIRequest := comfyUIStart || isComfyUIPathRequest(req) ||
+		(isComfyUIFrontendRoot(req) && req.ContentLength <= 0 &&
+			(req.Body == nil || req.Body == http.NoBody) && len(req.TransferEncoding) == 0)
+	return comfyUIRequest, isLlamaSwapModelRequest(req)
+}
+
+func validComfyUIBackend(comfyUIRequest, prompt bool, req *http.Request, backendID, promptBackend string) bool {
+	if !comfyUIRequest {
+		return true
+	}
+	return backendID == promptBackend && (!prompt || (req.URL.RawQuery == "" && !req.URL.ForceQuery))
+}
+
+func ensureComfyUIAdmissionState(
+	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration,
+) (comfyUICoordinatorStatus, bool) {
+	state := coordinator.snapshot()
+	if state.State != "unknown" {
+		return state, true
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
+	_, err := coordinator.reconcileInitial(ctx)
+	cancel()
+	if errors.Is(err, errComfyUIServiceUnavailable) {
+		err = coordinator.assumeInitialStopped()
+	}
+	if err != nil {
+		return comfyUICoordinatorStatus{}, false
+	}
+	return coordinator.snapshot(), true
+}
+
+func admitComfyUIPrompt(
+	coordinator *comfyUICoordinator, req *http.Request, state comfyUICoordinatorStatus,
+) (func(), bool) {
+	firstPrompt := state.State == "released"
+	leaseID, done, err := coordinator.admitPrompt()
+	if err == nil && firstPrompt {
+		ctx := context.WithValue(req.Context(), comfyUILeaseActivationContextKey{}, comfyUILeaseActivation{
+			coordinator: coordinator, leaseID: leaseID,
+		})
+		*req = *req.WithContext(ctx)
+	}
+	return done, err == nil
+}
+
+func admitCompetingModelRequest(
+	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration,
+) (func(), bool) {
+	state := coordinator.snapshot()
+	if !releaseComfyUIForModelRequest(coordinator, req, releaseTimeout, state) {
+		return nil, false
+	}
+	// Reserve under the coordinator lock: another acquisition may have won
+	// after verification. In that case no competing request is forwarded.
+	if req.Context().Err() != nil {
+		return nil, false
+	}
+	done, err := coordinator.reserveCompeting()
+	return done, err == nil
+}
+
+func releaseComfyUIForModelRequest(
+	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration, state comfyUICoordinatorStatus,
+) bool {
+	switch state.State {
+	case "active", "draining", "releasing":
+		ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
+		defer cancel()
+		_, err := coordinator.release(ctx, state.LeaseID)
+		if errors.Is(err, errComfyUIServiceUnavailable) {
+			err = coordinator.assumeLeaseStopped(state.LeaseID)
 		}
-		if req == nil || req.URL == nil || req.URL.RawPath != "" || req.Context().Err() != nil {
-			return nil, false
-		}
-		prompt := isComfyPromptRequest(req)
-		comfyUIRequest := isComfyUIPathRequest(req) ||
-			(isComfyUIFrontendRoot(req) && req.ContentLength <= 0 &&
-				(req.Body == nil || req.Body == http.NoBody) && len(req.TransferEncoding) == 0)
-		modelRequest := isLlamaSwapModelRequest(req)
-		if !comfyUIRequest && !modelRequest {
-			return nil, true
-		}
-		if comfyUIRequest {
-			if backendID != promptBackend ||
-				prompt && (req.URL.RawQuery != "" || req.URL.ForceQuery) {
-				return nil, false
-			}
-		}
-		state := coordinator.snapshot()
-		if state.State == "unknown" {
-			ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
-			_, err := coordinator.reconcileInitial(ctx)
-			cancel()
-			if errors.Is(err, errComfyUIServiceUnavailable) {
-				err = coordinator.assumeInitialStopped()
-			}
-			if err != nil {
-				return nil, false
-			}
-			state = coordinator.snapshot()
-		}
-		if comfyUIRequest {
-			firstPrompt := state.State == "released"
-			leaseID, done, err := coordinator.admitPrompt()
-			if err == nil && firstPrompt {
-				ctx := context.WithValue(req.Context(), comfyUILeaseActivationContextKey{}, comfyUILeaseActivation{
-					coordinator: coordinator, leaseID: leaseID,
-				})
-				*req = *req.WithContext(ctx)
-			}
-			return done, err == nil
-		}
-		// GET /props can load a model, so it goes through the same handoff as a
-		// competing generation POST.
-		state = coordinator.snapshot()
-		switch state.State {
-		case "active", "draining", "releasing":
-			ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
-			defer cancel()
-			_, releaseErr := coordinator.release(ctx, state.LeaseID)
-			if errors.Is(releaseErr, errComfyUIServiceUnavailable) {
-				releaseErr = coordinator.assumeLeaseStopped(state.LeaseID)
-			}
-			if releaseErr != nil || ctx.Err() != nil {
-				return nil, false
-			}
-		case "released":
-		default:
-			return nil, false
-		}
-		// Reserve under the coordinator lock: another acquisition may have won
-		// after verification. In that case no competing request is forwarded.
-		if req.Context().Err() != nil {
-			return nil, false
-		}
-		done, err := coordinator.reserveCompeting()
-		return done, err == nil
-	}, nil
+		return err == nil && ctx.Err() == nil
+	case "released":
+		return true
+	default:
+		return false
+	}
 }
 
 func isComfyUIPathRequest(req *http.Request) bool {

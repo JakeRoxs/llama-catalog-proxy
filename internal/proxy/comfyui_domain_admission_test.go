@@ -96,6 +96,39 @@ func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
 	}
 }
 
+func TestComfyUIStartModelUsesComfyUILease(t *testing.T) {
+	var verifications atomic.Int32
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		verifications.Add(1)
+		return confirmedCoordinatorEvidence(), nil
+	})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+	h := newHandler(t, baseConfig(backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(coordinator, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+
+	for _, tc := range []struct {
+		path, state string
+		checks      int32
+	}{
+		{"/upstream/comfyui_auto/?_=1", "active", 1},
+		{"/upstream/comfyui_auto/?_=2", "active", 1},
+		{"/upstream/other/?_=3", "released", 2},
+	} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.path, nil))
+		if state := coordinator.snapshot(); w.Code != http.StatusOK || state.State != tc.state || verifications.Load() != tc.checks {
+			t.Fatalf("GET %s: status=%d state=%+v verifications=%d", tc.path, w.Code, state, verifications.Load())
+		}
+	}
+}
+
 func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantState string, wantStatus int) {
 	var sends atomic.Int32
 	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
