@@ -439,20 +439,10 @@ func (c *AliasCollector) collect(ctx context.Context, id string, b *aliasBackend
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	u := b.url.JoinPath(aliasPath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := newBackendJSONRequest(ctx, u.String(), b.config.Headers, b.config.APIKey)
 	if err != nil {
 		state.State, state.Reason = aliasUnsupportedState, "invalid_request"
 		return nil, state
-	}
-	req.Header.Set("Accept", "application/json")
-	for key, value := range b.config.Headers {
-		if req.Header.Get(key) == "" {
-			req.Header.Set(key, value)
-		}
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
 	}
 	response, err := c.client.Do(req)
 	if err != nil {

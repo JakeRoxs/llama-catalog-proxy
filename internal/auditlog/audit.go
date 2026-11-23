@@ -86,13 +86,37 @@ func ValidateEvent(event Event) error {
 }
 
 func validateRequiredFields(event Event) error {
-	if !identity.ValidNodeID(event.LocalNodeID) || !validAuditID(event.ID) || event.At.IsZero() ||
-		!validAuditAction(event.Action) || !validAuditOutcome(event.Outcome) || event.AssertedUserSubject != "" ||
-		len(event.VerifiedUserSubject) > 256 || len(event.IdentityIssuer) > 256 || len(event.LocalAccount) > 128 ||
-		len(event.Role) > 64 || len(event.TargetID) > 128 || len(event.ModelID) > 256 || len(event.CorrelationID) > 64 {
+	if !validAuditRequiredIdentity(event) || !validAuditFieldLengths(event) {
 		return ErrInvalid
 	}
 	return nil
+}
+
+// validAuditRequiredIdentity reports whether the mandatory identity fields of an
+// audit event are acceptable: local node id, event id, timestamp, action, outcome,
+// and the absence of an asserted user subject. The checks run in the same
+// short-circuit order as the original validateRequiredFields chain.
+func validAuditRequiredIdentity(event Event) bool {
+	return identity.ValidNodeID(event.LocalNodeID) &&
+		validAuditID(event.ID) &&
+		!event.At.IsZero() &&
+		validAuditAction(event.Action) &&
+		validAuditOutcome(event.Outcome) &&
+		event.AssertedUserSubject == ""
+}
+
+// validAuditFieldLengths reports whether the optional identity and target fields
+// satisfy their maximum byte lengths: verified subject, issuer, local account, role,
+// target id, model id, and correlation id. The bounds are unchanged from the
+// original validateRequiredFields chain.
+func validAuditFieldLengths(event Event) bool {
+	return len(event.VerifiedUserSubject) <= 256 &&
+		len(event.IdentityIssuer) <= 256 &&
+		len(event.LocalAccount) <= 128 &&
+		len(event.Role) <= 64 &&
+		len(event.TargetID) <= 128 &&
+		len(event.ModelID) <= 256 &&
+		len(event.CorrelationID) <= 64
 }
 
 func validateOptionalFields(event Event) error {

@@ -7,6 +7,7 @@ package correlation
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"io"
 	"sort"
 	"sync"
@@ -246,6 +247,28 @@ func (c *Correlator) WithRetention(count int, age time.Duration, size int64) *Co
 // validIdentifier returns true if s is non-empty and within maxIdentifierSize bytes.
 func validIdentifier(s string) bool {
 	return s != "" && len(s) <= maxIdentifierSize
+}
+
+// validateActivity checks an activity record's identity and time fields. It is
+// pure: it does not mutate the record. Checks are ordered nil, backend ID,
+// activity ID, timestamp, epoch. Returns the first failing check's error.
+func validateActivity(a *ActivityRecord) error {
+	if a == nil {
+		return errors.New("nil activity: explicit unavailable")
+	}
+	if !validIdentifier(a.BackendID) {
+		return errors.New("invalid backend id: explicit unavailable")
+	}
+	if !validIdentifier(a.ActivityID) {
+		return errors.New("invalid activity id: explicit unavailable")
+	}
+	if a.Timestamp.IsZero() {
+		return errors.New("zero timestamp: explicit unavailable")
+	}
+	if a.Epoch <= 0 {
+		return errors.New("non-positive epoch: explicit unavailable")
+	}
+	return nil
 }
 
 // isNonnegativeSignedInt returns true if v is a signed integer type with a

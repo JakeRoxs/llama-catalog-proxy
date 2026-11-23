@@ -463,11 +463,7 @@ func buildLegacyBackendSnapshotIndices(snapshots []*diagnostics.Snapshot) (map[s
 		if snap == nil || snap.Backend == "" || !validIdentityComponent(snap.Backend) {
 			continue
 		}
-		snapCounts[snap.Backend]++
-		if snapCounts[snap.Backend] > 1 {
-			duplicateBackends[snap.Backend] = true
-		}
-		snapByBackend[snap.Backend] = snap
+		diagnostics.IndexBackendSnapshot(snap, snapByBackend, snapCounts, duplicateBackends)
 	}
 	return snapByBackend, duplicateBackends
 }
@@ -794,11 +790,7 @@ func buildSnapshotIndices(sources SnapshotSources, backendSnapshots []*diagnosti
 func buildBackendSnapshotIndices(snapshots []*diagnostics.Snapshot, snapByBackend map[string]*diagnostics.Snapshot, duplicateBackends map[string]bool) {
 	snapCounts := make(map[string]int)
 	for _, snap := range snapshots {
-		snapCounts[snap.Backend]++
-		if snapCounts[snap.Backend] > 1 {
-			duplicateBackends[snap.Backend] = true
-		}
-		snapByBackend[snap.Backend] = snap
+		diagnostics.IndexBackendSnapshot(snap, snapByBackend, snapCounts, duplicateBackends)
 	}
 }
 
@@ -1775,34 +1767,34 @@ func sampleTimestampRanges(matched []correlation.GPUSample) (first, last time.Ti
 // updateFloatRange records a float64 metric reading: known/missing counts and
 // pointer-preserving min/max. Nil values count as missing without touching
 // min/max; explicit zero values are known readings.
-func updateFloatRange(value *float64, known, missing *int, max, min **float64) {
+func updateFloatRange(value *float64, known, missing *int, maxPtr, minPtr **float64) {
 	if value == nil {
 		*missing++
 		return
 	}
 	*known++
-	if *max == nil || *value > **max {
-		*max = value
+	if *maxPtr == nil || *value > **maxPtr {
+		*maxPtr = value
 	}
-	if *min == nil || *value < **min {
-		*min = value
+	if *minPtr == nil || *value < **minPtr {
+		*minPtr = value
 	}
 }
 
 // updateIntRange records an int metric reading: known/missing counts and
 // pointer-preserving min/max. Nil values count as missing without touching
 // min/max; explicit zero values are known readings.
-func updateIntRange(value *int, known, missing *int, max, min **int) {
+func updateIntRange(value *int, known, missing *int, maxPtr, minPtr **int) {
 	if value == nil {
 		*missing++
 		return
 	}
 	*known++
-	if *max == nil || *value > **max {
-		*max = value
+	if *maxPtr == nil || *value > **maxPtr {
+		*maxPtr = value
 	}
-	if *min == nil || *value < **min {
-		*min = value
+	if *minPtr == nil || *value < **minPtr {
+		*minPtr = value
 	}
 }
 

@@ -216,13 +216,23 @@ func (s *linuxRecordStore) Acknowledge(id string) (Record, error) {
 	return record, nil
 }
 
-func validRecord(record Record) bool {
+// validRecordBase validates the base fields common to every accepted record:
+// version, job id, source/operation, start time, acknowledgment rules, and the
+// maximum error-code count. It returns false exactly when any base predicate
+// fails; callers must still validate error codes and state-specific rules.
+func validRecordBase(record Record) bool {
 	job := record.Job
 	if record.Version != 1 || !jobIDPattern.MatchString(job.ID) || !validRecordedSource(job.Source, job.Operation) || job.StartedAt.IsZero() ||
 		record.Acknowledged && !record.ReviewRequired || len(job.ErrorCodes) > 32 {
 		return false
 	}
-	for _, code := range job.ErrorCodes {
+	return true
+}
+
+// validRecordErrorCodes validates each error code against the accepted pattern and
+// enforces that cleanup_failed is only present when review is required.
+func validRecordErrorCodes(record Record) bool {
+	for _, code := range record.Job.ErrorCodes {
 		if !recordErrorCodePattern.MatchString(code) {
 			return false
 		}
@@ -230,36 +240,67 @@ func validRecord(record Record) bool {
 			return false
 		}
 	}
-	switch job.State {
+	return true
+}
+
+// validRecordRunningOrInterrupted validates records in the running or interrupted
+// state. These records must be uncompleted, unpublished, carry no result data, and
+// obey the acknowledgment/review rules for each state.
+func validRecordRunningOrInterrupted(record Record) bool {
+	job := record.Job
+	return job.CompletedAt.IsZero() && job.Result.Publication == PublicationUnknown &&
+		job.Result.Durability == "unknown" && job.Result.Bytes == 0 && job.Result.SHA256 == "" &&
+		job.Result.Metadata == nil && len(job.ErrorCodes) == 0 &&
+		(job.State != "interrupted" || record.ReviewRequired) &&
+		(job.State != "running" || !record.ReviewRequired && !record.Acknowledged)
+}
+
+// validRecordTerminal validates records in a terminal state. It enforces the
+// completion-time requirement and the state/error-code consistency rule, then
+// delegates the publication-specific rules to validRecordTerminalPublication.
+func validRecordTerminal(record Record) bool {
+	job := record.Job
+	if job.CompletedAt.IsZero() || (job.State == "succeeded") != (len(job.ErrorCodes) == 0) {
+		return false
+	}
+	return validRecordTerminalPublication(record)
+}
+
+// validRecordTerminalPublication validates the publication metadata for terminal
+// records. Each publication state carries its own exact combination of operation,
+// state, durability, bytes, hash, integrity, and metadata requirements.
+func validRecordTerminalPublication(record Record) bool {
+	job := record.Job
+	switch job.Result.Publication {
+	case PublicationNotPublished:
+		return job.State != "succeeded" && job.Result.Durability == "not_applicable"
+	case PublicationUnknown:
+		return job.State == "failed" && job.Result.Durability == "unknown" && record.ReviewRequired
+	case PublicationPublished:
+		return job.Operation != "adopt" && job.State != "canceled" && job.State != "timed_out" &&
+			(job.State != "failed" || record.ReviewRequired) &&
+			(job.Result.Durability == "confirmed" || job.Result.Durability == "uncertain" && record.ReviewRequired) &&
+			job.Result.Bytes > 0 && recordHashPattern.MatchString(job.Result.SHA256) &&
+			job.Result.Integrity == "calculated_unverified" && job.Result.Metadata != nil
+	case PublicationExisting:
+		return job.Operation == "adopt" && job.State == "succeeded" && !record.ReviewRequired &&
+			job.Result.Durability == "not_applicable" && job.Result.Bytes > 0 &&
+			recordHashPattern.MatchString(job.Result.SHA256) && job.Result.Integrity == "calculated_unverified" &&
+			job.Result.Metadata != nil
+	default:
+		return false
+	}
+}
+
+func validRecord(record Record) bool {
+	if !validRecordBase(record) || !validRecordErrorCodes(record) {
+		return false
+	}
+	switch record.Job.State {
 	case "running", "interrupted":
-		return job.CompletedAt.IsZero() && job.Result.Publication == PublicationUnknown &&
-			job.Result.Durability == "unknown" && job.Result.Bytes == 0 && job.Result.SHA256 == "" &&
-			job.Result.Metadata == nil && len(job.ErrorCodes) == 0 &&
-			(job.State != "interrupted" || record.ReviewRequired) &&
-			(job.State != "running" || !record.ReviewRequired && !record.Acknowledged)
+		return validRecordRunningOrInterrupted(record)
 	case "succeeded", "failed", "canceled", "timed_out":
-		if job.CompletedAt.IsZero() || (job.State == "succeeded") != (len(job.ErrorCodes) == 0) {
-			return false
-		}
-		switch job.Result.Publication {
-		case PublicationNotPublished:
-			return job.State != "succeeded" && job.Result.Durability == "not_applicable"
-		case PublicationUnknown:
-			return job.State == "failed" && job.Result.Durability == "unknown" && record.ReviewRequired
-		case PublicationPublished:
-			return job.Operation != "adopt" && job.State != "canceled" && job.State != "timed_out" &&
-				(job.State != "failed" || record.ReviewRequired) &&
-				(job.Result.Durability == "confirmed" || job.Result.Durability == "uncertain" && record.ReviewRequired) &&
-				job.Result.Bytes > 0 && recordHashPattern.MatchString(job.Result.SHA256) &&
-				job.Result.Integrity == "calculated_unverified" && job.Result.Metadata != nil
-		case PublicationExisting:
-			return job.Operation == "adopt" && job.State == "succeeded" && !record.ReviewRequired &&
-				job.Result.Durability == "not_applicable" && job.Result.Bytes > 0 &&
-				recordHashPattern.MatchString(job.Result.SHA256) && job.Result.Integrity == "calculated_unverified" &&
-				job.Result.Metadata != nil
-		default:
-			return false
-		}
+		return validRecordTerminal(record)
 	default:
 		return false
 	}

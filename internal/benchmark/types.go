@@ -179,48 +179,79 @@ func (r RunRecord) Validate() error {
 	}
 	requests := 0
 	reservedTokens := 0
-	for i, workload := range r.Workloads {
-		expected := syntheticWorkloads[i]
-		if workload.Name != expected.Name || workload.Category != expected.Category ||
-			workload.Version != expected.Version || workload.ReasoningEffort != expected.ReasoningEffort ||
-			len(workload.Samples) > r.Requested.Repetitions {
-			return errors.New("benchmark run contains an invalid workload")
-		}
-		iterations := make(map[int]bool, len(workload.Samples))
-		for _, sample := range workload.Samples {
-			if sample.Iteration < 1 || sample.Iteration > r.Requested.Repetitions ||
-				iterations[sample.Iteration] ||
-				(sample.Status != SampleCompleted && sample.Status != SampleFailed && sample.Status != SampleCanceled) ||
-				(sample.Correctness != CorrectnessPassed && sample.Correctness != CorrectnessFailed && sample.Correctness != CorrectnessNotEvaluated) ||
-				sample.RequestCount != len(sample.Requests) || sample.RequestCount > 2 ||
-				sample.InputBytes < 0 || sample.OutputBytes < 0 || !validErrorClass(sample.ErrorClass) ||
-				(r.Status == RunCompleted && sample.Status != SampleCompleted) {
-				return errors.New("benchmark run contains an invalid sample")
-			}
-			iterations[sample.Iteration] = true
-			if sample.DurationMS != nil && (math.IsNaN(*sample.DurationMS) || math.IsInf(*sample.DurationMS, 0) || *sample.DurationMS < 0) {
-				return errors.New("benchmark run contains an invalid sample duration")
-			}
-			requests += sample.RequestCount
-			for _, request := range sample.Requests {
-				if request.RequestBytes < 0 || request.PromptBytes < 0 || request.ResponseBytes < 0 ||
-					request.OutputBytes < 0 || request.MaxTokens < 1 || request.MaxTokens > r.Requested.MaxOutput ||
-					request.StartedAt.IsZero() || (!request.EndedAt.IsZero() && request.EndedAt.Before(request.StartedAt)) ||
-					(request.RequestID != "" && !validRequestID(request.RequestID)) ||
-					(request.HTTPStatus != 0 && (request.HTTPStatus < 100 || request.HTTPStatus > 599)) ||
-					!validErrorClass(request.ErrorClass) || !validDiagnosticState(request.DiagnosticState) {
-					return errors.New("benchmark run contains invalid request measurements")
-				}
-				reservedTokens += request.MaxTokens
-			}
-		}
-		if r.Status == RunCompleted && len(workload.Samples) != r.Requested.Repetitions {
-			return errors.New("completed benchmark run is missing samples")
+	for i := range r.Workloads {
+		if err := r.validateWorkload(i, &requests, &reservedTokens); err != nil {
+			return err
 		}
 	}
 	if requests > MaxRequests || reservedTokens != r.OutputTokensReserved ||
 		reservedTokens > r.Requested.TokenBudget {
 		return errors.New("benchmark request or token budget exceeded")
+	}
+	return nil
+}
+
+// validateWorkload validates a single workload's metadata and all of its samples.
+// It accumulates request and reserved-token counts into the provided counters.
+func (r RunRecord) validateWorkload(i int, requests *int, reservedTokens *int) error {
+	expected := syntheticWorkloads[i]
+	workload := r.Workloads[i]
+	if workload.Name != expected.Name || workload.Category != expected.Category ||
+		workload.Version != expected.Version || workload.ReasoningEffort != expected.ReasoningEffort ||
+		len(workload.Samples) > r.Requested.Repetitions {
+		return errors.New("benchmark run contains an invalid workload")
+	}
+	iterations := make(map[int]bool, len(workload.Samples))
+	for _, sample := range workload.Samples {
+		if err := r.validateSample(sample, iterations); err != nil {
+			return err
+		}
+		iterations[sample.Iteration] = true
+		if sample.DurationMS != nil && (math.IsNaN(*sample.DurationMS) || math.IsInf(*sample.DurationMS, 0) || *sample.DurationMS < 0) {
+			return errors.New("benchmark run contains an invalid sample duration")
+		}
+		*requests += sample.RequestCount
+		if err := r.validateRequests(sample.Requests, reservedTokens); err != nil {
+			return err
+		}
+	}
+	if r.Status == RunCompleted && len(workload.Samples) != r.Requested.Repetitions {
+		return errors.New("completed benchmark run is missing samples")
+	}
+	return nil
+}
+
+// validateSample validates a single sample's fields and request list. The iterations
+// map tracks seen iteration indices to detect duplicates within a workload.
+func (r RunRecord) validateSample(sample SampleResult, iterations map[int]bool) error {
+	if sample.Iteration < 1 || sample.Iteration > r.Requested.Repetitions ||
+		iterations[sample.Iteration] ||
+		(sample.Status != SampleCompleted && sample.Status != SampleFailed && sample.Status != SampleCanceled) ||
+		(sample.Correctness != CorrectnessPassed && sample.Correctness != CorrectnessFailed && sample.Correctness != CorrectnessNotEvaluated) ||
+		sample.RequestCount != len(sample.Requests) || sample.RequestCount > 2 ||
+		sample.InputBytes < 0 || sample.OutputBytes < 0 || !validErrorClass(sample.ErrorClass) ||
+		(r.Status == RunCompleted && sample.Status != SampleCompleted) {
+		return errors.New("benchmark run contains an invalid sample")
+	}
+	if sample.DurationMS != nil && (math.IsNaN(*sample.DurationMS) || math.IsInf(*sample.DurationMS, 0) || *sample.DurationMS < 0) {
+		return errors.New("benchmark run contains an invalid sample duration")
+	}
+	return nil
+}
+
+// validateRequests validates all request measurements in a sample and accumulates
+// reserved tokens. It shares the same error identity as the original inline check.
+func (r RunRecord) validateRequests(requests []RequestMeasurement, reservedTokens *int) error {
+	for _, request := range requests {
+		if request.RequestBytes < 0 || request.PromptBytes < 0 || request.ResponseBytes < 0 ||
+			request.OutputBytes < 0 || request.MaxTokens < 1 || request.MaxTokens > r.Requested.MaxOutput ||
+			request.StartedAt.IsZero() || (!request.EndedAt.IsZero() && request.EndedAt.Before(request.StartedAt)) ||
+			(request.RequestID != "" && !validRequestID(request.RequestID)) ||
+			(request.HTTPStatus != 0 && (request.HTTPStatus < 100 || request.HTTPStatus > 599)) ||
+			!validErrorClass(request.ErrorClass) || !validDiagnosticState(request.DiagnosticState) {
+			return errors.New("benchmark run contains invalid request measurements")
+		}
+		*reservedTokens += request.MaxTokens
 	}
 	return nil
 }

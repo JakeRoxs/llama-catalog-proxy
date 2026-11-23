@@ -401,20 +401,31 @@ func (s *CatalogGrantStore) read() error {
 	if err != nil || len(data) > maxCatalogGrantBytes {
 		return ErrCatalogGrantStore
 	}
+	stored, err := decodeCatalogGrantData(data, s.federationID, s.localNodeID)
+	if err != nil {
+		return err
+	}
+	s.data = *stored
+	return nil
+}
+
+// decodeCatalogGrantData decodes and validates a catalog-grants JSON payload,
+// rejecting unknown fields, trailing data, and invalid grant data. It also
+// ensures the inference grants map is initialized when absent.
+func decodeCatalogGrantData(data []byte, federationID, localNodeID string) (*catalogGrantData, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var stored catalogGrantData
 	if err := decoder.Decode(&stored); err != nil {
-		return ErrCatalogGrantStore
+		return nil, ErrCatalogGrantStore
 	}
-	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) || validateCatalogGrantData(stored, s.federationID, s.localNodeID) != nil {
-		return ErrCatalogGrantStore
+	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) || validateCatalogGrantData(stored, federationID, localNodeID) != nil {
+		return nil, ErrCatalogGrantStore
 	}
 	if stored.Inference == nil {
 		stored.Inference = make(map[string]InferenceGrant)
 	}
-	s.data = stored
-	return nil
+	return &stored, nil
 }
 
 func (s *CatalogGrantStore) persist() error {

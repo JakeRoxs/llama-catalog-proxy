@@ -30,8 +30,7 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 		clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}),
 		unavailable: make(map[string]string), routeInference: make(map[string]bool),
 	}
-	if state == nil || state.peer == nil || state.peer.Discovery == nil || !state.peer.Discovery.Enabled ||
-		state.pairingStore == nil || state.catalogGrantStore == nil {
+	if !discoveryEnabled(state) {
 		return result, nil
 	}
 	grants, err := state.catalogGrantStore.ListCatalogReadGrants()
@@ -42,31 +41,13 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 	if err != nil {
 		return result, err
 	}
-	routeInference := make(map[string]string)
-	for _, grant := range inferenceGrants {
-		if !grant.RouteOutgoing {
-			continue
-		}
-		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
-		if err != nil {
-			return discoveredPeerClients{clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}), unavailable: make(map[string]string), routeInference: make(map[string]bool)}, err
-		}
-		if paired && member.Fingerprint == grant.Fingerprint {
-			routeInference[grant.NodeID] = grant.Fingerprint
-		}
+	routeInference, err := eligibleInferenceRoutes(state, inferenceGrants)
+	if err != nil {
+		return result, err
 	}
-	pairedGrants := make([]federation.CatalogReadGrant, 0, len(grants))
-	for _, grant := range grants {
-		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
-		if err != nil {
-			return discoveredPeerClients{clients: make(map[string]*peerClient), authorizedIDs: make(map[string]struct{}), unavailable: make(map[string]string), routeInference: make(map[string]bool)}, err
-		}
-		if !paired || member.Fingerprint != grant.Fingerprint {
-			continue
-		}
-		result.authorizedIDs[grant.NodeID] = struct{}{}
-		result.routeInference[grant.NodeID] = routeInference[grant.NodeID] == grant.Fingerprint
-		pairedGrants = append(pairedGrants, grant)
+	pairedGrants, err := pairedCatalogReadGrants(state, &result, grants, routeInference)
+	if err != nil {
+		return result, err
 	}
 	if len(pairedGrants) == 0 {
 		return result, nil
@@ -90,10 +71,67 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 		}
 		return result, errors.New("mDNS candidate list was truncated")
 	}
+	endpoints, ambiguous := indexDiscoveryCandidates(candidates, state.peer.FederationID)
+	installDiscoveredPeerClients(state, pairedGrants, endpoints, ambiguous, routeInference, &result)
+	return result, nil
+}
+
+// discoveryEnabled reports whether peer discovery is enabled and the pairing and
+// catalog grant stores required to validate discovered peers are available.
+func discoveryEnabled(state *reloaderState) bool {
+	return state != nil && state.peer != nil && state.peer.Discovery != nil && state.peer.Discovery.Enabled &&
+		state.pairingStore != nil && state.catalogGrantStore != nil
+}
+
+// eligibleInferenceRoutes returns the fingerprint-keyed route-outgoing inference
+// grants for paired members whose certificate fingerprint matches the grant. A
+// pairing lookup failure fails the whole discovery run.
+func eligibleInferenceRoutes(state *reloaderState, inferenceGrants []federation.InferenceGrant) (map[string]string, error) {
+	routeInference := make(map[string]string)
+	for _, grant := range inferenceGrants {
+		if !grant.RouteOutgoing {
+			continue
+		}
+		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if paired && member.Fingerprint == grant.Fingerprint {
+			routeInference[grant.NodeID] = grant.Fingerprint
+		}
+	}
+	return routeInference, nil
+}
+
+// pairedCatalogReadGrants selects the catalog read grants whose member is paired
+// with a matching certificate fingerprint, records their authorized IDs and
+// whether route inference is enabled, and returns them in input order.
+func pairedCatalogReadGrants(state *reloaderState, result *discoveredPeerClients,
+	grants []federation.CatalogReadGrant, routeInference map[string]string) ([]federation.CatalogReadGrant, error) {
+	pairedGrants := make([]federation.CatalogReadGrant, 0, len(grants))
+	for _, grant := range grants {
+		member, paired, err := state.pairingStore.LookupMember(grant.NodeID)
+		if err != nil {
+			return nil, err
+		}
+		if !paired || member.Fingerprint != grant.Fingerprint {
+			continue
+		}
+		result.authorizedIDs[grant.NodeID] = struct{}{}
+		result.routeInference[grant.NodeID] = routeInference[grant.NodeID] == grant.Fingerprint
+		pairedGrants = append(pairedGrants, grant)
+	}
+	return pairedGrants, nil
+}
+
+// indexDiscoveryCandidates indexes mDNS candidates belonging to the local
+// federation by node ID, recording an ambiguous endpoint when a node advertises
+// more than one distinct peer URL. Duplicate URLs for the same node are accepted.
+func indexDiscoveryCandidates(candidates discovery.CandidateResult, federationID string) (map[string]string, map[string]bool) {
 	endpoints := make(map[string]string)
 	ambiguous := make(map[string]bool)
 	for _, candidate := range candidates.Candidates {
-		if candidate.FederationID != state.peer.FederationID {
+		if candidate.FederationID != federationID {
 			continue
 		}
 		if endpoint, exists := endpoints[candidate.NodeID]; exists && endpoint != candidate.PeerURL {
@@ -102,6 +140,15 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 		}
 		endpoints[candidate.NodeID] = candidate.PeerURL
 	}
+	return endpoints, ambiguous
+}
+
+// installDiscoveredPeerClients installs a dynamic discovered peer client for
+// each paired grant that is not already statically configured. Grants are
+// marked unavailable for ambiguous endpoints, missing discoveries, or client
+// creation failures.
+func installDiscoveredPeerClients(state *reloaderState, pairedGrants []federation.CatalogReadGrant,
+	endpoints map[string]string, ambiguous map[string]bool, routeInference map[string]string, result *discoveredPeerClients) {
 	for _, grant := range pairedGrants {
 		if _, configured := state.peerClients[grant.NodeID]; configured {
 			continue
@@ -123,7 +170,6 @@ func (r *Reloader) buildDiscoveredPeerClientsWithBrowse(state *reloaderState,
 		}
 		result.clients[grant.NodeID] = client
 	}
-	return result, nil
 }
 
 func newDiscoveredPeerClient(state *reloaderState, grant federation.CatalogReadGrant, endpoint string, routeInference bool) (*peerClient, error) {

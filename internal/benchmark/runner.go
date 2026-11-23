@@ -42,41 +42,12 @@ func Run(ctx context.Context, options RunOptions) (RunRecord, error) {
 	if err != nil {
 		return RunRecord{}, errors.New("could not create benchmark run ID")
 	}
-	record := RunRecord{
-		SchemaVersion:   SchemaVersion,
-		RunID:           runID,
-		WorkloadVersion: WorkloadVersion,
-		StartedAt:       time.Now().UTC(),
-		Status:          RunCompleted,
-		Requested:       config,
-		ModelBefore:     modelBefore,
-		Workloads:       make([]WorkloadResult, 0, len(syntheticWorkloads)),
-		Limitations: []string{
-			"active inference state is not exposed and cannot be verified",
-			"model lifecycle is observed before and after the run only; lifecycle at each inference request is unknown",
-			"applied sampling and draft configuration is not exposed by the diagnostics API",
-			"cache state is declared by the operator and is not independently verified",
-			"per-round draft acceptance is unsupported; available activity evidence is aggregate",
-			"GPU samples are shared-device approximations and are not model-owned measurements",
-			"response bodies and reasoning text are never persisted",
-		},
-	}
-
+	record := newRunRecord(runID, config, modelBefore)
 	workloads, partial := runWorkloads(runCtx, options.Client, config, &record)
 	record.Workloads = workloads
-
-	if runCtx.Err() != nil {
-		record.Status = RunCanceled
-	} else if partial || len(record.Workloads) != len(syntheticWorkloads) {
-		record.Status = RunPartial
-	}
+	record.Status = determineRunStatus(runCtx, partial, len(workloads))
 	if runCtx.Err() == nil {
-		modelAfter, observationErr := options.Client.ObserveReadyModel(runCtx, options.Backend, options.Model)
-		if observationErr == nil {
-			record.ModelAfter = modelAfter
-		} else {
-			record.Limitations = append(record.Limitations, "post_run_model_observation_unavailable")
-		}
+		observePostflightModel(runCtx, options.Client, options.Backend, options.Model, &record)
 	}
 	record.CompletedAt = time.Now().UTC()
 	if err := record.Validate(); err != nil {
@@ -133,6 +104,32 @@ func validateRequestedConfiguration(config RequestedConfiguration) error {
 
 func runSample(ctx context.Context, client *APIClient, workload syntheticWorkload, config RequestedConfiguration, iteration int, record *RunRecord) (SampleResult, bool) {
 	started := time.Now()
+	sample, messages := newSampleAndMessages(workload, iteration)
+	runner := &sampleRequestRunner{
+		client:   client,
+		workload: workload,
+		config:   config,
+		record:   record,
+		sample:   &sample,
+	}
+	first, failed, exhausted := sendRequest(ctx, runner, messages, workload.ToolRoundTrip)
+	if failed || exhausted {
+		setSampleFailure(&sample, ctx)
+		finalizeSample(&sample, started, ctx, client, config)
+		return sample, exhausted
+	}
+	if workload.ToolRoundTrip {
+		exhausted = runToolRoundTrip(ctx, runner, &sample, messages, first, workload)
+	} else {
+		recordTextCorrectness(&sample, first.Content, workload.Expected, "")
+	}
+	finalizeSample(&sample, started, ctx, client, config)
+	return sample, exhausted
+}
+
+// newSampleAndMessages constructs a fresh SampleResult and the initial chat
+// message sequence for a workload. It preserves the system prompt when present.
+func newSampleAndMessages(workload syntheticWorkload, iteration int) (SampleResult, []chatMessage) {
 	sample := SampleResult{
 		Iteration:   iteration,
 		Status:      SampleCompleted,
@@ -144,47 +141,54 @@ func runSample(ctx context.Context, client *APIClient, workload syntheticWorkloa
 		messages = append(messages, chatMessage{Role: "system", Content: workload.SystemPrompt})
 	}
 	messages = append(messages, chatMessage{Role: "user", Content: workload.UserPrompt})
+	return sample, messages
+}
 
-	runner := &sampleRequestRunner{
-		client:   client,
-		workload: workload,
-		config:   config,
-		record:   record,
-		sample:   &sample,
-	}
-	first, failed, exhausted := sendRequest(ctx, runner, messages, workload.ToolRoundTrip)
-	if failed || exhausted {
-		setSampleFailure(&sample, ctx)
-	} else if workload.ToolRoundTrip {
-		toolOutput, ok := toolRoundTripOutput(first.ToolCalls, "TOOL_ROUND_TRIP_OK")
-		if !ok {
-			sample.Correctness = CorrectnessFailed
-			sample.ErrorClass = "invalid_tool_call"
-		} else {
-			messages = append(messages, chatMessage{Role: "assistant", ToolCalls: first.ToolCalls})
-			messages = append(messages, chatMessage{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Content: toolOutput})
-			second, secondFailed, secondExhausted := sendRequest(ctx, runner, messages, false)
-			if secondFailed || secondExhausted {
-				exhausted = secondExhausted
-				setSampleFailure(&sample, ctx)
-			} else if strings.TrimSpace(second.Content) == workload.Expected {
-				sample.Correctness = CorrectnessPassed
-			} else {
-				sample.Correctness = CorrectnessFailed
-				sample.ErrorClass = "unexpected_tool_output"
-			}
-		}
-	} else if strings.TrimSpace(first.Content) == workload.Expected {
-		sample.Correctness = CorrectnessPassed
-	} else {
+// runToolRoundTrip executes the assistant tool call and the subsequent tool
+// response request. It returns whether the sample's token budget was exhausted.
+func runToolRoundTrip(ctx context.Context, runner *sampleRequestRunner, sample *SampleResult, messages []chatMessage, first chatResult, workload syntheticWorkload) bool {
+	toolOutput, ok := toolRoundTripOutput(first.ToolCalls, "TOOL_ROUND_TRIP_OK")
+	if !ok {
 		sample.Correctness = CorrectnessFailed
+		sample.ErrorClass = "invalid_tool_call"
+		return false
 	}
+	messages = append(messages, chatMessage{Role: "assistant", ToolCalls: first.ToolCalls})
+	messages = append(messages, chatMessage{Role: "tool", ToolCallID: first.ToolCalls[0].ID, Content: toolOutput})
+	second, secondFailed, secondExhausted := sendRequest(ctx, runner, messages, false)
+	if secondFailed || secondExhausted {
+		setSampleFailure(sample, ctx)
+		return secondExhausted
+	}
+	recordTextCorrectness(sample, second.Content, workload.Expected, "unexpected_tool_output")
+	return false
+}
+
+// finalizeSample stamps the sample duration, attaches proxy observations for
+// every recorded request, and sets the request count.
+func finalizeSample(sample *SampleResult, started time.Time, ctx context.Context, client *APIClient, config RequestedConfiguration) {
 	sample.DurationMS = floatPointer(float64(time.Since(started)) / float64(time.Millisecond))
 	for i := range sample.Requests {
 		client.attachObservation(ctx, &sample.Requests[i], config.Backend)
 	}
 	sample.RequestCount = len(sample.Requests)
-	return sample, exhausted
+}
+
+// recordTextCorrectness normalizes a trimmed response against the expected text.
+// On a match it marks the sample CorrectnessPassed. On a mismatch it marks
+// CorrectnessFailed and sets ErrorClass only when a nonempty mismatch error class
+// is passed; a plain mismatch leaves ErrorClass unchanged. This consolidates the
+// previously duplicated correctness branch across the tool-round-trip and normal
+// expected-content success paths.
+func recordTextCorrectness(sample *SampleResult, content, expected, mismatchErrorClass string) {
+	if strings.TrimSpace(content) == expected {
+		sample.Correctness = CorrectnessPassed
+		return
+	}
+	sample.Correctness = CorrectnessFailed
+	if mismatchErrorClass != "" {
+		sample.ErrorClass = mismatchErrorClass
+	}
 }
 
 // toolRoundTripOutput validates that exactly one tool call was made and that its
@@ -197,6 +201,54 @@ func toolRoundTripOutput(toolCalls []toolCall, expectedToolMessage string) (stri
 		return "", false
 	}
 	return toolMessage(toolCalls[0], expectedToolMessage)
+}
+
+// newRunRecord constructs the base RunRecord with metadata, the pre-flight model
+// observation, and the standard limitations list.
+func newRunRecord(runID string, config RequestedConfiguration, modelBefore *ModelObservation) RunRecord {
+	return RunRecord{
+		SchemaVersion:   SchemaVersion,
+		RunID:           runID,
+		WorkloadVersion: WorkloadVersion,
+		StartedAt:       time.Now().UTC(),
+		Status:          RunCompleted,
+		Requested:       config,
+		ModelBefore:     modelBefore,
+		Workloads:       make([]WorkloadResult, 0, len(syntheticWorkloads)),
+		Limitations: []string{
+			"active inference state is not exposed and cannot be verified",
+			"model lifecycle is observed before and after the run only; lifecycle at each inference request is unknown",
+			"applied sampling and draft configuration is not exposed by the diagnostics API",
+			"cache state is declared by the operator and is not independently verified",
+			"per-round draft acceptance is unsupported; available activity evidence is aggregate",
+			"GPU samples are shared-device approximations and are not model-owned measurements",
+			"response bodies and reasoning text are never persisted",
+		},
+	}
+}
+
+// determineRunStatus maps run context and workload outcomes to the final run
+// status. Cancellation takes precedence; otherwise a partial workload count or
+// budget exhaustion yields a partial run.
+func determineRunStatus(runCtx context.Context, partial bool, workloadCount int) RunStatus {
+	if runCtx.Err() != nil {
+		return RunCanceled
+	}
+	if partial || workloadCount != len(syntheticWorkloads) {
+		return RunPartial
+	}
+	return RunCompleted
+}
+
+// observePostflightModel observes the model after the run completes. On failure
+// it records the unavailability as a limitation rather than failing the run.
+func observePostflightModel(runCtx context.Context, client *APIClient, backend, model string, record *RunRecord) {
+	modelAfter, observationErr := client.ObserveReadyModel(runCtx, backend, model)
+	if observationErr == nil {
+		record.ModelAfter = modelAfter
+	} else {
+		record.Limitations = append(record.Limitations, "post_run_model_observation_unavailable")
+	}
 }
 
 // runWorkloads executes every synthetic workload in order, repeating each per

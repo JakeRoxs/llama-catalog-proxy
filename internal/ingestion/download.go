@@ -118,37 +118,54 @@ func (r *downloadReader) open() error {
 	}
 	sendToken := true
 	for redirects := 0; ; redirects++ {
-		request, err := http.NewRequestWithContext(r.ctx, http.MethodGet, current.String(), nil)
+		next, nextSendToken, done, body, expected, err := r.fetchRound(r.ctx, current, sendToken, redirects)
 		if err != nil {
-			return ErrDownloadInvalid
+			return err
 		}
-		request.Header.Set("Accept-Encoding", "identity")
-		if sendToken && r.token != "" {
-			request.Header.Set("Authorization", "Bearer "+r.token)
-		}
-		response, err := r.client.Do(request)
-		if err != nil {
-			return ErrDownloadTransport
-		}
-		switch response.StatusCode {
-		case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-			var nextURL *url.URL
-			var redirectErr error
-			nextURL, sendToken, redirectErr = redirectDecision(response, redirects, maxDownloadRedirects, sendToken, hfHost)
-			if redirectErr != nil {
-				return redirectErr
-			}
-			current = nextURL
-		case http.StatusOK:
-			body, expected, err := validateDownloadResponse(response, r.maxBytes)
-			if err != nil {
-				return err
-			}
+		if done {
 			r.body, r.expected = body, expected
 			return nil
-		default:
-			return closeDownloadResponse(response, ErrDownloadResponse)
 		}
+		current = next
+		sendToken = nextSendToken
+	}
+}
+
+// fetchRound performs one request to current and classifies the result.
+// next is the URL to follow on redirect (nil when terminal). nextSendToken is
+// the updated bearer-token forwarding decision. done is true when the round is
+// terminal (success or failure). body and expected are populated only on
+// success. err is a terminal error. The response body is closed on every
+// non-success path; on success it is returned to the caller for consumption.
+func (r *downloadReader) fetchRound(ctx context.Context, current *url.URL, sendToken bool, redirects int) (next *url.URL, nextSendToken bool, done bool, body io.ReadCloser, expected int64, err error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
+	if err != nil {
+		return nil, false, true, nil, 0, ErrDownloadInvalid
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	if sendToken && r.token != "" {
+		request.Header.Set("Authorization", "Bearer "+r.token)
+	}
+	response, err := r.client.Do(request)
+	if err != nil {
+		return nil, false, true, nil, 0, ErrDownloadTransport
+	}
+	switch response.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		next, nextSendToken, err = redirectDecision(response, redirects, maxDownloadRedirects, sendToken, hfHost)
+		if err != nil {
+			return nil, false, true, nil, 0, err
+		}
+		return next, nextSendToken, false, nil, 0, nil
+	case http.StatusOK:
+		body, expected, err = validateDownloadResponse(response, r.maxBytes)
+		if err != nil {
+			return nil, false, true, nil, 0, err
+		}
+		return nil, false, true, body, expected, nil
+	default:
+		err = closeDownloadResponse(response, ErrDownloadResponse)
+		return nil, false, true, nil, 0, err
 	}
 }
 

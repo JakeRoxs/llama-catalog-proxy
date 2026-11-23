@@ -21,8 +21,10 @@ import (
 // the management configuration changes while a proposal request is in flight.
 const managementConfigChangedMsg = "management configuration changed"
 
+// proposalsBasePath centralizes the management API base path for proposal routes.
+const proposalsBasePath = "/management/v1/proposals"
+
 func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, state *reloaderState) {
-	const base = "/management/v1/proposals"
 	if req.URL.RawQuery != "" {
 		http.NotFound(w, req)
 		return
@@ -49,26 +51,25 @@ func (r *Reloader) serveProposals(w http.ResponseWriter, req *http.Request, stat
 // serveProposalSpecialRoutes handles the create, creation, catalog, and verify
 // routes for the proposals resource. It returns true when a response was written.
 func (r *Reloader) serveProposalSpecialRoutes(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) bool {
-	const base = "/management/v1/proposals"
-	if req.URL.Path == base && req.Method == http.MethodPost {
+	if req.URL.Path == proposalsBasePath && req.Method == http.MethodPost {
 		r.createProposal(w, req, state, directory)
 		return true
 	}
-	if req.URL.Path == base+"/creation" {
+	if req.URL.Path == proposalsBasePath+"/creation" {
 		r.serveCreation(w, req, state, true)
 		return true
 	}
-	if strings.HasPrefix(req.URL.Path, base+"/") && strings.HasSuffix(req.URL.Path, "/catalog") {
-		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, base+"/"), "/catalog")
+	if strings.HasPrefix(req.URL.Path, proposalsBasePath+"/") && strings.HasSuffix(req.URL.Path, "/catalog") {
+		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, proposalsBasePath+"/"), "/catalog")
 		r.serveCreationCatalog(w, req, state, directory, id)
 		return true
 	}
-	if strings.HasPrefix(req.URL.Path, base+"/") && strings.HasSuffix(req.URL.Path, "/verify") && req.Method == http.MethodPost {
+	if strings.HasPrefix(req.URL.Path, proposalsBasePath+"/") && strings.HasSuffix(req.URL.Path, "/verify") && req.Method == http.MethodPost {
 		if req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
 			http.Error(w, "verification does not accept a request body", http.StatusBadRequest)
 			return true
 		}
-		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, base+"/"), "/verify")
+		id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, proposalsBasePath+"/"), "/verify")
 		r.verifyProposal(w, state, directory, id)
 		return true
 	}
@@ -78,8 +79,7 @@ func (r *Reloader) serveProposalSpecialRoutes(w http.ResponseWriter, req *http.R
 // serveProposalListGetDelete responds to GET list, GET/DELETE by id, and returns
 // 405 for anything else. It returns true when a response was written.
 func (r *Reloader) serveProposalListGetDelete(w http.ResponseWriter, req *http.Request, state *reloaderState, directory string) bool {
-	const base = "/management/v1/proposals"
-	if req.URL.Path == base && req.Method == http.MethodGet {
+	if req.URL.Path == proposalsBasePath && req.Method == http.MethodGet {
 		ids, err := modelconfig.ListProposals(directory)
 		if err != nil {
 			writeProposalError(w, err)
@@ -94,8 +94,8 @@ func (r *Reloader) serveProposalListGetDelete(w http.ResponseWriter, req *http.R
 		}{IDs: ids})
 		return true
 	}
-	if strings.HasPrefix(req.URL.Path, base+"/") && (req.Method == http.MethodGet || req.Method == http.MethodDelete) {
-		id := strings.TrimPrefix(req.URL.Path, base+"/")
+	if strings.HasPrefix(req.URL.Path, proposalsBasePath+"/") && (req.Method == http.MethodGet || req.Method == http.MethodDelete) {
+		id := strings.TrimPrefix(req.URL.Path, proposalsBasePath+"/")
 		return r.serveProposalGetDelete(w, req, state, directory, id)
 	}
 	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

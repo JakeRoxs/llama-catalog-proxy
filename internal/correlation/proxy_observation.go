@@ -155,9 +155,9 @@ func copyIntPtr(v *int64) *int64 {
 	return &x
 }
 
-// validPhase reports true if v is unknown (nil) or a finite, nonnegative
-// phase value. NaN, Inf, and negative phases are invalid.
-func validPhase(v *float64) bool {
+// validFiniteNonnegativeFloat reports true if v is unknown (nil) or a finite,
+// nonnegative value. NaN, Inf, and negative values are invalid.
+func validFiniteNonnegativeFloat(v *float64) bool {
 	if v == nil {
 		return true
 	}
@@ -165,13 +165,10 @@ func validPhase(v *float64) bool {
 	return !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0
 }
 
-// copyPhase copies a phase pointer. The caller must ensure validPhase(v) is
-// true; otherwise the result is nil (invalid).
-func copyPhase(v *float64) *float64 {
-	if v == nil || !validPhase(v) {
-		return nil
-	}
-	return copyFloatPtr(v)
+// validPhase reports true if v is unknown (nil) or a finite, nonnegative phase
+// value. It is the phase-specific alias for validFiniteNonnegativeFloat.
+func validPhase(v *float64) bool {
+	return validFiniteNonnegativeFloat(v)
 }
 
 // validInt64 reports true if v is unknown (nil) or a nonnegative integer.
@@ -191,13 +188,19 @@ func copyInt64(v *int64) *int64 {
 	return copyIntPtr(v)
 }
 
-// copyFiniteFloat copies a finite float pointer. The caller must ensure
-// validPhase(v) is true; otherwise the result is nil (invalid).
-func copyFiniteFloat(v *float64) *float64 {
-	if v == nil || !validPhase(v) {
+// copyFiniteNonnegativeFloat copies a finite, nonnegative float pointer. The
+// caller must ensure validFiniteNonnegativeFloat(v) is true; otherwise the
+// result is nil (invalid). Zero values are preserved.
+func copyFiniteNonnegativeFloat(v *float64) *float64 {
+	if v == nil || !validFiniteNonnegativeFloat(v) {
 		return nil
 	}
 	return copyFloatPtr(v)
+}
+
+// copyPhase copies a phase pointer. It delegates to copyFiniteNonnegativeFloat.
+func copyPhase(v *float64) *float64 {
+	return copyFiniteNonnegativeFloat(v)
 }
 
 // sanitizeString returns s if it is a member of the allowlist, otherwise "".
@@ -364,8 +367,8 @@ func copyAndValidateTokenUsage(summary timing.Summary, obs *ProxyObservation) bo
 // if any established timing is non-finite or negative. The input summary is
 // not mutated.
 func copyAndValidateEngineTimings(summary timing.Summary, obs *ProxyObservation) bool {
-	obs.PromptMS = copyFiniteFloat(summary.EngineTimings.PromptMS)
-	obs.PredictedMS = copyFiniteFloat(summary.EngineTimings.PredictedMS)
+	obs.PromptMS = copyFiniteNonnegativeFloat(summary.EngineTimings.PromptMS)
+	obs.PredictedMS = copyFiniteNonnegativeFloat(summary.EngineTimings.PredictedMS)
 	obs.PromptN = copyInt64(summary.EngineTimings.PromptN)
 	obs.PredictedN = copyInt64(summary.EngineTimings.PredictedN)
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,84 +39,115 @@ func runPeerCommand(args []string, stdout, stderr io.Writer) error {
 	}
 	switch args[0] {
 	case "invite":
-		if len(args) < 2 {
-			return errors.New("usage: llama-catalog-proxy peer invite {create|list|revoke} ...")
-		}
-		switch args[1] {
-		case "create":
-			return finishPeerCommand(runPeerInviteCreate(args[2:], stdout, stderr))
-		case "list":
-			return finishPeerCommand(runPeerInviteList(args[2:], stdout, stderr))
-		case "revoke":
-			return finishPeerCommand(runPeerInviteRevoke(args[2:], stdout, stderr))
-		default:
-			return errors.New("unknown peer invite action")
-		}
+		return finishPeerCommand(runPeerInviteAction(args[1:], stdout, stderr))
 	case "members":
-		if len(args) < 2 {
-			return errors.New("usage: llama-catalog-proxy peer members {list|revoke} ...")
-		}
-		switch args[1] {
-		case "list":
-			return finishPeerCommand(runPeerMembersList(args[2:], stdout, stderr))
-		case "revoke":
-			return finishPeerCommand(runPeerMemberRevoke(args[2:], stdout, stderr))
-		default:
-			return errors.New("unknown peer members action")
-		}
+		return finishPeerCommand(runPeerMembersAction(args[1:], stdout, stderr))
 	case "join":
 		return finishPeerCommand(runPeerJoin(args[1:], stdout, stderr))
 	case "discover":
 		return finishPeerCommand(runPeerDiscover(args[1:], stdout, stderr))
 	case "config":
-		if len(args) < 2 || args[1] != "plan" {
-			return errors.New("usage: llama-catalog-proxy peer config plan [--config path]")
-		}
-		return finishPeerCommand(runPeerConfigPlan(args[2:], stdout, stderr))
+		return finishPeerCommand(runPeerConfigAction(args[1:], stdout, stderr))
 	case "grants":
-		if len(args) < 2 {
-			return errors.New("usage: llama-catalog-proxy peer grants {create|list|revoke} ...")
-		}
-		switch args[1] {
-		case "create":
-			return finishPeerCommand(runPeerGrantCreate(args[2:], stdout, stderr))
-		case "list":
-			return finishPeerCommand(runPeerGrantList(args[2:], stdout, stderr))
-		case "revoke":
-			return finishPeerCommand(runPeerGrantRevoke(args[2:], stdout, stderr))
-		default:
-			return errors.New("unknown peer grants action")
-		}
+		return finishPeerCommand(runPeerGrantsAction(args[1:], stdout, stderr))
 	case "catalog-grants":
-		if len(args) < 2 {
-			return errors.New("usage: llama-catalog-proxy peer catalog-grants {create|list|revoke} ...")
-		}
-		switch args[1] {
-		case "create":
-			return finishPeerCommand(runPeerCatalogGrantCreate(args[2:], stdout, stderr))
-		case "list":
-			return finishPeerCommand(runPeerCatalogGrantList(args[2:], stdout, stderr))
-		case "revoke":
-			return finishPeerCommand(runPeerCatalogGrantRevoke(args[2:], stdout, stderr))
-		default:
-			return errors.New("unknown peer catalog-grants action")
-		}
+		return finishPeerCommand(runPeerCatalogGrantsAction(args[1:], stdout, stderr))
 	case "inference-grants":
-		if len(args) < 2 {
-			return errors.New("usage: llama-catalog-proxy peer inference-grants {create|list|revoke} ...")
-		}
-		switch args[1] {
-		case "create":
-			return finishPeerCommand(runPeerInferenceGrantCreate(args[2:], stdout, stderr))
-		case "list":
-			return finishPeerCommand(runPeerInferenceGrantList(args[2:], stdout, stderr))
-		case "revoke":
-			return finishPeerCommand(runPeerInferenceGrantRevoke(args[2:], stdout, stderr))
-		default:
-			return errors.New("unknown peer inference-grants action")
-		}
+		return finishPeerCommand(runPeerInferenceGrantsAction(args[1:], stdout, stderr))
 	default:
 		return errors.New("unknown peer action")
+	}
+}
+
+// runPeerInviteAction dispatches the peer invite subcommand group. It preserves the
+// exact usage and unknown-action errors of the prior nested dispatch.
+func runPeerInviteAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: llama-catalog-proxy peer invite {create|list|revoke} ...")
+	}
+	switch args[0] {
+	case "create":
+		return finishPeerCommand(runPeerInviteCreate(args[1:], stdout, stderr))
+	case "list":
+		return finishPeerCommand(runPeerInviteList(args[1:], stdout, stderr))
+	case "revoke":
+		return finishPeerCommand(runPeerInviteRevoke(args[1:], stdout, stderr))
+	default:
+		return errors.New("unknown peer invite action")
+	}
+}
+
+// runPeerMembersAction dispatches the peer members subcommand group.
+func runPeerMembersAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: llama-catalog-proxy peer members {list|revoke} ...")
+	}
+	switch args[0] {
+	case "list":
+		return finishPeerCommand(runPeerMembersList(args[1:], stdout, stderr))
+	case "revoke":
+		return finishPeerCommand(runPeerMemberRevoke(args[1:], stdout, stderr))
+	default:
+		return errors.New("unknown peer members action")
+	}
+}
+
+// runPeerConfigAction validates the peer config subcommand arguments.
+func runPeerConfigAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 || args[0] != "plan" {
+		return errors.New("usage: llama-catalog-proxy peer config plan [--config path]")
+	}
+	return finishPeerCommand(runPeerConfigPlan(args[1:], stdout, stderr))
+}
+
+// runPeerGrantsAction dispatches the peer grants subcommand group.
+func runPeerGrantsAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: llama-catalog-proxy peer grants {create|list|revoke} ...")
+	}
+	switch args[0] {
+	case "create":
+		return finishPeerCommand(runPeerGrantCreate(args[1:], stdout, stderr))
+	case "list":
+		return finishPeerCommand(runPeerGrantList(args[1:], stdout, stderr))
+	case "revoke":
+		return finishPeerCommand(runPeerGrantRevoke(args[1:], stdout, stderr))
+	default:
+		return errors.New("unknown peer grants action")
+	}
+}
+
+// runPeerCatalogGrantsAction dispatches the peer catalog-grants subcommand group.
+func runPeerCatalogGrantsAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: llama-catalog-proxy peer catalog-grants {create|list|revoke} ...")
+	}
+	switch args[0] {
+	case "create":
+		return finishPeerCommand(runPeerCatalogGrantCreate(args[1:], stdout, stderr))
+	case "list":
+		return finishPeerCommand(runPeerCatalogGrantList(args[1:], stdout, stderr))
+	case "revoke":
+		return finishPeerCommand(runPeerCatalogGrantRevoke(args[1:], stdout, stderr))
+	default:
+		return errors.New("unknown peer catalog-grants action")
+	}
+}
+
+// runPeerInferenceGrantsAction dispatches the peer inference-grants subcommand group.
+func runPeerInferenceGrantsAction(args []string, stdout, stderr io.Writer) error {
+	if len(args) < 1 {
+		return errors.New("usage: llama-catalog-proxy peer inference-grants {create|list|revoke} ...")
+	}
+	switch args[0] {
+	case "create":
+		return finishPeerCommand(runPeerInferenceGrantCreate(args[1:], stdout, stderr))
+	case "list":
+		return finishPeerCommand(runPeerInferenceGrantList(args[1:], stdout, stderr))
+	case "revoke":
+		return finishPeerCommand(runPeerInferenceGrantRevoke(args[1:], stdout, stderr))
+	default:
+		return errors.New("unknown peer inference-grants action")
 	}
 }
 
@@ -216,7 +248,29 @@ func runPeerMemberRevoke(args []string, stdout, stderr io.Writer) error {
 	})
 }
 
+// peerGrantCreateOptions holds the validated flags for the peer grants create command.
+type peerGrantCreateOptions struct {
+	configPath  string
+	requester   string
+	backend     string
+	models      string
+	expiresIn   string
+	acknowledge bool
+}
+
 func runPeerGrantCreate(args []string, stdout, stderr io.Writer) error {
+	options, err := parsePeerGrantCreateOptions(args, stderr)
+	if err != nil {
+		return err
+	}
+	return withPeerCLIAudit(options.configPath, "owner_grant.create", "", "", "", stdout, func(out io.Writer) (string, string, string, error) {
+		return createOwnerGrant(options, out)
+	})
+}
+
+// parsePeerGrantCreateOptions parses and validates the peer grants create flags,
+// returning the resolved options or a parse/validation error.
+func parsePeerGrantCreateOptions(args []string, stderr io.Writer) (peerGrantCreateOptions, error) {
 	flags := peerFlags("peer grants create", stderr)
 	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	requester := flags.String("requester-node", "", "paired requester node ID")
@@ -225,60 +279,71 @@ func runPeerGrantCreate(args []string, stdout, stderr io.Writer) error {
 	expiresIn := flags.String("expires-in", "30d", "grant lifetime from 5m to 90d")
 	acknowledge := flags.Bool("acknowledge", false, "confirm this owner authorization change")
 	if err := parsePeerFlags(flags, args); err != nil {
-		return err
+		return peerGrantCreateOptions{}, err
 	}
 	if *requester == "" || *backend == "" || *models == "" || !*acknowledge {
-		return errors.New("--requester-node, --backend, --models, and --acknowledge are required")
+		return peerGrantCreateOptions{}, errors.New("--requester-node, --backend, --models, and --acknowledge are required")
 	}
-	return withPeerCLIAudit(*configPath, "owner_grant.create", "", "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		grantConfig, store, err := openOwnerGrantConfig(*configPath)
-		if err != nil {
-			return "", "", "", err
+	return peerGrantCreateOptions{
+		configPath:  *configPath,
+		requester:   *requester,
+		backend:     *backend,
+		models:      *models,
+		expiresIn:   *expiresIn,
+		acknowledge: *acknowledge,
+	}, nil
+}
+
+// createOwnerGrant validates the owner grant scope and creates the grant. It is the
+// focused owner-grant creation/audit path extracted from runPeerGrantCreate.
+func createOwnerGrant(options peerGrantCreateOptions, out io.Writer) (string, string, string, error) {
+	grantConfig, store, err := openOwnerGrantConfig(options.configPath)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer store.Close()
+	peerGrant, ok := grantConfig.Peer.Peers[options.requester]
+	if !ok || !peerGrant.ManageSettings || !containsPeerCLIString(grantConfig.Peer.LocalBackends, options.backend) {
+		return "", "", "", errors.New("requester lacks the static owner scope or backend is not locally owned")
+	}
+	if !store.IsMember(options.requester) {
+		return "", "", "", errors.New("requester is not a paired node identity")
+	}
+	targetID, ok := grantConfig.Peer.ManagementTargets[options.backend]
+	if !ok || grantConfig.Management == nil {
+		return "", "", "", errors.New("backend has no local settings target")
+	}
+	target, ok := grantConfig.Management.Targets[targetID]
+	if !ok {
+		return "", "", "", errors.New("local management target is unavailable")
+	}
+	modelIDs := splitOwnerGrantModels(options.models)
+	if len(modelIDs) == 0 || len(modelIDs) > modelconfig.MaxOwnerGrantModels {
+		return "", "", "", errors.New("--models must name between one and 64 models")
+	}
+	for _, modelID := range modelIDs {
+		if _, err := modelconfig.ReadSettingsTarget(target.Directory, target.Filename, targetID, modelID); err != nil {
+			return "", "", "", errors.New("a requested model is not safely configurable on the target")
 		}
-		defer store.Close()
-		peerGrant, ok := grantConfig.Peer.Peers[*requester]
-		if !ok || !peerGrant.ManageSettings || !containsPeerCLIString(grantConfig.Peer.LocalBackends, *backend) {
-			return "", "", "", errors.New("requester lacks the static owner scope or backend is not locally owned")
-		}
-		if !store.IsMember(*requester) {
-			return "", "", "", errors.New("requester is not a paired node identity")
-		}
-		targetID, ok := grantConfig.Peer.ManagementTargets[*backend]
-		if !ok || grantConfig.Management == nil {
-			return "", "", "", errors.New("backend has no local settings target")
-		}
-		target, ok := grantConfig.Management.Targets[targetID]
-		if !ok {
-			return "", "", "", errors.New("local management target is unavailable")
-		}
-		modelIDs := splitOwnerGrantModels(*models)
-		if len(modelIDs) == 0 || len(modelIDs) > modelconfig.MaxOwnerGrantModels {
-			return "", "", "", errors.New("--models must name between one and 64 models")
-		}
-		for _, modelID := range modelIDs {
-			if _, err := modelconfig.ReadSettingsTarget(target.Directory, target.Filename, targetID, modelID); err != nil {
-				return "", "", "", errors.New("a requested model is not safely configurable on the target")
-			}
-		}
-		sort.Strings(modelIDs)
-		lifetime, err := time.ParseDuration(strings.TrimSpace(*expiresIn))
-		if err != nil || lifetime < 5*time.Minute || lifetime > modelconfig.MaxOwnerGrantLifetime {
-			return "", "", "", errors.New("--expires-in must be between 5m and 90d")
-		}
-		id, err := randomCLIGrantID()
-		if err != nil {
-			return "", "", "", errors.New("could not create owner grant")
-		}
-		created := time.Now().UTC()
-		grant := modelconfig.OwnerGrant{
-			ID: id, RequesterNodeID: *requester, Action: "manage_settings", BackendID: *backend, TargetID: targetID,
-			ModelIDs: modelIDs, CreatedAt: created, ExpiresAt: created.Add(lifetime), ApprovedBy: "local_cli",
-		}
-		if err := modelconfig.CreateOwnerGrant(grantConfig.Management.DelegatedStore.GrantDirectory, grant); err != nil {
-			return "", "", "", err
-		}
-		return targetID, "", grant.ID, json.NewEncoder(out).Encode(grant)
-	})
+	}
+	sort.Strings(modelIDs)
+	lifetime, err := time.ParseDuration(strings.TrimSpace(options.expiresIn))
+	if err != nil || lifetime < 5*time.Minute || lifetime > modelconfig.MaxOwnerGrantLifetime {
+		return "", "", "", errors.New("--expires-in must be between 5m and 90d")
+	}
+	id, err := randomCLIGrantID()
+	if err != nil {
+		return "", "", "", errors.New("could not create owner grant")
+	}
+	created := time.Now().UTC()
+	grant := modelconfig.OwnerGrant{
+		ID: id, RequesterNodeID: options.requester, Action: "manage_settings", BackendID: options.backend, TargetID: targetID,
+		ModelIDs: modelIDs, CreatedAt: created, ExpiresAt: created.Add(lifetime), ApprovedBy: "local_cli",
+	}
+	if err := modelconfig.CreateOwnerGrant(grantConfig.Management.DelegatedStore.GrantDirectory, grant); err != nil {
+		return "", "", "", err
+	}
+	return targetID, "", grant.ID, json.NewEncoder(out).Encode(grant)
 }
 
 func runPeerGrantList(args []string, stdout, stderr io.Writer) error {
@@ -440,7 +505,20 @@ func randomCLIGrantID() (string, error) {
 	return hex.EncodeToString(value), nil
 }
 
-func runPeerJoin(args []string, stdout, stderr io.Writer) error {
+// peerJoinOptions holds the validated flags for the peer join command.
+type peerJoinOptions struct {
+	configPath     string
+	peerURL        string
+	discoverNodeID string
+	expectedNodeID string
+	invitationFile string
+}
+
+// parsePeerJoinOptions parses and validates the peer join flags, returning the
+// resolved options or a parse/validation error. It enforces that exactly one of
+// --url or --discover-node-id is supplied together with --invitation-file, and
+// that --expected-node-id matches --discover-node-id when both are given.
+func parsePeerJoinOptions(args []string, stderr io.Writer) (peerJoinOptions, error) {
 	flags := peerFlags("peer join", stderr)
 	configPath := flags.String("config", defaultPeerConfigPath, peerConfigHelpText)
 	peerURL := flags.String("url", "", "HTTPS origin of the node issuing the invitation")
@@ -448,75 +526,122 @@ func runPeerJoin(args []string, stdout, stderr io.Writer) error {
 	expectedNodeID := flags.String("expected-node-id", "", "require this node ID from the peer TLS certificate")
 	invitationFile := flags.String("invitation-file", "", "owner-only file containing the invitation code")
 	if err := parsePeerFlags(flags, args); err != nil {
-		return err
+		return peerJoinOptions{}, err
 	}
 	if (*peerURL == "") == (*discoverNodeID == "") || *invitationFile == "" {
-		return errors.New("provide exactly one of --url or --discover-node-id and an --invitation-file; do not pass invitation codes as command arguments")
+		return peerJoinOptions{}, errors.New("provide exactly one of --url or --discover-node-id and an --invitation-file; do not pass invitation codes as command arguments")
 	}
 	if *discoverNodeID != "" {
 		if *expectedNodeID != "" && *expectedNodeID != *discoverNodeID {
-			return errors.New("--expected-node-id must match --discover-node-id")
+			return peerJoinOptions{}, errors.New("--expected-node-id must match --discover-node-id")
 		}
 		*expectedNodeID = *discoverNodeID
 	}
-	code, err := readPeerInvitation(*invitationFile)
+	return peerJoinOptions{
+		configPath:     *configPath,
+		peerURL:        *peerURL,
+		discoverNodeID: *discoverNodeID,
+		expectedNodeID: *expectedNodeID,
+		invitationFile: *invitationFile,
+	}, nil
+}
+
+// resolveJoinTargetURL resolves the peer endpoint to join, using --url when
+// supplied otherwise browsing mDNS candidates and selecting the one whose node
+// ID matches --discover-node-id.
+func resolveJoinTargetURL(cfg *config.Config, options peerJoinOptions) (string, error) {
+	targetURL := options.peerURL
+	if options.discoverNodeID != "" {
+		if cfg.Peer.Discovery == nil || !cfg.Peer.Discovery.Enabled {
+			return "", errors.New("mDNS discovery is not enabled in configuration")
+		}
+		candidates, err := discovery.Browse(context.Background(), discovery.Settings{
+			NodeID: cfg.Peer.NodeID, FederationID: cfg.Peer.FederationID,
+			Interface: cfg.Peer.Discovery.Interface, AdvertiseURL: cfg.Peer.Discovery.AdvertiseURL,
+		}, 3*time.Second)
+		if err != nil {
+			return "", err
+		}
+		targetURL, err = selectPeerCandidate(candidates, options.discoverNodeID)
+		if err != nil {
+			return "", err
+		}
+	}
+	return targetURL, nil
+}
+
+// loadJoinTLSMaterial loads the local peer identity certificate, federation trust
+// roots and CRLs required for the mTLS join handshake, preserving the certificate
+// -> roots -> CRLs load order.
+func loadJoinTLSMaterial(cfg *config.Config) (tls.Certificate, *x509.CertPool, []*x509.RevocationList, error) {
+	certificate, err := tls.LoadX509KeyPair(cfg.Peer.TLSCertFile, cfg.Peer.TLSKeyFile)
+	if err != nil {
+		return tls.Certificate{}, nil, nil, errors.New("could not load local peer identity certificate")
+	}
+	roots, err := federation.LoadTrustRoots(cfg.Peer.ClientCAFile)
+	if err != nil {
+		return tls.Certificate{}, nil, nil, errors.New("could not load federation CA bundle")
+	}
+	crls, err := federation.LoadCRLs(cfg.Peer.ClientCRLFile, cfg.Peer.RevocationMaxAge())
+	if err != nil {
+		return tls.Certificate{}, nil, nil, errors.New("could not load a fresh federation CRL bundle")
+	}
+	return certificate, roots, crls, nil
+}
+
+// joinPeer performs the pairing join against the target endpoint. It wraps any
+// JoinExpected failure with the "pairing failed" prefix so callers see a stable
+// error string.
+func joinPeer(ctx context.Context, store *federation.PairingStore, targetURL string, expectedNodeID, invitationCode string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (federation.Membership, error) {
+	member, err := store.JoinExpected(ctx, targetURL, federation.JoinExpectedOptions{
+		ExpectedNodeID: expectedNodeID,
+		Code:           invitationCode,
+		Certificate:    certificate,
+		Roots:          roots,
+		CRLs:           crls,
+		MaxCRLAge:      maxCRLAge,
+	})
+	if err != nil {
+		return federation.Membership{}, fmt.Errorf("pairing failed: %w", err)
+	}
+	return member, nil
+}
+
+func runPeerJoin(args []string, stdout, stderr io.Writer) error {
+	options, err := parsePeerJoinOptions(args, stderr)
 	if err != nil {
 		return err
 	}
-	return withPeerCLIAudit(*configPath, "pairing.join", "", "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		cfg, err := config.Load(*configPath)
+	code, err := readPeerInvitation(options.invitationFile)
+	if err != nil {
+		return err
+	}
+	return withPeerCLIAudit(options.configPath, "pairing.join", "", "", "", stdout, func(out io.Writer) (string, string, string, error) {
+		cfg, err := config.Load(options.configPath)
 		if err != nil {
 			return "", "", "", err
 		}
 		if cfg.Peer == nil || cfg.Peer.FederationID == "" {
 			return "", "", "", errors.New("peer federation identity is not configured")
 		}
-		targetURL := *peerURL
-		if *discoverNodeID != "" {
-			if cfg.Peer.Discovery == nil || !cfg.Peer.Discovery.Enabled {
-				return "", "", "", errors.New("mDNS discovery is not enabled in configuration")
-			}
-			candidates, err := discovery.Browse(context.Background(), discovery.Settings{
-				NodeID: cfg.Peer.NodeID, FederationID: cfg.Peer.FederationID,
-				Interface: cfg.Peer.Discovery.Interface, AdvertiseURL: cfg.Peer.Discovery.AdvertiseURL,
-			}, 3*time.Second)
-			if err != nil {
-				return "", "", "", err
-			}
-			targetURL, err = selectPeerCandidate(candidates, *discoverNodeID)
-			if err != nil {
-				return "", "", "", err
-			}
+		targetURL, err := resolveJoinTargetURL(&cfg, options)
+		if err != nil {
+			return "", "", "", err
 		}
 		store, err := federation.OpenPairingStore(cfg.Peer.MembershipDirectory, cfg.Peer.FederationID, cfg.Peer.NodeID)
 		if err != nil {
 			return "", "", "", err
 		}
 		defer store.Close()
-		certificate, err := tls.LoadX509KeyPair(cfg.Peer.TLSCertFile, cfg.Peer.TLSKeyFile)
+		certificate, roots, crls, err := loadJoinTLSMaterial(&cfg)
 		if err != nil {
-			return "", "", "", errors.New("could not load local peer identity certificate")
-		}
-		roots, err := federation.LoadTrustRoots(cfg.Peer.ClientCAFile)
-		if err != nil {
-			return "", "", "", errors.New("could not load federation CA bundle")
-		}
-		crls, err := federation.LoadCRLs(cfg.Peer.ClientCRLFile, cfg.Peer.RevocationMaxAge())
-		if err != nil {
-			return "", "", "", errors.New("could not load a fresh federation CRL bundle")
+			return "", "", "", err
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-		member, err := store.JoinExpected(ctx, targetURL, federation.JoinExpectedOptions{
-			ExpectedNodeID: *expectedNodeID,
-			Code:           code,
-			Certificate:    certificate,
-			Roots:          roots,
-			CRLs:           crls,
-			MaxCRLAge:      cfg.Peer.RevocationMaxAge(),
-		})
+		member, err := joinPeer(ctx, store, targetURL, options.expectedNodeID, code, certificate, roots, crls, cfg.Peer.RevocationMaxAge())
 		if err != nil {
-			return "", "", "", fmt.Errorf("pairing failed: %w", err)
+			return "", "", "", err
 		}
 		return member.NodeID, "", "", json.NewEncoder(out).Encode(map[string]any{"state": "paired", "member": member})
 	})

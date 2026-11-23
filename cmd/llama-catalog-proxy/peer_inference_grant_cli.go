@@ -27,19 +27,10 @@ func runPeerInferenceGrantCreate(args []string, stdout, stderr io.Writer) error 
 	if *nodeID == "" || (!*allowIncoming && !*routeOutgoing) || !*acknowledge {
 		return errors.New("--node-id, at least one inference direction, and --acknowledge are required")
 	}
-	return withPeerCLIAudit(*configPath, "inference_grant.create", *nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		members, grants, err := openConfiguredCatalogGrantStores(*configPath)
+	return withPeerGrantStores(*configPath, "inference_grant.create", *nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
+		member, err := lookupPairedMember(members, *nodeID, errors.New("inference access can only be granted to a currently paired identity"))
 		if err != nil {
 			return *nodeID, "", "", err
-		}
-		defer members.Close()
-		defer grants.Close()
-		member, paired, err := members.LookupMember(*nodeID)
-		if err != nil {
-			return *nodeID, "", "", err
-		}
-		if !paired {
-			return *nodeID, "", "", errors.New("inference access can only be granted to a currently paired identity")
 		}
 		grant, err := grants.GrantInference(member, *allowIncoming, *routeOutgoing, time.Now().UTC())
 		if err != nil {
@@ -55,13 +46,7 @@ func runPeerInferenceGrantList(args []string, stdout, stderr io.Writer) error {
 	if err := parsePeerFlags(flags, args); err != nil {
 		return err
 	}
-	return withPeerCLIAudit(*configPath, "inference_grant.list", "", "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		members, grants, err := openConfiguredCatalogGrantStores(*configPath)
-		if err != nil {
-			return "", "", "", err
-		}
-		defer members.Close()
-		defer grants.Close()
+	return withPeerGrantStores(*configPath, "inference_grant.list", "", stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
 		stored, err := grants.ListInferenceGrants()
 		if err != nil {
 			return "", "", "", err
@@ -91,17 +76,11 @@ func runPeerInferenceGrantRevoke(args []string, stdout, stderr io.Writer) error 
 	if *nodeID == "" || !*acknowledge {
 		return errors.New("--node-id and --acknowledge are required")
 	}
-	return withPeerCLIAudit(*configPath, "inference_grant.revoke", *nodeID, "", "", stdout, func(out io.Writer) (string, string, string, error) {
-		members, grants, err := openConfiguredCatalogGrantStores(*configPath)
-		if err != nil {
-			return *nodeID, "", "", err
-		}
-		defer members.Close()
-		defer grants.Close()
+	return withPeerGrantStores(*configPath, "inference_grant.revoke", *nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
 		if err := grants.RevokeInference(*nodeID); err != nil {
 			return *nodeID, "", "", err
 		}
-		_, err = io.WriteString(out, "inference grants revoked\n")
+		_, err := io.WriteString(out, "inference grants revoked\n")
 		return *nodeID, "", "", err
 	})
 }

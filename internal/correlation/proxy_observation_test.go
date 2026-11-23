@@ -809,18 +809,18 @@ func TestValidationHelpersNilZeroNaNInfNegative(t *testing.T) {
 		t.Fatal("copyPhase(NaN) should be nil")
 	}
 
-	// copyFiniteFloat shares the validPhase predicate.
-	if copyFiniteFloat(nilV) != nil {
-		t.Fatal("copyFiniteFloat(nil) should be nil")
+	// copyFiniteNonnegativeFloat uses the validFiniteNonnegativeFloat predicate.
+	if copyFiniteNonnegativeFloat(nilV) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(nil) should be nil")
 	}
-	if got := copyFiniteFloat(zeroV); got == nil || *got != 0.0 {
-		t.Fatal("copyFiniteFloat(zero) should preserve &0")
+	if got := copyFiniteNonnegativeFloat(zeroV); got == nil || *got != 0.0 {
+		t.Fatal("copyFiniteNonnegativeFloat(zero) should preserve &0")
 	}
-	if copyFiniteFloat(ptrF64(-1.0)) != nil {
-		t.Fatal("copyFiniteFloat(negative) should be nil")
+	if copyFiniteNonnegativeFloat(ptrF64(-1.0)) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(negative) should be nil")
 	}
-	if copyFiniteFloat(ptrF64(math.NaN())) != nil {
-		t.Fatal("copyFiniteFloat(NaN) should be nil")
+	if copyFiniteNonnegativeFloat(ptrF64(math.NaN())) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(NaN) should be nil")
 	}
 }
 

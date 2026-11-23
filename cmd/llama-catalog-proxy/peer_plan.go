@@ -41,28 +41,43 @@ func runPeerConfigPlan(args []string, stdout, stderr io.Writer) error {
 	if cfg.Peer == nil {
 		return errors.New("peer federation is not configured")
 	}
-	plan := peerConfigPlan{LocalNodeID: cfg.Peer.NodeID, FederationID: cfg.Peer.FederationID, Peers: []peerHandoffPlan{}}
-	ids := make([]string, 0, len(cfg.Peer.Peers))
-	for nodeID := range cfg.Peer.Peers {
+	plan := peerConfigPlan{
+		LocalNodeID: cfg.Peer.NodeID,
+		FederationID: cfg.Peer.FederationID,
+		Peers:       []peerHandoffPlan{},
+	}
+	for _, nodeID := range sortedPeerIDs(cfg.Peer.Peers) {
+		plan.Peers = append(plan.Peers, newPeerHandoffPlan(nodeID, cfg.Peer.Peers[nodeID], cfg.Peer.NodeID))
+	}
+	return json.NewEncoder(stdout).Encode(plan)
+}
+
+// sortedPeerIDs returns the peer node IDs from a grants map in ascending order.
+func sortedPeerIDs(peers map[string]config.PeerGrant) []string {
+	ids := make([]string, 0, len(peers))
+	for nodeID := range peers {
 		ids = append(ids, nodeID)
 	}
 	sort.Strings(ids)
-	for _, nodeID := range ids {
-		grant := cfg.Peer.Peers[nodeID]
-		plan.Peers = append(plan.Peers, peerHandoffPlan{
-			NodeID:                    nodeID,
-			OutboundURLConfigured:     grant.URL != "",
-			InboundTokenConfigured:    grant.Token != "",
-			OutboundTokenConfigured:   grant.OutboundToken != "",
-			OutboundCATrustConfigured: grant.CAFile != "",
-			OutboundCRLConfigured:     grant.CRLFile != "",
-			InboundScopes:             peerInboundScopes(grant),
-			OutboundScopes:            peerOutboundScopes(grant),
-			Direction:                 peerDirection(grant),
-			Handoff:                   peerHandoff(grant, cfg.Peer.NodeID),
-		})
+	return ids
+}
+
+// newPeerHandoffPlan builds a peerHandoffPlan for a single peer grant. nodeID
+// is the peer's identity (the map key); localNodeID is used to build the
+// conditional handoff messages.
+func newPeerHandoffPlan(nodeID string, grant config.PeerGrant, localNodeID string) peerHandoffPlan {
+	return peerHandoffPlan{
+		NodeID:                    nodeID,
+		OutboundURLConfigured:     grant.URL != "",
+		InboundTokenConfigured:    grant.Token != "",
+		OutboundTokenConfigured:   grant.OutboundToken != "",
+		OutboundCATrustConfigured: grant.CAFile != "",
+		OutboundCRLConfigured:     grant.CRLFile != "",
+		InboundScopes:             peerInboundScopes(grant),
+		OutboundScopes:            peerOutboundScopes(grant),
+		Direction:                 peerDirection(grant),
+		Handoff:                   peerHandoff(grant, localNodeID),
 	}
-	return json.NewEncoder(stdout).Encode(plan)
 }
 
 // peerInboundScopes returns the inbound scope list for a peer grant in the

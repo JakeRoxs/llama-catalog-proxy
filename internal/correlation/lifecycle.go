@@ -509,21 +509,7 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 // CheckRedirect policy, so this builder never enables following them.
 func buildLifecycleRequest(ctx context.Context, b *lifecycleBackendInfo) (*http.Request, error) {
 	u := b.url.JoinPath(lifecyclePath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	for key, value := range b.config.Headers {
-		if req.Header.Get(key) == "" {
-			req.Header.Set(key, value)
-		}
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
-	}
-	return req, nil
+	return newBackendJSONRequest(ctx, u.String(), b.config.Headers, b.config.APIKey)
 }
 
 // classifyLifecycleStatus maps an HTTP status to the backend state/reason and

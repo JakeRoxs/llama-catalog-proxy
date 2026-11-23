@@ -6,6 +6,8 @@ import (
 	"math"
 	"sort"
 	"time"
+
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/correlation"
 )
 
 type MetricStatistics struct {
@@ -176,70 +178,89 @@ func compareWorkload(baseline, candidate WorkloadResult) WorkloadComparison {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		baseStats := summarize(baseMetrics[name])
-		candidateStats := summarize(candidateMetrics[name])
-		var change *float64
-		if baseStats.Mean != nil && candidateStats.Mean != nil && *baseStats.Mean != 0 {
-			value := (*candidateStats.Mean - *baseStats.Mean) / *baseStats.Mean * 100
-			change = &value
-		}
-		out.Metrics = append(out.Metrics, MetricComparison{
-			Name:          name,
-			Baseline:      baseStats,
-			Candidate:     candidateStats,
-			ChangePercent: change,
-			Attribution:   metricAttribution(name),
-		})
+		out.Metrics = append(out.Metrics, compareMetric(name, baseMetrics[name], candidateMetrics[name]))
 	}
-	for side, samples := range [][]SampleResult{baseline.Samples, candidate.Samples} {
-		correctness := &out.Correctness.Baseline
-		failures := &out.Failures.Baseline
-		if side == 1 {
-			correctness = &out.Correctness.Candidate
-			failures = &out.Failures.Candidate
-		}
-		for _, sample := range samples {
-			switch sample.Correctness {
-			case CorrectnessPassed:
-				correctness.Passed++
-			case CorrectnessFailed:
-				correctness.Failed++
-			default:
-				correctness.NotEvaluated++
-			}
-			switch sample.Status {
-			case SampleFailed:
-				failures.FailedSamples++
-			case SampleCanceled:
-				failures.CanceledSamples++
-			}
-			for _, request := range sample.Requests {
-				if request.ProxyObservation == nil {
-					failures.UnknownTransport++
-					failures.UnknownGeneration++
-					continue
-				}
-				if request.ProxyObservation.TransportOutcome != "" && request.ProxyObservation.TransportOutcome != "returned" {
-					if request.ProxyObservation.TransportOutcome == "unknown" {
-						failures.UnknownTransport++
-					} else {
-						failures.IncompleteTransport++
-					}
-				} else if request.ProxyObservation.TransportOutcome == "" {
-					failures.UnknownTransport++
-				}
-				switch request.ProxyObservation.GenerationOutcome {
-				case "incomplete", "uninspected":
-					failures.IncompleteGeneration++
-				case "", "unknown":
-					failures.UnknownGeneration++
-				case "truncated":
-					failures.TruncatedGeneration++
-				}
-			}
-		}
-	}
+	compareCorrectness(&out.Correctness.Baseline, baseline.Samples)
+	compareCorrectness(&out.Correctness.Candidate, candidate.Samples)
+	compareFailures(&out.Failures.Baseline, baseline.Samples)
+	compareFailures(&out.Failures.Candidate, candidate.Samples)
 	return out
+}
+
+// compareMetric builds a single MetricComparison from baseline and candidate
+// sample values, preserving the change-percent calculation and attribution.
+func compareMetric(name string, baseValues, candidateValues []float64) MetricComparison {
+	baseStats := summarize(baseValues)
+	candidateStats := summarize(candidateValues)
+	var change *float64
+	if baseStats.Mean != nil && candidateStats.Mean != nil && *baseStats.Mean != 0 {
+		value := (*candidateStats.Mean - *baseStats.Mean) / *baseStats.Mean * 100
+		change = &value
+	}
+	return MetricComparison{
+		Name:          name,
+		Baseline:      baseStats,
+		Candidate:     candidateStats,
+		ChangePercent: change,
+		Attribution:   metricAttribution(name),
+	}
+}
+
+// compareCorrectness classifies every sample's correctness into the counts.
+func compareCorrectness(counts *CorrectnessCounts, samples []SampleResult) {
+	for _, sample := range samples {
+		switch sample.Correctness {
+		case CorrectnessPassed:
+			counts.Passed++
+		case CorrectnessFailed:
+			counts.Failed++
+		default:
+			counts.NotEvaluated++
+		}
+	}
+}
+
+// compareFailures classifies sample statuses and request transport/generation
+// outcomes into the failure counts.
+func compareFailures(counts *FailureCounts, samples []SampleResult) {
+	for _, sample := range samples {
+		switch sample.Status {
+		case SampleFailed:
+			counts.FailedSamples++
+		case SampleCanceled:
+			counts.CanceledSamples++
+		}
+		for _, request := range sample.Requests {
+			classifyRequestOutcome(request.ProxyObservation, counts)
+		}
+	}
+}
+
+// classifyRequestOutcome classifies a single request's transport and generation
+// outcomes. A nil observation is treated as unknown on both axes.
+func classifyRequestOutcome(observation *correlation.ProxyObservation, counts *FailureCounts) {
+	if observation == nil {
+		counts.UnknownTransport++
+		counts.UnknownGeneration++
+		return
+	}
+	if observation.TransportOutcome != "" && observation.TransportOutcome != "returned" {
+		if observation.TransportOutcome == "unknown" {
+			counts.UnknownTransport++
+		} else {
+			counts.IncompleteTransport++
+		}
+	} else if observation.TransportOutcome == "" {
+		counts.UnknownTransport++
+	}
+	switch observation.GenerationOutcome {
+	case "incomplete", "uninspected":
+		counts.IncompleteGeneration++
+	case "", "unknown":
+		counts.UnknownGeneration++
+	case "truncated":
+		counts.TruncatedGeneration++
+	}
 }
 
 func collectMetrics(samples []SampleResult) map[string][]float64 {

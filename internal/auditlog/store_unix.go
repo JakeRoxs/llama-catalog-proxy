@@ -271,59 +271,20 @@ func (s *Store) scan(now time.Time, prune bool) ([]Event, int64, error) {
 		return nil, 0, ErrUnavailable
 	}
 	cutoff := now.Add(-Retention + 24*time.Hour)
+	cutoffDay := time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, time.UTC)
 	var events []Event
 	var totalBytes int64
 	removed := false
 	for _, entry := range entries {
-		name := entry.Name()
-		if name == auditLockName {
-			continue
-		}
-		date, ok := parseAuditFilename(name)
-		if !ok || entry.IsDir() {
-			_ = directory.Close()
-			return nil, 0, ErrUnavailable
-		}
-		if date.Before(time.Date(cutoff.Year(), cutoff.Month(), cutoff.Day(), 0, 0, 0, 0, time.UTC)) {
-			if prune {
-				if err := s.root.Remove(name); err != nil {
-					_ = directory.Close()
-					return nil, 0, ErrUnavailable
-				}
-				removed = true
-			}
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 ||
-			info.Size() > MaxDayFileBytes || validateAuditFileOwner(info) != nil {
-			_ = directory.Close()
-			return nil, 0, ErrUnavailable
-		}
-		totalBytes += info.Size()
-		file, err := s.root.Open(name)
+		entryEvents, entryBytes, entryRemoved, err := s.scanEntry(entry, cutoffDay, prune)
 		if err != nil {
 			_ = directory.Close()
 			return nil, 0, ErrUnavailable
 		}
-		data, readErr := io.ReadAll(io.LimitReader(file, MaxDayFileBytes+1))
-		closeErr := file.Close()
-		if readErr != nil || closeErr != nil || len(data) > MaxDayFileBytes || (len(data) > 0 && data[len(data)-1] != '\n') {
-			_ = directory.Close()
-			return nil, 0, ErrUnavailable
-		}
-		for _, line := range bytes.Split(data, []byte{'\n'}) {
-			if len(line) == 0 {
-				continue
-			}
-			var event Event
-			decoder := json.NewDecoder(bytes.NewReader(line))
-			decoder.DisallowUnknownFields()
-			if decoder.Decode(&event) != nil || decoder.Decode(new(any)) != io.EOF || ValidateEvent(event) != nil || auditFilename(event.At) != name {
-				_ = directory.Close()
-				return nil, 0, ErrUnavailable
-			}
-			events = append(events, event)
+		events = append(events, entryEvents...)
+		totalBytes += entryBytes
+		if entryRemoved {
+			removed = true
 		}
 	}
 	if removed {
@@ -338,9 +299,88 @@ func (s *Store) scan(now time.Time, prune bool) ([]Event, int64, error) {
 	return events, totalBytes, nil
 }
 
-func auditEventCanAppend(events []Event, event Event) bool {
-	started := make(map[string]Event)
-	finished := make(map[string]bool)
+// scanEntry processes a single directory entry during scan: expiration/pruning,
+// metadata validation, file read, and strict event decoding.
+func (s *Store) scanEntry(entry os.DirEntry, cutoff time.Time, prune bool) ([]Event, int64, bool, error) {
+	name := entry.Name()
+	if name == auditLockName {
+		return nil, 0, false, nil
+	}
+	date, ok := parseAuditFilename(name)
+	if !ok || entry.IsDir() {
+		return nil, 0, false, ErrUnavailable
+	}
+	if date.Before(cutoff) {
+		if prune {
+			if err := s.root.Remove(name); err != nil {
+				return nil, 0, false, ErrUnavailable
+			}
+			return nil, 0, true, nil
+		}
+		return nil, 0, false, nil
+	}
+	info, err := entry.Info()
+	if err != nil || !validAuditDayFile(info) {
+		return nil, 0, false, ErrUnavailable
+	}
+	entryEvents, err := s.readAuditFile(entry)
+	if err != nil {
+		return nil, 0, false, ErrUnavailable
+	}
+	return entryEvents, info.Size(), false, nil
+}
+
+// readAuditFile opens, reads, and strictly decodes every event line of a day file.
+func (s *Store) readAuditFile(entry os.DirEntry) ([]Event, error) {
+	name := entry.Name()
+	file, err := s.root.Open(name)
+	if err != nil {
+		return nil, ErrUnavailable
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, MaxDayFileBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || len(data) > MaxDayFileBytes || (len(data) > 0 && data[len(data)-1] != '\n') {
+		return nil, ErrUnavailable
+	}
+	var events []Event
+	for _, line := range bytes.Split(data, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		event, err := decodeAuditLine(line, name)
+		if err != nil {
+			return nil, ErrUnavailable
+		}
+		events = append(events, event)
+	}
+	return events, nil
+}
+
+// decodeAuditLine strictly decodes a single JSONL event line and validates it.
+func decodeAuditLine(line []byte, name string) (Event, error) {
+	var event Event
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&event) != nil || decoder.Decode(new(any)) != io.EOF {
+		return Event{}, ErrUnavailable
+	}
+	if ValidateEvent(event) != nil || auditFilename(event.At) != name {
+		return Event{}, ErrUnavailable
+	}
+	return event, nil
+}
+
+// validAuditDayFile reports whether a day file's metadata is acceptable for scanning.
+func validAuditDayFile(info os.FileInfo) bool {
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > MaxDayFileBytes || validateAuditFileOwner(info) != nil {
+		return false
+	}
+	return true
+}
+
+func auditEventIndex(events []Event) (started map[string]Event, finished map[string]bool) {
+	started = make(map[string]Event)
+	finished = make(map[string]bool)
 	for _, existing := range events {
 		if existing.Phase == "started" {
 			started[existing.ID] = existing
@@ -348,39 +388,59 @@ func auditEventCanAppend(events []Event, event Event) bool {
 			finished[existing.ID] = true
 		}
 	}
+	return started, finished
+}
+
+func auditEventCanAppend(events []Event, event Event) bool {
+	started, finished := auditEventIndex(events)
 	switch event.Phase {
 	case "started":
-		for _, existing := range events {
-			if existing.ID == event.ID {
-				return false
-			}
-		}
-		pending := 0
-		for id := range started {
-			if !finished[id] {
-				pending++
-			}
-		}
-		return len(events)+pending+2 <= MaxEvents
+		return auditCanAppendStarted(events, event, started, finished)
 	case "event":
-		for _, existing := range events {
-			if existing.ID == event.ID {
-				return false
-			}
-		}
-		pending := 0
-		for id := range started {
-			if !finished[id] {
-				pending++
-			}
-		}
-		return len(events)+pending+1 <= MaxEvents
+		return auditCanAppendEvent(events, event, started, finished)
 	case "completed":
-		start, ok := started[event.ID]
-		return ok && !finished[event.ID] && sameAuditAction(start, event)
+		return auditCanAppendCompleted(events, event, started, finished)
 	default:
 		return false
 	}
+}
+
+func auditCanAppendStarted(events []Event, event Event, started map[string]Event, finished map[string]bool) bool {
+	for _, existing := range events {
+		if existing.ID == event.ID {
+			return false
+		}
+	}
+	pending := 0
+	for id := range started {
+		if !finished[id] {
+			pending++
+		}
+	}
+	return len(events)+pending+2 <= MaxEvents
+}
+
+func auditCanAppendEvent(events []Event, event Event, started map[string]Event, finished map[string]bool) bool {
+	for _, existing := range events {
+		if existing.ID == event.ID {
+			return false
+		}
+	}
+	pending := 0
+	for id := range started {
+		if !finished[id] {
+			pending++
+		}
+	}
+	return len(events)+pending+1 <= MaxEvents
+}
+
+func auditCanAppendCompleted(events []Event, event Event, started map[string]Event, finished map[string]bool) bool {
+	start, ok := started[event.ID]
+	if !ok || finished[event.ID] {
+		return false
+	}
+	return sameAuditAction(start, event)
 }
 
 func validAuditHistory(events []Event) bool {

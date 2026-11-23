@@ -523,6 +523,61 @@ func validateManagementJSON(data []byte) error {
 	return nil
 }
 
+// foldKey case-folds a JSON object key to its lowest folded form using
+// unicode.SimpleFold, matching the validator's duplicate-key detection
+// semantics. Iterating to a fixed point handles characters whose fold expands
+// and then refolds (e.g. the German sharp s).
+func foldKey(name string) string {
+	return strings.Map(func(r rune) rune {
+		lowestFolded := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < lowestFolded {
+				lowestFolded = next
+			}
+		}
+		return lowestFolded
+	}, name)
+}
+
+// readObject reads a JSON object, enforcing case-insensitive duplicate-key
+// detection and recursively reading each value. The closing delimiter is
+// consumed and its error returned.
+func readObject(decoder *json.Decoder, depth int) error {
+	keys := make(map[string]bool)
+	for decoder.More() {
+		key, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		name, ok := key.(string)
+		if !ok {
+			return errors.New("invalid object key")
+		}
+		folded := foldKey(name)
+		if keys[folded] {
+			return errors.New("duplicate object key")
+		}
+		keys[folded] = true
+		if err := readManagementJSONValue(decoder, depth+1); err != nil {
+			return err
+		}
+	}
+	_, err := decoder.Token()
+	return err
+}
+
+// readArray reads a JSON array by recursively reading each element. The closing
+// delimiter is consumed and its error returned.
+func readArray(decoder *json.Decoder, depth int) error {
+	for decoder.More() {
+		if err := readManagementJSONValue(decoder, depth+1); err != nil {
+			return err
+		}
+	}
+	_, err := decoder.Token()
+	return err
+}
+
 func readManagementJSONValue(decoder *json.Decoder, depth int) error {
 	if depth > 8 {
 		return errors.New("JSON nesting exceeds limit")
@@ -533,43 +588,9 @@ func readManagementJSONValue(decoder *json.Decoder, depth int) error {
 	}
 	switch token {
 	case json.Delim('{'):
-		keys := make(map[string]bool)
-		for decoder.More() {
-			key, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			name, ok := key.(string)
-			if !ok {
-				return errors.New("invalid object key")
-			}
-			folded := strings.Map(func(r rune) rune {
-				lowestFolded := r
-				for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
-					if next < lowestFolded {
-						lowestFolded = next
-					}
-				}
-				return lowestFolded
-			}, name)
-			if keys[folded] {
-				return errors.New("duplicate object key")
-			}
-			keys[folded] = true
-			if err := readManagementJSONValue(decoder, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
+		return readObject(decoder, depth)
 	case json.Delim('['):
-		for decoder.More() {
-			if err := readManagementJSONValue(decoder, depth+1); err != nil {
-				return err
-			}
-		}
-		_, err = decoder.Token()
-		return err
+		return readArray(decoder, depth)
 	}
 	return nil
 }

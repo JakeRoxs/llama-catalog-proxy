@@ -532,11 +532,7 @@ func indexBackendSnapshots(backendSnapshots []*diagnostics.Snapshot) (map[string
 	duplicateBackends := make(map[string]bool)
 	counts := make(map[string]int)
 	for _, snap := range backendSnapshots {
-		snapByBackend[snap.Backend] = snap
-		counts[snap.Backend]++
-		if counts[snap.Backend] > 1 {
-			duplicateBackends[snap.Backend] = true
-		}
+		diagnostics.IndexBackendSnapshot(snap, snapByBackend, counts, duplicateBackends)
 	}
 	return snapByBackend, duplicateBackends
 }
