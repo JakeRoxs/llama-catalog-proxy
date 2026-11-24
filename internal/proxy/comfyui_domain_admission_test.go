@@ -117,9 +117,9 @@ func TestComfyUIStartModelUsesComfyUILease(t *testing.T) {
 		path, state string
 		checks      int32
 	}{
-		{"/upstream/comfyui_auto/?_=1", "active", 1},
-		{"/upstream/comfyui_auto/?_=2", "active", 1},
-		{"/upstream/other/?_=3", "released", 2},
+		{"/upstream/comfyui_auto/?_=1", "active", 0},
+		{"/upstream/comfyui_auto/?_=2", "active", 0},
+		{"/upstream/other/?_=3", "released", 1},
 	} {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, tc.path, nil))
@@ -193,7 +193,7 @@ func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {
 	}
 }
 
-func TestComfyUIStartRetriesAfterTransientInitialReconciliationFailure(t *testing.T) {
+func TestCompetingStartRetriesAfterTransientInitialReconciliationFailure(t *testing.T) {
 	var verifications, starts atomic.Int32
 	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
 		if verifications.Add(1) == 1 {
@@ -216,13 +216,90 @@ func TestComfyUIStartRetriesAfterTransientInitialReconciliationFailure(t *testin
 
 	for i, wantStatus := range []int{http.StatusServiceUnavailable, http.StatusAccepted} {
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/comfyui_auto/?_=retry", nil))
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/other/?_=retry", nil))
 		if w.Code != wantStatus {
 			t.Fatalf("start attempt %d status=%d want=%d body=%q", i+1, w.Code, wantStatus, w.Body.String())
 		}
 	}
-	if starts.Load() != 1 || verifications.Load() != 2 || coordinator.snapshot().State != "active" {
+	if starts.Load() != 1 || verifications.Load() != 2 || coordinator.snapshot().State != "released" {
 		t.Fatalf("starts=%d verifications=%d state=%+v", starts.Load(), verifications.Load(), coordinator.snapshot())
+	}
+}
+
+func TestFirstComfyUIRunLetsSchedulerSwapBeforeCheckingVRAM(t *testing.T) {
+	var verifies, sends atomic.Int32
+	for _, endpoint := range []string{"/comfyui/prompt", "/comfyui/api/prompt"} {
+		t.Run(endpoint, func(t *testing.T) {
+			verifies.Store(0)
+			sends.Store(0)
+			c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+				verifies.Add(1)
+				return ComfyUIReleaseResult{FreeRequested: true}, ErrComfyUIReleaseUnknown
+			})
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				sends.Add(1)
+				if req.Method != http.MethodPost || req.URL.Path != endpoint || c.snapshot().State != "acquiring" {
+					t.Errorf("unexpected scheduler request %s %s, lease state=%+v", req.Method, req.URL.Path, c.snapshot())
+				}
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer backend.Close()
+			cfg := baseConfig(backend.URL)
+			cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+			h := newHandler(t, cfg).(*Handler)
+			admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.backendAdmission = admit
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, endpoint, nil))
+			if w.Code != http.StatusAccepted || sends.Load() != 1 || verifies.Load() != 0 || c.snapshot().State != "active" {
+				t.Fatalf("status=%d sends=%d checks=%d state=%+v", w.Code, sends.Load(), verifies.Load(), c.snapshot())
+			}
+		})
+	}
+}
+
+func TestComfyUIRunDoesNotBypassUnknownRelease(t *testing.T) {
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		return ComfyUIReleaseResult{FreeRequested: true}, ErrComfyUIReleaseUnknown
+	})
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default"); allowed {
+		t.Fatal("ambiguous release admitted a competing request")
+	}
+	if _, allowed := admit(httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", nil), "default"); allowed {
+		t.Fatal("ambiguous release admitted a prompt")
+	}
+	if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/upstream/comfyui_auto/?_=1", nil), "default"); allowed {
+		t.Fatal("ambiguous release admitted an explicit start")
+	}
+}
+
+func TestComfyUIRunCanAcquireAfterPreFreeProbeFailure(t *testing.T) {
+	checks := 0
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		checks++
+		return ComfyUIReleaseResult{}, ErrComfyUIReleaseUnknown
+	})
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default"); allowed {
+		t.Fatal("failed probe admitted a competing request")
+	}
+	done, allowed := admit(httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", nil), "default")
+	if !allowed || done == nil || checks != 1 || c.snapshot().State != "acquiring" {
+		t.Fatalf("allowed=%v checks=%d state=%+v", allowed, checks, c.snapshot())
+	}
+	done()
+	if _, allowed := admit(httptest.NewRequest(http.MethodPost, "/comfyui/api/prompt", nil), "default"); allowed {
+		t.Fatal("scheduler dispatch without activation reopened admission")
 	}
 }
 

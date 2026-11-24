@@ -63,23 +63,28 @@ func admitComfyUIDomainRequest(
 	if !validComfyUIBackend(comfyUIRequest, prompt, req, backendID, promptBackend) {
 		return nil, false
 	}
-	state, ok := ensureComfyUIAdmissionState(coordinator, req, releaseTimeout)
-	if !ok {
+	if prompt || isComfyUISchedulerStart(req) {
+		return admitComfyUISchedulerPrompt(coordinator, req, true)
+	}
+	if !ensureComfyUIAdmissionState(coordinator, req, releaseTimeout) {
 		return nil, false
 	}
 	if comfyUIRequest {
-		return admitComfyUIPrompt(coordinator, req, state)
+		return admitComfyUISchedulerPrompt(coordinator, req, false)
 	}
 	return admitCompetingModelRequest(coordinator, req, releaseTimeout)
 }
 
 func isComfyUIDomainRoute(req *http.Request) (bool, bool) {
 	// The llama-swap UI starts comfyui_auto through the generic model route.
-	comfyUIStart := req.Method == http.MethodGet && req.URL.Path == "/upstream/comfyui_auto/"
-	comfyUIRequest := comfyUIStart || isComfyUIPathRequest(req) ||
+	comfyUIRequest := isComfyUISchedulerStart(req) || isComfyUIPathRequest(req) ||
 		(isComfyUIFrontendRoot(req) && req.ContentLength <= 0 &&
 			(req.Body == nil || req.Body == http.NoBody) && len(req.TransferEncoding) == 0)
 	return comfyUIRequest, isLlamaSwapModelRequest(req)
+}
+
+func isComfyUISchedulerStart(req *http.Request) bool {
+	return req.Method == http.MethodGet && req.URL.Path == "/upstream/comfyui_auto/"
 }
 
 func validComfyUIBackend(comfyUIRequest, prompt bool, req *http.Request, backendID, promptBackend string) bool {
@@ -91,10 +96,9 @@ func validComfyUIBackend(comfyUIRequest, prompt bool, req *http.Request, backend
 
 func ensureComfyUIAdmissionState(
 	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration,
-) (comfyUICoordinatorStatus, bool) {
-	state := coordinator.snapshot()
-	if state.State != "unknown" {
-		return state, true
+) bool {
+	if coordinator.snapshot().State != "unknown" {
+		return true
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
 	_, err := coordinator.reconcileInitial(ctx)
@@ -102,17 +106,13 @@ func ensureComfyUIAdmissionState(
 	if errors.Is(err, errComfyUIServiceUnavailable) {
 		err = coordinator.assumeInitialStopped()
 	}
-	if err != nil {
-		return comfyUICoordinatorStatus{}, false
-	}
-	return coordinator.snapshot(), true
+	return err == nil
 }
 
-func admitComfyUIPrompt(
-	coordinator *comfyUICoordinator, req *http.Request, state comfyUICoordinatorStatus,
+func admitComfyUISchedulerPrompt(
+	coordinator *comfyUICoordinator, req *http.Request, initialAllowed bool,
 ) (func(), bool) {
-	firstPrompt := state.State == "released"
-	leaseID, done, err := coordinator.admitPrompt()
+	leaseID, done, firstPrompt, err := coordinator.admitSchedulerPrompt(initialAllowed)
 	if err == nil && firstPrompt {
 		ctx := context.WithValue(req.Context(), comfyUILeaseActivationContextKey{}, comfyUILeaseActivation{
 			coordinator: coordinator, leaseID: leaseID,

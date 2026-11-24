@@ -131,34 +131,38 @@ func assertStatusPollsRouteDirectly(t *testing.T, directReads, schedulerCalls *a
 	handler *Handler, token string, owner *Reloader, peerPathEndpoint string) {
 	endpoints := []string{"/queue", "/prompt", "/system_stats", "/api/queue", "/api/prompt",
 		"/api/system_stats", "/api/history/id", "/api/jobs?limit=20", "/api/jobs/id"}
-	for _, viaPeer := range []bool{false, true} {
-		for _, endpoint := range endpoints {
-			requestPath := "/comfyui" + endpoint
-			if viaPeer {
-				requestPath = peerPathEndpoint
-				if _, query, ok := strings.Cut(endpoint, "?"); ok {
-					requestPath += "?" + query
-				}
-			}
-			request := httptest.NewRequest(http.MethodGet, requestPath, nil)
-			request.Header.Set("Authorization", "Bearer "+token)
-			response := httptest.NewRecorder()
-			if viaPeer {
-				request.TLS = &tls.ConnectionState{}
-				endpointPath, _, _ := strings.Cut(endpoint, "?")
-				request.Header.Set(peerPathServiceHeader, "comfyui")
-				request.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte("/comfyui"+endpointPath)))
-				owner.PeerHandler().ServeHTTP(response, request)
-			} else {
-				handler.ServeHTTP(response, request)
-			}
-			if response.Code != http.StatusOK || response.Body.String() != endpoint {
-				t.Fatalf("peer=%v endpoint=%s: status=%d body=%q", viaPeer, endpoint, response.Code, response.Body.String())
-			}
-		}
+	for _, endpoint := range endpoints {
+		assertStatusPollRoute(t, false, endpoint, handler, token, owner, peerPathEndpoint)
+		assertStatusPollRoute(t, true, endpoint, handler, token, owner, peerPathEndpoint)
 	}
 	if directReads.Load() != 18 || schedulerCalls.Load() != 0 {
 		t.Fatalf("polling requests: direct=%d scheduler=%d", directReads.Load(), schedulerCalls.Load())
+	}
+}
+
+func assertStatusPollRoute(t *testing.T, viaPeer bool, endpoint string, handler *Handler, token string,
+	owner *Reloader, peerPathEndpoint string) {
+	requestPath := "/comfyui" + endpoint
+	endpointPath, query, _ := strings.Cut(endpoint, "?")
+	if viaPeer {
+		requestPath = peerPathEndpoint
+		if query != "" {
+			requestPath += "?" + query
+		}
+	}
+	request := httptest.NewRequest(http.MethodGet, requestPath, nil)
+	request.Header.Set("Authorization", "Bearer "+token)
+	response := httptest.NewRecorder()
+	if viaPeer {
+		request.TLS = &tls.ConnectionState{}
+		request.Header.Set(peerPathServiceHeader, "comfyui")
+		request.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte("/comfyui"+endpointPath)))
+		owner.PeerHandler().ServeHTTP(response, request)
+	} else {
+		handler.ServeHTTP(response, request)
+	}
+	if response.Code != http.StatusOK || response.Body.String() != endpoint {
+		t.Fatalf("peer=%v endpoint=%s: status=%d body=%q", viaPeer, endpoint, response.Code, response.Body.String())
 	}
 }
 
@@ -307,6 +311,10 @@ func TestLocalComfyUIResultReadsBypassSchedulerAndStripCallerCredentials(t *test
 		defaultBackend: "llama", pathRoutes: []route{{prefix: "/comfyui", backendID: "llama"}},
 		proxies: map[string]*httputil.ReverseProxy{"llama": httputil.NewSingleHostReverseProxy(llamaTarget)},
 	}
+	counters := resultReadCounters{
+		resultReads: &resultReads, llamaReads: &llamaReads, jobQueueProbes: &jobQueueProbes,
+		llamaQueueRequests: &llamaQueueRequests,
+	}
 	request := httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&subfolder=run&type=output", nil)
 	request.Header.Set("Authorization", "Bearer caller-secret")
 	request.Header.Set("Cookie", "session=caller-secret")
@@ -314,15 +322,17 @@ func TestLocalComfyUIResultReadsBypassSchedulerAndStripCallerCredentials(t *test
 	request.Header.Set("Range", "bytes=0-3")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	assertResultReadServed(t, response, &resultReads, &llamaReads, &jobQueueProbes,
-		http.StatusOK, "image", int32(1), int32(0), int32(0))
+	assertResultReadServed(t, response, counters, resultReadExpectation{
+		status: http.StatusOK, body: "image", resultReads: 1,
+	})
 
 	repeat := httptest.NewRecorder()
 	repeatRequest := httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&subfolder=run&type=output", nil)
 	repeatRequest.Header.Set("Range", "bytes=0-3")
 	handler.ServeHTTP(repeat, repeatRequest)
-	assertResultReadRepeated(t, repeat, &resultReads, &llamaReads, &jobQueueProbes,
-		http.StatusOK, int32(2), int32(0), int32(0))
+	assertResultReadRepeated(t, repeat, counters, resultReadExpectation{
+		status: http.StatusOK, resultReads: 2,
+	})
 
 	invalidWrite := httptest.NewRecorder()
 	handler.ServeHTTP(invalidWrite, httptest.NewRequest(http.MethodPost, "/comfyui/history/id", strings.NewReader("{}")))
@@ -330,8 +340,25 @@ func TestLocalComfyUIResultReadsBypassSchedulerAndStripCallerCredentials(t *test
 
 	otherRead := httptest.NewRecorder()
 	handler.ServeHTTP(otherRead, httptest.NewRequest(http.MethodGet, "/comfyui/other", nil))
-	assertNonResultFallsBackToLlama(t, otherRead, &llamaReads, &llamaQueueRequests, &jobQueueProbes,
-		http.StatusOK, int32(1), int32(0), int32(0))
+	assertNonResultFallsBackToLlama(t, otherRead, counters, resultReadExpectation{
+		status: http.StatusOK, llamaReads: 1,
+	})
+}
+
+type resultReadCounters struct {
+	resultReads        *atomic.Int32
+	llamaReads         *atomic.Int32
+	jobQueueProbes     *atomic.Int32
+	llamaQueueRequests *atomic.Int32
+}
+
+type resultReadExpectation struct {
+	status             int
+	body               string
+	resultReads        int32
+	llamaReads         int32
+	jobQueueProbes     int32
+	llamaQueueRequests int32
 }
 
 // assertResultReadServed verifies the initial result read: the body passes through
@@ -339,27 +366,26 @@ func TestLocalComfyUIResultReadsBypassSchedulerAndStripCallerCredentials(t *test
 // response, the result backend was contacted once with owner credentials and the
 // safe Range, and no llama-swap or job-queue activity is triggered.
 func assertResultReadServed(t *testing.T, response *httptest.ResponseRecorder,
-	resultReads, llamaReads, jobQueueProbes *atomic.Int32,
-	wantStatus int, wantBody string, wantResultReads, wantLlamaReads, wantJobQueueProbes int32) {
-	if response.Code != wantStatus || response.Body.String() != wantBody ||
+	counters resultReadCounters, want resultReadExpectation) {
+	if response.Code != want.status || response.Body.String() != want.body ||
 		response.Header().Get("Set-Cookie") != "" ||
 		response.Header().Get("Authorization") != "" ||
-		resultReads.Load() != wantResultReads || llamaReads.Load() != wantLlamaReads ||
-		jobQueueProbes.Load() != wantJobQueueProbes {
+		counters.resultReads.Load() != want.resultReads || counters.llamaReads.Load() != want.llamaReads ||
+		counters.jobQueueProbes.Load() != want.jobQueueProbes {
 		t.Fatalf("result-read response status=%d body=%q headers=%v result=%d llama=%d job_queue=%d",
-			response.Code, response.Body.String(), response.Header(), resultReads.Load(), llamaReads.Load(), jobQueueProbes.Load())
+			response.Code, response.Body.String(), response.Header(), counters.resultReads.Load(),
+			counters.llamaReads.Load(), counters.jobQueueProbes.Load())
 	}
 }
 
 // assertResultReadRepeated verifies a second result read reuses the cached result
 // (another backend read, no scheduler or job-queue activity).
 func assertResultReadRepeated(t *testing.T, response *httptest.ResponseRecorder,
-	resultReads, llamaReads, jobQueueProbes *atomic.Int32,
-	wantStatus int, wantResultReads, wantLlamaReads, wantJobQueueProbes int32) {
-	if response.Code != wantStatus || resultReads.Load() != wantResultReads ||
-		llamaReads.Load() != wantLlamaReads || jobQueueProbes.Load() != wantJobQueueProbes {
+	counters resultReadCounters, want resultReadExpectation) {
+	if response.Code != want.status || counters.resultReads.Load() != want.resultReads ||
+		counters.llamaReads.Load() != want.llamaReads || counters.jobQueueProbes.Load() != want.jobQueueProbes {
 		t.Fatalf("repeated result read acquired scheduler activity: status=%d result=%d llama=%d job_queue=%d",
-			response.Code, resultReads.Load(), llamaReads.Load(), jobQueueProbes.Load())
+			response.Code, counters.resultReads.Load(), counters.llamaReads.Load(), counters.jobQueueProbes.Load())
 	}
 }
 
@@ -375,12 +401,12 @@ func assertHistoryWriteRejected(t *testing.T, response *httptest.ResponseRecorde
 // assertNonResultFallsBackToLlama verifies a non-result path remains on llama-swap
 // (one llama read, no queue probing).
 func assertNonResultFallsBackToLlama(t *testing.T, response *httptest.ResponseRecorder,
-	llamaReads, llamaQueueRequests, jobQueueProbes *atomic.Int32,
-	wantStatus int, wantLlamaReads, wantLlamaQueueRequests, wantJobQueueProbes int32) {
-	if response.Code != wantStatus || llamaReads.Load() != wantLlamaReads ||
-		llamaQueueRequests.Load() != wantLlamaQueueRequests || jobQueueProbes.Load() != wantJobQueueProbes {
+	counters resultReadCounters, want resultReadExpectation) {
+	if response.Code != want.status || counters.llamaReads.Load() != want.llamaReads ||
+		counters.llamaQueueRequests.Load() != want.llamaQueueRequests ||
+		counters.jobQueueProbes.Load() != want.jobQueueProbes {
 		t.Fatalf("non-result path did not remain on llama-swap: status=%d llama=%d llama_queue=%d job_queue=%d",
-			response.Code, llamaReads.Load(), llamaQueueRequests.Load(), jobQueueProbes.Load())
+			response.Code, counters.llamaReads.Load(), counters.llamaQueueRequests.Load(), counters.jobQueueProbes.Load())
 	}
 }
 
@@ -446,18 +472,26 @@ func TestPeerComfyUIResultReadsHonorPathGrantAndKeepPromptRouteOnLlamaSwap(t *te
 	request.Header.Set("X-Caller-Secret", "frontend-secret")
 	response := httptest.NewRecorder()
 	requester.ServeHTTP(response, request)
-	assertPeerPathGrantedResultRead(t, response, &resultReads, &promptRequests,
-		http.StatusOK, true, "owned output", false, int32(0))
+	counters := peerReadCounters{resultReads: &resultReads, promptRequests: &promptRequests}
+	assertPeerResultRead(t, peerReadObservation{
+		status: response.Code, body: response.Body.String(), header: response.Header(),
+	}, counters, peerReadExpectation{
+		status: http.StatusOK, body: "owned output", checkBody: true, resultReads: 1,
+	})
 
 	write := httptest.NewRecorder()
 	requester.ServeHTTP(write, httptest.NewRequest(http.MethodPost, "/comfyui/history/prompt-id", strings.NewReader("body")))
-	assertPeerPathGrantedResultRead(t, write, &resultReads, &promptRequests,
-		http.StatusMethodNotAllowed, false, "", true, int32(0))
+	assertPeerResultRead(t, peerReadObservation{
+		status: write.Code, body: write.Body.String(), header: write.Header(),
+	}, counters, peerReadExpectation{
+		status: http.StatusMethodNotAllowed, resultReads: 1, checkPrompt: true,
+	})
 
 	hashView := httptest.NewRecorder()
 	requester.ServeHTTP(hashView, httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=blake3%3Aabc&type=output", nil))
-	assertPeerPathGrantedResultRead(t, hashView, &resultReads, &promptRequests,
-		http.StatusForbidden, false, "", false, int32(0))
+	assertPeerResultRead(t, peerReadObservation{
+		status: hashView.Code, body: hashView.Body.String(), header: hashView.Header(),
+	}, counters, peerReadExpectation{status: http.StatusForbidden, resultReads: 1})
 
 	prompt := httptest.NewRecorder()
 	requester.ServeHTTP(prompt, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(`{"prompt":{}}`)))
@@ -466,8 +500,9 @@ func TestPeerComfyUIResultReadsHonorPathGrantAndKeepPromptRouteOnLlamaSwap(t *te
 	ownerPeer.Peers["udms"] = config.PeerGrant{Token: requesterToken, PathAccess: []string{"unrelated-service"}}
 	unauthorized := httptest.NewRecorder()
 	requester.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&type=output", nil))
-	assertPeerPathGrantedResultRead(t, unauthorized, &resultReads, &promptRequests,
-		http.StatusForbidden, false, "", false, int32(0))
+	assertPeerResultRead(t, peerReadObservation{
+		status: unauthorized.Code, body: unauthorized.Body.String(), header: unauthorized.Header(),
+	}, counters, peerReadExpectation{status: http.StatusForbidden, resultReads: 1})
 
 	closePeerClients(map[string]*peerClient{"bigboi": peer})
 }
@@ -547,21 +582,63 @@ func TestPeerComfyUIResultReadsUseOwnerTargetAndKeepPromptOnLlamaSwap(t *testing
 	}
 	body, _ := io.ReadAll(response.Body)
 	_ = response.Body.Close()
-	assertPeerResultRead(t, response.StatusCode, string(body), response.Header, &resultReads, &fallbackRequests, &promptRequests, http.StatusOK, true, "owned output", true, int32(0), false, int32(0))
+	counters := peerReadCounters{
+		resultReads: &resultReads, fallbackRequests: &fallbackRequests, promptRequests: &promptRequests,
+	}
+	assertPeerResultRead(t, peerReadObservation{
+		status: response.StatusCode, body: string(body), header: response.Header,
+	}, counters, peerReadExpectation{
+		status: http.StatusOK, body: "owned output", checkBody: true, resultReads: 1,
+		checkFallback: true, fallbackRequests: 0,
+	})
 
 	writeResult := httptest.NewRecorder()
 	requester.ServeHTTP(writeResult, httptest.NewRequest(http.MethodPost, "/comfyui/history/id", strings.NewReader("body")))
-	assertPeerResultRead(t, writeResult.Code, writeResult.Body.String(), writeResult.Header(), &resultReads, &fallbackRequests, &promptRequests, http.StatusMethodNotAllowed, false, "", true, int32(0), false, int32(0))
+	assertPeerResultRead(t, peerReadObservation{
+		status: writeResult.Code, body: writeResult.Body.String(), header: writeResult.Header(),
+	}, counters, peerReadExpectation{
+		status: http.StatusMethodNotAllowed, resultReads: 1, checkFallback: true,
+	})
 
 	prompt := httptest.NewRecorder()
 	requester.ServeHTTP(prompt, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", strings.NewReader(`{"prompt":{}}`)))
-	assertPeerResultRead(t, prompt.Code, prompt.Body.String(), prompt.Header(), &resultReads, &fallbackRequests, &promptRequests, http.StatusOK, false, "", true, int32(1), true, int32(1))
+	assertPeerResultRead(t, peerReadObservation{
+		status: prompt.Code, body: prompt.Body.String(), header: prompt.Header(),
+	}, counters, peerReadExpectation{
+		status: http.StatusOK, resultReads: 1, checkFallback: true, fallbackRequests: 1,
+		checkPrompt: true, promptRequests: 1,
+	})
 
 	ownerPeer.Peers["udms"] = config.PeerGrant{Token: requesterToken, PathAccess: []string{"unrelated-service"}}
 	unauthorized := httptest.NewRecorder()
 	requester.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&type=output", nil))
-	assertPeerResultRead(t, unauthorized.Code, unauthorized.Body.String(), unauthorized.Header(), &resultReads, &fallbackRequests, &promptRequests, http.StatusForbidden, false, "", false, int32(0), false, int32(0))
+	assertPeerResultRead(t, peerReadObservation{
+		status: unauthorized.Code, body: unauthorized.Body.String(), header: unauthorized.Header(),
+	}, counters, peerReadExpectation{status: http.StatusForbidden, resultReads: 1})
 	closePeerClients(map[string]*peerClient{"bigboi": outbound})
+}
+
+type peerReadCounters struct {
+	resultReads      *atomic.Int32
+	fallbackRequests *atomic.Int32
+	promptRequests   *atomic.Int32
+}
+
+type peerReadObservation struct {
+	status int
+	body   string
+	header http.Header
+}
+
+type peerReadExpectation struct {
+	status           int
+	body             string
+	checkBody        bool
+	resultReads      int32
+	checkFallback    bool
+	fallbackRequests int32
+	checkPrompt      bool
+	promptRequests   int32
 }
 
 // assertPeerResultRead verifies a federated result-read response reached the
@@ -570,34 +647,23 @@ func TestPeerComfyUIResultReadsUseOwnerTargetAndKeepPromptOnLlamaSwap(t *testing
 // (body, fallback, prompt) are gated so the same helper covers the initial
 // read, the write allowlist, the llama-swap prompt route, and the revoked-grant
 // denial without adding control flow to the test function.
-func assertPeerResultRead(t *testing.T, status int, body string, header http.Header,
-	resultReads, fallbackRequests, promptRequests *atomic.Int32,
-	wantStatus int, checkBody bool, wantBody string, checkFallback bool, wantFallback int32, checkPrompt bool, wantPrompt int32) {
-	if status != wantStatus || (checkBody && body != wantBody) ||
-		header.Get("Set-Cookie") != "" ||
-		resultReads.Load() != 1 || (checkFallback && fallbackRequests.Load() != wantFallback) ||
-		(checkPrompt && promptRequests.Load() != wantPrompt) {
+func assertPeerResultRead(t *testing.T, response peerReadObservation,
+	counters peerReadCounters, want peerReadExpectation) {
+	if response.status != want.status || (want.checkBody && response.body != want.body) ||
+		response.header.Get("Set-Cookie") != "" || counters.resultReads.Load() != want.resultReads ||
+		(want.checkFallback && counters.fallbackRequests.Load() != want.fallbackRequests) ||
+		(want.checkPrompt && counters.promptRequests.Load() != want.promptRequests) {
 		t.Fatalf("peer result read status=%d body=%q result=%d fallback=%d prompt=%d",
-			status, body, resultReads.Load(), fallbackRequests.Load(), promptRequests.Load())
+			response.status, response.body, counters.resultReads.Load(),
+			counterValue(counters.fallbackRequests), counterValue(counters.promptRequests))
 	}
 }
 
-// assertPeerPathGrantedResultRead verifies a federated result read reached the
-// owner result backend through a granted peer path, that no Set-Cookie (caller
-// credentials) leaked in the response, and that the result and prompt counters
-// match expectations. Optional checks (body, prompt) are gated so the same
-// helper covers the initial path-granted read, the write allowlist, the
-// identity-boundary denial, and the revoked-grant denial without adding control
-// flow to the test function.
-func assertPeerPathGrantedResultRead(t *testing.T, response *httptest.ResponseRecorder,
-	resultReads, promptRequests *atomic.Int32,
-	wantStatus int, checkBody bool, wantBody string, checkPrompt bool, wantPrompt int32) {
-	if response.Code != wantStatus || (checkBody && response.Body.String() != wantBody) ||
-		response.Header().Get("Set-Cookie") != "" ||
-		resultReads.Load() != 1 || (checkPrompt && promptRequests.Load() != wantPrompt) {
-		t.Fatalf("peer path-granted result read status=%d body=%q result=%d prompt=%d",
-			response.Code, response.Body.String(), resultReads.Load(), promptRequests.Load())
+func counterValue(counter *atomic.Int32) int32 {
+	if counter == nil {
+		return 0
 	}
+	return counter.Load()
 }
 
 // assertPeerPromptFallback verifies a prompt request remains routed through

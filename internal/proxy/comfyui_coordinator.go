@@ -50,6 +50,7 @@ func (c *comfyUICoordinator) blockAdmission() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.status.State, c.status.LeaseID = "unknown", ""
+	c.initialReconcile = false
 	c.receipt = ComfyUIReleaseResult{}
 	if c.cancel != nil {
 		c.cancel()
@@ -60,17 +61,20 @@ func (c *comfyUICoordinator) blockAdmission() {
 // Reconciliation is explicit: constructing the coordinator never invokes /free.
 // The eventual owner must establish external exclusivity before calling this.
 func (c *comfyUICoordinator) reconcile(ctx context.Context) (ComfyUIReleaseResult, error) {
-	c.mu.Lock()
-	c.initialReconcile = false
-	c.mu.Unlock()
+	return c.reconcileWithMode(ctx, false)
+}
+
+func (c *comfyUICoordinator) reconcileWithMode(ctx context.Context, initialOnly bool) (ComfyUIReleaseResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ComfyUIReleaseResult{State: "unknown"}, err
 	}
 	c.mu.Lock()
-	if c.status.State != "unknown" || c.verifying || c.status.Submissions != 0 || c.status.Competing != 0 || c.verify == nil {
+	if (initialOnly && !c.initialReconcile) || c.status.State != "unknown" ||
+		c.verifying || c.status.Submissions != 0 || c.status.Competing != 0 || c.verify == nil {
 		c.mu.Unlock()
 		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIAdmissionBlocked
 	}
+	c.initialReconcile = false
 	operationCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c.cancel, c.verifying = cancel, true
@@ -83,14 +87,7 @@ func (c *comfyUICoordinator) reconcile(ctx context.Context) (ComfyUIReleaseResul
 // reconcileInitial permits request-triggered startup verification. Failed
 // checks may be retried only when they prove /free was not requested.
 func (c *comfyUICoordinator) reconcileInitial(ctx context.Context) (ComfyUIReleaseResult, error) {
-	c.mu.Lock()
-	if !c.initialReconcile {
-		c.mu.Unlock()
-		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIAdmissionBlocked
-	}
-	c.initialReconcile = false
-	c.mu.Unlock()
-	return c.reconcile(ctx)
+	return c.reconcileWithMode(ctx, true)
 }
 
 // assumeInitialStopped records the narrow best-effort case where the first
@@ -135,6 +132,10 @@ func (c *comfyUICoordinator) beginLeaseLocked() (string, error) {
 	if c.status.State != "released" || c.verifying || c.status.Competing != 0 || c.status.Submissions != 0 {
 		return "", errComfyUIAdmissionBlocked
 	}
+	return c.openLeaseLocked()
+}
+
+func (c *comfyUICoordinator) openLeaseLocked() (string, error) {
 	var secret [16]byte
 	if _, err := rand.Read(secret[:]); err != nil {
 		c.status.State = "unknown"
@@ -152,22 +153,38 @@ func (c *comfyUICoordinator) beginLeaseLocked() (string, error) {
 // admitPrompt creates and reserves the first lease in one critical section.
 // Only the first prompt may enter while its helper is still acquiring.
 func (c *comfyUICoordinator) admitPrompt() (string, func(), error) {
+	id, done, _, err := c.admitSchedulerPrompt(false)
+	return id, done, err
+}
+
+// An explicit scheduler request can perform the initial swap itself. This
+// does not assert that the GPU is released or unlock competing admission.
+func (c *comfyUICoordinator) admitSchedulerPrompt(initialAllowed bool) (string, func(), bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if initialAllowed && c.initialReconcile && c.status.State == "unknown" &&
+		!c.verifying && c.status.Submissions == 0 && c.status.Competing == 0 {
+		c.initialReconcile = false
+		id, err := c.openLeaseLocked()
+		if err != nil {
+			return "", nil, false, err
+		}
+		return id, c.reserveSubmissionLocked(id, true), true, nil
+	}
 	switch c.status.State {
 	case "released":
 		id, err := c.beginLeaseLocked()
 		if err != nil {
-			return "", nil, err
+			return "", nil, false, err
 		}
-		return id, c.reserveSubmissionLocked(id, true), nil
+		return id, c.reserveSubmissionLocked(id, true), true, nil
 	case "active":
 		if c.status.Submissions < 128 {
 			id := c.status.LeaseID
-			return id, c.reserveSubmissionLocked(id, false), nil
+			return id, c.reserveSubmissionLocked(id, false), false, nil
 		}
 	}
-	return "", nil, errComfyUIAdmissionBlocked
+	return "", nil, false, errComfyUIAdmissionBlocked
 }
 
 func (c *comfyUICoordinator) activate(leaseID string) error {
@@ -333,10 +350,11 @@ func (c *comfyUICoordinator) finishVerification(ctx context.Context, expectedSta
 	}
 	c.verifying, c.cancel = false, nil
 	if err != nil {
+		mayRetry := c.status.State == "reconciling" && expectedState == "reconciling" &&
+			!result.FreeRequested && !errors.Is(err, errComfyUIServiceUnavailable)
 		c.status.State = "unknown"
 		c.receipt = ComfyUIReleaseResult{}
-		if expectedState == "reconciling" && !result.FreeRequested &&
-			!errors.Is(err, errComfyUIServiceUnavailable) {
+		if mayRetry {
 			// The initial probe failed before /free could be sent. Allow a later
 			// request to retry after a transient connection or queue failure.
 			c.initialReconcile = true

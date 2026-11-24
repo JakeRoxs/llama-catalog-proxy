@@ -1419,10 +1419,16 @@ command does not stop ComfyUI or wire itself into llama-swap.
 
 When `admission_backends` is configured, the coordinator is wired into common owner-side backend
 dispatch, including authorized peer inference/path forwarding. It starts in `unknown`, verifies release
-before admission, assigns opaque lease IDs, and drains submitted HTTP requests before invoking the
+before competing admission, assigns opaque lease IDs, and drains submitted HTTP requests before invoking the
 queue/VRAM verifier. A successful first ComfyUI prompt response activates its lease; ambiguous starts
 leave admission unknown. Competing requests reserve the released domain while being forwarded. This
 process-local state is reset to unknown on proxy restart or config reload; it is not durable recovery.
+
+An explicit ComfyUI prompt or the llama-swap UI's `GET /upstream/comfyui_auto/` can acquire the
+initial lease without checking free VRAM first. These requests still go to llama-swap so it can
+evict a resident model before forwarding to ComfyUI. This does not reopen admission after an
+ambiguous `/free` or a failed scheduler handoff. Keep `/comfyui` pointed at the scheduler,
+not at the direct ComfyUI origin, for this GPU-sharing setup.
 
 The separate Linux private Unix-socket transport is implemented and tested but is not started by the application
 and has no configuration/CLI binding. It requires an existing owner-only directory, creates a
