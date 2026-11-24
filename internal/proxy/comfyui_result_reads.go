@@ -495,8 +495,20 @@ func validateComfyUIViewQueryValues(query url.Values) (string, int, string) {
 				return "", http.StatusBadRequest, "invalid ComfyUI output subfolder"
 			}
 		case "type":
-			if value != "" && value != "output" {
-				return "", http.StatusForbidden, "ComfyUI result reads are limited to output files"
+			if !validComfyUIViewType(value) {
+				return "", http.StatusForbidden, "unsupported ComfyUI result file type"
+			}
+		case "preview":
+			if !validComfyUIViewPreview(value) {
+				return "", http.StatusBadRequest, "invalid ComfyUI image preview format"
+			}
+		case "rand":
+			if !validComfyUIViewCacheBuster(value) {
+				return "", http.StatusBadRequest, "invalid ComfyUI image cache buster"
+			}
+		case "channel":
+			if value != "rgba" && value != "rgb" && value != "a" {
+				return "", http.StatusBadRequest, "invalid ComfyUI image channel"
 			}
 		}
 	}
@@ -509,7 +521,42 @@ func validComfyUIOutputFilename(filename string) bool {
 }
 
 func validComfyUIViewKey(key string) bool {
-	return key == "filename" || key == "subfolder" || key == "type" || key == "format"
+	// The ComfyUI frontend adds preview-format and cache-busting parameters to
+	// /view requests; keep the allowlist aligned with those image URLs.
+	switch key {
+	case "filename", "subfolder", "type", "format", "preview", "rand", "channel":
+		return true
+	default:
+		return false
+	}
+}
+
+func validComfyUIViewType(value string) bool {
+	return value == "" || value == "input" || value == "output" || value == "temp"
+}
+
+func validComfyUIViewPreview(value string) bool {
+	format, quality, hasQuality := strings.Cut(value, ";")
+	if format != "webp" && format != "jpeg" {
+		return false
+	}
+	if !hasQuality {
+		return true
+	}
+	number, err := strconv.Atoi(quality)
+	return err == nil && number >= 1 && number <= 100
+}
+
+func validComfyUIViewCacheBuster(value string) bool {
+	if value == "" || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= '0' && character <= '9') && character != '.' && character != '-' && character != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func validComfyUIOutputSubfolder(value string) bool {

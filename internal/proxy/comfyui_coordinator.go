@@ -80,8 +80,8 @@ func (c *comfyUICoordinator) reconcile(ctx context.Context) (ComfyUIReleaseResul
 	return c.finishVerification(operationCtx, "reconciling")
 }
 
-// reconcileInitial permits one request-triggered startup verification. An
-// ambiguous release must not cause a later request to issue /free again.
+// reconcileInitial permits request-triggered startup verification. Failed
+// checks may be retried only when they prove /free was not requested.
 func (c *comfyUICoordinator) reconcileInitial(ctx context.Context) (ComfyUIReleaseResult, error) {
 	c.mu.Lock()
 	if !c.initialReconcile {
@@ -335,6 +335,12 @@ func (c *comfyUICoordinator) finishVerification(ctx context.Context, expectedSta
 	if err != nil {
 		c.status.State = "unknown"
 		c.receipt = ComfyUIReleaseResult{}
+		if expectedState == "reconciling" && !result.FreeRequested &&
+			!errors.Is(err, errComfyUIServiceUnavailable) {
+			// The initial probe failed before /free could be sent. Allow a later
+			// request to retry after a transient connection or queue failure.
+			c.initialReconcile = true
+		}
 		c.signalLocked()
 		return ComfyUIReleaseResult{State: "unknown"}, errors.Join(ErrComfyUIReleaseUnknown, err)
 	}

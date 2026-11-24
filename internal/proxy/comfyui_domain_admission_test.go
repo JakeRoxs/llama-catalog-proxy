@@ -193,6 +193,39 @@ func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {
 	}
 }
 
+func TestComfyUIStartRetriesAfterTransientInitialReconciliationFailure(t *testing.T) {
+	var verifications, starts atomic.Int32
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		if verifications.Add(1) == 1 {
+			return ComfyUIReleaseResult{State: "unknown"}, errors.New("temporary queue probe failure")
+		}
+		return confirmedCoordinatorEvidence(), nil
+	})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		starts.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+
+	h := newHandler(t, baseConfig(backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(coordinator, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+
+	for i, wantStatus := range []int{http.StatusServiceUnavailable, http.StatusAccepted} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/comfyui_auto/?_=retry", nil))
+		if w.Code != wantStatus {
+			t.Fatalf("start attempt %d status=%d want=%d body=%q", i+1, w.Code, wantStatus, w.Body.String())
+		}
+	}
+	if starts.Load() != 1 || verifications.Load() != 2 || coordinator.snapshot().State != "active" {
+		t.Fatalf("starts=%d verifications=%d state=%+v", starts.Load(), verifications.Load(), coordinator.snapshot())
+	}
+}
+
 func TestLlamaSwapModelStartRecoversWhenActiveComfyUIIsStopped(t *testing.T) {
 	var verifications, schedulerCalls atomic.Int32
 	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {

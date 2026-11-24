@@ -32,6 +32,9 @@ func TestValidateComfyUIResultReadAllowlist(t *testing.T) {
 		{"API stats alias", httptest.NewRequest(http.MethodGet, "/comfyui/api/system_stats", nil), true, 0},
 		{"API history alias", httptest.NewRequest(http.MethodGet, "/comfyui/api/history/id", nil), true, 0},
 		{"API view alias", httptest.NewRequest(http.MethodGet, "/comfyui/api/view?filename=output.png", nil), true, 0},
+		{"view input image", httptest.NewRequest(http.MethodGet, "/comfyui/api/view?filename=input.png&type=input", nil), true, 0},
+		{"view temporary preview", httptest.NewRequest(http.MethodGet, "/comfyui/api/view?filename=preview.png&type=temp", nil), true, 0},
+		{"view frontend preview parameters", httptest.NewRequest(http.MethodGet, "/comfyui/api/view?filename=output.png&type=output&preview=webp%3B90&rand=0.123&channel=rgba", nil), true, 0},
 		{"history offset", httptest.NewRequest(http.MethodGet, "/comfyui/api/history?max_items=20&offset=-1", nil), true, 0},
 		{"jobs status", httptest.NewRequest(http.MethodGet, "/comfyui/api/jobs?status=completed,failed&limit=20&offset=0&sort_by=created_at&sort_order=desc", nil), true, 0},
 		{"job item", httptest.NewRequest(http.MethodGet, "/comfyui/api/jobs/prompt-id", nil), true, 0},
@@ -54,7 +57,9 @@ func TestValidateComfyUIResultReadAllowlist(t *testing.T) {
 		{"invalid history ID rejected", httptest.NewRequest(http.MethodGet, "/comfyui/history/../queue", nil), true, http.StatusBadRequest},
 		{"nested history ID rejected", httptest.NewRequest(http.MethodGet, "/comfyui/history/id/child", nil), true, http.StatusNotFound},
 		{"encoded slash rejected", httptest.NewRequest(http.MethodGet, "/comfyui/history%2Fid", nil), true, http.StatusBadRequest},
-		{"view input files denied", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=input.png&type=input", nil), true, http.StatusForbidden},
+		{"unsupported view type denied", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=secret.png&type=models", nil), true, http.StatusForbidden},
+		{"unsupported preview format rejected", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&preview=html", nil), true, http.StatusBadRequest},
+		{"invalid cache buster rejected", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&rand=../../secret", nil), true, http.StatusBadRequest},
 		{"peer hash filename denied", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=blake3%3Aabc&type=output", nil), true, http.StatusForbidden},
 		{"view traversal rejected", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=..%2Fsecret.png", nil), true, http.StatusBadRequest},
 		{"unknown view query rejected", httptest.NewRequest(http.MethodGet, "/comfyui/view?filename=output.png&user_id=other", nil), true, http.StatusBadRequest},
@@ -202,6 +207,50 @@ func assertMutationsScheduled(t *testing.T, directReads, schedulerCalls *atomic.
 	}
 	if schedulerCalls.Load() != 6 || directReads.Load() != 18 {
 		t.Fatalf("mutation routing: direct=%d scheduler=%d", directReads.Load(), schedulerCalls.Load())
+	}
+}
+
+func TestComfyUIViewRoutesFrontendInputAndOutputImages(t *testing.T) {
+	requests := make(chan string, 3)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests <- req.URL.RequestURI()
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = io.WriteString(w, "image")
+	}))
+	defer backend.Close()
+
+	resultProxy, err := newComfyUIResultReadProxy(&config.ComfyUIResultReadConfig{URL: backend.URL}, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handler{
+		logger: discardLogger(), comfyUIResultReadProxy: resultProxy, comfyUIResultSlots: make(chan struct{}, 1),
+	}
+	for _, test := range []struct {
+		requestURI string
+		wantURI    string
+	}{
+		{
+			"/comfyui/api/view?filename=marinara-ref.png&type=input&preview=webp%3B90&rand=0.123",
+			"/api/view?filename=marinara-ref.png&type=input&preview=webp%3B90&rand=0.123",
+		},
+		{
+			"/comfyui/api/view?filename=ComfyUI_00001_.png&subfolder=&type=output&preview=webp%3B90&rand=0.456",
+			"/api/view?filename=ComfyUI_00001_.png&subfolder=&type=output&preview=webp%3B90&rand=0.456",
+		},
+		{
+			"/comfyui/api/view?filename=ComfyUI_temp_12345.png&type=temp&rand=0.789",
+			"/api/view?filename=ComfyUI_temp_12345.png&type=temp&rand=0.789",
+		},
+	} {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, test.requestURI, nil))
+		if response.Code != http.StatusOK || response.Body.String() != "image" {
+			t.Fatalf("GET %s status=%d body=%q", test.requestURI, response.Code, response.Body.String())
+		}
+		if got := <-requests; got != test.wantURI {
+			t.Errorf("upstream request URI=%q want=%q", got, test.wantURI)
+		}
 	}
 }
 
