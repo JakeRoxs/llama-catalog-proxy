@@ -102,6 +102,7 @@ type Handler struct {
 	catalog                    *catalog.Service
 	proxies                    map[string]*httputil.ReverseProxy
 	backendAdmission           func(*http.Request, string) (release func(), allowed bool)
+	backendAdmissionStatus     func() comfyUICoordinatorStatus
 	defaultBackend             string
 	modelRoutes                []route
 	pathRoutes                 []route
@@ -170,6 +171,7 @@ type handlerDependencies struct {
 	comfyUIResultReadProxy *httputil.ReverseProxy
 	comfyUIResultReadProbe func(context.Context) error
 	backendAdmission       func(*http.Request, string) (func(), bool)
+	backendAdmissionStatus func() comfyUICoordinatorStatus
 }
 
 func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (http.Handler, error) {
@@ -213,6 +215,7 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 		}
 	}
 	var backendAdmission func(*http.Request, string) (func(), bool)
+	var backendAdmissionStatus func() comfyUICoordinatorStatus
 	if cfg.Peer != nil && cfg.Peer.ComfyUILease != nil && len(cfg.Peer.ComfyUILease.AdmissionBackends) > 0 {
 		releaseClient := &http.Client{
 			Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
@@ -233,6 +236,7 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 		coordinator := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
 			return VerifyComfyUIRelease(ctx, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
 		})
+		backendAdmissionStatus = coordinator.snapshot
 		backendAdmission, err = newComfyUIDomainAdmission(coordinator,
 			cfg.Peer.ComfyUILease.AdmissionBackends, cfg.PathRoutes[comfyUIPathPrefix],
 			cfg.Peer.ComfyUILease.ReleaseTimeoutDuration())
@@ -245,6 +249,7 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs, comfyUIResultReadProxy: resultReadProxy,
 		comfyUIResultReadProbe: resultReadProbe,
 		backendAdmission:       backendAdmission,
+		backendAdmissionStatus: backendAdmissionStatus,
 	}, nil
 }
 
@@ -364,6 +369,7 @@ func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagno
 		catalog:                dependencies.catalog,
 		proxies:                dependencies.proxies,
 		backendAdmission:       dependencies.backendAdmission,
+		backendAdmissionStatus: dependencies.backendAdmissionStatus,
 		defaultBackend:         cfg.DefaultBackend,
 		modelRoutes:            dependencies.modelRoutes,
 		pathRoutes:             dependencies.pathRoutes,
@@ -691,6 +697,26 @@ func (h *Handler) dispatchBackend(w http.ResponseWriter, req *http.Request, back
 			defer release()
 		}
 		if !allowed {
+			if h.backendAdmissionStatus != nil {
+				state := h.backendAdmissionStatus()
+				h.logger.Warn("backend admission denied",
+					"request_id", requestIDFromContext(req.Context()),
+					"backend_id", backendID,
+					"method", req.Method,
+					"path", req.URL.Path,
+					"admission_state", state.State,
+					"lease_id_present", state.LeaseID != "",
+					"submissions", state.Submissions,
+					"competing", state.Competing,
+				)
+			} else {
+				h.logger.Warn("backend admission denied",
+					"request_id", requestIDFromContext(req.Context()),
+					"backend_id", backendID,
+					"method", req.Method,
+					"path", req.URL.Path,
+				)
+			}
 			writeJSONError(h.logger, w, http.StatusServiceUnavailable, "backend admission blocked")
 			return
 		}
