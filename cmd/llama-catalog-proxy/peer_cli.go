@@ -589,17 +589,28 @@ func loadJoinTLSMaterial(cfg *config.Config) (tls.Certificate, *x509.CertPool, [
 	return certificate, roots, crls, nil
 }
 
+// peerJoinRequest contains the values passed to the pairing handshake.
+type peerJoinRequest struct {
+	targetURL      string
+	expectedNodeID string
+	invitationCode string
+	certificate    tls.Certificate
+	roots          *x509.CertPool
+	crls           []*x509.RevocationList
+	maxCRLAge      time.Duration
+}
+
 // joinPeer performs the pairing join against the target endpoint. It wraps any
 // JoinExpected failure with the "pairing failed" prefix so callers see a stable
 // error string.
-func joinPeer(ctx context.Context, store *federation.PairingStore, targetURL string, expectedNodeID, invitationCode string, certificate tls.Certificate, roots *x509.CertPool, crls []*x509.RevocationList, maxCRLAge time.Duration) (federation.Membership, error) {
-	member, err := store.JoinExpected(ctx, targetURL, federation.JoinExpectedOptions{
-		ExpectedNodeID: expectedNodeID,
-		Code:           invitationCode,
-		Certificate:    certificate,
-		Roots:          roots,
-		CRLs:           crls,
-		MaxCRLAge:      maxCRLAge,
+func joinPeer(ctx context.Context, store *federation.PairingStore, request peerJoinRequest) (federation.Membership, error) {
+	member, err := store.JoinExpected(ctx, request.targetURL, federation.JoinExpectedOptions{
+		ExpectedNodeID: request.expectedNodeID,
+		Code:           request.invitationCode,
+		Certificate:    request.certificate,
+		Roots:          request.roots,
+		CRLs:           request.crls,
+		MaxCRLAge:      request.maxCRLAge,
 	})
 	if err != nil {
 		return federation.Membership{}, fmt.Errorf("pairing failed: %w", err)
@@ -639,7 +650,11 @@ func runPeerJoin(args []string, stdout, stderr io.Writer) error {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 		defer cancel()
-		member, err := joinPeer(ctx, store, targetURL, options.expectedNodeID, code, certificate, roots, crls, cfg.Peer.RevocationMaxAge())
+		member, err := joinPeer(ctx, store, peerJoinRequest{
+			targetURL: targetURL, expectedNodeID: options.expectedNodeID,
+			invitationCode: code, certificate: certificate, roots: roots,
+			crls: crls, maxCRLAge: cfg.Peer.RevocationMaxAge(),
+		})
 		if err != nil {
 			return "", "", "", err
 		}

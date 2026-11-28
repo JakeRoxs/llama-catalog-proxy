@@ -18,26 +18,20 @@ type peerCatalogGrantView struct {
 }
 
 func runPeerCatalogGrantCreate(args []string, stdout, stderr io.Writer) error {
-	flags := peerFlags("peer catalog-grants create", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, configPathHelpText)
-	nodeID := flags.String("node-id", "", "paired node identity to grant catalog read")
-	acknowledge := flags.Bool("acknowledge", false, "confirm this catalog authorization change")
-	if err := parsePeerFlags(flags, args); err != nil {
+	configPath, nodeID, err := parsePeerCatalogGrantChangeFlags(args, stderr, "create", "paired node identity to grant catalog read")
+	if err != nil {
 		return err
 	}
-	if *nodeID == "" || !*acknowledge {
-		return errors.New("--node-id and --acknowledge are required")
-	}
-	return withPeerGrantStores(*configPath, "catalog_read_grant.create", *nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
-		member, err := lookupPairedMember(members, *nodeID, errors.New("catalog read can only be granted to a currently paired identity"))
+	return withPeerGrantStores(configPath, "catalog_read_grant.create", nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
+		member, err := lookupPairedMember(members, nodeID, errors.New("catalog read can only be granted to a currently paired identity"))
 		if err != nil {
-			return *nodeID, "", "", err
+			return nodeID, "", "", err
 		}
 		grant, err := grants.GrantCatalogRead(member, time.Now().UTC())
 		if err != nil {
-			return *nodeID, "", "", err
+			return nodeID, "", "", err
 		}
-		return *nodeID, "", "", json.NewEncoder(out).Encode(grant)
+		return nodeID, "", "", json.NewEncoder(out).Encode(grant)
 	})
 }
 
@@ -68,23 +62,31 @@ func runPeerCatalogGrantList(args []string, stdout, stderr io.Writer) error {
 }
 
 func runPeerCatalogGrantRevoke(args []string, stdout, stderr io.Writer) error {
-	flags := peerFlags("peer catalog-grants revoke", stderr)
-	configPath := flags.String("config", defaultPeerConfigPath, configPathHelpText)
-	nodeID := flags.String("node-id", "", "paired node identity whose catalog grant will be revoked")
-	acknowledge := flags.Bool("acknowledge", false, "confirm this catalog authorization change")
-	if err := parsePeerFlags(flags, args); err != nil {
+	configPath, nodeID, err := parsePeerCatalogGrantChangeFlags(args, stderr, "revoke", "paired node identity whose catalog grant will be revoked")
+	if err != nil {
 		return err
 	}
-	if *nodeID == "" || !*acknowledge {
-		return errors.New("--node-id and --acknowledge are required")
-	}
-	return withPeerGrantStores(*configPath, "catalog_read_grant.revoke", *nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
-		if err := grants.RevokeCatalogRead(*nodeID); err != nil {
-			return *nodeID, "", "", err
+	return withPeerGrantStores(configPath, "catalog_read_grant.revoke", nodeID, stdout, func(members *federation.PairingStore, grants *federation.CatalogGrantStore, out io.Writer) (string, string, string, error) {
+		if err := grants.RevokeCatalogRead(nodeID); err != nil {
+			return nodeID, "", "", err
 		}
 		_, err := io.WriteString(out, "catalog_read grant revoked; outbound dynamic inference routing disabled\n")
-		return *nodeID, "", "", err
+		return nodeID, "", "", err
 	})
+}
+
+func parsePeerCatalogGrantChangeFlags(args []string, stderr io.Writer, action, nodeIDHelp string) (configPath, nodeID string, err error) {
+	flags := peerFlags("peer catalog-grants "+action, stderr)
+	configValue := flags.String("config", defaultPeerConfigPath, configPathHelpText)
+	nodeValue := flags.String("node-id", "", nodeIDHelp)
+	acknowledge := flags.Bool("acknowledge", false, "confirm this catalog authorization change")
+	if err := parsePeerFlags(flags, args); err != nil {
+		return "", "", err
+	}
+	if *nodeValue == "" || !*acknowledge {
+		return "", "", errors.New("--node-id and --acknowledge are required")
+	}
+	return *configValue, *nodeValue, nil
 }
 
 func openConfiguredCatalogGrantStores(configPath string) (*federation.PairingStore, *federation.CatalogGrantStore, error) {

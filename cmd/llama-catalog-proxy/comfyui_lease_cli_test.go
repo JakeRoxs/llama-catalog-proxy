@@ -21,21 +21,26 @@ func TestComfyUILeaseReleaseCLIRequiresAcknowledgementAndUsesOwnerConfig(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeComfyUIPeerConfig(t, configPath, pristine, server.URL, "")
+	assertRejectedReleaseCases(t, configPath, pristine, server.URL, &queueCalls, &freeCalls, &statsCalls)
+	assertSuccessfulReleaseDoesNotLeakOwnerDetails(t, configPath, pristine, server.URL, &queueCalls, &freeCalls, &statsCalls)
+}
 
-	// Unacknowledged release is rejected and makes no backend calls.
+func assertRejectedReleaseCases(t *testing.T, configPath string, pristine []byte, serverURL string, queueCalls, freeCalls, statsCalls *atomic.Int32) {
+	t.Helper()
+	writeComfyUIPeerConfig(t, configPath, pristine, serverURL, "")
 	assertReleaseRequiresAcknowledgement(t, configPath)
-	assertNoComfyUICalls(t, "unacknowledged", &queueCalls, &freeCalls, &statsCalls)
+	assertNoComfyUICalls(t, "unacknowledged", queueCalls, freeCalls, statsCalls)
 
-	// Proxy admission coordination disables standalone release.
-	writeComfyUIPeerConfig(t, configPath, pristine, server.URL, "local")
+	writeComfyUIPeerConfig(t, configPath, pristine, serverURL, "local")
 	assertReleaseDisabledByAdmission(t, configPath)
-	assertNoComfyUICalls(t, "disabled standalone", &queueCalls, &freeCalls, &statsCalls)
+	assertNoComfyUICalls(t, "disabled standalone", queueCalls, freeCalls, statsCalls)
+}
 
-	// Acknowledged release succeeds and does not leak owner URL or secret.
-	writeComfyUIPeerConfig(t, configPath, pristine, server.URL, "")
-	output := assertSuccessfulRelease(t, configPath, &queueCalls, &freeCalls, &statsCalls)
-	if strings.Contains(output, server.URL) || strings.Contains(output, "owner-secret") {
+func assertSuccessfulReleaseDoesNotLeakOwnerDetails(t *testing.T, configPath string, pristine []byte, serverURL string, queueCalls, freeCalls, statsCalls *atomic.Int32) {
+	t.Helper()
+	writeComfyUIPeerConfig(t, configPath, pristine, serverURL, "")
+	output := assertSuccessfulRelease(t, configPath, queueCalls, freeCalls, statsCalls)
+	if strings.Contains(output, serverURL) || strings.Contains(output, "owner-secret") {
 		t.Fatalf("release output leaked owner endpoint or credential: %s", output)
 	}
 }

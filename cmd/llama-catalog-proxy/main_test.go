@@ -97,40 +97,33 @@ func newTestServer(t *testing.T, prefix, apiKey, customHeader, activityBody, mod
 		bodies["/running"] = runningBody
 	}
 	bodies["/api/metrics/activity"] = activityBody
+	fixture := testServerFixture{apiKey: apiKey, customHeader: customHeader, prefix: prefix, seen: seen, mu: &mu, bodies: bodies}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		serveTestRequest(t, apiKey, customHeader, prefix, seen, &mu, bodies, w, r)
+		serveTestRequest(t, fixture, w, r)
 	}))
 	return server, seen
+}
+
+type testServerFixture struct {
+	apiKey       string
+	customHeader string
+	prefix       string
+	seen         map[string]int
+	mu           *sync.Mutex
+	bodies       map[string]string
 }
 
 // serveTestRequest handles a single request to the test fixture server. It
 // enforces GET-only, the Authorization/X-Api-Key/X-Custom headers, the
 // optional /proxy prefix, the safe path whitelist, and activity query
 // bounds, then records the path in seen and serves the capability body.
-func serveTestRequest(t *testing.T, apiKey, customHeader, prefix string, seen map[string]int, mu *sync.Mutex, bodies map[string]string, w http.ResponseWriter, r *http.Request) {
+func serveTestRequest(t *testing.T, fixture testServerFixture, w http.ResponseWriter, r *http.Request) {
 	t.Helper()
-	if r.Method != http.MethodGet {
-		t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	path, ok := validateTestFixtureRequest(t, fixture, w, r, false)
+	if !ok {
 		return
 	}
-	if r.Header.Get("Authorization") != "Bearer "+apiKey {
-		t.Errorf("authorization not applied on %s", r.URL.Path)
-	}
-	if r.Header.Get("X-Api-Key") != apiKey {
-		t.Errorf("x-api-key not applied on %s", r.URL.Path)
-	}
-	if customHeader != "" && r.Header.Get("X-Custom") != customHeader {
-		t.Errorf("custom header not applied on %s", r.URL.Path)
-	}
-	path := r.URL.Path
-	if prefix != "" {
-		if !strings.HasPrefix(path, prefix) {
-			t.Errorf("prefix not preserved on %s", r.URL.Path)
-		}
-		path = strings.TrimPrefix(path, prefix)
-	}
-	if _, ok := bodies[path]; !ok {
+	if _, ok := fixture.bodies[path]; !ok {
 		t.Errorf("unsafe/unexpected path %s", r.URL.Path)
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -143,11 +136,49 @@ func serveTestRequest(t *testing.T, apiKey, customHeader, prefix string, seen ma
 	} else if r.URL.RawQuery != "" {
 		t.Errorf("unexpected query on %s: %s", r.URL.Path, r.URL.RawQuery)
 	}
-	mu.Lock()
-	seen[path]++
-	mu.Unlock()
+	fixture.mu.Lock()
+	fixture.seen[path]++
+	fixture.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, bodies[path])
+	fmt.Fprint(w, fixture.bodies[path])
+}
+
+func validateTestFixtureRequest(t *testing.T, fixture testServerFixture, w http.ResponseWriter, r *http.Request, rejectInvalidHeaders bool) (string, bool) {
+	t.Helper()
+	if r.Method != http.MethodGet {
+		t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return "", false
+	}
+	validHeaders := true
+	if r.Header.Get("Authorization") != "Bearer "+fixture.apiKey {
+		t.Errorf("authorization not applied on %s", r.URL.Path)
+		validHeaders = false
+	}
+	if r.Header.Get("X-Api-Key") != fixture.apiKey {
+		t.Errorf("x-api-key not applied on %s", r.URL.Path)
+		validHeaders = false
+	}
+	if fixture.customHeader != "" && r.Header.Get("X-Custom") != fixture.customHeader {
+		t.Errorf("custom header not applied on %s", r.URL.Path)
+		validHeaders = false
+	}
+	if rejectInvalidHeaders && !validHeaders {
+		w.WriteHeader(http.StatusBadRequest)
+		return "", false
+	}
+	path := r.URL.Path
+	if fixture.prefix != "" {
+		if !strings.HasPrefix(path, fixture.prefix) {
+			t.Errorf("prefix not preserved on %s", r.URL.Path)
+			if rejectInvalidHeaders {
+				w.WriteHeader(http.StatusBadRequest)
+				return "", false
+			}
+		}
+		path = strings.TrimPrefix(path, fixture.prefix)
+	}
+	return path, true
 }
 
 func parseReport(t *testing.T, buf *bytes.Buffer) map[string]any {
@@ -206,6 +237,13 @@ func TestRunDiagnosticsOmitsBackendActivityWhenRequestHistoryFalse(t *testing.T)
 		t.Fatalf("runDiagnostics error: %v", err)
 	}
 	report := parseReport(t, &buf)
+	assertNoBackendActivityReport(t, report)
+	assertCapabilitiesProbedOnce(t, seen)
+	assertNoFixtureSecrets(t, buf.String(), server.URL, true)
+}
+
+func assertNoBackendActivityReport(t *testing.T, report map[string]any) {
+	t.Helper()
 	if _, ok := report["backend_activity"]; ok {
 		t.Fatal("backend_activity should be omitted when request_history is false")
 	}
@@ -213,6 +251,10 @@ func TestRunDiagnosticsOmitsBackendActivityWhenRequestHistoryFalse(t *testing.T)
 	if !ok || len(backends) != 1 {
 		t.Fatalf("expected 1 backend snapshot, got %v", backends)
 	}
+}
+
+func assertCapabilitiesProbedOnce(t *testing.T, seen map[string]int) {
+	t.Helper()
 	if seen["/api/metrics/activity"] != 1 {
 		t.Fatalf("activity path probed %d times, want 1 (capabilities only)", seen["/api/metrics/activity"])
 	}
@@ -221,8 +263,15 @@ func TestRunDiagnosticsOmitsBackendActivityWhenRequestHistoryFalse(t *testing.T)
 			t.Fatalf("capability op %s probed %d times, want 1", op, seen[op])
 		}
 	}
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header", "SHORT_MODEL_SECRET", "SHORT_TASK_SECRET", "SHORT_ROUTE_SECRET", "SHORT_PEER_SECRET", "SHORT_PATH_SECRET", "SHORT_ERROR_SECRET", "SHORT_KEY_SECRET", "SHORT_VALUE_SECRET"} {
+}
+
+func assertNoFixtureSecrets(t *testing.T, output, serverURL string, includeActivity bool) {
+	t.Helper()
+	secrets := []string{serverURL, "sentinel-key", "sentinel-header"}
+	if includeActivity {
+		secrets = append(secrets, "SHORT_MODEL_SECRET", "SHORT_TASK_SECRET", "SHORT_ROUTE_SECRET", "SHORT_PEER_SECRET", "SHORT_PATH_SECRET", "SHORT_ERROR_SECRET", "SHORT_KEY_SECRET", "SHORT_VALUE_SECRET")
+	}
+	for _, secret := range secrets {
 		if strings.Contains(output, secret) {
 			t.Fatalf("secret leaked in output: %q", secret)
 		}
@@ -258,12 +307,7 @@ func TestRunDiagnosticsRequestHistoryDisabledBackendNoHTTP(t *testing.T) {
 	if len(seen) != 0 {
 		t.Fatalf("backend was probed %d times, want 0", len(seen))
 	}
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header"} {
-		if strings.Contains(output, secret) {
-			t.Fatalf("secret leaked in output: %q", secret)
-		}
-	}
+	assertNoFixtureSecrets(t, buf.String(), server.URL, false)
 }
 
 // assertLlamaSwapRecord verifies the normalized LlamaSwap activity record:
@@ -358,12 +402,7 @@ func TestRunDiagnosticsRequestHistoryLlamaSwap(t *testing.T) {
 	assertLlamaSwapRecord(t, record)
 	assertLlamaSwapBackendActivityState(t, backendActivity)
 	// No secrets from the LlamaSwap activity record leaked.
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header", "SHORT_MODEL_SECRET", "SHORT_TASK_SECRET", "SHORT_ROUTE_SECRET", "SHORT_PEER_SECRET", "SHORT_PATH_SECRET", "SHORT_ERROR_SECRET", "SHORT_KEY_SECRET", "SHORT_VALUE_SECRET"} {
-		if strings.Contains(output, secret) {
-			t.Fatalf("secret leaked in output: %q", secret)
-		}
-	}
+	assertNoFixtureSecrets(t, buf.String(), server.URL, true)
 	if seen["/api/metrics/activity"] != 2 {
 		t.Fatalf("activity path probed %d times, want 2 (capabilities + collector)", seen["/api/metrics/activity"])
 	}
@@ -772,83 +811,7 @@ func assertLifecycleEventSupport(t *testing.T, support map[string]any) {
 // resolved identities and identity_unresolved for unresolved identities.
 // We do not pretend 0 events were collected.
 func TestRunDiagnosticsRequestHistoryActivityLifecycleEvents(t *testing.T) {
-	// Canonical model "canon" declares alias "shortalias".
-	modelsBody, err := json.Marshal(map[string]any{
-		"data": []any{
-			map[string]any{
-				"id": "canon",
-				"meta": map[string]any{
-					"llamaswap": map[string]any{
-						"type":    "model",
-						"modelID": "canon",
-						"aliases": []string{"shortalias"},
-					},
-				},
-			},
-			map[string]any{
-				"id": "shortalias",
-				"meta": map[string]any{
-					"llamaswap": map[string]any{
-						"type":    "alias",
-						"modelID": "canon",
-					},
-				},
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// /running readiness snapshot for the canonical model.
-	runningBody, err := json.Marshal(map[string]any{
-		"running": []any{
-			map[string]any{
-				"model": "canon",
-				"state": "ready",
-			},
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Activity for shortalias (resolves to canon) and nosuchmodel (unknown).
-	activityBody, err := json.Marshal(map[string]any{
-		"data": []any{
-			map[string]any{
-				"id":               42,
-				"timestamp":        activityFixtureTime.Format(time.RFC3339),
-				"resp_status_code": 200,
-				"model":            "shortalias",
-				"task":             "chat",
-				"route":            "local",
-				"peer_id":          "",
-				"req_path":         "/",
-				"error_msg":        "",
-				"metadata":         map[string]any{},
-				"tokens":           map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-			map[string]any{
-				"id":               43,
-				"timestamp":        activityFixtureTime.Format(time.RFC3339),
-				"resp_status_code": 200,
-				"model":            "nosuchmodel",
-				"task":             "chat",
-				"route":            "local",
-				"peer_id":          "",
-				"req_path":         "/",
-				"error_msg":        "",
-				"metadata":         map[string]any{},
-				"tokens":           map[string]any{"input_tokens": 0, "output_tokens": 0},
-			},
-		},
-		"page":        1,
-		"limit":       100,
-		"total":       2,
-		"total_pages": 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	modelsBody, runningBody, activityBody := linksLifecycleFixtures(t)
 
 	server, _ := newTestServer(t, "/proxy", "sentinel-key", "sentinel-header", string(activityBody), string(modelsBody), string(runningBody))
 	defer server.Close()
@@ -895,14 +858,12 @@ func TestRunDiagnosticsRequestHistoryActivityLifecycleEvents(t *testing.T) {
 		t.Fatalf("observed_event_count = %v, want 0", e1["observed_event_count"])
 	}
 
-	// No secrets leaked.
-	output := buf.String()
-	for _, secret := range []string{server.URL, "sentinel-key", "sentinel-header"} {
-		if strings.Contains(output, secret) {
-			t.Fatalf("secret leaked in output: %q", secret)
-		}
-	}
-	// Raw model IDs must not appear as JSON string values.
+	assertNoFixtureSecrets(t, buf.String(), server.URL, false)
+	assertRawModelIDsAbsent(t, buf.String())
+}
+
+func assertRawModelIDsAbsent(t *testing.T, output string) {
+	t.Helper()
 	for _, raw := range []string{"canon", "shortalias", "nosuchmodel"} {
 		if strings.Contains(output, `"`+raw+`"`) {
 			t.Fatalf("raw model ID %q leaked as a value in output", raw)
@@ -917,33 +878,11 @@ func TestRunDiagnosticsRequestHistoryActivityLifecycleEvents(t *testing.T) {
 // any other path. Counter updates are guarded by mu.
 func serveSSEFixtureRequest(t *testing.T, eventsCount, logsCount *int, mu *sync.Mutex, bodies map[string]string, w http.ResponseWriter, r *http.Request) {
 	t.Helper()
-	if r.Method != http.MethodGet {
-		t.Errorf("unexpected method %s on %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusMethodNotAllowed)
+	fixture := testServerFixture{apiKey: "sentinel-key", customHeader: "sentinel-header", prefix: "/proxy", bodies: bodies}
+	path, ok := validateTestFixtureRequest(t, fixture, w, r, true)
+	if !ok {
 		return
 	}
-	if r.Header.Get("Authorization") != "Bearer sentinel-key" {
-		t.Errorf("authorization not applied on %s", r.URL.Path)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	if r.Header.Get("X-Api-Key") != "sentinel-key" {
-		t.Errorf("x-api-key not applied on %s", r.URL.Path)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	if r.Header.Get("X-Custom") != "sentinel-header" {
-		t.Errorf("custom header not applied on %s", r.URL.Path)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	path := r.URL.Path
-	if !strings.HasPrefix(path, "/proxy") {
-		t.Errorf("prefix not preserved on %s", r.URL.Path)
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	path = strings.TrimPrefix(path, "/proxy")
 	if _, ok := bodies[path]; ok {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, bodies[path])
