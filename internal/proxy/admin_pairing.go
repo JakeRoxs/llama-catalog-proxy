@@ -455,6 +455,18 @@ func (r *Reloader) createAdminPairingInvitation(w http.ResponseWriter, req *http
 	})
 }
 
+// configuredPairingJoinOrigin uses the submitted origin only to select a
+// server-configured destination. No list means web enrollment is disabled.
+func configuredPairingJoinOrigin(origins []string, submitted string) (string, bool) {
+	submitted = strings.TrimSuffix(submitted, "/")
+	for _, origin := range origins {
+		if strings.TrimSuffix(origin, "/") == submitted {
+			return origin, true
+		}
+	}
+	return "", false
+}
+
 func (r *Reloader) joinAdminPairing(w http.ResponseWriter, req *http.Request) {
 	var input struct {
 		URL  string `json:"url"`
@@ -476,12 +488,17 @@ func (r *Reloader) joinAdminPairing(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, errPairingUnavailable, http.StatusServiceUnavailable)
 		return
 	}
+	origin, allowed := configuredPairingJoinOrigin(state.peer.PairingJoinOrigins, input.URL)
+	if !allowed {
+		http.Error(w, "peer origin is not approved for web pairing", http.StatusForbidden)
+		return
+	}
 	transaction, err := r.beginAdminAudit(req, "pairing.join", "", "", "")
 	if err != nil {
 		http.Error(w, errAuditStoreUnavailable, http.StatusServiceUnavailable)
 		return
 	}
-	member, err := state.pairingStore.Join(req.Context(), input.URL, input.Code, *state.certificate, state.peerClientCAs,
+	member, err := state.pairingStore.Join(req.Context(), origin, input.Code, *state.certificate, state.peerClientCAs,
 		state.peerClientCRLs, state.peer.RevocationMaxAge())
 	if !r.finishAdminMutation(w, transaction, err, member.NodeID, "", "") {
 		return

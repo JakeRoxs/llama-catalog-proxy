@@ -279,8 +279,19 @@ there is no automatic global propagation.
    fresh and the report receipt status recovers before removing old backup material.
 
 An authorized local `administer_federation` user can create an invitation and join another node from
-the `/admin/` pairing panel. The CLI provides the same operations over the same store; run it as the
-proxy service account, which must own the protected membership directory:
+the `/admin/` pairing panel. Before joining from the panel, list the issuing node's HTTPS origin in
+the joining node's server configuration:
+
+```yaml
+peer:
+  pairing_join_origins:
+    - https://node-a.example
+```
+
+The panel accepts only those configured destinations (an optional trailing slash is ignored).
+An omitted or empty list disables web joins, but not invitation creation. The CLI does not require
+this allowlist and uses the same pairing store. Run it as the proxy service account, which must own
+the protected membership directory:
 
 ```sh
 llama-catalog-proxy peer invite create --config /config/config.yaml --node-id node-b

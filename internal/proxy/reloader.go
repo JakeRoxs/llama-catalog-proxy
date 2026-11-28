@@ -853,6 +853,7 @@ func copyPeerConfig(peer *config.PeerConfig) *config.PeerConfig {
 	}
 	peerCopy := *peer
 	peerCopy.LocalBackends = append([]string(nil), peer.LocalBackends...)
+	peerCopy.PairingJoinOrigins = append([]string(nil), peer.PairingJoinOrigins...)
 	peerCopy.ManagementTargets = make(map[string]string, len(peer.ManagementTargets))
 	for backend, target := range peer.ManagementTargets {
 		peerCopy.ManagementTargets[backend] = target

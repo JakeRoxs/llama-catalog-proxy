@@ -853,7 +853,7 @@ async function joinWithInvitation(event) {
     pairingNotice(`Paired with ${result.member.node_id}. No operation scopes were granted.`);
     await refreshDashboard();
   } catch {
-    pairingNotice("Pairing outcome may be unknown. Refresh the member list before retrying; check the peer origin, invitation, and CA-issued identity certificate.", true);
+    pairingNotice("Pairing outcome may be unknown. Refresh the member list before retrying; check the approved peer origin, invitation, and CA-issued identity certificate.", true);
   }
 }
 

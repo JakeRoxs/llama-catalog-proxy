@@ -151,10 +151,15 @@ peer:
   crl_max_age: 24h
   membership_directory: /var/lib/catalog-proxy/federation
   audit_directory: /var/lib/catalog-proxy/audit
+  pairing_join_origins: ["https://peer.example:9293/"]
   peers: {}
 `
-	if _, err := Load(writeConfig(t, base)); err != nil {
+	cfg, err := Load(writeConfig(t, base))
+	if err != nil {
 		t.Fatalf("valid federation identity config rejected: %v", err)
+	}
+	if origins := cfg.Peer.PairingJoinOrigins; len(origins) != 1 || origins[0] != "https://peer.example:9293/" {
+		t.Fatalf("pairing join origins = %v", origins)
 	}
 	cases := map[string]string{
 		"missing client CA":               strings.Replace(base, "  client_ca_file: /certs/federation-ca.pem\n", "", 1),
@@ -164,6 +169,8 @@ peer:
 		"invalid CRL age":                 strings.Replace(base, "  crl_max_age: 24h\n", "  crl_max_age: 90d\n", 1),
 		"client CA without federation ID": strings.Replace(base, "  federation_id: lab.example\n", "", 1),
 		"invalid federation ID":           strings.Replace(base, "lab.example", "invalid_domain", 1),
+		"non-HTTPS join origin":           strings.Replace(base, "https://peer.example:9293/", "http://peer.example:9293/", 1),
+		"join URL with path":              strings.Replace(base, "https://peer.example:9293/", "https://peer.example:9293/other", 1),
 	}
 	for name, contents := range cases {
 		t.Run(name, func(t *testing.T) {

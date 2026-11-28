@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +17,48 @@ import (
 
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 )
+
+func TestBackendAdmissionDenialLogOmitsRequestPath(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status func() comfyUICoordinatorStatus
+	}{
+		{name: "without coordinator status"},
+		{name: "with coordinator status", status: func() comfyUICoordinatorStatus {
+			return comfyUICoordinatorStatus{State: "active", LeaseID: "private-lease-id"}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const path = "/private-request-path"
+			var logs bytes.Buffer
+			h := &Handler{
+				logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
+				backendAdmission:       func(*http.Request, string) (func(), bool) { return nil, false },
+				backendAdmissionStatus: tc.status,
+			}
+			requestID := generateRequestID()
+			req := httptest.NewRequestWithContext(context.WithValue(t.Context(), requestIDKey{}, requestID), http.MethodPost, path, nil)
+			w := httptest.NewRecorder()
+			h.dispatchBackend(w, req, "test-backend")
+
+			if w.Code != http.StatusServiceUnavailable {
+				t.Fatalf("denial status = %d, want %d", w.Code, http.StatusServiceUnavailable)
+			}
+			logged := logs.String()
+			if strings.Contains(logged, " path=") || strings.Contains(logged, path) || strings.Contains(logged, "private-lease-id") {
+				t.Fatalf("denial log includes a request path or lease ID: %s", logged)
+			}
+			for _, want := range []string{"backend admission denied", "backend_id=test-backend", "request_id=" + requestID} {
+				if !strings.Contains(logged, want) {
+					t.Errorf("denial log missing %q: %s", want, logged)
+				}
+			}
+			if tc.status != nil && !strings.Contains(logged, "lease_id_present=true") {
+				t.Errorf("denial log missing lease presence: %s", logged)
+			}
+		})
+	}
+}
 
 func TestOwnerBackendDispatchSharesAdmissionBoundary(t *testing.T) {
 	var forwarded atomic.Int32

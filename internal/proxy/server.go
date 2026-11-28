@@ -697,13 +697,14 @@ func (h *Handler) dispatchBackend(w http.ResponseWriter, req *http.Request, back
 			defer release()
 		}
 		if !allowed {
+			// Peer forwarding can populate URL.Path from a request header.
+			// Keep the server-generated request ID for correlation instead.
 			if h.backendAdmissionStatus != nil {
 				state := h.backendAdmissionStatus()
 				h.logger.Warn("backend admission denied",
 					"request_id", requestIDFromContext(req.Context()),
 					"backend_id", backendID,
 					"method", req.Method,
-					"path", req.URL.Path,
 					"admission_state", state.State,
 					"lease_id_present", state.LeaseID != "",
 					"submissions", state.Submissions,
@@ -714,7 +715,6 @@ func (h *Handler) dispatchBackend(w http.ResponseWriter, req *http.Request, back
 					"request_id", requestIDFromContext(req.Context()),
 					"backend_id", backendID,
 					"method", req.Method,
-					"path", req.URL.Path,
 				)
 			}
 			writeJSONError(h.logger, w, http.StatusServiceUnavailable, "backend admission blocked")

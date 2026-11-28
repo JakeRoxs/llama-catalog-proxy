@@ -3,11 +3,13 @@ package proxy
 import (
 	"crypto/x509"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,6 +353,12 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 		certificate: &ownerCertificate, peerClientCAs: roots, peerClientCRLs: crls, pairingStore: ownerStore, auditStore: ownerAudit,
 	})
 	server := httptest.NewUnstartedServer(owner.PeerHandler())
+	var connections atomic.Int32
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
 	server.TLS = owner.PeerTLSConfig()
 	server.StartTLS()
 	defer server.Close()
@@ -365,10 +373,11 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 	}
 	auth.sessions["admin-session"] = adminSession{subject: "operator", roles: []string{"administer_federation"}, csrf: "admin-csrf", lastSeen: time.Now(), expiresAt: time.Now().Add(time.Hour)}
 	joining := &Reloader{logger: logger, adminAuth: auth, auditStore: joiningAudit}
-	joining.state.Store(&reloaderState{
+	joiningState := &reloaderState{
 		peer:        &config.PeerConfig{NodeID: "node-b", FederationID: "lab.example"},
 		certificate: &joiningCertificate, peerClientCAs: roots, peerClientCRLs: crls, pairingStore: joiningStore, auditStore: joiningAudit,
-	})
+	}
+	joining.state.Store(joiningState)
 	requestJoin := func(code string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, "https://catalog.example/admin/api/v1/federation/join",
 			strings.NewReader(`{"url":"`+server.URL+`","invitation_code":"`+code+`"}`))
@@ -380,6 +389,17 @@ func TestPairingJoinUsesOneTimeInvitationAndPersistsBothMemberships(t *testing.T
 		joining.ServeHTTP(response, req)
 		return response
 	}
+	if denied := requestJoin(invite.Code); denied.Code != http.StatusForbidden {
+		t.Fatalf("web join without configured origins = %d %s", denied.Code, denied.Body.String())
+	}
+	joiningState.peer.PairingJoinOrigins = []string{"https://peer.example"}
+	if denied := requestJoin(invite.Code); denied.Code != http.StatusForbidden {
+		t.Fatalf("web join to unconfigured origin = %d %s", denied.Code, denied.Body.String())
+	}
+	if connections.Load() != 0 || ownerStore.IsMember("node-b") || joiningStore.IsMember("node-a") {
+		t.Fatal("rejected web join opened a connection or changed membership")
+	}
+	joiningState.peer.PairingJoinOrigins = []string{server.URL + "/"}
 	assertInvitationHandshakeRejectedStableMembership(t, requestJoin, ownerStore, joiningStore)
 	assertReciprocalMembershipPersisted(t, requestJoin, invite, ownerStore, joiningStore)
 	assertNoDuplicateMembershipOnRetry(t, requestJoin, invite, ownerStore, joiningStore)

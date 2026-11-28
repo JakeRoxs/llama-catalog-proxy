@@ -124,6 +124,12 @@ func VerifyPeerClientIdentity(certificates []*x509.Certificate, roots *x509.Cert
 	return ValidateIdentityCertificate(certificates[0], federationID, nodeID)
 }
 
+// ValidateJoinOrigin checks whether an origin is usable for peer enrollment.
+func ValidateJoinOrigin(value string) error {
+	_, err := validEndpoint(value)
+	return err
+}
+
 func validEndpoint(value string) (string, error) {
 	target, err := url.Parse(value)
 	if err != nil || len(value) > 2048 || target.Scheme != "https" || target.Hostname() == "" || target.User != nil ||

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/federation"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/identity"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/privateorigin"
@@ -141,6 +142,7 @@ type PeerConfig struct {
 	ClientCRLFile         string                   `yaml:"client_crl_file,omitempty"`
 	CRLMaxAge             string                   `yaml:"crl_max_age,omitempty"`
 	MembershipDirectory   string                   `yaml:"membership_directory,omitempty"`
+	PairingJoinOrigins    []string                 `yaml:"pairing_join_origins,omitempty"`
 	AuditDirectory        string                   `yaml:"audit_directory,omitempty"`
 	CatalogGrantDirectory string                   `yaml:"catalog_grant_directory,omitempty"`
 	LocalBackends         []string                 `yaml:"local_backends"`
@@ -1050,6 +1052,14 @@ func validatePeer(c Config) error {
 		}
 	} else if p.ClientCAFile != "" || p.ClientCRLFile != "" || p.MembershipDirectory != "" || p.CRLMaxAge != "" {
 		return errors.New("peer client trust files, membership_directory, and crl_max_age require federation_id")
+	}
+	if len(p.PairingJoinOrigins) != 0 && p.FederationID == "" {
+		return errors.New("peer pairing_join_origins requires federation_id")
+	}
+	for i, origin := range p.PairingJoinOrigins {
+		if err := federation.ValidateJoinOrigin(origin); err != nil {
+			return fmt.Errorf("peer pairing_join_origins entry %d: %w", i+1, err)
+		}
 	}
 	if p.Discovery != nil && p.Discovery.Enabled {
 		if p.FederationID == "" || len(p.FederationID) > 241 || p.CatalogGrantDirectory == "" {
