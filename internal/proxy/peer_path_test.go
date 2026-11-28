@@ -261,7 +261,7 @@ func assertWebSocketUpgrade(t *testing.T, f *federationFixture) {
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
 
-	key := "dGhlIHNhbXBsZSBub25jZQ=="
+	key := base64.StdEncoding.EncodeToString(make([]byte, 16))
 	_, err = fmt.Fprintf(connection, "GET /comfyui/ws?clientId=ws-peer HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\nOrigin: https://frontend.example\r\n\r\n",
 		strings.TrimPrefix(f.requesterServer.URL, "http://"), key)
 	if err != nil {
@@ -519,27 +519,32 @@ func TestValidPeerPathRequest(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			gotPath, gotEscaped, err := validPeerPathRequest(test.encodedPath, test.service, test.localPrefix, test.method)
-			if test.wantError {
-				if err == nil {
-					t.Fatalf("validPeerPathRequest(%q) = %q, %q, nil, want error", test.encodedPath, gotPath, gotEscaped)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("validPeerPathRequest(%q) = %q, %q, %v, want %q", test.encodedPath, gotPath, gotEscaped, err, test.wantPath)
-			}
-			if gotPath != test.wantPath {
-				t.Errorf("validPeerPathRequest(%q) = %q, want %q", test.encodedPath, gotPath, test.wantPath)
-			}
-			decoded, err := base64.RawURLEncoding.DecodeString(test.encodedPath)
-			if err != nil {
-				t.Fatalf("decode test input %q: %v", test.encodedPath, err)
-			}
-			if string(decoded) != gotEscaped {
-				t.Errorf("validPeerPathRequest(%q) escapedPath = %q, want %q", test.encodedPath, gotEscaped, decoded)
-			}
+			assertPeerPathRequest(t, test.encodedPath, test.service, test.localPrefix, test.method, test.wantPath, test.wantError)
 		})
+	}
+}
+
+func assertPeerPathRequest(t *testing.T, encodedPath, service, localPrefix, method, wantPath string, wantError bool) {
+	t.Helper()
+	gotPath, gotEscaped, err := validPeerPathRequest(encodedPath, service, localPrefix, method)
+	if wantError {
+		if err == nil {
+			t.Fatalf("validPeerPathRequest(%q) = %q, %q, nil, want error", encodedPath, gotPath, gotEscaped)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("validPeerPathRequest(%q) = %q, %q, %v, want %q", encodedPath, gotPath, gotEscaped, err, wantPath)
+	}
+	if gotPath != wantPath {
+		t.Errorf("validPeerPathRequest(%q) = %q, want %q", encodedPath, gotPath, wantPath)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encodedPath)
+	if err != nil {
+		t.Fatalf("decode test input %q: %v", encodedPath, err)
+	}
+	if string(decoded) != gotEscaped {
+		t.Errorf("validPeerPathRequest(%q) escapedPath = %q, want %q", encodedPath, gotEscaped, decoded)
 	}
 }
 
