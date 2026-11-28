@@ -32,10 +32,14 @@ type comfyUICoordinator struct {
 	cancel           context.CancelFunc
 	receipt          ComfyUIReleaseResult
 	initialReconcile bool
+	initialPrompt    bool
 }
 
 func newComfyUICoordinator(verify func(context.Context) (ComfyUIReleaseResult, error)) *comfyUICoordinator {
-	return &comfyUICoordinator{status: comfyUICoordinatorStatus{State: "unknown"}, changed: make(chan struct{}), verify: verify, initialReconcile: true}
+	return &comfyUICoordinator{
+		status: comfyUICoordinatorStatus{State: "unknown"}, changed: make(chan struct{}),
+		verify: verify, initialReconcile: true, initialPrompt: true,
+	}
 }
 
 func (c *comfyUICoordinator) snapshot() comfyUICoordinatorStatus {
@@ -162,9 +166,10 @@ func (c *comfyUICoordinator) admitPrompt() (string, func(), error) {
 func (c *comfyUICoordinator) admitSchedulerPrompt(initialAllowed bool) (string, func(), bool, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if initialAllowed && c.initialReconcile && c.status.State == "unknown" &&
+	if initialAllowed && c.initialPrompt && c.initialReconcile && c.status.State == "unknown" &&
 		!c.verifying && c.status.Submissions == 0 && c.status.Competing == 0 {
 		c.initialReconcile = false
+		c.initialPrompt = false
 		id, err := c.openLeaseLocked()
 		if err != nil {
 			return "", nil, false, err
@@ -229,7 +234,11 @@ func (c *comfyUICoordinator) reserveSubmissionLocked(leaseID string, first bool)
 			c.status.Submissions--
 			if first && c.status.State == "acquiring" && c.status.LeaseID == leaseID {
 				// HTTP completion without activation does not prove the helper never started.
+				// Permit the next request to attempt full external reconciliation; it
+				// must still confirm queue and VRAM evidence before competing admission.
 				c.status.State, c.status.LeaseID = "unknown", ""
+				c.initialReconcile = true
+				c.initialPrompt = false
 			}
 			c.signalLocked()
 		})

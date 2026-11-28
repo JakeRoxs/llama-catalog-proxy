@@ -102,6 +102,12 @@ func ensureComfyUIAdmissionState(
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
 	_, err := coordinator.reconcileInitial(ctx)
+	if errors.Is(err, errComfyUIAdmissionBlocked) {
+		// Initial reconciliation is one-shot when its outcome may be ambiguous.
+		// A later request may try again, but only by repeating the full queue,
+		// /free, and VRAM verification—not by assuming the prior operation worked.
+		_, err = coordinator.reconcile(ctx)
+	}
 	cancel()
 	if errors.Is(err, errComfyUIServiceUnavailable) {
 		err = coordinator.assumeInitialStopped()

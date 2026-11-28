@@ -88,7 +88,7 @@ func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
 		wantStatus int
 	}{
 		{"accepted prompt activates lease", http.StatusAccepted, "active", http.StatusAccepted},
-		{"failed prompt leaves lease unknown", http.StatusBadGateway, "unknown", http.StatusBadGateway},
+		{"validation failure leaves lease unknown until verified reconciliation", http.StatusBadRequest, "unknown", http.StatusBadRequest},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			runComfyUIDomainFirstPromptActivationCase(t, test.status, test.wantState, test.wantStatus)
@@ -143,6 +143,12 @@ func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantSta
 		if state.State != "acquiring" || state.Submissions != 1 || state.LeaseID == "" {
 			t.Errorf("first prompt was forwarded without an acquisition reservation: %+v", state)
 		}
+		if status == http.StatusBadRequest {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"type":"prompt_outputs_failed_validation","message":"Prompt outputs failed validation"}}`))
+			return
+		}
 		w.WriteHeader(status)
 	}))
 	defer backend.Close()
@@ -160,9 +166,14 @@ func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantSta
 		t.Fatalf("first prompt status=%d sends=%d state=%+v", w.Code, sends.Load(), state)
 	}
 	if wantState == "unknown" {
-		if _, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default"); allowed {
-			t.Fatal("ambiguous first prompt opened competing admission")
+		done, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default")
+		if !allowed || done == nil {
+			t.Fatal("failed first prompt did not trigger verified release before competing admission")
 		}
+		if state := c.snapshot(); state.State != "released" || state.Competing != 1 {
+			t.Fatalf("competing admission was not backed by confirmed release: %+v", state)
+		}
+		done()
 	}
 }
 
@@ -198,6 +209,39 @@ func TestCompetingStartRetriesAfterTransientInitialReconciliationFailure(t *test
 	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
 		if verifications.Add(1) == 1 {
 			return ComfyUIReleaseResult{State: "unknown"}, errors.New("temporary queue probe failure")
+		}
+		return confirmedCoordinatorEvidence(), nil
+	})
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		starts.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer backend.Close()
+
+	h := newHandler(t, baseConfig(backend.URL)).(*Handler)
+	admit, err := newComfyUIDomainAdmission(coordinator, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+
+	for i, wantStatus := range []int{http.StatusServiceUnavailable, http.StatusAccepted} {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/upstream/other/?_=retry", nil))
+		if w.Code != wantStatus {
+			t.Fatalf("start attempt %d status=%d want=%d body=%q", i+1, w.Code, wantStatus, w.Body.String())
+		}
+	}
+	if starts.Load() != 1 || verifications.Load() != 2 || coordinator.snapshot().State != "released" {
+		t.Fatalf("starts=%d verifications=%d state=%+v", starts.Load(), verifications.Load(), coordinator.snapshot())
+	}
+}
+
+func TestCompetingStartRetriesAfterAmbiguousReconciliationFailure(t *testing.T) {
+	var verifications, starts atomic.Int32
+	coordinator := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		if verifications.Add(1) == 1 {
+			return ComfyUIReleaseResult{State: "unknown", FreeRequested: true}, ErrComfyUIReleaseUnknown
 		}
 		return confirmedCoordinatorEvidence(), nil
 	})
@@ -405,7 +449,14 @@ func newHandoffFixture(t *testing.T, verifyOK bool) *handoffFixture {
 		unblock: make(chan struct{}),
 	}
 	f.c = newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
-		if f.checks.Add(1) == 1 {
+		call := f.checks.Add(1)
+		if call == 1 {
+			return confirmedCoordinatorEvidence(), nil
+		}
+		if call > 2 {
+			if !verifyOK {
+				return ComfyUIReleaseResult{FreeRequested: true}, ErrComfyUIReleaseUnknown
+			}
 			return confirmedCoordinatorEvidence(), nil
 		}
 		close(f.started)
@@ -521,7 +572,7 @@ func unblockAndVerify(t *testing.T, f *handoffFixture, verifyOK bool) {
 		}
 	} else if _, err := f.c.reserveCompeting(); !errors.Is(err, errComfyUIAdmissionBlocked) {
 		t.Fatal("unconfirmed release opened admission")
-	} else if got := f.status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || f.checks.Load() != 2 || f.sends.Load() != 2 {
+	} else if got := f.status(http.MethodPost, "/v1/chat/completions"); got != http.StatusServiceUnavailable || f.checks.Load() != 3 || f.sends.Load() != 2 {
 		t.Fatal("competing POST retried an unconfirmed release or forwarded")
 	}
 }
