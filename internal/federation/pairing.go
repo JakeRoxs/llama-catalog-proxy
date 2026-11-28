@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -91,6 +92,11 @@ type PairingStore struct {
 	data         pairingData
 	closed       bool
 	failed       bool
+	// lookupNetIP resolves endpoint hostnames at dial time. Defaults to the
+	// production resolver (net.DefaultResolver.LookupNetIP) but can be
+	// overridden per store for deterministic testing without mutating
+	// package-level state.
+	lookupNetIP func(ctx context.Context, netw, name string) ([]net.IP, error)
 }
 
 func OpenPairingStore(directory, federationID, localNodeID string) (*PairingStore, error) {
@@ -116,6 +122,7 @@ func OpenPairingStore(directory, federationID, localNodeID string) (*PairingStor
 			Members: make(map[string]Membership), Invites: make(map[string]inviteRecord), Consumed: make(map[string]consumedRecord),
 			Revoked: make(map[string][]string),
 		},
+		lookupNetIP: defaultLookupNetIP,
 	}
 	if err := store.openLock(); err != nil {
 		_ = root.Close()
@@ -852,7 +859,9 @@ func localLeafCertificate(certificate tls.Certificate) (*x509.Certificate, error
 
 // newJoinTransport builds the HTTP transport used by JoinExpected, including the
 // TLS VerifyConnection callback that validates the peer certificate, revocation
-// state and expected node identity before any request is sent.
+// state and expected node identity before any request is sent, and a DialContext
+// that validates the resolved destination IP at dial time, pins DNS results to
+// prevent rebinding, and preserves the mDNS/LAN pairing path (.local hostnames).
 func newJoinTransport(s *PairingStore, options JoinExpectedOptions) *http.Transport {
 	return &http.Transport{
 		TLSClientConfig: &tls.Config{
@@ -861,9 +870,86 @@ func newJoinTransport(s *PairingStore, options JoinExpectedOptions) *http.Transp
 				return s.verifyPeerConnection(state, options)
 			},
 		},
+		DialContext:        s.joinDialContext,
 		DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
 		TLSHandshakeTimeout: 5 * time.Second, IdleConnTimeout: 10 * time.Second,
 	}
+}
+
+// defaultLookupNetIP is the production DNS resolution function. It is set once
+// at package initialization and never mutated, so it is safe for concurrent
+// use across stores and goroutines.
+var defaultLookupNetIP = func(ctx context.Context, netw, name string) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, netw, name)
+	if err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, addr := range addrs {
+		ips = append(ips, net.ParseIP(addr.String()))
+	}
+	return ips, nil
+}
+
+// joinDialContext is the DialContext for the join transport. It resolves the
+// endpoint host to IP addresses at dial time, rejects private/reserved
+// destinations unless the hostname is an mDNS/LAN peer (suffix .local) and the
+// resolved IP matches the discovery LAN address policy, pins the DNS results by
+// dialing the resolved IP directly (preventing DNS rebinding), and returns the
+// first successful connection. Loopback is allowed for local development and
+// testing; mTLS peer certificate verification authenticates the application
+// data channel after the TCP connection is established.
+func (s *PairingStore) joinDialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, ErrInvitation
+	}
+	// Strip IPv6 brackets so LookupNetIP receives a bare host.
+	host = strings.Trim(host, "[]")
+	// Resolve the host to IP addresses. This pins the DNS result so dialing the
+	// resolved IP directly prevents DNS rebinding. The context deadline from
+	// JoinExpected bounds the resolution.
+	ips, err := s.lookupNetIP(ctx, "ip", host)
+	if err != nil || len(ips) == 0 {
+		return nil, ErrInvitation
+	}
+	isMDNS := strings.HasSuffix(strings.ToLower(host), ".local")
+	var validIPs []string
+	for _, ip := range ips {
+		ipStr := ip.String()
+		parsedIP := net.ParseIP(ipStr)
+		if parsedIP == nil {
+			continue
+		}
+		if validEndpointIP(parsedIP) {
+			validIPs = append(validIPs, ipStr)
+			continue
+		}
+		// Allow only LAN addresses per discovery.usableAddress for mDNS/LAN
+		// peers (private RFC 1918/ULA that are global-unicast; excludes
+		// loopback, link-local, multicast, unspecified, reserved, documentation).
+		if isMDNS && validEndpointLANIP(parsedIP) {
+			validIPs = append(validIPs, ipStr)
+			continue
+		}
+		// Allow loopback for local development and testing.
+		if parsedIP.IsLoopback() {
+			validIPs = append(validIPs, ipStr)
+			continue
+		}
+	}
+	if len(validIPs) == 0 {
+		return nil, ErrInvitation
+	}
+	// Dial the resolved IP directly (not the hostname) to prevent rebinding.
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	for _, ip := range validIPs {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, ErrInvitation
 }
 
 // verifyPeerConnection validates the peer TLS connection presented during enrollment.
@@ -893,7 +979,10 @@ func newJoinClient(transport *http.Transport) *http.Client {
 }
 
 // sendEnrollRequest builds and executes the enroll request, presenting the invitation
-// code as a request header.
+// code as a request header. The origin is validated by validEndpoint before this
+// function is called, so the outbound destination (scheme, host, port) is bounded
+// to a user-provided but vetted peer endpoint; redirects are rejected by the
+// client and TLS peer certificate verification is enforced by the transport.
 func sendEnrollRequest(ctx context.Context, client *http.Client, origin, code string) (*http.Response, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+"/peer/v1/enroll", nil)
 	if err != nil {

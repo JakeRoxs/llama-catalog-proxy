@@ -94,13 +94,38 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 	if !logContains(logs.String(), "route_kind", "default") {
 		t.Fatalf("default route kind not logged: %s", logs.String())
 	}
-	for key, value := range map[string]string{
-		"client_addr":     "192.0.2.12:54321",
-		"x_forwarded_for": "198.51.100.8",
-		"user_agent":      "ComfyUI-Test/1.0",
+	if !logContains(logs.String(), "client_addr", "192.0.2.12:54321") {
+		t.Fatalf("client_addr not present in request summary log: %s", logs.String())
+	}
+}
+
+func TestSensitiveHeadersAreNotLogged(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	defer backend.Close()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	cfg := baseConfig(backend.URL)
+	handler, err := New(cfg, logger, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"qwen"}`))
+	request.Header.Set("Authorization", "Bearer secret-token")
+	request.Header.Set("Cookie", "session=secret-cookie")
+	request.Header.Set("X-Api-Key", "secret-api-key")
+	request.Header.Set("X-Forwarded-For", "198.51.100.8")
+	request.Header.Set("User-Agent", "test-agent/1.0")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	logText := logs.String()
+	for _, token := range []string{
+		"secret-token", "secret-cookie", "secret-api-key", "Bearer secret-token", "session=secret-cookie",
+		"198.51.100.8", "test-agent/1.0",
 	} {
-		if !logContains(logs.String(), key, value) {
-			t.Fatalf("%s not present in request summary log: %s", key, logs.String())
+		if strings.Contains(logText, token) {
+			t.Fatalf("sensitive header value %q leaked into request summary log: %s", token, logText)
 		}
 	}
 }

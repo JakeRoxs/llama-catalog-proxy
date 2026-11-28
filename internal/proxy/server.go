@@ -891,8 +891,6 @@ func (h *Handler) logRequest(request *http.Request, response *responseWriter, st
 			"method", request.Method,
 			"path", request.URL.Path,
 			"client_addr", request.RemoteAddr,
-			"x_forwarded_for", request.Header.Get(xForwardedForHeader),
-			"user_agent", request.UserAgent(),
 			"route_kind", info.kind,
 			"backend_id", info.backendID,
 			"status", response.status,

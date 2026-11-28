@@ -8,6 +8,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -130,6 +131,178 @@ func validEndpoint(value string) (string, error) {
 		target.RawPath != "" || target.ForceQuery || strings.TrimSpace(value) != value {
 		return "", errors.New("invalid peer endpoint")
 	}
+	// Reject private/reserved IP addresses to prevent server-side request
+	// forgery to internal services (metadata endpoints, link-local services,
+	// RFC 1918 networks, multicast). Loopback is permitted for local
+	// development and testing; the mTLS peer certificate verification
+	// performed by the join transport protects the data channel even for
+	// loopback destinations. DNS rebinding and host-based SSRF are mitigated
+	// by the dial-time resolve-and-pin policy in joinDialContext, which
+	// validates each resolved IP and dials the resolved IP directly.
+	if !validEndpointHost(target.Hostname()) {
+		return "", errors.New("invalid peer endpoint")
+	}
 	target.Path = ""
 	return strings.TrimSuffix(target.String(), "/"), nil
+}
+
+// validEndpointHost reports whether host is safe to dial as a peer endpoint.
+// IP addresses in private/reserved ranges (RFC 1918, RFC 1000 link-local,
+// RFC 5737 documentation, IPv6 link-local, multicast, unspecified, the
+// reserved IPv4 range 240.0.0.0/4, and IPv6 documentation ranges
+// 2001::/23, 2002::/16, 2001:db8::/32) are rejected to prevent SSRF to
+// internal services. Loopback is allowed for local development and testing.
+// Hostnames are validated by format only; DNS rebinding and host-based SSRF
+// are mitigated by the dial-time resolve-and-pin policy in joinDialContext.
+func validEndpointHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
+			return false
+		}
+		// Reject the reserved IPv4 range 240.0.0.0/4 and RFC 5737
+		// documentation ranges (TEST-NET-1/2/3).
+		if ip4 := ip.To4(); ip4 != nil {
+			if ip4[0] >= 240 ||
+				(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
+				(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
+				(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
+				(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
+				return false
+			}
+		}
+		// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
+		// 2001:db8::/32), consistent with internal/ingestion/download.go.
+		if isDocumentationIPv6(ip) {
+			return false
+		}
+		return true
+	}
+	return validHostname(host)
+}
+
+// validHostname reports whether host is a syntactically valid RFC 1123
+// hostname. It does not resolve DNS.
+func validHostname(host string) bool {
+	if host == "" || len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !validHostnameLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// validHostnameLabel reports whether label is a syntactically valid RFC 1123
+// hostname label: one to 63 characters, each a letter, digit, or hyphen, with
+// hyphens permitted only in the interior (never the first or last character).
+func validHostnameLabel(label string) bool {
+	if len(label) < 1 || len(label) > 63 {
+		return false
+	}
+	for _, c := range label {
+		if !isHostnameRune(c) {
+			return false
+		}
+	}
+	return label[0] != '-' && label[len(label)-1] != '-'
+}
+
+// isHostnameRune reports whether c is a character permitted in an RFC 1123
+// hostname label: a letter, a digit, or a hyphen.
+func isHostnameRune(c rune) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-'
+}
+
+// validEndpointIP reports whether ip is a public address safe to dial as a peer
+// endpoint destination for non-.local hostnames. Private/reserved addresses
+// (RFC 1918, RFC 1000 link-local, RFC 5737 documentation, IPv6 link-local,
+// multicast, unspecified, reserved 240.0.0.0/4, and IPv6 documentation
+// 2001::/23, 2002::/16, 2001:db8::/32) are rejected to prevent SSRF to
+// internal services. Loopback is not considered public here; it is handled
+// separately at dial time to preserve local development and testing.
+func validEndpointIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	// Reject the reserved IPv4 range 240.0.0.0/4 and RFC 5737 documentation
+	// ranges (TEST-NET-1/2/3).
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] >= 240 ||
+			(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
+			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
+			(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
+			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
+			return false
+		}
+	}
+	// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
+	// 2001:db8::/32), consistent with internal/ingestion/download.go.
+	if isDocumentationIPv6(ip) {
+		return false
+	}
+	return true
+}
+
+// validEndpointLANIP reports whether ip is a valid LAN address for an mDNS/LAN
+// peer endpoint, matching internal/discovery.usableAddress: private RFC 1918/
+// ULA addresses that are global-unicast, excluding loopback, link-local,
+// multicast, unspecified, reserved, and documentation addresses. This is the
+// allowlist applied to resolved IPs when the endpoint hostname ends in .local.
+func validEndpointLANIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	// Match discovery.usableAddress: private AND global-unicast, excluding
+	// loopback, link-local, multicast, and unspecified.
+	if !ip.IsPrivate() || !ip.IsGlobalUnicast() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	// Reject reserved IPv4 range 240.0.0.0/4 and RFC 5737 documentation
+	// ranges (TEST-NET-1/2/3).
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] >= 240 ||
+			(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
+			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
+			(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
+			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
+			return false
+		}
+	}
+	// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
+	// 2001:db8::/32), consistent with internal/ingestion/download.go.
+	if isDocumentationIPv6(ip) {
+		return false
+	}
+	return true
+}
+
+// isDocumentationIPv6 reports whether ip is an IPv6 documentation address
+// (2001::/23, 2002::/16, 2001:db8::/32), consistent with the special-range
+// policy in internal/ingestion/download.go.
+func isDocumentationIPv6(ip net.IP) bool {
+	if len(ip) != 16 {
+		return false
+	}
+	// 2001::/23: first 23 bits are 00100000 00000001 0000000.
+	// Byte 3's first 7 bits must be zero; byte 3 is 0x00 or 0x01.
+	if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] <= 0x01 {
+		return true
+	}
+	// 2002::/16: 00100000 00000010
+	if ip[0] == 0x20 && ip[1] == 0x02 {
+		return true
+	}
+	// 2001:db8::/32: 00100000 00000001 00001101 10111000
+	if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 {
+		return true
+	}
+	return false
 }
