@@ -78,104 +78,139 @@ func newPeerClientsWithMembership(peer *config.PeerConfig, membership *federatio
 	if peer == nil {
 		return clients, cache, nil
 	}
-	var clientCertificates []tls.Certificate
-	if peer.FederationID != "" {
-		certificate, err := tls.LoadX509KeyPair(peer.TLSCertFile, peer.TLSKeyFile)
-		if err != nil {
-			return nil, nil, fmt.Errorf("load peer client identity: %w", err)
-		}
-		if len(certificate.Certificate) == 0 {
-			return nil, nil, fmt.Errorf("peer client identity certificate is empty")
-		}
-		leaf, err := x509.ParseCertificate(certificate.Certificate[0])
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse peer client identity certificate: %w", err)
-		}
-		certificate.Leaf = leaf
-		if err := validatePeerIdentityCertificate(leaf, peer.FederationID, peer.NodeID); err != nil {
-			return nil, nil, fmt.Errorf("invalid peer client identity certificate: %w", err)
-		}
-		clientCertificates = []tls.Certificate{certificate}
+	clientCertificates, err := peerClientCertificates(peer)
+	if err != nil {
+		return nil, nil, err
 	}
 	for id, grant := range peer.Peers {
 		if grant.URL == "" {
 			continue
 		}
-		var roots *x509.CertPool
-		var serverCRLs []*x509.RevocationList
-		if grant.CAFile != "" {
-			if peer.FederationID != "" {
-				var err error
-				roots, err = federation.LoadTrustRoots(grant.CAFile)
-				if err != nil {
-					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
-				}
-			} else {
-				file, err := os.Open(grant.CAFile)
-				if err != nil {
-					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
-				}
-				data, readErr := io.ReadAll(io.LimitReader(file, maxPeerCABytes+1))
-				closeErr := file.Close()
-				if readErr != nil || closeErr != nil {
-					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
-				}
-				roots = x509.NewCertPool()
-				if len(data) > maxPeerCABytes || !roots.AppendCertsFromPEM(data) {
-					return nil, nil, fmt.Errorf("invalid peer CA for %q", id)
-				}
-			}
+		roots, serverCRLs, err := peerTrustMaterial(peer, grant, id)
+		if err != nil {
+			return nil, nil, err
 		}
-		if peer.FederationID != "" {
-			var err error
-			serverCRLs, err = federation.LoadCRLs(grant.CRLFile, peer.RevocationMaxAge())
-			if err != nil {
-				return nil, nil, fmt.Errorf("invalid peer CRL for %q", id)
-			}
-		}
-		transport := &http.Transport{
-			TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: clientCertificates},
-			DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
-			IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: peerReportTimeout,
-		}
-		if peer.FederationID != "" {
-			if membership == nil {
-				return nil, nil, errors.New("peer membership store unavailable")
-			}
-			transport.DisableKeepAlives = true
-			transport.TLSClientConfig.VerifyConnection = func(connection tls.ConnectionState) error {
-				if len(connection.VerifiedChains) == 0 || len(connection.PeerCertificates) == 0 {
-					return errors.New("peer server identity unavailable")
-				}
-				if federation.VerifyCertificateRevocation(connection.VerifiedChains, serverCRLs, peer.RevocationMaxAge(), time.Now()) != nil {
-					return errors.New("peer server certificate is revoked or CRL is stale")
-				}
-				serverCert := connection.PeerCertificates[0]
-				serverNodeID, err := federation.PeerIdentityNodeID(serverCert, peer.FederationID)
-				if err != nil || serverNodeID != id {
-					return errors.New("peer server identity mismatch")
-				}
-				member, ok := membership.GetMember(id)
-				if !ok || member.Fingerprint != federation.CertificateFingerprint(serverCert) {
-					return errors.New("peer is not paired with this certificate")
-				}
-				return nil
-			}
-		}
-		clients[id] = &peerClient{
-			id: id, endpoint: strings.TrimSuffix(grant.URL, "/") + "/peer/v1/report", token: grant.OutboundToken,
-			origin: strings.TrimSuffix(grant.URL, "/"), routeInference: grant.RouteInference,
-			routeManagement: grant.RouteManagement, routePaths: grant.RoutePaths, serverCRLs: serverCRLs,
-			crlMaxAge:          peer.RevocationMaxAge(),
-			inferenceTransport: transport.Clone(),
-			client: &http.Client{Transport: transport, Timeout: peerReportTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			}},
+		clients[id], err = newPeerClientForGrant(peer, membership, id, grant, roots, serverCRLs, clientCertificates)
+		if err != nil {
+			return nil, nil, err
 		}
 		clients[id].inferenceTransport.MaxConnsPerHost = 8
 		cache.entries[id] = peerCacheEntry{routeInference: grant.RouteInference}
 	}
 	return clients, cache, nil
+}
+
+func peerClientCertificates(peer *config.PeerConfig) ([]tls.Certificate, error) {
+	if peer.FederationID == "" {
+		return nil, nil
+	}
+	certificate, err := tls.LoadX509KeyPair(peer.TLSCertFile, peer.TLSKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load peer client identity: %w", err)
+	}
+	if len(certificate.Certificate) == 0 {
+		return nil, fmt.Errorf("peer client identity certificate is empty")
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse peer client identity certificate: %w", err)
+	}
+	certificate.Leaf = leaf
+	if err := validatePeerIdentityCertificate(leaf, peer.FederationID, peer.NodeID); err != nil {
+		return nil, fmt.Errorf("invalid peer client identity certificate: %w", err)
+	}
+	return []tls.Certificate{certificate}, nil
+}
+
+func peerTrustMaterial(peer *config.PeerConfig, grant config.PeerGrant, id string) (*x509.CertPool, []*x509.RevocationList, error) {
+	roots, err := loadPeerTrustRoots(peer, grant.CAFile, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	var serverCRLs []*x509.RevocationList
+	if peer.FederationID != "" {
+		serverCRLs, err = federation.LoadCRLs(grant.CRLFile, peer.RevocationMaxAge())
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid peer CRL for %q", id)
+		}
+	}
+	return roots, serverCRLs, nil
+}
+
+func loadPeerTrustRoots(peer *config.PeerConfig, caFile, id string) (*x509.CertPool, error) {
+	if caFile == "" {
+		return nil, nil
+	}
+	if peer.FederationID != "" {
+		roots, err := federation.LoadTrustRoots(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("invalid peer CA for %q", id)
+		}
+		return roots, nil
+	}
+	file, err := os.Open(caFile)
+	if err != nil {
+		return nil, fmt.Errorf("invalid peer CA for %q", id)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxPeerCABytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return nil, fmt.Errorf("invalid peer CA for %q", id)
+	}
+	roots := x509.NewCertPool()
+	if len(data) > maxPeerCABytes || !roots.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("invalid peer CA for %q", id)
+	}
+	return roots, nil
+}
+
+func newPeerClientForGrant(peer *config.PeerConfig, membership *federation.PairingStore, id string, grant config.PeerGrant,
+	roots *x509.CertPool, serverCRLs []*x509.RevocationList, clientCertificates []tls.Certificate) (*peerClient, error) {
+	transport := &http.Transport{
+		TLSClientConfig:    &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: clientCertificates},
+		DisableCompression: true, MaxConnsPerHost: 1, MaxIdleConnsPerHost: 1,
+		IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: peerReportTimeout,
+	}
+	if peer.FederationID != "" {
+		if membership == nil {
+			return nil, errors.New("peer membership store unavailable")
+		}
+		transport.DisableKeepAlives = true
+		transport.TLSClientConfig.VerifyConnection = peerServerIdentityVerifier(peer, membership, id, serverCRLs)
+	}
+	client := &peerClient{
+		id: id, endpoint: strings.TrimSuffix(grant.URL, "/") + "/peer/v1/report", token: grant.OutboundToken,
+		origin: strings.TrimSuffix(grant.URL, "/"), routeInference: grant.RouteInference,
+		routeManagement: grant.RouteManagement, routePaths: grant.RoutePaths, serverCRLs: serverCRLs,
+		crlMaxAge:          peer.RevocationMaxAge(),
+		inferenceTransport: transport.Clone(),
+		client: &http.Client{Transport: transport, Timeout: peerReportTimeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}},
+	}
+	client.inferenceTransport.MaxConnsPerHost = 8
+	return client, nil
+}
+
+func peerServerIdentityVerifier(peer *config.PeerConfig, membership *federation.PairingStore, id string, serverCRLs []*x509.RevocationList) func(tls.ConnectionState) error {
+	return func(connection tls.ConnectionState) error {
+		if len(connection.VerifiedChains) == 0 || len(connection.PeerCertificates) == 0 {
+			return errors.New("peer server identity unavailable")
+		}
+		if federation.VerifyCertificateRevocation(connection.VerifiedChains, serverCRLs, peer.RevocationMaxAge(), time.Now()) != nil {
+			return errors.New("peer server certificate is revoked or CRL is stale")
+		}
+		serverCert := connection.PeerCertificates[0]
+		serverNodeID, err := federation.PeerIdentityNodeID(serverCert, peer.FederationID)
+		if err != nil || serverNodeID != id {
+			return errors.New("peer server identity mismatch")
+		}
+		member, ok := membership.GetMember(id)
+		if !ok || member.Fingerprint != federation.CertificateFingerprint(serverCert) {
+			return errors.New("peer is not paired with this certificate")
+		}
+		return nil
+	}
 }
 
 func (c *peerClient) fetch(ctx context.Context) (*nodecontract.Receipt, string) {
@@ -279,30 +314,36 @@ func (c *peerCache) views(now time.Time, selected string) ([]peerView, bool) {
 		if selected != "" && selected != id {
 			continue
 		}
-		view := peerView{NodeID: id, Status: "unknown", LastError: entry.lastError}
-		if !entry.lastAttempt.IsZero() {
-			at := entry.lastAttempt
-			view.LastAttempt = &at
-			view.Status = "unavailable"
-		}
-		if entry.receipt != nil {
-			age := now.Sub(entry.receipt.ReceivedAt)
-			if age >= 0 && age <= peerRetention {
-				at := entry.receipt.ReceivedAt
-				view.ReceivedAt = &at
-				view.Status = "stale"
-				if entry.lastError == "" && age <= peerFreshAge {
-					view.Status = "fresh"
-				}
-				if selected != "" {
-					view.Report = &entry.receipt.Report
-				}
-			}
-		}
-		views = append(views, view)
+		views = append(views, peerCacheEntryView(id, entry, now, selected != ""))
 	}
 	sort.Slice(views, func(i, j int) bool { return views[i].NodeID < views[j].NodeID })
 	return views, true
+}
+
+func peerCacheEntryView(id string, entry peerCacheEntry, now time.Time, includeReport bool) peerView {
+	view := peerView{NodeID: id, Status: "unknown", LastError: entry.lastError}
+	if !entry.lastAttempt.IsZero() {
+		at := entry.lastAttempt
+		view.LastAttempt = &at
+		view.Status = "unavailable"
+	}
+	if entry.receipt == nil {
+		return view
+	}
+	age := now.Sub(entry.receipt.ReceivedAt)
+	if age < 0 || age > peerRetention {
+		return view
+	}
+	at := entry.receipt.ReceivedAt
+	view.ReceivedAt = &at
+	view.Status = "stale"
+	if entry.lastError == "" && age <= peerFreshAge {
+		view.Status = "fresh"
+	}
+	if includeReport {
+		view.Report = &entry.receipt.Report
+	}
+	return view
 }
 
 func (r *Reloader) refreshPeers(state *reloaderState) {
@@ -317,18 +358,7 @@ func (r *Reloader) refreshPeerClients(state *reloaderState, clients map[string]*
 		go func() {
 			defer workers.Done()
 			for client := range jobs {
-				if client.dynamic && !client.catalogRead {
-					state.peerCache.markDynamicUnavailable(client.id, "catalog_read_not_granted", client.routeInference, time.Now())
-					continue
-				}
-				receipt, reason := client.fetch(state.peerContext)
-				if state.peerContext.Err() != nil {
-					continue
-				}
-				state.peerCache.updateSource(client.id, receipt, reason, time.Now(), client.dynamic, client.routeInference)
-				if reason != "" {
-					r.logger.Warn("peer report refresh failed", "node_id", client.id, "reason", reason)
-				}
+				r.refreshPeerClient(state, client)
 			}
 		}()
 	}
@@ -345,67 +375,106 @@ func (r *Reloader) refreshPeerClients(state *reloaderState, clients map[string]*
 	workers.Wait()
 }
 
+func (r *Reloader) refreshPeerClient(state *reloaderState, client *peerClient) {
+	if client.dynamic && !client.catalogRead {
+		state.peerCache.markDynamicUnavailable(client.id, "catalog_read_not_granted", client.routeInference, time.Now())
+		return
+	}
+	receipt, reason := client.fetch(state.peerContext)
+	if state.peerContext.Err() != nil {
+		return
+	}
+	state.peerCache.updateSource(client.id, receipt, reason, time.Now(), client.dynamic, client.routeInference)
+	if reason != "" {
+		r.logger.Warn("peer report refresh failed", "node_id", client.id, "reason", reason)
+	}
+}
+
 func (r *Reloader) watchPeers() {
 	defer r.wg.Done()
 	for {
 		state := r.state.Load()
 		r.refreshPeerCatalogs(state)
-		clients := state.peerClients
-		var dynamicClients map[string]*peerClient
-		if state.peer != nil && state.peer.Discovery != nil && state.peer.Discovery.Enabled {
-			discovered, err := r.buildDiscoveredPeerClients(state)
-			dynamicClients = discovered.clients
-			state.peerCache.retainDynamic(discovered.authorizedIDs)
-			now := time.Now()
-			for nodeID := range discovered.authorizedIDs {
-				if _, configured := state.peerClients[nodeID]; configured {
-					continue
-				}
-				if _, found := discovered.clients[nodeID]; found {
-					continue
-				}
-				reason := discovered.unavailable[nodeID]
-				if reason == "" {
-					reason = "not_discovered"
-				}
-				state.peerCache.markDynamicUnavailable(nodeID, reason, discovered.routeInference[nodeID], now)
-			}
-			if err != nil && state.peerContext.Err() == nil {
-				if r.lastPeerDiscoveryError != err.Error() {
-					r.logger.Warn("peer mDNS catalog discovery failed", "error", err)
-					r.lastPeerDiscoveryError = err.Error()
-				}
-			} else if err == nil {
-				r.lastPeerDiscoveryError = ""
-			}
-			clients = make(map[string]*peerClient, len(state.peerClients)+len(dynamicClients))
-			for nodeID, client := range state.peerClients {
-				clients[nodeID] = client
-			}
-			for nodeID, client := range dynamicClients {
-				if _, exists := clients[nodeID]; !exists {
-					clients[nodeID] = client
-				}
-			}
-		}
+		clients, dynamicClients := r.peerClientsForState(state)
 		if len(clients) != 0 {
 			r.refreshPeerClients(state, clients)
 		}
 		if len(dynamicClients) != 0 {
 			closePeerClients(dynamicClients)
 		}
-		timer := time.NewTimer(peerRefreshIntervalForTTL(state.cacheTTL))
-		select {
-		case <-r.stop:
-			timer.Stop()
+		if !r.waitForPeerRefresh(state.cacheTTL) {
 			return
-		case <-r.peerWake:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
 		}
 	}
+}
+
+func (r *Reloader) peerClientsForState(state *reloaderState) (map[string]*peerClient, map[string]*peerClient) {
+	if !peerDiscoveryEnabled(state.peer) {
+		return state.peerClients, nil
+	}
+	discovered, err := r.buildDiscoveredPeerClients(state)
+	r.updateDiscoveredPeerState(state, discovered, err)
+	return mergePeerClientSets(state.peerClients, discovered.clients), discovered.clients
+}
+
+func peerDiscoveryEnabled(peer *config.PeerConfig) bool {
+	return peer != nil && peer.Discovery != nil && peer.Discovery.Enabled
+}
+
+func (r *Reloader) updateDiscoveredPeerState(state *reloaderState, discovered discoveredPeerClients, discoveryErr error) {
+	state.peerCache.retainDynamic(discovered.authorizedIDs)
+	now := time.Now()
+	for nodeID := range discovered.authorizedIDs {
+		if _, configured := state.peerClients[nodeID]; configured {
+			continue
+		}
+		if _, found := discovered.clients[nodeID]; found {
+			continue
+		}
+		reason := discovered.unavailable[nodeID]
+		if reason == "" {
+			reason = "not_discovered"
+		}
+		state.peerCache.markDynamicUnavailable(nodeID, reason, discovered.routeInference[nodeID], now)
+	}
+	if discoveryErr != nil && state.peerContext.Err() == nil {
+		if r.lastPeerDiscoveryError != discoveryErr.Error() {
+			r.logger.Warn("peer mDNS catalog discovery failed", "error", discoveryErr)
+			r.lastPeerDiscoveryError = discoveryErr.Error()
+		}
+		return
+	}
+	if discoveryErr == nil {
+		r.lastPeerDiscoveryError = ""
+	}
+}
+
+func mergePeerClientSets(configured, discovered map[string]*peerClient) map[string]*peerClient {
+	clients := make(map[string]*peerClient, len(configured)+len(discovered))
+	for nodeID, client := range configured {
+		clients[nodeID] = client
+	}
+	for nodeID, client := range discovered {
+		if _, exists := clients[nodeID]; !exists {
+			clients[nodeID] = client
+		}
+	}
+	return clients
+}
+
+func (r *Reloader) waitForPeerRefresh(cacheTTL time.Duration) bool {
+	timer := time.NewTimer(peerRefreshIntervalForTTL(cacheTTL))
+	select {
+	case <-r.stop:
+		timer.Stop()
+		return false
+	case <-r.peerWake:
+		if !timer.Stop() {
+			<-timer.C
+		}
+	case <-timer.C:
+	}
+	return true
 }
 
 func peerRefreshIntervalForTTL(ttl time.Duration) time.Duration {

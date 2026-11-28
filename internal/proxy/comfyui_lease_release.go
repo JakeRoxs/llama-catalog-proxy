@@ -116,34 +116,59 @@ func VerifyComfyUIRelease(ctx context.Context, targetURL string, targetHeaders h
 		}
 		return result, fmt.Errorf("ComfyUI /free returned HTTP %d", response.StatusCode)
 	}
+	return confirmComfyUIReleaseAfterFree(ctx, comfyUIReleaseConfirmation{
+		queueTracker: queueTracker,
+		idleSamples:  idleSamples,
+		pollInterval: pollInterval,
+		client:       client,
+		targetURL:    targetURL,
+		headers:      targetHeaders,
+		thresholds:   lease.MinimumFreeVRAMBytes,
+	}, &result)
+}
+
+type comfyUIReleaseConfirmation struct {
+	queueTracker *comfyUIJobTracker
+	idleSamples  int
+	pollInterval time.Duration
+	client       *http.Client
+	targetURL    string
+	headers      http.Header
+	thresholds   map[string]int64
+}
+
+// confirmComfyUIReleaseAfterFree polls the queue after /free until the queue is stably
+// empty and per-device VRAM evidence meets the configured thresholds for the required
+// number of consecutive idle samples. It returns the accumulated release result.
+func confirmComfyUIReleaseAfterFree(ctx context.Context, confirmation comfyUIReleaseConfirmation, out *ComfyUIReleaseResult) (ComfyUIReleaseResult, error) {
 	stableSamples := 0
 	for {
-		busy, err := queueTracker.queueBusy(ctx)
+		busy, err := confirmation.queueTracker.queueBusy(ctx)
 		if err != nil {
-			return result, fmt.Errorf("%w: queue state after /free is unsupported", ErrComfyUIReleaseUnknown)
+			return *out, fmt.Errorf("%w: queue state after /free is unsupported", ErrComfyUIReleaseUnknown)
 		}
 		if busy {
 			stableSamples = 0
 		} else {
-			devices, enough, err := readComfyUIReleaseEvidence(ctx, client, targetURL, targetHeaders, lease.MinimumFreeVRAMBytes)
+			devices, enough, err := readComfyUIReleaseEvidence(ctx, confirmation.client, confirmation.targetURL, confirmation.headers, confirmation.thresholds)
 			if err != nil {
-				return result, fmt.Errorf("%w: %v", ErrComfyUIReleaseUnknown, err)
+				return *out, fmt.Errorf("%w: %v", ErrComfyUIReleaseUnknown, err)
 			}
-			result.Devices = devices
+			out.Devices = devices
 			if enough {
 				stableSamples++
-				result.QueueIdleSamples = stableSamples
-				if stableSamples >= idleSamples {
-					result.State = "confirmed"
-					return result, nil
+				out.QueueIdleSamples = stableSamples
+				if stableSamples >= confirmation.idleSamples {
+					out.State = "confirmed"
+					return *out, nil
 				}
 			} else {
 				stableSamples = 0
-				result.QueueIdleSamples = 0
+				out.QueueIdleSamples = 0
 			}
 		}
-		if err := waitComfyUIReleasePoll(ctx, pollInterval); err != nil {
-			return result, fmt.Errorf("%w: release did not meet the configured queue and VRAM criteria before timeout", ErrComfyUIReleaseUnknown)
+		if err := waitComfyUIReleasePoll(ctx, confirmation.pollInterval); err != nil {
+			return *out, fmt.Errorf("%w: release did not meet the configured queue and VRAM criteria before timeout", ErrComfyUIReleaseUnknown)
 		}
 	}
 }
@@ -209,6 +234,10 @@ func readComfyUIReleaseEvidence(ctx context.Context, client *http.Client, target
 	if decoder.Decode(new(any)) != io.EOF || len(stats.Devices) == 0 || len(stats.Devices) > maxComfyUIReleaseDevices {
 		return nil, false, ErrComfyUIReleaseUnknown
 	}
+	return collectComfyUIReleaseEvidence(stats, thresholds)
+}
+
+func collectComfyUIReleaseEvidence(stats comfyUIReleaseStats, thresholds map[string]int64) ([]ComfyUIDeviceReleaseEvidence, bool, error) {
 	seen := make(map[string]struct{}, len(stats.Devices))
 	evidence := make([]ComfyUIDeviceReleaseEvidence, 0, len(stats.Devices))
 	enough := true

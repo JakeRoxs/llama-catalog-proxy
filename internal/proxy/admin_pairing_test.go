@@ -426,6 +426,51 @@ func assertNoDuplicateMembershipOnRetry(t *testing.T, requestJoin func(string) *
 }
 
 func TestAdminOwnerGrantRequiresStaticCeilingAndCreatesTargetModelGrant(t *testing.T) {
+	reloader, store, grantDir := newOwnerGrantFixture(t)
+	defer store.Close()
+
+	// Missing explicit confirmation is rejected.
+	if response := ownerGrantCreate(reloader, "node-b", false); response.Code != http.StatusBadRequest {
+		t.Fatalf("missing explicit grant confirmation status = %d", response.Code)
+	}
+	// An unpaired requester is forbidden.
+	if response := ownerGrantCreate(reloader, "node-c", true); response.Code != http.StatusForbidden {
+		t.Fatalf("unpaired owner grant status = %d %s", response.Code, response.Body.String())
+	}
+	created := ownerGrantCreate(reloader, "node-b", true)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create owner grant = %d %s", created.Code, created.Body.String())
+	}
+	var grant modelconfig.OwnerGrant
+	if err := json.Unmarshal(created.Body.Bytes(), &grant); err != nil || grant.RequesterNodeID != "node-b" || grant.TargetID != "target-a" {
+		t.Fatalf("owner grant response = %+v, %v", grant, err)
+	}
+	// The static ManageSettings ceiling allows the approved model only.
+	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || !allowed {
+		t.Fatalf("authorized target-model grant = %v, %v", allowed, err)
+	}
+	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "other-model"); err != nil || allowed {
+		t.Fatalf("grant broadened to an unapproved model = %v, %v", allowed, err)
+	}
+	assertOwnerGrantListed(t, reloader, grant)
+	assertOwnerGrantRevoked(t, reloader, grant)
+	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || allowed {
+		t.Fatalf("revoked owner grant remained authorized = %v, %v", allowed, err)
+	}
+	// Dropping the ManageSettings peer grant revokes the owner grant.
+	reloader.state.Load().peer.Peers["node-b"] = config.PeerGrant{Token: strings.Repeat("b", 32), ManageSettings: false}
+	if response := ownerGrantCreate(reloader, "node-b", true); response.Code != http.StatusForbidden {
+		t.Fatalf("grant bypassed the static ManageSettings ceiling: %d %s", response.Code, response.Body.String())
+	}
+}
+
+// newOwnerGrantFixture builds the fixture for the owner-grant tests: temp
+// membership/grants/target directories, a target config.yaml, a pairing store
+// with node-b as a member, an operator admin session, and a reloader wired with
+// a management target and a peer that can manage settings. The caller owns the
+// returned store and should close it.
+func newOwnerGrantFixture(t *testing.T) (*Reloader, *federation.PairingStore, string) {
+	t.Helper()
 	root := t.TempDir()
 	membershipDir := filepath.Join(root, "membership")
 	grantDir := filepath.Join(root, "grants")
@@ -442,15 +487,17 @@ func TestAdminOwnerGrantRequiresStaticCeilingAndCreatesTargetModelGrant(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
 	if _, err := store.AddMember("node-b", strings.Repeat("a", 64), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	audit := newTestAuditStore(t, "owner")
 	logger := discardLogger()
 	auth, err := newAdminAuth(&config.ManagementUIConfig{
-		IssuerURL: "https://identity.example", ClientID: "catalog", ClientSecret: strings.Repeat("c", 32),
-		RedirectURL: "https://catalog.example/admin/auth/callback", RoleGroups: map[string][]string{"administer_federation": {"federation-admins"}},
+		IssuerURL:    "https://identity.example",
+		ClientID:     "catalog",
+		ClientSecret: strings.Repeat("c", 32),
+		RedirectURL:  "https://catalog.example/admin/auth/callback",
+		RoleGroups:   map[string][]string{"administer_federation": {"federation-admins"}},
 	}, logger, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -461,47 +508,40 @@ func TestAdminOwnerGrantRequiresStaticCeilingAndCreatesTargetModelGrant(t *testi
 		DelegatedStore: &config.DelegatedStoreConfig{ProposalDirectory: filepath.Join(root, "proposals"), OperationDirectory: filepath.Join(root, "operations"), GrantDirectory: grantDir},
 	}
 	peer := &config.PeerConfig{
-		NodeID: "owner", FederationID: "lab.example", LocalBackends: []string{"backend-a"},
+		NodeID:            "owner",
+		FederationID:      "lab.example",
+		LocalBackends:     []string{"backend-a"},
 		ManagementTargets: map[string]string{"backend-a": "target-a"},
 		Peers:             map[string]config.PeerGrant{"node-b": {Token: strings.Repeat("b", 32), ManageSettings: true}},
 	}
 	reloader := &Reloader{logger: logger, adminAuth: auth, auditStore: audit}
 	reloader.state.Store(&reloaderState{peer: peer, management: management, pairingStore: store, auditStore: audit})
-	create := func(requester string, confirm bool) *httptest.ResponseRecorder {
-		confirmation := "false"
-		if confirm {
-			confirmation = "true"
-		}
-		body := `{"requester_node_id":"` + requester + `","backend_id":"backend-a","model_ids":["model"],"expires_in":"24h","confirm_grant":` + confirmation + `}`
-		req := httptest.NewRequest(http.MethodPost, "https://catalog.example/admin/api/v1/federation/grants", strings.NewReader(body))
-		req.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
-		req.Header.Set("Origin", "https://catalog.example")
-		req.Header.Set(adminCSRFHeader, "admin-csrf")
-		req.Header.Set("Content-Type", "application/json")
-		response := httptest.NewRecorder()
-		reloader.ServeHTTP(response, req)
-		return response
+	return reloader, store, grantDir
+}
+
+// ownerGrantCreate builds and posts an owner-grant create request through the
+// reloader, returning the response. The confirmation flag is serialized as a
+// JSON boolean in the request body.
+func ownerGrantCreate(reloader *Reloader, requester string, confirm bool) *httptest.ResponseRecorder {
+	confirmation := "false"
+	if confirm {
+		confirmation = "true"
 	}
-	if response := create("node-b", false); response.Code != http.StatusBadRequest {
-		t.Fatalf("missing explicit grant confirmation status = %d", response.Code)
-	}
-	if response := create("node-c", true); response.Code != http.StatusForbidden {
-		t.Fatalf("unpaired owner grant status = %d %s", response.Code, response.Body.String())
-	}
-	created := create("node-b", true)
-	if created.Code != http.StatusCreated {
-		t.Fatalf("create owner grant = %d %s", created.Code, created.Body.String())
-	}
-	var grant modelconfig.OwnerGrant
-	if err := json.Unmarshal(created.Body.Bytes(), &grant); err != nil || grant.RequesterNodeID != "node-b" || grant.TargetID != "target-a" {
-		t.Fatalf("owner grant response = %+v, %v", grant, err)
-	}
-	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || !allowed {
-		t.Fatalf("authorized target-model grant = %v, %v", allowed, err)
-	}
-	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "other-model"); err != nil || allowed {
-		t.Fatalf("grant broadened to an unapproved model = %v, %v", allowed, err)
-	}
+	body := `{"requester_node_id":"` + requester + `","backend_id":"backend-a","model_ids":["model"],"expires_in":"24h","confirm_grant":` + confirmation + `}`
+	req := httptest.NewRequest(http.MethodPost, "https://catalog.example/admin/api/v1/federation/grants", strings.NewReader(body))
+	req.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
+	req.Header.Set("Origin", "https://catalog.example")
+	req.Header.Set(adminCSRFHeader, "admin-csrf")
+	req.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	reloader.ServeHTTP(response, req)
+	return response
+}
+
+// assertOwnerGrantListed asserts the grant list returns 200, includes the
+// created grant id, and does not leak the delegation token.
+func assertOwnerGrantListed(t *testing.T, reloader *Reloader, grant modelconfig.OwnerGrant) {
+	t.Helper()
 	listRequest := httptest.NewRequest(http.MethodGet, "https://catalog.example/admin/api/v1/federation/grants", nil)
 	listRequest.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
 	listResponse := httptest.NewRecorder()
@@ -509,6 +549,11 @@ func TestAdminOwnerGrantRequiresStaticCeilingAndCreatesTargetModelGrant(t *testi
 	if listResponse.Code != http.StatusOK || !strings.Contains(listResponse.Body.String(), grant.ID) || strings.Contains(listResponse.Body.String(), "delegation_token") {
 		t.Fatalf("owner grant list response = %d %s", listResponse.Code, listResponse.Body.String())
 	}
+}
+
+// assertOwnerGrantRevoked asserts the grant revoke returns 204.
+func assertOwnerGrantRevoked(t *testing.T, reloader *Reloader, grant modelconfig.OwnerGrant) {
+	t.Helper()
 	revokeRequest := httptest.NewRequest(http.MethodDelete, "https://catalog.example/admin/api/v1/federation/grants/"+grant.ID, nil)
 	revokeRequest.AddCookie(&http.Cookie{Name: adminSessionCookie, Value: "admin-session"})
 	revokeRequest.Header.Set("Origin", "https://catalog.example")
@@ -517,12 +562,5 @@ func TestAdminOwnerGrantRequiresStaticCeilingAndCreatesTargetModelGrant(t *testi
 	reloader.ServeHTTP(revokeResponse, revokeRequest)
 	if revokeResponse.Code != http.StatusNoContent {
 		t.Fatalf("owner grant revoke = %d %s", revokeResponse.Code, revokeResponse.Body.String())
-	}
-	if allowed, err := modelconfig.OwnerGrantAuthorizes(grantDir, "node-b", "manage_settings", "backend-a", "target-a", "model"); err != nil || allowed {
-		t.Fatalf("revoked owner grant remained authorized = %v, %v", allowed, err)
-	}
-	peer.Peers["node-b"] = config.PeerGrant{Token: strings.Repeat("b", 32), ManageSettings: false}
-	if response := create("node-b", true); response.Code != http.StatusForbidden {
-		t.Fatalf("grant bypassed the static ManageSettings ceiling: %d %s", response.Code, response.Body.String())
 	}
 }

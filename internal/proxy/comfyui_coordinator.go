@@ -289,7 +289,7 @@ func (c *comfyUICoordinator) release(ctx context.Context, leaseID string) (Comfy
 			c.mu.Unlock()
 			return ComfyUIReleaseResult{State: "unknown"}, err
 		}
-		if leaseID == "" || c.status.LeaseID != leaseID {
+		if c.isStaleLease(leaseID) {
 			c.mu.Unlock()
 			return ComfyUIReleaseResult{State: "unknown"}, errComfyUIStaleLease
 		}
@@ -299,23 +299,26 @@ func (c *comfyUICoordinator) release(ctx context.Context, leaseID string) (Comfy
 			c.mu.Unlock()
 			return result, nil
 		}
-		if c.verifying && (c.status.State == "draining" || c.status.State == "releasing") {
-			changed := c.changed
-			c.mu.Unlock()
-			select {
-			case <-ctx.Done():
+		if c.isVerifyingDrainOrRelease() {
+			if !c.awaitReleaseSignal(ctx) {
 				return ComfyUIReleaseResult{State: "unknown"}, ctx.Err()
-			case <-changed:
 			}
 			c.mu.Lock()
 			continue
 		}
-		if c.status.State != "active" || c.verifying || c.verify == nil {
+		if c.isAdmissionBlocked() {
 			c.mu.Unlock()
 			return ComfyUIReleaseResult{State: "unknown"}, errComfyUIAdmissionBlocked
 		}
 		break
 	}
+	return c.drainAndVerify(ctx)
+}
+
+// drainAndVerify transitions the coordinator to draining, waits for outstanding
+// submissions to drain, then runs the release verifier. Caller must hold c.mu;
+// the method unlocks in every return path.
+func (c *comfyUICoordinator) drainAndVerify(ctx context.Context) (ComfyUIReleaseResult, error) {
 	operationCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	c.cancel, c.verifying = cancel, true
@@ -332,6 +335,40 @@ func (c *comfyUICoordinator) release(ctx context.Context, leaseID string) (Comfy
 	c.signalLocked()
 	c.mu.Unlock()
 	return c.finishVerification(operationCtx, "releasing")
+}
+
+// awaitReleaseSignal waits for the changed channel or context cancellation while
+// another verification drains or releases. Caller must hold c.mu; it unlocks
+// during the wait and returns with c.mu unlocked. Returns false if ctx was
+// cancelled.
+func (c *comfyUICoordinator) awaitReleaseSignal(ctx context.Context) bool {
+	changed := c.changed
+	c.mu.Unlock()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-changed:
+	}
+	return true
+}
+
+// isStaleLease reports whether leaseID is empty or does not match the held lease.
+// Caller must hold c.mu.
+func (c *comfyUICoordinator) isStaleLease(leaseID string) bool {
+	return leaseID == "" || c.status.LeaseID != leaseID
+}
+
+// isVerifyingDrainOrRelease reports whether a verification is in flight while the
+// coordinator is draining or releasing. Caller must hold c.mu.
+func (c *comfyUICoordinator) isVerifyingDrainOrRelease() bool {
+	return c.verifying && (c.status.State == "draining" || c.status.State == "releasing")
+}
+
+// isAdmissionBlocked reports whether release cannot proceed because the lease is
+// not active, a verification is in flight, or no verifier is configured.
+// Caller must hold c.mu.
+func (c *comfyUICoordinator) isAdmissionBlocked() bool {
+	return c.status.State != "active" || c.verifying || c.verify == nil
 }
 
 func (c *comfyUICoordinator) invalidate(leaseID string) error {

@@ -60,45 +60,43 @@ func TestComfyUICoordinatorDrainsAndCachesGenerationBoundRelease(t *testing.T) {
 	assertStaleLeaseRejected(t, c, ctx, &calls, leaseID, nextID)
 }
 
-func TestComfyUICoordinatorRetriesInitialCheckOnlyBeforeFree(t *testing.T) {
-	t.Run("pre-free failure can retry", func(t *testing.T) {
-		var calls atomic.Int32
-		c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
-			if calls.Add(1) == 1 {
-				return ComfyUIReleaseResult{State: "unknown"}, errors.New("temporary queue probe failure")
-			}
-			return confirmedCoordinatorEvidence(), nil
-		})
-		if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
-			t.Fatalf("first check error=%v, want unknown release", err)
+func TestComfyUICoordinatorRetriesInitialCheckOnlyBeforeFree_PreFreeFailureCanRetry(t *testing.T) {
+	var calls atomic.Int32
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		if calls.Add(1) == 1 {
+			return ComfyUIReleaseResult{State: "unknown"}, errors.New("temporary queue probe failure")
 		}
-		if state := c.snapshot(); state.State != "unknown" {
-			t.Fatalf("failed pre-free check changed admission state: %+v", state)
-		}
-		if _, err := c.reconcileInitial(context.Background()); err != nil {
-			t.Fatalf("retry failed: %v", err)
-		}
-		if state := c.snapshot(); state.State != "released" || calls.Load() != 2 {
-			t.Fatalf("retry state=%+v verifier calls=%d", state, calls.Load())
-		}
+		return confirmedCoordinatorEvidence(), nil
 	})
+	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
+		t.Fatalf("first check error=%v, want unknown release", err)
+	}
+	if state := c.snapshot(); state.State != "unknown" {
+		t.Fatalf("failed pre-free check changed admission state: %+v", state)
+	}
+	if _, err := c.reconcileInitial(context.Background()); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if state := c.snapshot(); state.State != "released" || calls.Load() != 2 {
+		t.Fatalf("retry state=%+v verifier calls=%d", state, calls.Load())
+	}
+}
 
-	t.Run("post-free failure remains blocked", func(t *testing.T) {
-		var calls atomic.Int32
-		c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
-			calls.Add(1)
-			return ComfyUIReleaseResult{State: "unknown", FreeRequested: true}, ErrComfyUIReleaseUnknown
-		})
-		if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
-			t.Fatalf("first check error=%v, want unknown release", err)
-		}
-		if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, errComfyUIAdmissionBlocked) {
-			t.Fatalf("post-free retry error=%v, want admission blocked", err)
-		}
-		if calls.Load() != 1 || c.snapshot().State != "unknown" {
-			t.Fatalf("post-free verification retried: calls=%d state=%+v", calls.Load(), c.snapshot())
-		}
+func TestComfyUICoordinatorRetriesInitialCheckOnlyBeforeFree_PostFreeFailureRemainsBlocked(t *testing.T) {
+	var calls atomic.Int32
+	c := newComfyUICoordinator(func(context.Context) (ComfyUIReleaseResult, error) {
+		calls.Add(1)
+		return ComfyUIReleaseResult{State: "unknown", FreeRequested: true}, ErrComfyUIReleaseUnknown
 	})
+	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
+		t.Fatalf("first check error=%v, want unknown release", err)
+	}
+	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, errComfyUIAdmissionBlocked) {
+		t.Fatalf("post-free retry error=%v, want admission blocked", err)
+	}
+	if calls.Load() != 1 || c.snapshot().State != "unknown" {
+		t.Fatalf("post-free verification retried: calls=%d state=%+v", calls.Load(), c.snapshot())
+	}
 }
 
 func countingVerifier(t *testing.T, cPtr **comfyUICoordinator, calls *atomic.Int32) func(context.Context) (ComfyUIReleaseResult, error) {

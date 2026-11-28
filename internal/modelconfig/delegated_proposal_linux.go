@@ -121,57 +121,81 @@ func RecoverDelegatedProposal(directory string, query DelegatedProposalRecoveryQ
 		if err != nil {
 			return err
 		}
-		matches := make([]DelegatedProposal, 0, 2)
-		for _, id := range ids {
-			proposal, err := readDelegatedProposal(root, id)
-			if err != nil {
-				return err
-			}
-			if proposal.Owner == query.Owner && proposal.RequesterNode == query.RequesterNode &&
-				proposal.BackendID == query.BackendID && proposal.Proposal.ModelID == query.ModelID &&
-				proposal.Proposal.TargetID == query.TargetID && proposal.Proposal.Revision == query.Revision &&
-				reflect.DeepEqual(proposal.Proposal.Settings, query.Settings) {
-				matches = append(matches, proposal)
-			}
+		matches, err := findMatchingDelegatedProposals(root, ids, query)
+		if err != nil {
+			return err
 		}
 		if len(matches) == 0 {
 			return ErrProposalNotFound
 		}
-		outcome := "recovered"
-		if len(matches) > 1 {
-			outcome = "ambiguous"
-		} else if !now.Before(matches[0].ExpiresAt) {
-			outcome = "expired"
+		applied, err := applyRecoveryToMatches(root, dir, matches, query, credentialScope, now, requestDigest)
+		if err != nil {
+			return err
 		}
-		for _, proposal := range matches {
-			proposal.RecoveryAudit = append(proposal.RecoveryAudit, DelegatedProposalRecoveryAudit{
-				At: now.UTC(), ProposalID: proposal.Proposal.ID, RequesterNode: query.RequesterNode, CredentialScope: credentialScope,
-				OwnerNode: query.Owner.NodeID, TargetID: proposal.Proposal.TargetID,
-				BackendID: query.BackendID, ModelID: query.ModelID, SourceRevision: query.Revision,
-				ReviewRevision: proposal.ReviewRevision, RequestDigest: hex.EncodeToString(requestDigest[:]), Outcome: outcome,
-			})
-			if len(proposal.RecoveryAudit) > MaxDelegatedProposalRecoveryAudit {
-				proposal.RecoveryAudit = append([]DelegatedProposalRecoveryAudit(nil),
-					proposal.RecoveryAudit[len(proposal.RecoveryAudit)-MaxDelegatedProposalRecoveryAudit:]...)
-			}
-			data, err := json.Marshal(proposal)
-			if err != nil || len(data) > maxProposalBytes || !validDelegatedProposal(proposal) {
-				return ErrProposalStore
-			}
-			if err := replaceDelegatedProposal(root, dir, proposal.Proposal.ID, data); err != nil {
-				return err
-			}
-			if len(matches) == 1 {
-				result = proposal
-			}
-		}
-		if len(matches) > 1 {
-			return ErrDelegatedProposalAmbiguous
-		}
+		result = applied
 		return nil
 	})
 	if err != nil {
 		return DelegatedProposal{}, err
+	}
+	return result, nil
+}
+
+// findMatchingDelegatedProposals returns all proposals matching the recovery
+// query, reading each proposal read-only from the locked store.
+func findMatchingDelegatedProposals(root *os.Root, ids []string, query DelegatedProposalRecoveryQuery) ([]DelegatedProposal, error) {
+	matches := make([]DelegatedProposal, 0, 2)
+	for _, id := range ids {
+		proposal, err := readDelegatedProposal(root, id)
+		if err != nil {
+			return nil, err
+		}
+		if proposal.Owner == query.Owner && proposal.RequesterNode == query.RequesterNode &&
+			proposal.BackendID == query.BackendID && proposal.Proposal.ModelID == query.ModelID &&
+			proposal.Proposal.TargetID == query.TargetID && proposal.Proposal.Revision == query.Revision &&
+			reflect.DeepEqual(proposal.Proposal.Settings, query.Settings) {
+			matches = append(matches, proposal)
+		}
+	}
+	return matches, nil
+}
+
+// applyRecoveryToMatches records a recovery audit event for each matched
+// proposal, trims the audit to the bounded size, and persists each updated
+// proposal. It returns the single applied proposal when exactly one match
+// exists, or ErrDelegatedProposalAmbiguous when multiple matches exist.
+func applyRecoveryToMatches(root *os.Root, dir *os.File, matches []DelegatedProposal, query DelegatedProposalRecoveryQuery, credentialScope string, now time.Time, requestDigest [32]byte) (DelegatedProposal, error) {
+	outcome := "recovered"
+	if len(matches) > 1 {
+		outcome = "ambiguous"
+	} else if !now.Before(matches[0].ExpiresAt) {
+		outcome = "expired"
+	}
+	var result DelegatedProposal
+	for _, proposal := range matches {
+		proposal.RecoveryAudit = append(proposal.RecoveryAudit, DelegatedProposalRecoveryAudit{
+			At: now.UTC(), ProposalID: proposal.Proposal.ID, RequesterNode: query.RequesterNode, CredentialScope: credentialScope,
+			OwnerNode: query.Owner.NodeID, TargetID: proposal.Proposal.TargetID,
+			BackendID: query.BackendID, ModelID: query.ModelID, SourceRevision: query.Revision,
+			ReviewRevision: proposal.ReviewRevision, RequestDigest: hex.EncodeToString(requestDigest[:]), Outcome: outcome,
+		})
+		if len(proposal.RecoveryAudit) > MaxDelegatedProposalRecoveryAudit {
+			proposal.RecoveryAudit = append([]DelegatedProposalRecoveryAudit(nil),
+				proposal.RecoveryAudit[len(proposal.RecoveryAudit)-MaxDelegatedProposalRecoveryAudit:]...)
+		}
+		data, err := json.Marshal(proposal)
+		if err != nil || len(data) > maxProposalBytes || !validDelegatedProposal(proposal) {
+			return DelegatedProposal{}, ErrProposalStore
+		}
+		if err := replaceDelegatedProposal(root, dir, proposal.Proposal.ID, data); err != nil {
+			return DelegatedProposal{}, err
+		}
+		if len(matches) == 1 {
+			result = proposal
+		}
+	}
+	if len(matches) > 1 {
+		return DelegatedProposal{}, ErrDelegatedProposalAmbiguous
 	}
 	return result, nil
 }

@@ -412,39 +412,13 @@ func assertNonResultFallsBackToLlama(t *testing.T, response *httptest.ResponseRe
 
 func TestPeerComfyUIResultReadsHonorPathGrantAndKeepPromptRouteOnLlamaSwap(t *testing.T) {
 	var resultReads, promptRequests atomic.Int32
-	resultBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		resultReads.Add(1)
-		if req.Method != http.MethodGet || req.URL.Path != "/view" || req.URL.RawQuery != "filename=output.png&type=output" {
-			t.Errorf("peer result request = %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
-		}
-		if req.Header.Get("Authorization") != "Bearer owner-result-key" || req.Header.Get("Cookie") != "" || req.Header.Get("X-Caller-Secret") != "" {
-			t.Errorf("caller credentials reached owner ComfyUI: %v", req.Header)
-		}
-		w.Header().Set("Set-Cookie", "owner-session=secret")
-		_, _ = io.WriteString(w, "owned output")
-	}))
-	defer resultBackend.Close()
-	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method == http.MethodPost && req.URL.Path == "/comfyui/prompt" {
-			promptRequests.Add(1)
-		}
-		_, _ = io.WriteString(w, "llama-swap")
-	}))
-	defer llama.Close()
+	resultBackend := newPeerResultReadBackend(t, &resultReads)
+	llama := newPeerLlamaServer(t, &promptRequests, nil)
 	llamaURL, err := url.Parse(llama.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resultProxy, err := newComfyUIResultReadProxy(&config.ComfyUIResultReadConfig{URL: resultBackend.URL, APIKey: "owner-result-key"}, discardLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownerHandler := &Handler{
-		logger: discardLogger(), pathRoutes: []route{{prefix: "/comfyui", backendID: "llama"}},
-		proxies:                map[string]*httputil.ReverseProxy{"llama": httputil.NewSingleHostReverseProxy(llamaURL)},
-		comfyUIResultReadProxy: resultProxy, comfyUIResultSlots: make(chan struct{}, 2),
-	}
-	requesterToken := strings.Repeat("r", 32)
+	_, ownerHandler, requesterToken := newPeerOwnerProxyAndHandler(t, resultBackend, llamaURL)
 	ownerPeer := &config.PeerConfig{
 		NodeID: "bigboi", ExposedPathRoutes: map[string]string{"comfyui": "/comfyui"},
 		Peers: map[string]config.PeerGrant{"udms": {Token: requesterToken, PathAccess: []string{"comfyui"}}},
@@ -509,42 +483,13 @@ func TestPeerComfyUIResultReadsHonorPathGrantAndKeepPromptRouteOnLlamaSwap(t *te
 
 func TestPeerComfyUIResultReadsUseOwnerTargetAndKeepPromptOnLlamaSwap(t *testing.T) {
 	var resultReads, promptRequests, fallbackRequests atomic.Int32
-	resultBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		resultReads.Add(1)
-		if req.Method != http.MethodGet || req.URL.Path != "/view" || req.URL.RawQuery != "filename=output.png&type=output" {
-			t.Errorf("peer result request = %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
-		}
-		if req.Header.Get("Authorization") != "Bearer owner-result-key" || req.Header.Get("Cookie") != "" || req.Header.Get("X-Caller-Secret") != "" {
-			t.Errorf("caller credentials reached owner result backend: %v", req.Header)
-		}
-		w.Header().Set("Set-Cookie", "owner-session=secret")
-		_, _ = io.WriteString(w, "owned output")
-	}))
-	defer resultBackend.Close()
-	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		fallbackRequests.Add(1)
-		if req.Method == http.MethodPost && req.URL.Path == "/comfyui/prompt" {
-			promptRequests.Add(1)
-		}
-		_, _ = io.WriteString(w, "llama-swap")
-	}))
-	defer llama.Close()
+	resultBackend := newPeerResultReadBackend(t, &resultReads)
+	llama := newPeerLlamaServer(t, &promptRequests, &fallbackRequests)
 	llamaURL, err := url.Parse(llama.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resultProxy, err := newComfyUIResultReadProxy(&config.ComfyUIResultReadConfig{
-		URL: resultBackend.URL, APIKey: "owner-result-key",
-	}, discardLogger())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ownerHandler := &Handler{
-		logger: discardLogger(), pathRoutes: []route{{prefix: "/comfyui", backendID: "llama"}},
-		proxies:                map[string]*httputil.ReverseProxy{"llama": httputil.NewSingleHostReverseProxy(llamaURL)},
-		comfyUIResultReadProxy: resultProxy, comfyUIResultSlots: make(chan struct{}, 2),
-	}
-	requesterToken := strings.Repeat("r", 32)
+	_, ownerHandler, requesterToken := newPeerOwnerProxyAndHandler(t, resultBackend, llamaURL)
 	ownerPeer := &config.PeerConfig{
 		NodeID: "bigboi", ExposedPathRoutes: map[string]string{"comfyui": "/comfyui"},
 		Peers: map[string]config.PeerGrant{"udms": {Token: requesterToken, PathAccess: []string{"comfyui"}}},
@@ -674,4 +619,61 @@ func assertPeerPromptFallback(t *testing.T, response *httptest.ResponseRecorder,
 		t.Fatalf("prompt did not remain routed through llama-swap: status=%d prompts=%d",
 			response.Code, promptRequests.Load())
 	}
+}
+
+// newPeerResultReadBackend creates a ComfyUI result backend for peer result-read
+// tests. It counts reads, verifies the request path/query and that caller
+// credentials are stripped while owner credentials are applied, then writes
+// "owned output". The server is cleaned up when the test ends.
+func newPeerResultReadBackend(t *testing.T, resultReads *atomic.Int32) *httptest.Server {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		resultReads.Add(1)
+		if req.Method != http.MethodGet || req.URL.Path != "/view" || req.URL.RawQuery != "filename=output.png&type=output" {
+			t.Errorf("peer result request = %s %s?%s", req.Method, req.URL.Path, req.URL.RawQuery)
+		}
+		if req.Header.Get("Authorization") != "Bearer owner-result-key" || req.Header.Get("Cookie") != "" || req.Header.Get("X-Caller-Secret") != "" {
+			t.Errorf("caller credentials reached owner result backend: %v", req.Header)
+		}
+		w.Header().Set("Set-Cookie", "owner-session=secret")
+		_, _ = io.WriteString(w, "owned output")
+	}))
+	t.Cleanup(backend.Close)
+	return backend
+}
+
+// newPeerLlamaServer creates a llama-swap backend for peer result-read tests.
+// It counts prompt requests and, when fallbackRequests is non-nil, counts every
+// request as a fallback. It writes "llama-swap". The server is cleaned up when
+// the test ends.
+func newPeerLlamaServer(t *testing.T, promptRequests *atomic.Int32, fallbackRequests *atomic.Int32) *httptest.Server {
+	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if fallbackRequests != nil {
+			fallbackRequests.Add(1)
+		}
+		if req.Method == http.MethodPost && req.URL.Path == "/comfyui/prompt" {
+			promptRequests.Add(1)
+		}
+		_, _ = io.WriteString(w, "llama-swap")
+	}))
+	t.Cleanup(llama.Close)
+	return llama
+}
+
+// newPeerOwnerProxyAndHandler builds the result-read proxy and the owner handler
+// for peer result-read tests. The owner handler routes result reads through the
+// proxy and all other requests to the llama backend. It returns the proxy,
+// handler, and requester bearer token.
+func newPeerOwnerProxyAndHandler(t *testing.T, resultBackend *httptest.Server, llamaURL *url.URL) (*httputil.ReverseProxy, *Handler, string) {
+	resultProxy, err := newComfyUIResultReadProxy(&config.ComfyUIResultReadConfig{
+		URL: resultBackend.URL, APIKey: "owner-result-key",
+	}, discardLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerHandler := &Handler{
+		logger: discardLogger(), pathRoutes: []route{{prefix: "/comfyui", backendID: "llama"}},
+		proxies:                map[string]*httputil.ReverseProxy{"llama": httputil.NewSingleHostReverseProxy(llamaURL)},
+		comfyUIResultReadProxy: resultProxy, comfyUIResultSlots: make(chan struct{}, 2),
+	}
+	return resultProxy, ownerHandler, strings.Repeat("r", 32)
 }

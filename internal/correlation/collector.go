@@ -189,16 +189,11 @@ func (c *ActivityCollector) ResetEpoch() {
 // an activity already observed is not re-stored (idempotent replay). Same
 // numeric IDs reused across backend/epoch are distinct keys.
 func (c *ActivityCollector) Refresh(ctx context.Context) ([]*ActivityRecord, error) {
-	if err := ctx.Err(); err != nil {
+	if err := c.acquireRefreshGate(ctx); err != nil {
 		return nil, err
 	}
-	// Serialize callers. Honor cancellation while waiting for the gate.
-	select {
-	case c.refreshGate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-	defer func() { <-c.refreshGate }()
+	defer c.releaseRefreshGate()
+
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -206,17 +201,74 @@ func (c *ActivityCollector) Refresh(ctx context.Context) ([]*ActivityRecord, err
 	// Snapshot the epoch and the sorted configured backend jobs under the lock,
 	// then release it so collection can proceed without holding the lock across
 	// HTTP.
+	epoch, jobs := c.snapshotBackendJobs()
+
+	// Run the bounded worker pool and merge each result into the store.
+	results := c.collectBackends(ctx, jobs)
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	epochChanged := c.mergeResults(ctx, epoch, results)
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	c.mu.Lock()
-	epoch := c.epoch
-	jobs := make([]backendJob, 0, len(c.backends))
+	if epochChanged || c.epoch != epoch {
+		c.mu.Unlock()
+		return nil, ErrActivityEpochChanged
+	}
+	// Count and size retention on write.
+	c.evictCountLocked()
+	c.evictSizeLocked()
+	// Return defensive copies after releasing the lock.
+	snapshot := c.snapshotLocked()
+	c.mu.Unlock()
+	return snapshot, nil
+}
+
+// acquireRefreshGate serializes Refresh callers. It honors context cancellation
+// while waiting for the gate and returns ctx.Err() rather than blocking forever.
+// The caller must call releaseRefreshGate after a successful acquisition.
+func (c *ActivityCollector) acquireRefreshGate(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.refreshGate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+// releaseRefreshGate releases the gate acquired by refreshGate.
+func (c *ActivityCollector) releaseRefreshGate() {
+	<-c.refreshGate
+}
+
+// snapshotBackendJobs captures the collection epoch and returns the configured
+// backends as sorted jobs. The lock is released before returning so collection
+// can proceed without holding it across HTTP.
+func (c *ActivityCollector) snapshotBackendJobs() (epoch int64, jobs []backendJob) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	epoch = c.epoch
+	jobs = make([]backendJob, 0, len(c.backends))
 	for id, b := range c.backends {
 		jobs = append(jobs, backendJob{id: id, b: b})
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
-	c.mu.Unlock()
+	return
+}
 
-	// Run the actual bounded worker pool: min(4, len(jobs)) goroutines reading
-	// from a bounded job channel and sending to a bounded result channel.
+// collectBackends runs the bounded worker pool: min(4, len(jobs)) goroutines
+// reading from a bounded job channel and sending to a bounded result channel.
+// Results are keyed by backend id, so arrival order is not significant.
+func (c *ActivityCollector) collectBackends(ctx context.Context, jobs []backendJob) []backendResult {
 	n := 4
 	if n > len(jobs) {
 		n = len(jobs)
@@ -248,11 +300,18 @@ func (c *ActivityCollector) Refresh(ctx context.Context) ([]*ActivityRecord, err
 		wg.Wait()
 	}()
 
-	// Merge each result into the store under the lock. If the epoch changed
-	// while requests were in flight, discard everything and report it without
-	// repopulating.
-	epochChanged := false
+	results := make([]backendResult, 0, len(jobs))
 	for r := range resultChan {
+		results = append(results, r)
+	}
+	return results
+}
+
+// mergeResults merges each backend result into the store under the lock. It
+// returns true if the collection epoch changed while requests were in flight
+// (stale results must be discarded).
+func (c *ActivityCollector) mergeResults(ctx context.Context, epoch int64, results []backendResult) (epochChanged bool) {
+	for _, r := range results {
 		c.mu.Lock()
 		if c.epoch != epoch {
 			epochChanged = true
@@ -263,53 +322,58 @@ func (c *ActivityCollector) Refresh(ctx context.Context) ([]*ActivityRecord, err
 			c.mu.Unlock()
 			continue
 		}
-		state := r.state
-		for _, rec := range r.records {
-			rec.Epoch = epoch
-			dk := dedupKey{backendID: r.id, activityID: rec.ActivityID}
-			if existing, ok := c.dedup[dk]; ok {
-				if existing.epoch == epoch {
-					// Replay within the same epoch. Detect identity conflict
-					// on conflicting timestamps without merging.
-					storedKey := activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}
-					stored := c.store[storedKey]
-					if stored != nil && !stored.Timestamp.Equal(rec.Timestamp) {
-						stored.IdentityConflict = true
-						if state.Coverage == "" || state.Coverage == "complete" {
-							state.Coverage = "partial"
-						}
-					}
-					continue
-				}
-				// Observed in an earlier epoch: idempotent replay, keep the
-				// first observation (already stored under its epoch).
-				continue
-			}
-			c.store[activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}] = rec
-			c.dedup[dk] = activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}
-			c.totalSize += estimateActivitySize(rec)
+		c.mergeResultLocked(epoch, r)
+		c.mu.Unlock()
+	}
+	return epochChanged
+}
+
+// mergeResultLocked merges one backend result into the store. The caller must
+// hold the mutex.
+func (c *ActivityCollector) mergeResultLocked(epoch int64, r backendResult) {
+	state := r.state
+	for _, rec := range r.records {
+		rec.Epoch = epoch
+		if c.mergeReplayedRecord(epoch, r, rec, &state) {
+			continue
 		}
-		c.backendState[r.id] = state
-		// Bound retained and staged rows independently of the number of backends.
-		c.evictCountLocked()
-		c.evictSizeLocked()
-		c.mu.Unlock()
+		c.store[activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}] = rec
+		c.dedup[dedupKey{backendID: r.id, activityID: rec.ActivityID}] = activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}
+		c.totalSize += estimateActivitySize(rec)
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	c.mu.Lock()
-	if epochChanged || c.epoch != epoch {
-		c.mu.Unlock()
-		return nil, ErrActivityEpochChanged
-	}
-	// Count and size retention on write.
+	c.backendState[r.id] = state
 	c.evictCountLocked()
 	c.evictSizeLocked()
-	// Return defensive copies after releasing the lock.
-	snapshot := c.snapshotLocked()
-	c.mu.Unlock()
-	return snapshot, nil
+}
+
+// mergeReplayedRecord handles a record whose (backendID, activityID) was already
+// observed. Within the same epoch it detects identity conflicts on conflicting
+// timestamps without merging; across epochs the first observation wins. It
+// returns true when the record is a duplicate (already stored) and should be
+// skipped, false when it is new and should be stored. The caller must hold the
+// mutex.
+func (c *ActivityCollector) mergeReplayedRecord(epoch int64, r backendResult, rec *ActivityRecord, state *BackendState) (duplicate bool) {
+	dk := dedupKey{backendID: r.id, activityID: rec.ActivityID}
+	existing, ok := c.dedup[dk]
+	if !ok {
+		return false
+	}
+	if existing.epoch != epoch {
+		// Observed in an earlier epoch: idempotent replay, keep the first
+		// observation (already stored under its epoch).
+		return true
+	}
+	// Replay within the same epoch. Detect identity conflict on conflicting
+	// timestamps without merging.
+	storedKey := activityKey{backendID: r.id, epoch: epoch, activityID: rec.ActivityID}
+	stored := c.store[storedKey]
+	if stored != nil && !stored.Timestamp.Equal(rec.Timestamp) {
+		stored.IdentityConflict = true
+		if state.Coverage == "" || state.Coverage == "complete" {
+			state.Coverage = "partial"
+		}
+	}
+	return true
 }
 
 // collect fetches one page of activity from a backend and normalizes it. It

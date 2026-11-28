@@ -325,173 +325,53 @@ func TestCopyPeerClientAddressHeadersUsesObservedAddressAndAllowlist(t *testing.
 	}
 }
 
-func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
-	type inferenceEvent struct {
-		model, authorization, apiKey, private, partPrivate, file string
-		forwardedFor, realIP                                     string
-	}
-	events := make(chan inferenceEvent, 4)
-	canceled := make(chan struct{}, 1)
-	var localInference atomic.Int32
-	makeBackend := func(id string) *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-			if request.Method == http.MethodGet {
-				if id == "model-b" {
-					_, _ = io.WriteString(w, `{"data":[{"id":"model-b","meta":{"llamaswap":{"aliases":["model-b-alias"]}}}]}`)
-				} else {
-					_, _ = fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
-				}
-				return
-			}
-			if id == "model-b" {
-				model := ""
-				if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
-					reader, err := request.MultipartReader()
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					for {
-						part, err := reader.NextPart()
-						if err == io.EOF {
-							break
-						}
-						if err != nil {
-							t.Error(err)
-							return
-						}
-						data, err := io.ReadAll(part)
-						_ = part.Close()
-						if err != nil {
-							t.Error(err)
-							return
-						}
-						if part.FormName() == "model" {
-							model = string(data)
-						}
-					}
-					if model != "bigboi/model-b" {
-						t.Errorf("local multipart model = %q", model)
-					}
-				} else {
-					var body struct {
-						Model string `json:"model"`
-					}
-					if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
-						t.Error(err)
-						return
-					}
-					model = body.Model
-					if model != "model-b-alias" {
-						t.Errorf("peer alias was not preserved to the backend: %q", model)
-					}
-				}
-				localInference.Add(1)
-				_, _ = io.WriteString(w, `{"ok":true}`)
-				return
-			}
-			if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
-				reader, err := request.MultipartReader()
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				event := inferenceEvent{
-					authorization: request.Header.Get("Authorization"), apiKey: request.Header.Get("X-Api-Key"),
-					private: request.Header.Get("X-Private"), forwardedFor: request.Header.Get("X-Forwarded-For"),
-					realIP: request.Header.Get("X-Real-IP"),
-				}
-				for {
-					part, err := reader.NextPart()
-					if err == io.EOF {
-						break
-					}
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					data, err := io.ReadAll(part)
-					if err != nil {
-						t.Error(err)
-						return
-					}
-					if part.FormName() == "model" {
-						event.model = string(data)
-					} else if part.FormName() == "file" {
-						event.file, event.partPrivate = string(data), part.Header.Get("X-Private")
-					}
-				}
-				events <- event
-				_, _ = io.WriteString(w, `{"ok":true}`)
-				return
-			}
-			var body struct {
-				Model string `json:"model"`
-			}
-			if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
-				t.Error(err)
-				return
-			}
-			events <- inferenceEvent{
-				model: body.Model, authorization: request.Header.Get("Authorization"),
-				apiKey: request.Header.Get("X-Api-Key"), private: request.Header.Get("X-Private"),
-				forwardedFor: request.Header.Get("X-Forwarded-For"), realIP: request.Header.Get("X-Real-IP"),
-			}
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: first\n\n")
-			w.(http.Flusher).Flush()
-			<-request.Context().Done()
-			canceled <- struct{}{}
-		}))
-	}
-	backendA, backendB := makeBackend("model-a"), makeBackend("model-b")
-	defer backendA.Close()
-	defer backendB.Close()
-	certA, keyA, _ := peerTestCertificate(t)
-	certB, keyB, _ := peerTestCertificate(t)
-	listenerA, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addrA := listenerA.Addr().String()
-	listenerB, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		_ = listenerA.Close()
-		t.Fatal(err)
-	}
-	addrB := listenerB.Addr().String()
-	tokenA, tokenB := strings.Repeat("a", 32), strings.Repeat("b", 32)
-	diag := strings.Repeat("d", 32)
-	pathA, pathB := configPath(t), configPath(t)
-	// peerFileConfig groups the local node/backend fields and the optional peer
-	// block fields into a single argument, keeping the config writer under the
-	// 7-parameter limit. peerID is always emitted as the peer node_id; the peer
-	// block (peers:) is only written when peer is non-nil.
-	type peerLocal struct {
-		id      string
-		addr    string
-		cert    string
-		key     string
-		backend string
-	}
+type peerInferenceEvent struct {
+	model, authorization, apiKey, private, partPrivate, file string
+	forwardedFor, realIP                                     string
+}
 
-	type peerBlock struct {
-		addr     string
-		ca       string
-		inToken  string
-		outToken string
-	}
+type peerExchangeLocalConfig struct {
+	id, addr, cert, key, backend string
+}
 
-	type peerFileConfig struct {
-		path   string
-		local  peerLocal
-		peerID string
-		peer   *peerBlock
-	}
+type peerExchangePeerConfig struct {
+	addr, ca, inToken, outToken string
+}
 
-	write := func(cfg peerFileConfig) {
-		t.Helper()
-		text := fmt.Sprintf(`default_backend: local
+type peerExchangeConfig struct {
+	path   string
+	local  peerExchangeLocalConfig
+	peerID string
+	peer   *peerExchangePeerConfig
+}
+
+type twoPeerExchangeHarness struct {
+	t              *testing.T
+	events         chan peerInferenceEvent
+	canceled       chan struct{}
+	localInference *atomic.Int32
+	backendA       *httptest.Server
+	backendB       *httptest.Server
+	certA, keyA    string
+	certB, keyB    string
+	listenerA      net.Listener
+	listenerB      net.Listener
+	addrA, addrB   string
+	tokenA, tokenB string
+	diag           string
+	pathA, pathB   string
+	a, b           *Reloader
+	serverA        *http.Server
+	clientServer   *httptest.Server
+	clientServerA  *httptest.Server
+	modelID        string
+	reverseModelID string
+	inferenceBody  string
+}
+
+func writePeerExchangeConfig(t *testing.T, diag string, cfg peerExchangeConfig) {
+	t.Helper()
+	text := fmt.Sprintf(`default_backend: local
 diagnostics_api_key: %q
 backends: {local: {url: %q, api_key: "owner-backend-key", prefix: %q}}
 path_routes: {"/v1": local}
@@ -503,73 +383,39 @@ peer:
   tls_key_file: %q
   local_backends: [local]
 `, diag, cfg.local.backend, cfg.local.id+"/", cfg.local.id, cfg.peerID, cfg.local.addr, cfg.local.cert, cfg.local.key)
-		if cfg.peer != nil {
-			text += fmt.Sprintf("  peers:\n    %s: {token: %q, catalog_read: true, diagnostics_read: true, inference: true, url: %q, outbound_token: %q, ca_file: %q, route_inference: true}\n",
-				cfg.peerID, cfg.peer.inToken, "https://"+cfg.peer.addr, cfg.peer.outToken, cfg.peer.ca)
-		}
-		if err := os.WriteFile(cfg.path, []byte(text), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	if cfg.peer != nil {
+		text += fmt.Sprintf("  peers:\n    %s: {token: %q, catalog_read: true, diagnostics_read: true, inference: true, url: %q, outbound_token: %q, ca_file: %q, route_inference: true}\n",
+			cfg.peerID, cfg.peer.inToken, "https://"+cfg.peer.addr, cfg.peer.outToken, cfg.peer.ca)
 	}
-	write(peerFileConfig{
-		path:   pathA,
-		local:  peerLocal{id: "udms", addr: addrA, cert: certA, key: keyA, backend: backendA.URL},
-		peerID: "bigboi",
-		peer:   &peerBlock{addr: addrB, ca: certB, inToken: tokenA, outToken: tokenB},
-	})
-	write(peerFileConfig{
-		path:   pathB,
-		local:  peerLocal{id: "bigboi", addr: addrB, cert: certB, key: keyB, backend: backendB.URL},
-		peerID: "udms",
-		peer:   &peerBlock{addr: addrA, ca: certA, inToken: tokenB, outToken: tokenA},
-	})
-	a, _, err := NewReloader(pathA, discardLogger(), nil, nil, nil, nil, nil)
-	if err != nil {
+	if err := os.WriteFile(cfg.path, []byte(text), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	b, _, err := NewReloader(pathB, discardLogger(), nil, nil, nil, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, r := range []*Reloader{a, b} {
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-		if w.Code != http.StatusOK {
-			t.Fatalf("warm catalog: %d", w.Code)
+}
+
+func startPeerExchangeServer(t *testing.T, reloader *Reloader, listener net.Listener) *http.Server {
+	t.Helper()
+	server := &http.Server{Handler: reloader.PeerHandler(), TLSConfig: reloader.PeerTLSConfig()}
+	go func() { _ = server.ServeTLS(listener, "", "") }()
+	t.Cleanup(func() { _ = server.Close() })
+	return server
+}
+
+func waitPeerExchangeView(t *testing.T, reloader *Reloader, peerID, status string) peerView {
+	t.Helper()
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		views, ok := reloader.state.Load().peerCache.views(time.Now(), peerID)
+		if ok && len(views) == 1 && views[0].Status == status {
+			return views[0]
 		}
-		w = httptest.NewRecorder()
-		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/ready", nil))
-		if w.Code != http.StatusOK {
-			t.Fatalf("warm readiness: %d", w.Code)
-		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	startServer := func(r *Reloader, listener net.Listener) *http.Server {
-		server := &http.Server{Handler: r.PeerHandler(), TLSConfig: r.PeerTLSConfig()}
-		go func() { _ = server.ServeTLS(listener, "", "") }()
-		t.Cleanup(func() { _ = server.Close() })
-		return server
-	}
-	serverA := startServer(a, listenerA)
-	startServer(b, listenerB)
-	a.Start()
-	b.Start()
-	t.Cleanup(a.Stop)
-	t.Cleanup(b.Stop)
-	waitView := func(r *Reloader, peerID, status string) peerView {
-		t.Helper()
-		deadline := time.Now().Add(4 * time.Second)
-		for time.Now().Before(deadline) {
-			views, ok := r.state.Load().peerCache.views(time.Now(), peerID)
-			if ok && len(views) == 1 && views[0].Status == status {
-				return views[0]
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		t.Fatalf("peer %s did not become %s", peerID, status)
-		return peerView{}
-	}
-	viewA := waitView(a, "bigboi", "fresh")
-	viewB := waitView(b, "udms", "fresh")
+	t.Fatalf("peer %s did not become %s", peerID, status)
+	return peerView{}
+}
+
+func assertPeerExchangeReports(t *testing.T, viewA, viewB peerView) {
+	t.Helper()
 	if viewA.Report == nil || len(viewA.Report.Observations) != 1 ||
 		viewA.Report.Observations[0].Identity.LocalID != "model-b" ||
 		!slices.Contains(viewA.Report.Observations[0].Aliases, "model-b-alias") ||
@@ -584,103 +430,334 @@ peer:
 		(*viewB.Report.BackendReadiness)[0].Status != "ready" {
 		t.Fatal("two-node reports did not retain readiness evidence")
 	}
-	b.refreshPeers(b.state.Load())
-	viewB = waitView(b, "udms", "fresh")
+}
+
+func newTwoPeerExchangeHarness(t *testing.T) *twoPeerExchangeHarness {
+	t.Helper()
+	h := &twoPeerExchangeHarness{
+		t: t, events: make(chan peerInferenceEvent, 4), canceled: make(chan struct{}, 1),
+		localInference: &atomic.Int32{}, tokenA: strings.Repeat("a", 32),
+		tokenB: strings.Repeat("b", 32), diag: strings.Repeat("d", 32),
+		pathA: configPath(t), pathB: configPath(t),
+		modelID: "udms/model-a", reverseModelID: "bigboi/model-b-alias",
+	}
+	h.backendA = newTwoPeerBackend(t, "model-a", h.events, h.canceled, h.localInference)
+	h.backendB = newTwoPeerBackend(t, "model-b", h.events, h.canceled, h.localInference)
+	t.Cleanup(h.backendA.Close)
+	t.Cleanup(h.backendB.Close)
+	h.certA, h.keyA, _ = peerTestCertificate(t)
+	h.certB, h.keyB, _ = peerTestCertificate(t)
+	listenerA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.addrA = listenerA.Addr().String()
+	listenerB, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		_ = listenerA.Close()
+		t.Fatal(err)
+	}
+	h.addrB = listenerB.Addr().String()
+	h.listenerA, h.listenerB = listenerA, listenerB
+	writePeerExchangeConfig(t, h.diag, peerExchangeConfig{
+		path: h.pathA, local: peerExchangeLocalConfig{id: "udms", addr: h.addrA, cert: h.certA, key: h.keyA, backend: h.backendA.URL},
+		peerID: "bigboi", peer: &peerExchangePeerConfig{addr: h.addrB, ca: h.certB, inToken: h.tokenA, outToken: h.tokenB},
+	})
+	writePeerExchangeConfig(t, h.diag, peerExchangeConfig{
+		path: h.pathB, local: peerExchangeLocalConfig{id: "bigboi", addr: h.addrB, cert: h.certB, key: h.keyB, backend: h.backendB.URL},
+		peerID: "udms", peer: &peerExchangePeerConfig{addr: h.addrA, ca: h.certA, inToken: h.tokenB, outToken: h.tokenA},
+	})
+	var errA, errB error
+	h.a, _, errA = NewReloader(h.pathA, discardLogger(), nil, nil, nil, nil, nil)
+	if errA != nil {
+		t.Fatal(errA)
+	}
+	h.b, _, errB = NewReloader(h.pathB, discardLogger(), nil, nil, nil, nil, nil)
+	if errB != nil {
+		h.a.Stop()
+		t.Fatal(errB)
+	}
+	warmPeerExchangeReloader(t, h.a)
+	warmPeerExchangeReloader(t, h.b)
+	h.serverA = startPeerExchangeServer(t, h.a, listenerA)
+	startPeerExchangeServer(t, h.b, listenerB)
+	h.a.Start()
+	h.b.Start()
+	t.Cleanup(h.a.Stop)
+	t.Cleanup(h.b.Stop)
+	viewA := waitPeerExchangeView(t, h.a, "bigboi", "fresh")
+	viewB := waitPeerExchangeView(t, h.b, "udms", "fresh")
+	assertPeerExchangeReports(t, viewA, viewB)
+	h.b.refreshPeers(h.b.state.Load())
+	viewB = waitPeerExchangeView(t, h.b, "udms", "fresh")
 	if viewB.Report == nil || len(viewB.Report.Observations) != 1 ||
 		viewB.Report.Observations[0].Identity.OwnerNodeID != "udms" {
 		t.Fatal("imported models were re-exported")
 	}
-	modelID := "udms/model-a"
-	clientServer := httptest.NewServer(b)
-	defer clientServer.Close()
-	catalogResp, err := http.Get(clientServer.URL + "/v1/models")
+	h.clientServer = httptest.NewServer(h.b)
+	h.clientServerA = httptest.NewServer(h.a)
+	t.Cleanup(h.clientServer.Close)
+	t.Cleanup(h.clientServerA.Close)
+	h.inferenceBody = fmt.Sprintf(`{"model":%q,"stream":true}`, h.modelID)
+	return h
+}
+
+func warmPeerExchangeReloader(t *testing.T, reloader *Reloader) {
+	t.Helper()
+	for _, path := range []string{"/v1/models", "/ready"} {
+		w := httptest.NewRecorder()
+		reloader.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("warm %s: %d", strings.Trim(path, "/"), w.Code)
+		}
+	}
+}
+
+func newTwoPeerBackend(t *testing.T, id string, events chan<- peerInferenceEvent, canceled chan<- struct{}, localInference *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodGet {
+			servePeerExchangeCatalog(w, id)
+			return
+		}
+		if id == "model-b" {
+			servePeerExchangeLocalInference(t, w, request, localInference)
+			return
+		}
+		if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
+			servePeerExchangeMultipart(t, w, request, events)
+			return
+		}
+		servePeerExchangeStream(t, w, request, events, canceled)
+	}))
+}
+
+func servePeerExchangeCatalog(w http.ResponseWriter, id string) {
+	if id == "model-b" {
+		_, _ = io.WriteString(w, `{"data":[{"id":"model-b","meta":{"llamaswap":{"aliases":["model-b-alias"]}}}]}`)
+		return
+	}
+	_, _ = fmt.Fprintf(w, `{"data":[{"id":%q}]}`, id)
+}
+
+func servePeerExchangeLocalInference(t *testing.T, w http.ResponseWriter, request *http.Request, localInference *atomic.Int32) {
+	t.Helper()
+	model := ""
+	if strings.HasPrefix(request.Header.Get("Content-Type"), "multipart/form-data") {
+		model = readPeerExchangeMultipartModel(t, request)
+		if model != "bigboi/model-b" {
+			t.Errorf("local multipart model = %q", model)
+		}
+	} else {
+		var body struct {
+			Model string `json:"model"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		model = body.Model
+		if model != "model-b-alias" {
+			t.Errorf("peer alias was not preserved to the backend: %q", model)
+		}
+	}
+	localInference.Add(1)
+	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func readPeerExchangeMultipartModel(t *testing.T, request *http.Request) string {
+	t.Helper()
+	reader, err := request.MultipartReader()
 	if err != nil {
-		t.Fatal(err)
+		t.Error(err)
+		return ""
+	}
+	model := ""
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return model
+		}
+		if err != nil {
+			t.Error(err)
+			return model
+		}
+		data, err := io.ReadAll(part)
+		_ = part.Close()
+		if err != nil {
+			t.Error(err)
+			return model
+		}
+		if part.FormName() == "model" {
+			model = string(data)
+		}
+	}
+}
+
+func servePeerExchangeMultipart(t *testing.T, w http.ResponseWriter, request *http.Request, events chan<- peerInferenceEvent) {
+	t.Helper()
+	reader, err := request.MultipartReader()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	event := peerInferenceEvent{
+		authorization: request.Header.Get("Authorization"), apiKey: request.Header.Get("X-Api-Key"),
+		private: request.Header.Get("X-Private"), forwardedFor: request.Header.Get("X-Forwarded-For"),
+		realIP: request.Header.Get("X-Real-IP"),
+	}
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		data, err := io.ReadAll(part)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if part.FormName() == "model" {
+			event.model = string(data)
+		} else if part.FormName() == "file" {
+			event.file, event.partPrivate = string(data), part.Header.Get("X-Private")
+		}
+	}
+	events <- event
+	_, _ = io.WriteString(w, `{"ok":true}`)
+}
+
+func servePeerExchangeStream(t *testing.T, w http.ResponseWriter, request *http.Request, events chan<- peerInferenceEvent, canceled chan<- struct{}) {
+	t.Helper()
+	var body struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		t.Error(err)
+		return
+	}
+	events <- peerInferenceEvent{
+		model: body.Model, authorization: request.Header.Get("Authorization"),
+		apiKey: request.Header.Get("X-Api-Key"), private: request.Header.Get("X-Private"),
+		forwardedFor: request.Header.Get("X-Forwarded-For"), realIP: request.Header.Get("X-Real-IP"),
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	_, _ = io.WriteString(w, "data: first\n\n")
+	w.(http.Flusher).Flush()
+	<-request.Context().Done()
+	canceled <- struct{}{}
+}
+
+func TestTwoPeerReportExchangeOutageAndRemoval(t *testing.T) {
+	h := newTwoPeerExchangeHarness(t)
+	h.verifyPeerCatalogs()
+	h.verifyReversePeerInference()
+	h.verifyPeerStreamingInference()
+	h.verifyPeerMultipartInference()
+	h.verifyPeerDiagnostics()
+	h.simulatePeerOutage()
+	h.recoverPeer()
+	h.removePeer()
+}
+
+func (h *twoPeerExchangeHarness) verifyPeerCatalogs() {
+	catalogResp, err := http.Get(h.clientServer.URL + "/v1/models")
+	if err != nil {
+		h.t.Fatal(err)
 	}
 	catalogBody, err := io.ReadAll(catalogResp.Body)
 	_ = catalogResp.Body.Close()
-	if err != nil || !strings.Contains(string(catalogBody), modelID) || !strings.Contains(string(catalogBody), `"receipt_status":"fresh"`) {
-		t.Fatalf("combined catalog missing peer: %s (%v)", catalogBody, err)
+	if err != nil || !strings.Contains(string(catalogBody), h.modelID) || !strings.Contains(string(catalogBody), `"receipt_status":"fresh"`) {
+		h.t.Fatalf("combined catalog missing peer: %s (%v)", catalogBody, err)
 	}
-	reverseModelID := "bigboi/model-b-alias"
-	clientServerA := httptest.NewServer(a)
-	defer clientServerA.Close()
-	reverseCatalog, err := http.Get(clientServerA.URL + "/v1/models")
+	reverseCatalog, err := http.Get(h.clientServerA.URL + "/v1/models")
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
 	reverseCatalogBody, err := io.ReadAll(reverseCatalog.Body)
 	_ = reverseCatalog.Body.Close()
 	if err != nil || !strings.Contains(string(reverseCatalogBody), `"id":"bigboi/model-b"`) || !strings.Contains(string(reverseCatalogBody), `"model-b-alias"`) {
-		t.Fatalf("reverse combined catalog missing peer: %s (%v)", reverseCatalogBody, err)
+		h.t.Fatalf("reverse combined catalog missing peer: %s (%v)", reverseCatalogBody, err)
 	}
-	reverseInferenceBody := fmt.Sprintf(`{"model":%q,"stream":false}`, reverseModelID)
-	reverseResponse, err := http.Post(clientServerA.URL+"/v1/chat/completions", "application/json", strings.NewReader(reverseInferenceBody))
+}
+
+func (h *twoPeerExchangeHarness) verifyReversePeerInference() {
+	body := fmt.Sprintf(`{"model":%q,"stream":false}`, h.reverseModelID)
+	response, err := http.Post(h.clientServerA.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = reverseResponse.Body.Close()
-	if reverseResponse.StatusCode != http.StatusOK || localInference.Load() != 1 {
-		t.Fatalf("reverse peer inference status=%d owner requests=%d", reverseResponse.StatusCode, localInference.Load())
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || h.localInference.Load() != 1 {
+		h.t.Fatalf("reverse peer inference status=%d owner requests=%d", response.StatusCode, h.localInference.Load())
 	}
+}
+
+func (h *twoPeerExchangeHarness) verifyPeerStreamingInference() {
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
-	inferenceBody := fmt.Sprintf(`{"model":%q,"stream":true}`, modelID)
-	inferenceReq, err := http.NewRequestWithContext(requestCtx, http.MethodPost, clientServer.URL+"/v1/chat/completions", strings.NewReader(inferenceBody))
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, h.clientServer.URL+"/v1/chat/completions", strings.NewReader(h.inferenceBody))
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	inferenceReq.Header.Set("Content-Type", "application/json")
-	inferenceReq.Header.Set("Authorization", "Bearer client-inference-secret")
-	inferenceReq.Header.Set("X-Api-Key", "client-inference-secret")
-	inferenceReq.Header.Set("X-Private", "client-private-value")
-	inferenceReq.Header.Set("X-Forwarded-For", "203.0.113.77")
-	inferenceReq.Header.Set("X-Real-IP", "203.0.113.77")
-	stream, err := (&http.Client{Timeout: 4 * time.Second}).Do(inferenceReq)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer client-inference-secret")
+	request.Header.Set("X-Api-Key", "client-inference-secret")
+	request.Header.Set("X-Private", "client-private-value")
+	request.Header.Set("X-Forwarded-For", "203.0.113.77")
+	request.Header.Set("X-Real-IP", "203.0.113.77")
+	stream, err := (&http.Client{Timeout: 4 * time.Second}).Do(request)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
 	buf := make([]byte, len("data: first\n\n"))
 	if _, err := io.ReadFull(stream.Body, buf); err != nil || string(buf) != "data: first\n\n" {
-		t.Fatalf("stream first chunk = %q, %v", buf, err)
+		h.t.Fatalf("stream first chunk = %q, %v", buf, err)
 	}
 	select {
-	case event := <-events:
+	case event := <-h.events:
 		if event.model != "model-a" || event.authorization != "Bearer owner-backend-key" ||
 			event.apiKey != "owner-backend-key" || event.private != "" ||
 			!strings.HasPrefix(event.forwardedFor, "203.0.113.77") || event.realIP != "203.0.113.77" {
-			t.Fatalf("credential or model isolation failed: %#v", event)
+			h.t.Fatalf("credential or model isolation failed: %#v", event)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("owner backend did not receive request")
+		h.t.Fatal("owner backend did not receive request")
 	}
 	cancelRequest()
 	_ = stream.Body.Close()
 	select {
-	case <-canceled:
+	case <-h.canceled:
 	case <-time.After(time.Second):
-		t.Fatal("client cancellation did not reach owner backend")
+		h.t.Fatal("client cancellation did not reach owner backend")
 	}
-	multipartBody := &bytes.Buffer{}
-	form := multipart.NewWriter(multipartBody)
-	if err := form.WriteField("model", "bigboi/model-b"); err != nil {
-		t.Fatal(err)
+}
+
+func (h *twoPeerExchangeHarness) verifyPeerMultipartInference() {
+	localBody := &bytes.Buffer{}
+	localForm := multipart.NewWriter(localBody)
+	if err := localForm.WriteField("model", "bigboi/model-b"); err != nil {
+		h.t.Fatal(err)
 	}
-	contentType := form.FormDataContentType()
-	if err := form.Close(); err != nil {
-		t.Fatal(err)
+	localContentType := localForm.FormDataContentType()
+	if err := localForm.Close(); err != nil {
+		h.t.Fatal(err)
 	}
-	localResp, err := http.Post(clientServer.URL+"/v1/audio/transcriptions", contentType, multipartBody)
+	localResponse, err := http.Post(h.clientServer.URL+"/v1/audio/transcriptions", localContentType, localBody)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = localResp.Body.Close()
-	if localResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
-		t.Fatalf("local multipart status=%d count=%d", localResp.StatusCode, localInference.Load())
+	_ = localResponse.Body.Close()
+	if localResponse.StatusCode != http.StatusOK || h.localInference.Load() != 2 {
+		h.t.Fatalf("local multipart status=%d count=%d", localResponse.StatusCode, h.localInference.Load())
 	}
-	peerMultipart := &bytes.Buffer{}
-	form = multipart.NewWriter(peerMultipart)
-	if err := form.WriteField("model", modelID); err != nil {
-		t.Fatal(err)
+
+	peerBody := &bytes.Buffer{}
+	form := multipart.NewWriter(peerBody)
+	if err := form.WriteField("model", h.modelID); err != nil {
+		h.t.Fatal(err)
 	}
 	partHeader := make(textproto.MIMEHeader)
 	partHeader.Set("Content-Disposition", `form-data; name="file"; filename="audio.wav"`)
@@ -688,129 +765,133 @@ peer:
 	partHeader.Set("X-Private", "private-part-value")
 	part, err := form.CreatePart(partHeader)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
 	audioBytes := []byte{0x00, 0xff, 0x80, '\r', '\n', 0x01}
 	if _, err := part.Write(audioBytes); err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	contentType = form.FormDataContentType()
+	contentType := form.FormDataContentType()
 	if err := form.Close(); err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	remoteResp, err := http.Post(clientServer.URL+"/v1/audio/transcriptions", contentType, peerMultipart)
+	response, err := http.Post(h.clientServer.URL+"/v1/audio/transcriptions", contentType, peerBody)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = remoteResp.Body.Close()
-	if remoteResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
-		t.Fatalf("peer multipart failed or fell back: status=%d count=%d", remoteResp.StatusCode, localInference.Load())
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || h.localInference.Load() != 2 {
+		h.t.Fatalf("peer multipart failed or fell back: status=%d count=%d", response.StatusCode, h.localInference.Load())
 	}
 	select {
-	case event := <-events:
+	case event := <-h.events:
 		if event.model != "model-a" || event.authorization != "Bearer owner-backend-key" ||
 			event.apiKey != "owner-backend-key" || event.partPrivate != "" || event.file != string(audioBytes) {
-			t.Fatalf("peer multipart isolation failed: %#v", event)
+			h.t.Fatalf("peer multipart isolation failed: %#v", event)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("owner backend did not receive multipart request")
+		h.t.Fatal("owner backend did not receive multipart request")
 	}
-	unauth := httptest.NewRecorder()
-	b.ServeHTTP(unauth, httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=udms", nil))
-	if unauth.Code != http.StatusUnauthorized {
-		t.Fatalf("diagnostics without authorization: %d", unauth.Code)
+}
+
+func (h *twoPeerExchangeHarness) verifyPeerDiagnostics() {
+	unauthorized := httptest.NewRecorder()
+	h.b.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=udms", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		h.t.Fatalf("diagnostics without authorization: %d", unauthorized.Code)
 	}
 	request := httptest.NewRequest(http.MethodGet, "/diagnostics/v1/peers?node_id=udms", nil)
-	request.Header.Set("Authorization", "Bearer "+diag)
+	request.Header.Set("Authorization", "Bearer "+h.diag)
 	diagnostics := httptest.NewRecorder()
-	b.ServeHTTP(diagnostics, request)
+	h.b.ServeHTTP(diagnostics, request)
 	if diagnostics.Code != http.StatusOK || !strings.Contains(diagnostics.Body.String(), "model-a") ||
 		!strings.Contains(diagnostics.Body.String(), `"backend_readiness"`) ||
-		strings.Contains(diagnostics.Body.String(), tokenA) {
-		t.Fatalf("unexpected diagnostics status/content: %d", diagnostics.Code)
+		strings.Contains(diagnostics.Body.String(), h.tokenA) {
+		h.t.Fatalf("unexpected diagnostics status/content: %d", diagnostics.Code)
 	}
-	if err := serverA.Close(); err != nil {
-		t.Fatal(err)
+}
+
+func (h *twoPeerExchangeHarness) simulatePeerOutage() {
+	if err := h.serverA.Close(); err != nil {
+		h.t.Fatal(err)
 	}
 	select {
-	case b.peerWake <- struct{}{}:
+	case h.b.peerWake <- struct{}{}:
 	default:
 	}
-	stale := waitView(b, "udms", "stale")
+	stale := waitPeerExchangeView(h.t, h.b, "udms", "stale")
 	if stale.Report == nil || stale.LastError != "unavailable" {
-		t.Fatalf("outage did not preserve stale report: %#v", stale)
+		h.t.Fatalf("outage did not preserve stale report: %#v", stale)
 	}
-	staleCatalog, err := http.Get(clientServer.URL + "/v1/models")
+	catalog, err := http.Get(h.clientServer.URL + "/v1/models")
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	staleData, err := io.ReadAll(staleCatalog.Body)
-	_ = staleCatalog.Body.Close()
-	if err != nil || !strings.Contains(string(staleData), modelID) || !strings.Contains(string(staleData), `"receipt_status":"stale"`) {
-		t.Fatalf("stale peer disappeared from catalog: %s (%v)", staleData, err)
+	data, err := io.ReadAll(catalog.Body)
+	_ = catalog.Body.Close()
+	if err != nil || !strings.Contains(string(data), h.modelID) || !strings.Contains(string(data), `"receipt_status":"stale"`) {
+		h.t.Fatalf("stale peer disappeared from catalog: %s (%v)", data, err)
 	}
-	staleResp, err := http.Post(clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(inferenceBody))
+	response, err := http.Post(h.clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(h.inferenceBody))
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = staleResp.Body.Close()
-	if staleResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
-		t.Fatalf("stale peer inference fell back: status=%d", staleResp.StatusCode)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || h.localInference.Load() != 2 {
+		h.t.Fatalf("stale peer inference fell back: status=%d", response.StatusCode)
 	}
-	listenerA, err = net.Listen("tcp", addrA)
+}
+
+func (h *twoPeerExchangeHarness) recoverPeer() {
+	listener, err := net.Listen("tcp", h.addrA)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	startServer(a, listenerA)
+	startPeerExchangeServer(h.t, h.a, listener)
 	select {
-	case b.peerWake <- struct{}{}:
+	case h.b.peerWake <- struct{}{}:
 	default:
 	}
-	waitView(b, "udms", "fresh")
-	recoveredBody := &bytes.Buffer{}
-	form = multipart.NewWriter(recoveredBody)
-	if err := form.WriteField("model", modelID); err != nil {
-		t.Fatal(err)
+	waitPeerExchangeView(h.t, h.b, "udms", "fresh")
+	body := &bytes.Buffer{}
+	form := multipart.NewWriter(body)
+	if err := form.WriteField("model", h.modelID); err != nil {
+		h.t.Fatal(err)
 	}
-	contentType = form.FormDataContentType()
+	contentType := form.FormDataContentType()
 	if err := form.Close(); err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	recoveredResp, err := http.Post(clientServer.URL+"/v1/audio/transcriptions", contentType, recoveredBody)
+	response, err := http.Post(h.clientServer.URL+"/v1/audio/transcriptions", contentType, body)
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = recoveredResp.Body.Close()
-	if recoveredResp.StatusCode != http.StatusOK || localInference.Load() != 2 {
-		t.Fatalf("recovered peer inference status=%d count=%d", recoveredResp.StatusCode, localInference.Load())
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusOK || h.localInference.Load() != 2 {
+		h.t.Fatalf("recovered peer inference status=%d count=%d", response.StatusCode, h.localInference.Load())
 	}
 	select {
-	case event := <-events:
+	case event := <-h.events:
 		if event.model != "model-a" {
-			t.Fatalf("recovered peer received wrong model: %q", event.model)
+			h.t.Fatalf("recovered peer received wrong model: %q", event.model)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("recovered owner backend did not receive request")
+		h.t.Fatal("recovered owner backend did not receive request")
 	}
-	write(peerFileConfig{
-		path:   pathB,
-		local:  peerLocal{id: "bigboi", addr: addrB, cert: certB, key: keyB, backend: backendB.URL},
+}
+
+func (h *twoPeerExchangeHarness) removePeer() {
+	writePeerExchangeConfig(h.t, h.diag, peerExchangeConfig{
+		path: h.pathB, local: peerExchangeLocalConfig{id: "bigboi", addr: h.addrB, cert: h.certB, key: h.keyB, backend: h.backendB.URL},
 		peerID: "udms",
 	})
-	if err := b.reload(); err != nil {
-		t.Fatal(err)
+	if err := h.b.reload(); err != nil {
+		h.t.Fatal(err)
 	}
-	if views, ok := b.state.Load().peerCache.views(time.Now(), "udms"); ok || len(views) != 0 {
-		t.Fatal("removed peer retained in active cache")
+	if views, ok := h.b.state.Load().peerCache.views(time.Now(), "udms"); ok || len(views) != 0 {
+		h.t.Fatal("removed peer retained in active cache")
 	}
-	removedResp, err := http.Post(clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(inferenceBody))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = removedResp.Body.Close()
-	if removedResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
-		t.Fatalf("removed peer inference fell back: status=%d", removedResp.StatusCode)
-	}
+	h.assertPeerInferenceUnavailable("removed")
 	disabledPeerConfig := fmt.Sprintf(`default_backend: local
 backends: {local: {url: %q}}
 peer:
@@ -820,20 +901,24 @@ peer:
   tls_cert_file: %q
   tls_key_file: %q
   local_backends: [local]
-`, backendB.URL, addrB, certB, keyB)
-	if err := os.WriteFile(pathB, []byte(disabledPeerConfig), 0o600); err != nil {
-		t.Fatal(err)
+`, h.backendB.URL, h.addrB, h.certB, h.keyB)
+	if err := os.WriteFile(h.pathB, []byte(disabledPeerConfig), 0o600); err != nil {
+		h.t.Fatal(err)
 	}
-	if err := b.reload(); err != nil {
-		t.Fatal(err)
+	if err := h.b.reload(); err != nil {
+		h.t.Fatal(err)
 	}
-	disabledResp, err := http.Post(clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(inferenceBody))
+	h.assertPeerInferenceUnavailable("disabled")
+}
+
+func (h *twoPeerExchangeHarness) assertPeerInferenceUnavailable(state string) {
+	response, err := http.Post(h.clientServer.URL+"/v1/chat/completions", "application/json", strings.NewReader(h.inferenceBody))
 	if err != nil {
-		t.Fatal(err)
+		h.t.Fatal(err)
 	}
-	_ = disabledResp.Body.Close()
-	if disabledResp.StatusCode != http.StatusServiceUnavailable || localInference.Load() != 2 {
-		t.Fatalf("disabled peer inference fell back: status=%d", disabledResp.StatusCode)
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable || h.localInference.Load() != 2 {
+		h.t.Fatalf("%s peer inference fell back: status=%d", state, response.StatusCode)
 	}
 }
 
@@ -902,6 +987,19 @@ func TestPeerReceiptFreshnessAndRetention(t *testing.T) {
 	}
 }
 
+func assertRejectedPeerFetchModes(t *testing.T, client *peerClient, mode *atomic.Int32, calls *atomic.Int32) {
+	t.Helper()
+	for n, want := range []string{"http_error", "invalid_report", "invalid_report", "unauthorized", "invalid_report"} {
+		mode.Store(int32(n))
+		if receipt, reason := client.fetch(context.Background()); receipt != nil || reason != want {
+			t.Fatalf("mode %d: receipt=%v reason=%s", n, receipt, reason)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("peer redirect was followed")
+	}
+}
+
 func TestPeerFetchRejectsRedirectsAndInvalidReports(t *testing.T) {
 	var calls atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls.Add(1) }))
@@ -951,15 +1049,7 @@ func TestPeerFetchRejectsRedirectsAndInvalidReports(t *testing.T) {
 	}
 	defer closePeerClients(clients)
 	client := clients["node-b"]
-	for n, want := range []string{"http_error", "invalid_report", "invalid_report", "unauthorized", "invalid_report"} {
-		mode.Store(int32(n))
-		if receipt, reason := client.fetch(context.Background()); receipt != nil || reason != want {
-			t.Fatalf("mode %d: receipt=%v reason=%s", n, receipt, reason)
-		}
-	}
-	if calls.Load() != 0 {
-		t.Fatal("peer redirect was followed")
-	}
+	assertRejectedPeerFetchModes(t, client, &mode, &calls)
 	mode.Store(5)
 	if receipt, reason := client.fetch(context.Background()); receipt == nil || reason != "" || receipt.Report.Source.NodeID != "node-b" {
 		t.Fatalf("valid peer report: receipt=%v reason=%s", receipt, reason)

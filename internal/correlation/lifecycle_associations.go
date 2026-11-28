@@ -279,33 +279,77 @@ func validateIdentities(identities []ActivityModelIdentity) error {
 	return nil
 }
 
-// validateEvents validates each lifecycle transition event.
+// validateEvents validates each lifecycle transition event. Validation is
+// delegated to focused field-group helpers so the control flow stays linear and
+// each check's intent is explicit. The first failing check's error is returned.
 func validateEvents(events []LifecycleTransitionEvidence) error {
 	for _, e := range events {
-		if !validIdentifier(e.BackendID) {
-			return errors.New("invalid event backend id: explicit unavailable")
+		if err := validateEvent(e); err != nil {
+			return err
 		}
-		if e.Epoch <= 0 {
-			return errors.New("non-positive event epoch: explicit unavailable")
-		}
-		if e.ModelRef != "" && !isModelReference(e.ModelRef) {
-			return errors.New("invalid event model ref: explicit unavailable")
-		}
-		if !isLifecycleTransitionState(e.OldState) {
-			return errors.New("invalid event old state: explicit unavailable")
-		}
-		if !isLifecycleTransitionState(e.NewState) {
-			return errors.New("invalid event new state: explicit unavailable")
-		}
-		if e.ObservedAt.IsZero() {
-			return errors.New("zero event observed at: explicit unavailable")
-		}
-		if e.SourceTime != nil && e.SourceTime.IsZero() {
-			return errors.New("zero event source time: explicit unavailable")
-		}
-		if len(e.SourceEventID) > 256 {
-			return errors.New("source event id too long: explicit unavailable")
-		}
+	}
+	return nil
+}
+
+// validateEvent validates one lifecycle transition event's scalar fields. It
+// returns the first failing check's error so the caller can stop at the first
+// invalid field.
+func validateEvent(e LifecycleTransitionEvidence) error {
+	if err := validateEventIdentity(e); err != nil {
+		return err
+	}
+	if err := validateEventStates(e); err != nil {
+		return err
+	}
+	if err := validateEventTimes(e); err != nil {
+		return err
+	}
+	if err := validateEventSourceEventID(e); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateEventIdentity validates the event's backend, epoch, and model ref.
+func validateEventIdentity(e LifecycleTransitionEvidence) error {
+	if !validIdentifier(e.BackendID) {
+		return errors.New("invalid event backend id: explicit unavailable")
+	}
+	if e.Epoch <= 0 {
+		return errors.New("non-positive event epoch: explicit unavailable")
+	}
+	if e.ModelRef != "" && !isModelReference(e.ModelRef) {
+		return errors.New("invalid event model ref: explicit unavailable")
+	}
+	return nil
+}
+
+// validateEventStates validates the event's old and new transition states.
+func validateEventStates(e LifecycleTransitionEvidence) error {
+	if !isLifecycleTransitionState(e.OldState) {
+		return errors.New("invalid event old state: explicit unavailable")
+	}
+	if !isLifecycleTransitionState(e.NewState) {
+		return errors.New("invalid event new state: explicit unavailable")
+	}
+	return nil
+}
+
+// validateEventTimes validates the event's observed and optional source time.
+func validateEventTimes(e LifecycleTransitionEvidence) error {
+	if e.ObservedAt.IsZero() {
+		return errors.New("zero event observed at: explicit unavailable")
+	}
+	if e.SourceTime != nil && e.SourceTime.IsZero() {
+		return errors.New("zero event source time: explicit unavailable")
+	}
+	return nil
+}
+
+// validateEventSourceEventID validates the event's source event ID length.
+func validateEventSourceEventID(e LifecycleTransitionEvidence) error {
+	if len(e.SourceEventID) > 256 {
+		return errors.New("source event id too long: explicit unavailable")
 	}
 	return nil
 }
@@ -412,7 +456,8 @@ func buildBaseAssoc(a *ActivityRecord, window AssociationWindow) ActivityLifecyc
 // associateOneActivity associates one activity with nearby lifecycle transition
 // events. It starts from the unavailable base association and applies the
 // identity resolution, conflict, and source-clock window rules. The result is
-// returned without mutating the inputs.
+// returned without mutating the inputs. Decision flow is decomposed into
+// focused helpers so each validation and assignment is explicit.
 func associateOneActivity(
 	a *ActivityRecord,
 	identityByKey map[identityKey]*ActivityModelIdentity,
@@ -425,7 +470,7 @@ func associateOneActivity(
 
 	// Validate the activity's reported model ref before output: it must
 	// be blank or an opaque model reference. Raw labels are never copied.
-	if a.ReportedModelRef != "" && !isModelReference(a.ReportedModelRef) {
+	if !isValidReportedModelRef(a.ReportedModelRef) {
 		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
 		return assoc
 	}
@@ -436,30 +481,26 @@ func associateOneActivity(
 	// is never merged.
 	key := identityKey{a.BackendID, a.Epoch, a.ActivityID}
 	id, ok := identityByKey[key]
-	if !ok || identityAmbiguous[key] || a.IdentityConflict {
+	if !isIdentityResolvable(ok, identityAmbiguous[key], a.IdentityConflict) {
 		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
 		return assoc
 	}
 
 	// The activity's reported model ref must match the identity's when
 	// both are present; never borrow the canonical ref as the model ref.
-	if a.ReportedModelRef != "" && id.ReportedModelRef != "" && a.ReportedModelRef != id.ReportedModelRef {
+	if !doReportedAndIdentityModelRefsMatch(a.ReportedModelRef, id.ReportedModelRef) {
 		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
 		return assoc
 	}
 
 	// Only a uniquely catalog_resolved identity with a canonical ref and
 	// positive epoch is matched.
-	identityResolved := false
-	if id.State == aliasStateExact && id.CanonicalRef != "" && id.Epoch > 0 {
-		identityResolved = true
-		assoc.CanonicalRef = id.CanonicalRef
-	}
-
+	identityResolved, canonicalRef := resolveIdentity(id)
 	if !identityResolved {
 		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
 		return assoc
 	}
+	assoc.CanonicalRef = canonicalRef
 
 	// Transition events name configured models. Match the independently
 	// resolved canonical reference, never the possibly aliased reported name.
@@ -487,6 +528,48 @@ func associateOneActivity(
 	ws := assoc.WindowStart
 	we := assoc.WindowEnd
 
+	validSourceTimes, hasSourceTime := collectValidSourceTimes(matching, ws, we)
+
+	// Observed event count is scoped metadata: the number of distinct
+	// transition events observed for this backend/epoch/model ref.
+	assoc.ObservedEventCount = len(matching)
+
+	applySourceClockResult(&assoc, validSourceTimes, hasSourceTime)
+
+	return assoc
+}
+
+// isValidReportedModelRef reports whether the activity's reported model ref is
+// blank or an opaque model reference. Raw labels are never copied to output.
+func isValidReportedModelRef(ref string) bool {
+	return ref == "" || isModelReference(ref)
+}
+
+// isIdentityResolvable reports whether a looked-up identity can be used: it
+// must exist, be non-ambiguous, and the activity must not have a conflict.
+func isIdentityResolvable(ok bool, ambiguous bool, identityConflict bool) bool {
+	return ok && !ambiguous && !identityConflict
+}
+
+// doReportedAndIdentityModelRefsMatch reports whether the activity's reported
+// model ref matches the identity's when both are present.
+func doReportedAndIdentityModelRefsMatch(reported, identityRef string) bool {
+	return reported == "" || identityRef == "" || reported == identityRef
+}
+
+// resolveIdentity returns whether the identity is uniquely catalog_resolved
+// with a canonical ref and positive epoch, and the canonical ref when resolved.
+func resolveIdentity(id *ActivityModelIdentity) (bool, string) {
+	if id.State == aliasStateExact && id.CanonicalRef != "" && id.Epoch > 0 {
+		return true, id.CanonicalRef
+	}
+	return false, ""
+}
+
+// collectValidSourceTimes collects the source times of matching events that
+// fall within the activity's association window. It also reports whether any
+// matching event had a non-nil SourceTime.
+func collectValidSourceTimes(matching []*LifecycleTransitionEvidence, ws, we time.Time) ([]time.Time, bool) {
 	var validSourceTimes []time.Time
 	hasSourceTime := false
 	for _, e := range matching {
@@ -498,11 +581,12 @@ func associateOneActivity(
 			}
 		}
 	}
+	return validSourceTimes, hasSourceTime
+}
 
-	// Observed event count is scoped metadata: the number of distinct
-	// transition events observed for this backend/epoch/model ref.
-	assoc.ObservedEventCount = len(matching)
-
+// applySourceClockResult sets the association's kind, matched count, event
+// times, and reason based on the valid source times collected in the window.
+func applySourceClockResult(assoc *ActivityLifecycleAssociation, validSourceTimes []time.Time, hasSourceTime bool) {
 	if len(validSourceTimes) > 0 {
 		// Valid source-clock association.
 		assoc.Kind = lifecycleAssociationKind
@@ -523,6 +607,4 @@ func associateOneActivity(
 			assoc.Reason = lifecycleAssociationReasonOutsideWindow
 		}
 	}
-
-	return assoc
 }

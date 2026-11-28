@@ -180,73 +180,14 @@ func mapFoldedCommandScalar(data []byte, node *yaml.Node) (mappedCommand, error)
 	if node.Line < 1 || node.Line > bytes.Count(data, []byte{'\n'})+1 {
 		return mappedCommand{}, errors.New("invalid command scalar location")
 	}
-	lineStart := 0
-	for line := 1; line < node.Line; line++ {
-		i := bytes.IndexByte(data[lineStart:], '\n')
-		if i < 0 {
-			return mappedCommand{}, errors.New("invalid command scalar location")
-		}
-		lineStart += i + 1
+	lineStart, err := advanceToFoldedLine(data, 0, node.Line)
+	if err != nil {
+		return mappedCommand{}, err
 	}
-	headerEnd := bytes.IndexByte(data[lineStart:], '\n')
-	if headerEnd < 0 {
-		return mappedCommand{}, errors.New("unsupported folded command scalar")
+	value, sources, err := foldScalarContent(data, lineStart)
+	if err != nil {
+		return mappedCommand{}, err
 	}
-	header := data[lineStart : lineStart+headerEnd]
-	headerIndent := 0
-	for headerIndent < len(header) && header[headerIndent] == ' ' {
-		headerIndent++
-	}
-	position := lineStart + headerEnd + 1
-	contentIndent := -1
-	var decoded strings.Builder
-	var sources []int
-	var blankAfterContent bool
-	for position < len(data) {
-		lineEnd := bytes.IndexByte(data[position:], '\n')
-		if lineEnd < 0 {
-			lineEnd = len(data) - position
-		}
-		line := data[position : position+lineEnd]
-		if bytes.ContainsRune(line, '\r') {
-			return mappedCommand{}, errors.New("unsupported folded command line ending")
-		}
-		indent := 0
-		for indent < len(line) && line[indent] == ' ' {
-			indent++
-		}
-		blank := indent == len(line)
-		if !blank && indent <= headerIndent {
-			break
-		}
-		if blank {
-			blankAfterContent = blankAfterContent || contentIndent >= 0
-		} else {
-			if blankAfterContent {
-				// Blank-line folding changes command token boundaries; fail closed.
-				return mappedCommand{}, errors.New("unsupported folded command scalar")
-			}
-			if contentIndent < 0 {
-				contentIndent = indent
-			}
-			if indent != contentIndent {
-				return mappedCommand{}, errors.New("unsupported folded command indentation")
-			}
-			if decoded.Len() != 0 {
-				decoded.WriteByte(' ')
-				sources = append(sources, -1)
-			}
-			decoded.Write(line[contentIndent:])
-			for index := contentIndent; index < len(line); index++ {
-				sources = append(sources, position+index)
-			}
-		}
-		position += lineEnd
-		if position < len(data) {
-			position++
-		}
-	}
-	value := decoded.String()
 	if node.Value != value && node.Value != value+"\n" {
 		return mappedCommand{}, errors.New("unsupported folded command scalar")
 	}
@@ -254,6 +195,106 @@ func mapFoldedCommandScalar(data []byte, node *yaml.Node) (mappedCommand, error)
 		return mappedCommand{}, errors.New("unsupported folded command scalar")
 	}
 	return mappedCommand{text: value, source: sources}, nil
+}
+
+// advanceToFoldedLine advances lineStart to the first byte of the target line
+// (1-indexed) by scanning for newline separators. An error is returned when the
+// target line lies beyond the data.
+func advanceToFoldedLine(data []byte, lineStart, targetLine int) (int, error) {
+	for line := 1; line < targetLine; line++ {
+		i := bytes.IndexByte(data[lineStart:], '\n')
+		if i < 0 {
+			return 0, errors.New("invalid command scalar location")
+		}
+		lineStart += i + 1
+	}
+	return lineStart, nil
+}
+
+// foldedState accumulates the decoded value and source positions while folding a
+// multi-line scalar block.
+type foldedState struct {
+	contentIndent     int
+	blankAfterContent bool
+	decoded           strings.Builder
+	sources           []int
+}
+
+// foldScalarContent folds the content of a folded scalar block starting at
+// lineStart (the first byte after the header's terminating newline).
+func foldScalarContent(data []byte, lineStart int) (string, []int, error) {
+	headerEnd := bytes.IndexByte(data[lineStart:], '\n')
+	if headerEnd < 0 {
+		return "", nil, errors.New("unsupported folded command scalar")
+	}
+	header := data[lineStart : lineStart+headerEnd]
+	headerIndent := 0
+	for headerIndent < len(header) && header[headerIndent] == ' ' {
+		headerIndent++
+	}
+	position := lineStart + headerEnd + 1
+	state := foldedState{
+		contentIndent: -1,
+		sources:       make([]int, 0),
+	}
+	for position < len(data) {
+		lineEnd := bytes.IndexByte(data[position:], '\n')
+		if lineEnd < 0 {
+			lineEnd = len(data) - position
+		}
+		line := data[position : position+lineEnd]
+		stop, err := state.processFoldedLine(line, position, lineEnd, headerIndent)
+		if err != nil {
+			return "", nil, err
+		}
+		if stop {
+			break
+		}
+		position += lineEnd
+		if position < len(data) {
+			position++
+		}
+	}
+	return state.decoded.String(), state.sources, nil
+}
+
+// processFoldedLine processes one content line of a folded scalar. It returns
+// stop=true when the content block ends at a less-indented non-blank line.
+func (s *foldedState) processFoldedLine(line []byte, position, lineEnd, headerIndent int) (bool, error) {
+	if bytes.ContainsRune(line, '\r') {
+		return false, errors.New("unsupported folded command line ending")
+	}
+	indent := 0
+	for indent < len(line) && line[indent] == ' ' {
+		indent++
+	}
+	blank := indent == len(line)
+	if !blank && indent <= headerIndent {
+		return true, nil
+	}
+	if blank {
+		s.blankAfterContent = s.blankAfterContent || s.contentIndent >= 0
+		return false, nil
+	}
+	if s.blankAfterContent {
+		// Blank-line folding changes command token boundaries; fail closed.
+		return false, errors.New("unsupported folded command scalar")
+	}
+	if s.contentIndent < 0 {
+		s.contentIndent = indent
+	}
+	if indent != s.contentIndent {
+		return false, errors.New("unsupported folded command indentation")
+	}
+	if s.decoded.Len() != 0 {
+		s.decoded.WriteByte(' ')
+		s.sources = append(s.sources, -1)
+	}
+	s.decoded.Write(line[s.contentIndent:])
+	for index := s.contentIndent; index < len(line); index++ {
+		s.sources = append(s.sources, position+index)
+	}
+	return false, nil
 }
 
 func commandSourceRangeForToken(command mappedCommand, token commandToken) (int, int, bool) {

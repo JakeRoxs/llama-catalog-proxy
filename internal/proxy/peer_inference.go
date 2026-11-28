@@ -22,6 +22,13 @@ const peerTargetUnavailable = "peer target unavailable"
 
 type peerAddressHeadersContextKey struct{}
 
+type preparedPeerInference struct {
+	id        nodecontract.ModelIdentity
+	path      string
+	handler   *Handler
+	rewritten []byte
+}
+
 func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
@@ -36,77 +43,104 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 		return
 	}
 	state := r.state.Load()
+	prepared, ok := preparePeerInference(w, req, state, r.instanceID)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithCancel(req.Context())
+	stop := context.AfterFunc(state.peerContext, cancel)
+	defer func() { stop(); cancel() }()
+	if !r.peerInferenceTargetFresh(ctx, state, prepared.id, prepared.handler) || r.state.Load() != state {
+		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
+		return
+	}
+	forwardPeerInference(w, req, ctx, prepared)
+}
+
+func preparePeerInference(w http.ResponseWriter, req *http.Request, state *reloaderState, instanceID string) (preparedPeerInference, bool) {
 	if state.peer == nil || !peerAuthorized(req, state, peerInference) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return preparedPeerInference{}, false
 	}
 	id, path, instance, generation, err := peerTargetHeaders(req, state.peer.NodeID)
-	if err != nil || instance != r.instanceID || generation != state.generation {
+	if err != nil || instance != instanceID || generation != state.generation {
 		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
-		return
+		return preparedPeerInference{}, false
 	}
-	owned := false
-	for _, backend := range state.peer.LocalBackends {
-		if backend == id.BackendID {
-			owned = true
-			break
-		}
-	}
-	check := req.Clone(req.Context())
-	check.URL.Path = path
-	if !owned || !isInferenceRequest(check) || strings.ContainsAny(path, "?#") {
+	if !peerInferenceTargetOwned(req, state, id, path) {
 		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
-		return
-	}
-	contentType, params, err := mime.ParseMediaType(req.Header.Get(contentTypeHeader))
-	if err != nil || (contentType != "application/json" && contentType != "multipart/form-data") || req.Header.Get("Content-Encoding") != "" {
-		http.Error(w, "JSON or multipart request required", http.StatusUnsupportedMediaType)
-		return
+		return preparedPeerInference{}, false
 	}
 	handler, ok := state.handler.(*Handler)
 	if !ok {
 		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
-		return
+		return preparedPeerInference{}, false
+	}
+	body, contentType, params, ok := readPeerInferenceBody(w, req, handler)
+	if !ok {
+		return preparedPeerInference{}, false
+	}
+	rewritten, err := rewritePeerInferenceBody(body, contentType, params, handler, id)
+	if err != nil {
+		http.Error(w, "invalid peer model", http.StatusBadRequest)
+		return preparedPeerInference{}, false
+	}
+	return preparedPeerInference{id: id, path: path, handler: handler, rewritten: rewritten}, true
+}
+
+func peerInferenceTargetOwned(req *http.Request, state *reloaderState, id nodecontract.ModelIdentity, path string) bool {
+	for _, backend := range state.peer.LocalBackends {
+		if backend == id.BackendID {
+			check := req.Clone(req.Context())
+			check.URL.Path = path
+			return isInferenceRequest(check) && !strings.ContainsAny(path, "?#")
+		}
+	}
+	return false
+}
+
+func readPeerInferenceBody(w http.ResponseWriter, req *http.Request, handler *Handler) ([]byte, string, map[string]string, bool) {
+	contentType, params, err := mime.ParseMediaType(req.Header.Get(contentTypeHeader))
+	if err != nil || (contentType != "application/json" && contentType != "multipart/form-data") || req.Header.Get("Content-Encoding") != "" {
+		http.Error(w, "JSON or multipart request required", http.StatusUnsupportedMediaType)
+		return nil, "", nil, false
 	}
 	if req.Body == nil {
 		http.Error(w, "request body required", http.StatusBadRequest)
-		return
+		return nil, "", nil, false
 	}
 	if req.ContentLength > handler.maxJSONBody {
 		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
-		return
+		return nil, "", nil, false
 	}
 	body, err := io.ReadAll(io.LimitReader(req.Body, handler.maxJSONBody+1))
 	if err != nil || int64(len(body)) > handler.maxJSONBody {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
-		return
+		return nil, "", nil, false
 	}
-	var rewritten []byte
+	return body, contentType, params, true
+}
+
+func rewritePeerInferenceBody(body []byte, contentType string, params map[string]string, handler *Handler, id nodecontract.ModelIdentity) ([]byte, error) {
 	aliases := handler.modelAliases(id.BackendID, id.LocalID)
 	if contentType == "multipart/form-data" {
 		requestedModel, ambiguous, parseErr := multipartPeerModel(body, params["boundary"], func(model string) bool {
 			return model == id.LocalID || modelHasAlias(aliases, model)
 		})
 		if parseErr != nil || ambiguous || requestedModel == "" {
-			err = errors.New("invalid peer model")
-		} else {
-			rewritten, err = rewriteMultipartModel(body, params["boundary"], requestedModel, requestedModel, handler.maxJSONBody)
+			return nil, errors.New("invalid peer model")
 		}
-	} else {
-		rewritten, err = verifyOwnerModelBody(body, id.LocalID, aliases...)
+		return rewriteMultipartModel(body, params["boundary"], requestedModel, requestedModel, handler.maxJSONBody)
 	}
-	if err != nil {
-		http.Error(w, "invalid peer model", http.StatusBadRequest)
-		return
-	}
-	ctx, cancel := context.WithCancel(req.Context())
-	stop := context.AfterFunc(state.peerContext, cancel)
-	defer func() { stop(); cancel() }()
+	return verifyOwnerModelBody(body, id.LocalID, aliases...)
+}
+
+func (r *Reloader) peerInferenceTargetFresh(ctx context.Context, state *reloaderState, id nodecontract.ModelIdentity, handler *Handler) bool {
 	reportCtx, reportCancel := context.WithTimeout(ctx, peerReportTimeout)
+	defer reportCancel()
 	report, err := nodecontract.LocalReportFromCatalog(reportCtx, nodecontract.Source{
 		NodeID: state.peer.NodeID, ProxyInstanceID: r.instanceID, ConfigGeneration: state.generation,
 	}, []string{id.BackendID}, handler.catalog, time.Now(), state.cacheTTL)
-	reportCancel()
 	found := false
 	if err == nil {
 		for _, obs := range report.Observations {
@@ -116,14 +150,14 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 			}
 		}
 	}
-	if !found || r.state.Load() != state {
-		http.Error(w, peerTargetUnavailable, http.StatusServiceUnavailable)
-		return
-	}
+	return found
+}
+
+func forwardPeerInference(w http.ResponseWriter, req *http.Request, ctx context.Context, prepared preparedPeerInference) {
 	ctx = context.WithValue(ctx, requestIDKey{}, generateRequestID())
 	ctx = context.WithValue(ctx, peerAddressHeadersContextKey{}, true)
 	req = req.WithContext(ctx)
-	req.URL.Path, req.URL.RawPath, req.URL.RawQuery = path, "", ""
+	req.URL.Path, req.URL.RawPath, req.URL.RawQuery = prepared.path, "", ""
 	accept := req.Header.Get("Accept")
 	originalContentType := req.Header.Get(contentTypeHeader)
 	addressHeaders := make(http.Header)
@@ -142,14 +176,15 @@ func (r *Reloader) servePeerInference(w http.ResponseWriter, req *http.Request) 
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
-	restoreRequestBody(req, rewritten)
-	if !handler.reserveModelRequest(w, req, id.BackendID) {
+	restoreRequestBody(req, prepared.rewritten)
+	if !prepared.handler.reserveModelRequest(w, req, prepared.id.BackendID) {
 		return
 	}
-	if handler.comfyUIWaitTimeout > 0 && handler.comfyUIJobs != nil && handler.sharesComfyUIBackend(id.BackendID) {
-		defer handler.comfyUIJobs.endInference()
+	if prepared.handler.comfyUIWaitTimeout > 0 && prepared.handler.comfyUIJobs != nil &&
+		prepared.handler.sharesComfyUIBackend(prepared.id.BackendID) {
+		defer prepared.handler.comfyUIJobs.endInference()
 	}
-	handler.dispatchBackend(w, req, id.BackendID)
+	prepared.handler.dispatchBackend(w, req, prepared.id.BackendID)
 }
 
 func (h *Handler) modelAliases(backendID, localID string) []string {

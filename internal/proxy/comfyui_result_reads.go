@@ -490,29 +490,42 @@ func validateComfyUIViewQueryValues(query url.Values) (string, int, string) {
 		switch key {
 		case "filename":
 			filename = value
-		case "subfolder":
-			if !validComfyUIOutputSubfolder(value) {
-				return "", http.StatusBadRequest, "invalid ComfyUI output subfolder"
-			}
-		case "type":
-			if !validComfyUIViewType(value) {
-				return "", http.StatusForbidden, "unsupported ComfyUI result file type"
-			}
-		case "preview":
-			if !validComfyUIViewPreview(value) {
-				return "", http.StatusBadRequest, "invalid ComfyUI image preview format"
-			}
-		case "rand":
-			if !validComfyUIViewCacheBuster(value) {
-				return "", http.StatusBadRequest, "invalid ComfyUI image cache buster"
-			}
-		case "channel":
-			if value != "rgba" && value != "rgb" && value != "a" {
-				return "", http.StatusBadRequest, "invalid ComfyUI image channel"
+		case "subfolder", "type", "preview", "rand", "channel":
+			if status, message := validateComfyUIViewValue(key, value); status != 0 {
+				return "", status, message
 			}
 		}
 	}
 	return filename, 0, ""
+}
+
+// validateComfyUIViewValue validates the non-filename view query parameters
+// (subfolder, type, preview, rand, channel). It returns a non-zero status and
+// message when the value is invalid.
+func validateComfyUIViewValue(key, value string) (int, string) {
+	switch key {
+	case "subfolder":
+		if !validComfyUIOutputSubfolder(value) {
+			return http.StatusBadRequest, "invalid ComfyUI output subfolder"
+		}
+	case "type":
+		if !validComfyUIViewType(value) {
+			return http.StatusForbidden, "unsupported ComfyUI result file type"
+		}
+	case "preview":
+		if !validComfyUIViewPreview(value) {
+			return http.StatusBadRequest, "invalid ComfyUI image preview format"
+		}
+	case "rand":
+		if !validComfyUIViewCacheBuster(value) {
+			return http.StatusBadRequest, "invalid ComfyUI image cache buster"
+		}
+	case "channel":
+		if value != "rgba" && value != "rgb" && value != "a" {
+			return http.StatusBadRequest, "invalid ComfyUI image channel"
+		}
+	}
+	return 0, ""
 }
 
 func validComfyUIOutputFilename(filename string) bool {

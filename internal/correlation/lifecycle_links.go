@@ -98,6 +98,41 @@ func LinkCurrentLifecycle(identities []ActivityModelIdentity, report LifecycleRe
 	return observations, nil
 }
 
+// validateActivityIdentity checks one activity identity's scope. It is pure:
+// it does not mutate the identity. Checks are ordered: backend ID, activity ID,
+// epoch, reported ref, canonical ref. Returns the first failing check's error.
+func validateActivityIdentity(id ActivityModelIdentity) error {
+	if !validIdentifier(id.BackendID) || !validIdentifier(id.ActivityID) {
+		return errors.New("invalid activity identity scope")
+	}
+	if id.Epoch <= 0 {
+		return errors.New("invalid activity identity epoch")
+	}
+	if id.ReportedModelRef != "" && !isModelReference(id.ReportedModelRef) {
+		return errors.New("invalid activity identity reported model ref")
+	}
+	if id.CanonicalRef != "" && !isModelReference(id.CanonicalRef) {
+		return errors.New("invalid activity identity canonical ref")
+	}
+	return nil
+}
+
+// validateLifecycleModel checks one lifecycle model's scope. It is pure: it
+// does not mutate the model. Checks are ordered: backend ID, epoch, model ref.
+// Returns the first failing check's error.
+func validateLifecycleModel(m LifecycleModel) error {
+	if !validIdentifier(m.BackendID) {
+		return errors.New("invalid lifecycle model scope")
+	}
+	if m.Epoch <= 0 {
+		return errors.New("invalid lifecycle model epoch")
+	}
+	if !isModelReference(m.ModelRef) {
+		return errors.New("invalid lifecycle model ref")
+	}
+	return nil
+}
+
 // validateLinkScope checks the identity and model scope upfront. It is pure:
 // it does not mutate the identities or the report. Checks are ordered:
 // identities first (backend ID, activity ID, epoch, reported ref, canonical
@@ -105,28 +140,13 @@ func LinkCurrentLifecycle(identities []ActivityModelIdentity, report LifecycleRe
 // check's error.
 func validateLinkScope(identities []ActivityModelIdentity, report LifecycleReport) error {
 	for _, id := range identities {
-		if !validIdentifier(id.BackendID) || !validIdentifier(id.ActivityID) {
-			return errors.New("invalid activity identity scope")
-		}
-		if id.Epoch <= 0 {
-			return errors.New("invalid activity identity epoch")
-		}
-		if id.ReportedModelRef != "" && !isModelReference(id.ReportedModelRef) {
-			return errors.New("invalid activity identity reported model ref")
-		}
-		if id.CanonicalRef != "" && !isModelReference(id.CanonicalRef) {
-			return errors.New("invalid activity identity canonical ref")
+		if err := validateActivityIdentity(id); err != nil {
+			return err
 		}
 	}
 	for _, m := range report.Models {
-		if !validIdentifier(m.BackendID) {
-			return errors.New("invalid lifecycle model scope")
-		}
-		if m.Epoch <= 0 {
-			return errors.New("invalid lifecycle model epoch")
-		}
-		if !isModelReference(m.ModelRef) {
-			return errors.New("invalid lifecycle model ref")
+		if err := validateLifecycleModel(m); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -955,39 +955,47 @@ func attributeActivities(identity ModelIdentity, expectedRef string, indices *sn
 	seenActivity := make(map[activityKey]bool)
 	var attributedRecords []*correlation.ActivityRecord
 	for _, id := range matchingIdentities {
-		if id.State != catalogResolvedState || id.CanonicalRef != expectedRef {
-			continue
-		}
-		if indices.identityAmbiguous[identityKey{id.BackendID, id.Epoch, id.ActivityID}] {
+		if ok, r, amb := evaluateActivityIdentity(id, expectedRef, indices); ok {
+			activityIdentity := activityKey{r.BackendID, r.Epoch, r.ActivityID}
+			if seenActivity[activityIdentity] {
+				continue // dedupe by unique backend/epoch/activity ID
+			}
+			seenActivity[activityIdentity] = true
+			attributedRecords = append(attributedRecords, r)
+			attributed = true
+		} else if amb {
 			ambiguous = true
-			continue
 		}
-		key := activityKey{id.BackendID, id.Epoch, id.ActivityID}
-		if indices.activityConflict[key] {
-			ambiguous = true
-			continue
-		}
-		r, ok := indices.activitiesByKey[key]
-		if !ok || r == nil {
-			continue
-		}
-		if id.ReportedModelRef != "" && r.ReportedModelRef != "" && id.ReportedModelRef != r.ReportedModelRef {
-			ambiguous = true
-			continue
-		}
-		if r.IdentityConflict {
-			ambiguous = true
-			continue
-		}
-		activityIdentity := activityKey{r.BackendID, r.Epoch, r.ActivityID}
-		if seenActivity[activityIdentity] {
-			continue // dedupe by unique backend/epoch/activity ID
-		}
-		seenActivity[activityIdentity] = true
-		attributedRecords = append(attributedRecords, r)
-		attributed = true
 	}
 	return attributedRecords, attributed, ambiguous
+}
+
+// evaluateActivityIdentity assesses one matching identity against the
+// attribution filters. It returns whether the identity should be attributed,
+// the corresponding activity record (nil when not attributable), and whether
+// the identity is ambiguous/conflicting.
+func evaluateActivityIdentity(id correlation.ActivityModelIdentity, expectedRef string, indices *snapshotIndices) (attributed bool, r *correlation.ActivityRecord, ambiguous bool) {
+	if id.State != catalogResolvedState || id.CanonicalRef != expectedRef {
+		return false, nil, false
+	}
+	if indices.identityAmbiguous[identityKey{id.BackendID, id.Epoch, id.ActivityID}] {
+		return false, nil, true
+	}
+	key := activityKey{id.BackendID, id.Epoch, id.ActivityID}
+	if indices.activityConflict[key] {
+		return false, nil, true
+	}
+	r, ok := indices.activitiesByKey[key]
+	if !ok || r == nil {
+		return false, nil, false
+	}
+	if id.ReportedModelRef != "" && r.ReportedModelRef != "" && id.ReportedModelRef != r.ReportedModelRef {
+		return false, nil, true
+	}
+	if r.IdentityConflict {
+		return false, nil, true
+	}
+	return true, r, false
 }
 
 // assembleModelSnapshot assembles one ModelSnapshot from a resolved catalog
@@ -1671,17 +1679,6 @@ func collectGPUSamples(
 	deviceAssocsByActivity map[activityKey][]correlation.ActivityDeviceAssociation,
 	gpuSamplesByDevice map[gpuSampleKey][]correlation.GPUSample,
 ) (matched []correlation.GPUSample, windowStart, windowEnd time.Time, hasWindow bool, backendID string) {
-	// sampleKey bounds a deduplication key: backend + epoch + device + source
-	// timestamp. Overlapping associations that reference the same sample are
-	// counted once.
-	type sampleKey struct {
-		backendID string
-		epoch     int64
-		deviceID  string
-		// UTC strips the monotonic clock reading so equal wall-clock source
-		// timestamps dedupe regardless of collection order.
-		timestamp time.Time
-	}
 	seen := make(map[sampleKey]struct{})
 	for _, r := range records {
 		backendID = r.BackendID
@@ -1690,33 +1687,49 @@ func collectGPUSamples(
 			if assoc.Kind != "approximate_time_window" {
 				continue
 			}
-			if !hasWindow {
-				windowStart = assoc.WindowStart
-				windowEnd = assoc.WindowEnd
-				hasWindow = true
-			} else {
-				if assoc.WindowStart.Before(windowStart) {
-					windowStart = assoc.WindowStart
-				}
-				if assoc.WindowEnd.After(windowEnd) {
-					windowEnd = assoc.WindowEnd
-				}
-			}
-			// Join actual samples within the association's explicit window.
-			skey := gpuSampleKey{assoc.BackendID, assoc.Epoch, assoc.DeviceID}
-			for _, s := range gpuSamplesByDevice[skey] {
-				if !s.Timestamp.Before(assoc.WindowStart) && !s.Timestamp.After(assoc.WindowEnd) {
-					dedupKey := sampleKey{s.BackendID, s.Epoch, s.DeviceID, s.Timestamp.UTC()}
-					if _, exists := seen[dedupKey]; exists {
-						continue // duplicate sample: count once
-					}
-					seen[dedupKey] = struct{}{}
-					matched = append(matched, s)
-				}
-			}
+			hasWindow, windowStart, windowEnd = expandWindow(hasWindow, windowStart, windowEnd, assoc.WindowStart, assoc.WindowEnd)
+			joinSamplesInWindow(gpuSamplesByDevice, assoc, seen, &matched)
 		}
 	}
 	return matched, windowStart, windowEnd, hasWindow, backendID
+}
+
+// expandWindow folds the association's window into the aggregate window,
+// initializing it on first use. The aggregate window spans all qualifying
+// associations so overlapping time windows are covered once.
+func expandWindow(hasWindow bool, windowStart, windowEnd time.Time, start, end time.Time) (bool, time.Time, time.Time) {
+	if !hasWindow {
+		return true, start, end
+	}
+	if start.Before(windowStart) {
+		windowStart = start
+	}
+	if end.After(windowEnd) {
+		windowEnd = end
+	}
+	return hasWindow, windowStart, windowEnd
+}
+
+// joinSamplesInWindow appends samples from gpuSamplesByDevice[assoc] that fall
+// within [assoc.WindowStart, assoc.WindowEnd], deduping by sampleKey using the
+// shared seen set so overlapping associations count each sample once.
+func joinSamplesInWindow(
+	gpuSamplesByDevice map[gpuSampleKey][]correlation.GPUSample,
+	assoc correlation.ActivityDeviceAssociation,
+	seen map[sampleKey]struct{},
+	matched *[]correlation.GPUSample,
+) {
+	skey := gpuSampleKey{assoc.BackendID, assoc.Epoch, assoc.DeviceID}
+	for _, s := range gpuSamplesByDevice[skey] {
+		if !s.Timestamp.Before(assoc.WindowStart) && !s.Timestamp.After(assoc.WindowEnd) {
+			dedupKey := sampleKey{s.BackendID, s.Epoch, s.DeviceID, s.Timestamp.UTC()}
+			if _, exists := seen[dedupKey]; exists {
+				continue // duplicate sample: count once
+			}
+			seen[dedupKey] = struct{}{}
+			*matched = append(*matched, s)
+		}
+	}
 }
 
 // resolveGPUWindowState resolves the measurement state, freshness, and reason
@@ -1911,6 +1924,17 @@ type gpuSampleKey struct {
 	backendID string
 	epoch     int64
 	deviceID  string
+}
+
+// sampleKey bounds a deduplication key: backend + epoch + device + source
+// timestamp. Overlapping associations that reference the same sample are
+// counted once. UTC strips the monotonic clock reading so equal wall-clock
+// source timestamps dedupe regardless of collection order.
+type sampleKey struct {
+	backendID string
+	epoch     int64
+	deviceID  string
+	timestamp time.Time
 }
 
 // isModelReference reports whether ref is a bounded opaque model reference:

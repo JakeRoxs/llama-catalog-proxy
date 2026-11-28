@@ -13,8 +13,12 @@ function message(text) {
 
 async function api(path, options = {}) {
 	const headers = {};
-	if (token) headers.Authorization = `Bearer ${token}`;
-  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+	if (token) {
+		headers.Authorization = `Bearer ${token}`;
+	}
+	if (options.body !== undefined) {
+		headers["Content-Type"] = "application/json";
+	}
   const response = await fetch(`/benchmark/v1${path}`, {
     method: options.method || "GET",
     headers,
@@ -78,6 +82,16 @@ function displayRun(record) {
   paragraph(content, `Status: ${record.status} · ${record.requested.backend} / ${record.requested.model}`);
   paragraph(content, "Requested settings are not proof of effective runtime settings.");
   heading(content, "Workload results");
+  renderWorkloadResults(content, workloads, record);
+  if (workloads.length === 0) paragraph(content, "No workload evidence was recorded.");
+  heading(content, "Sample evidence");
+  paragraph(content, "Elapsed time is measured by the benchmark client around each request sequence. Missing proxy observations are unknown.");
+  renderSampleEvidence(content, workloads);
+  heading(content, "Limitations");
+  renderLimitations(content, record.limitations || []);
+}
+
+function renderWorkloadResults(content, workloads, record) {
   const body = table(content, ["Workload", "Samples", "Passed", "Failed", "Not evaluated", "Incomplete"]);
   for (const workload of workloads) {
     const samples = workload.samples || [];
@@ -90,9 +104,9 @@ function displayRun(record) {
     cell(row, samples.filter((s) => s.status !== "completed").length);
     body.appendChild(row);
   }
-  if (workloads.length === 0) paragraph(content, "No workload evidence was recorded.");
-  heading(content, "Sample evidence");
-  paragraph(content, "Elapsed time is measured by the benchmark client around each request sequence. Missing proxy observations are unknown.");
+}
+
+function renderSampleEvidence(content, workloads) {
   const details = table(content, ["Workload", "Iteration", "Status", "Correctness", "Elapsed ms", "Diagnostics", "Transport", "Generation"]);
   for (const workload of workloads) {
     for (const sample of workload.samples || []) {
@@ -108,8 +122,10 @@ function displayRun(record) {
       details.appendChild(row);
     }
   }
-  heading(content, "Limitations");
-  for (const item of record.limitations || []) paragraph(content, item);
+}
+
+function renderLimitations(content, limitations) {
+  for (const item of limitations) paragraph(content, item);
 }
 
 function formatMetric(value) {
@@ -128,32 +144,44 @@ function displayComparison(report) {
   for (const item of report.confounders || []) paragraph(content, item);
   paragraph(content, report.context.per_round_acceptance_state);
   for (const workload of report.workloads || []) {
-    heading(content, workload.name);
-    const a = workload.coverage.baseline;
-    const b = workload.coverage.candidate;
-    paragraph(content, `Samples recorded / expected: baseline ${a.samples_recorded} / ${a.samples_expected}${a.recorded ? "" : " (workload missing)"}; candidate ${b.samples_recorded} / ${b.samples_expected}${b.recorded ? "" : " (workload missing)"}.`);
-    const correctness = table(content, ["Side", "Passed", "Failed", "Not evaluated", "Failed samples", "Canceled", "Incomplete transport", "Unknown transport", "Incomplete generation", "Unknown generation", "Truncated"]);
-    for (const side of ["baseline", "candidate"]) {
-      const row = document.createElement("tr");
-      const c = workload.correctness[side];
-      const f = workload.failures[side];
-      for (const value of [side, c.passed, c.failed, c.not_evaluated, f.failed_samples, f.canceled_samples, f.incomplete_transport, f.unknown_transport, f.incomplete_generation, f.unknown_generation, f.truncated_generation]) cell(row, value);
-      correctness.appendChild(row);
-    }
-    if (!workload.metrics || workload.metrics.length === 0) {
-      paragraph(content, "No performance measurements available.");
-      continue;
-    }
-    const metrics = table(content, ["Metric", "Baseline mean (n)", "Candidate mean (n)", "Change", "Attribution"]);
-    for (const metric of workload.metrics) {
-      const row = document.createElement("tr");
-      cell(row, metric.name);
-      cell(row, `${formatMetric(metric.baseline.mean)} (${metric.baseline.sample_count})`);
-      cell(row, `${formatMetric(metric.candidate.mean)} (${metric.candidate.sample_count})`);
-      cell(row, metric.change_percent == null ? "unknown" : `${formatMetric(metric.change_percent)}%`);
-      cell(row, metric.attribution);
-      metrics.appendChild(row);
-    }
+    renderWorkloadComparison(content, workload);
+  }
+}
+
+function renderWorkloadComparison(content, workload) {
+  heading(content, workload.name);
+  const a = workload.coverage.baseline;
+  const b = workload.coverage.candidate;
+  paragraph(content, `Samples recorded / expected: baseline ${a.samples_recorded} / ${a.samples_expected}${a.recorded ? "" : " (workload missing)"}; candidate ${b.samples_recorded} / ${b.samples_expected}${b.recorded ? "" : " (workload missing)"}.`);
+  renderCorrectnessTable(content, workload);
+  if (!workload.metrics || workload.metrics.length === 0) {
+    paragraph(content, "No performance measurements available.");
+    return;
+  }
+  renderMetricsTable(content, workload);
+}
+
+function renderCorrectnessTable(content, workload) {
+  const correctness = table(content, ["Side", "Passed", "Failed", "Not evaluated", "Failed samples", "Canceled", "Incomplete transport", "Unknown transport", "Incomplete generation", "Unknown generation", "Truncated"]);
+  for (const side of ["baseline", "candidate"]) {
+    const row = document.createElement("tr");
+    const c = workload.correctness[side];
+    const f = workload.failures[side];
+    for (const value of [side, c.passed, c.failed, c.not_evaluated, f.failed_samples, f.canceled_samples, f.incomplete_transport, f.unknown_transport, f.incomplete_generation, f.unknown_generation, f.truncated_generation]) cell(row, value);
+    correctness.appendChild(row);
+  }
+}
+
+function renderMetricsTable(content, workload) {
+  const metrics = table(content, ["Metric", "Baseline mean (n)", "Candidate mean (n)", "Change", "Attribution"]);
+  for (const metric of workload.metrics) {
+    const row = document.createElement("tr");
+    cell(row, metric.name);
+    cell(row, `${formatMetric(metric.baseline.mean)} (${metric.baseline.sample_count})`);
+    cell(row, `${formatMetric(metric.candidate.mean)} (${metric.candidate.sample_count})`);
+    cell(row, metric.change_percent == null ? "unknown" : `${formatMetric(metric.change_percent)}%`);
+    cell(row, metric.attribution);
+    metrics.appendChild(row);
   }
 }
 
@@ -204,9 +232,15 @@ async function refreshRuns() {
     rows.appendChild(row);
   }
   byId("compare").disabled = !baseline || !candidate;
-  byId("history-note").textContent = result.truncated
-    ? "Showing at most 100 reports, selected by file modification time."
-    : result.runs.length ? "Select a report to inspect it or choose two runs to compare." : "No saved reports.";
+  let historyNote;
+  if (result.truncated) {
+    historyNote = "Showing at most 100 reports, selected by file modification time.";
+  } else if (result.runs.length) {
+    historyNote = "Select a report to inspect it or choose two runs to compare.";
+  } else {
+    historyNote = "No saved reports.";
+  }
+  byId("history-note").textContent = historyNote;
 }
 
 let publicReadOnlyMode = false;
@@ -246,9 +280,15 @@ async function refreshJob() {
   }
   currentJob = job.id;
   byId("job-state").textContent = job.state.toUpperCase();
-  byId("job-detail").textContent = job.error_code
-    ? `Job ${job.id}: ${job.error_code}${job.run_id ? `; inspect report ${job.run_id} before retrying` : ""}`
-    : `Job ${job.id}${job.run_id ? ` · report ${job.run_id}` : ""}`;
+  let jobDetail;
+  if (job.error_code) {
+    const reportRef = job.run_id ? `; inspect report ${job.run_id} before retrying` : "";
+    jobDetail = `Job ${job.id}: ${job.error_code}${reportRef}`;
+  } else {
+    const reportRef = job.run_id ? ` · report ${job.run_id}` : "";
+    jobDetail = `Job ${job.id}${reportRef}`;
+  }
+  byId("job-detail").textContent = jobDetail;
   const active = job.state === "running" || job.state === "canceling";
   byId("cancel").hidden = !active;
   byId("cancel").disabled = job.state === "canceling";
@@ -328,5 +368,5 @@ if (!window.isSecureContext) {
   byId("security-warning").hidden = false;
   byId("unlock-form").querySelector("button").disabled = true;
 } else {
-  void enterPublicReadOnlyView();
+  enterPublicReadOnlyView().catch(() => {});
 }

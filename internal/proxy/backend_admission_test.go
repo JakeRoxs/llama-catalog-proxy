@@ -50,23 +50,35 @@ func TestOwnerBackendDispatchSharesAdmissionBoundary(t *testing.T) {
 		{"peer inference", "POST", "/peer/v1/inference", `{"model":"example"}`, "/v1/chat/completions"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			ctx := &admissionCaseContext{t: t, h: h, owner: owner, forwarded: &forwarded, token: token}
 			for _, allowed := range []bool{false, true} {
-				runAdmissionCase(t, h, owner, &forwarded, token, test.name, test.method, test.path, test.body, test.target, allowed)
+				ctx.run(test.name, test.method, test.path, test.body, test.target, allowed)
 			}
 		})
 	}
 }
 
-// runAdmissionCase builds and dispatches one admission-matrix request, then
-// asserts the admission callback ran once, the release/send counters match the
-// allowed decision, and the upstream was forwarded exactly when admission passed.
-func runAdmissionCase(t *testing.T, h *Handler, owner *Reloader, forwarded *atomic.Int32, token, name, method, path, body, target string, allowed bool) {
-	t.Helper()
+// admissionCaseContext bundles the shared fixtures for running one admission-matrix
+// request and asserting the admission decision. Grouping the fixtures here collapses
+// the runAdmissionCase parameter list from 11 to a cohesive context plus per-case data.
+type admissionCaseContext struct {
+	t         *testing.T
+	h         *Handler
+	owner     *Reloader
+	forwarded *atomic.Int32
+	token     string
+}
+
+// run builds and dispatches one admission-matrix request, then asserts the
+// admission callback ran once, the release/send counters match the allowed
+// decision, and the upstream was forwarded exactly when admission passed.
+func (ctx *admissionCaseContext) run(name, method, path, body, target string, allowed bool) {
+	ctx.t.Helper()
 	var checks, releases int
-	h.backendAdmission = func(req *http.Request, backendID string) (func(), bool) {
+	ctx.h.backendAdmission = func(req *http.Request, backendID string) (func(), bool) {
 		checks++
 		if backendID != "default" || req.URL.Path != target || req.Method != method {
-			t.Errorf("incorrect admission target: %s %s %s", backendID, req.Method, req.URL.Path)
+			ctx.t.Errorf("incorrect admission target: %s %s %s", backendID, req.Method, req.URL.Path)
 		}
 		if !allowed {
 			return nil, false
@@ -75,31 +87,31 @@ func runAdmissionCase(t *testing.T, h *Handler, owner *Reloader, forwarded *atom
 	}
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Authorization", "Bearer "+ctx.token)
 	req.TLS = &tls.ConnectionState{}
 	w := httptest.NewRecorder()
-	before := forwarded.Load()
+	before := ctx.forwarded.Load()
 	switch name {
 	case "peer path":
 		req.Header.Set(peerPathServiceHeader, "comfyui")
 		req.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(target)))
-		owner.PeerHandler().ServeHTTP(w, req)
+		ctx.owner.PeerHandler().ServeHTTP(w, req)
 	case "peer inference":
 		req.Header.Set(peerBackendHeader, base64.RawURLEncoding.EncodeToString([]byte("default")))
 		req.Header.Set(peerModelHeader, base64.RawURLEncoding.EncodeToString([]byte("example")))
 		req.Header.Set(peerPathHeader, target)
-		req.Header.Set(peerInstanceHeader, owner.instanceID)
+		req.Header.Set(peerInstanceHeader, ctx.owner.instanceID)
 		req.Header.Set(peerGenerationHeader, "1")
-		owner.PeerHandler().ServeHTTP(w, req)
+		ctx.owner.PeerHandler().ServeHTTP(w, req)
 	default:
-		h.ServeHTTP(w, req)
+		ctx.h.ServeHTTP(w, req)
 	}
 	wantStatus, wantSends := http.StatusServiceUnavailable, 0
 	if allowed {
 		wantStatus, wantSends = http.StatusAccepted, 1
 	}
-	if w.Code != wantStatus || checks != 1 || releases != wantSends || forwarded.Load()-before != int32(wantSends) {
-		t.Fatalf("allowed=%v status=%d checks=%d releases=%d sends=%d body=%q", allowed, w.Code, checks, releases, forwarded.Load()-before, w.Body.String())
+	if w.Code != wantStatus || checks != 1 || releases != wantSends || ctx.forwarded.Load()-before != int32(wantSends) {
+		ctx.t.Fatalf("allowed=%v status=%d checks=%d releases=%d sends=%d body=%q", allowed, w.Code, checks, releases, ctx.forwarded.Load()-before, w.Body.String())
 	}
 }
 

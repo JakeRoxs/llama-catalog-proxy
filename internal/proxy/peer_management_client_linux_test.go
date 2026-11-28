@@ -21,213 +21,160 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
+type delegatedOperationTransportHarness struct {
+	t *testing.T
+	fixture delegatedApplyFixture
+	operation modelconfig.DelegatedOperation
+	caller, outbound string
+	server, redirect *httptest.Server
+	r *Reloader
+	state *reloaderState
+	clients map[string]*peerClient
+	request *http.Request
+	mode, calls, redirects atomic.Int32
+	entered, release, cancelEntered chan struct{}
+}
+
 func TestForwardDelegatedOperationUsesScopedPeerTransport(t *testing.T) {
-	fixture := newDelegatedApplyFixture(t)
-	reserveDelegatedFixture(t, fixture)
-	operation, err := modelconfig.LoadDelegatedOperation(fixture.operations, fixture.input.ProposalID)
-	if err != nil {
-		t.Fatal(err)
+	h := newDelegatedOperationTransportHarness(t)
+	h.assertResponseValidation()
+	h.assertLifecycleAndCancellation()
+	h.assertPreflightAndCredentials()
+}
+
+func newDelegatedOperationTransportHarness(t *testing.T) *delegatedOperationTransportHarness {
+	t.Helper()
+	h := &delegatedOperationTransportHarness{
+		t:t, fixture:newDelegatedApplyFixture(t), caller:strings.Repeat("c",32), outbound:strings.Repeat("t",32),
+		entered:make(chan struct{}), release:make(chan struct{}), cancelEntered:make(chan struct{}),
 	}
-	caller, outbound := strings.Repeat("c", 32), strings.Repeat("t", 32)
-	var mode, calls, redirects atomic.Int32
-	entered, release, cancelEntered := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	redirect := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		redirects.Add(1)
-	}))
-	defer redirect.Close()
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		calls.Add(1)
-		if req.Method != http.MethodGet ||
-			req.URL.Path != "/peer/v1/management/operations/"+fixture.input.ProposalID+"/"+fixture.input.OperationID ||
-			req.URL.RawQuery != "" || req.Header.Get("Authorization") != "Bearer "+outbound ||
-			req.Header.Get("X-Unsafe") != "" || req.Header.Get("Cookie") != "" {
-			t.Errorf("unexpected outbound request: method=%s path=%s", req.Method, req.URL.Path)
-		}
-		if mode.Load() == 7 {
-			http.Redirect(w, req, redirect.URL, http.StatusFound)
-			return
-		}
-		if mode.Load() == 8 {
-			http.Error(w, "secret remote error", http.StatusForbidden)
-			return
-		}
-		if mode.Load() == 11 {
-			close(entered)
-			<-release
-		}
-		if mode.Load() == 13 {
-			close(cancelEntered)
-			<-req.Context().Done()
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		record := operation
-		switch mode.Load() {
-		case 1:
-			record.Owner.NodeID = "different"
-		case 2:
-			record.RequesterNode = "other"
-		case 3:
-			record.OperationID = strings.Repeat("f", 32)
-		case 4:
-			_, _ = io.WriteString(w, strings.Repeat("x", maxManagementRequest+1))
-			return
-		case 5:
-			w.Header().Set("Content-Type", "text/plain")
-		case 6:
-			w.Header().Set("Content-Encoding", "gzip")
-		case 12:
-			record.CallerScope = "individual"
-		}
-		data, err := json.Marshal(record)
-		if err != nil {
-			t.Error(err)
-			return
-		}
-		if mode.Load() == 9 {
-			data = append(bytes.TrimSuffix(data, []byte("}")), []byte(`,"outcome":"written"}`)...)
-		}
-		if mode.Load() == 10 {
-			data = append(bytes.TrimSuffix(data, []byte("}")), []byte(`,"unexpected":"secret"}`)...)
-		}
-		_, _ = w.Write(data)
-	}))
-	defer server.Close()
-	caPath := filepath.Join(t.TempDir(), "peer-ca.pem")
-	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
-		"owner": {URL: server.URL, OutboundToken: outbound, CAFile: caPath, RouteManagement: true},
+	reserveDelegatedFixture(t,h.fixture)
+	var err error
+	h.operation,err=modelconfig.LoadDelegatedOperation(h.fixture.operations,h.fixture.input.ProposalID)
+	if err!=nil { t.Fatal(err) }
+	h.redirect=httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter,*http.Request){h.redirects.Add(1)}))
+	t.Cleanup(h.redirect.Close)
+	h.server=httptest.NewTLSServer(http.HandlerFunc(h.serveOwnerRequest))
+	t.Cleanup(h.server.Close)
+	caPath:=filepath.Join(t.TempDir(),"peer-ca.pem")
+	if err:=os.WriteFile(caPath,pem.EncodeToMemory(&pem.Block{Type:"CERTIFICATE",Bytes:h.server.Certificate().Raw}),0o600); err!=nil {t.Fatal(err)}
+	peer:=&config.PeerConfig{NodeID:"requester",Peers:map[string]config.PeerGrant{
+		"owner":{URL:h.server.URL,OutboundToken:h.outbound,CAFile:caPath,RouteManagement:true},
 	}}
-	clients, _, err := newPeerClients(peer)
-	if err != nil {
-		t.Fatal(err)
+	h.clients,_,err=newPeerClients(peer); if err!=nil {t.Fatal(err)}
+	t.Cleanup(func(){closePeerClients(h.clients)})
+	h.state=&reloaderState{peer:peer,peerClients:h.clients,management:&config.ManagementConfig{DelegationToken:h.caller}}
+	h.r=&Reloader{managementSlots:make(chan struct{},2)}; h.r.state.Store(h.state)
+	h.request=httptest.NewRequest(http.MethodGet,"https://receiver.example/management/v1/operation",nil)
+	h.request.Header.Set("Authorization","Bearer "+h.caller)
+	h.request.Header.Set("X-Unsafe","do-not-forward")
+	h.request.Header.Set("Cookie","do-not-forward")
+	return h
+}
+
+func (h *delegatedOperationTransportHarness) lookup(req *http.Request,state *reloaderState,owner,proposal string)(modelconfig.DelegatedOperation,error){
+	return h.r.forwardDelegatedOperation(req,state,owner,proposal,h.fixture.input.OperationID)
+}
+
+func (h *delegatedOperationTransportHarness) lookupOwner()(modelconfig.DelegatedOperation,error){
+	return h.lookup(h.request,h.state,"owner",h.fixture.input.ProposalID)
+}
+
+func (h *delegatedOperationTransportHarness) serveOwnerRequest(w http.ResponseWriter,req *http.Request){
+	h.calls.Add(1)
+	if req.Method!=http.MethodGet || req.URL.Path!="/peer/v1/management/operations/"+h.fixture.input.ProposalID+"/"+h.fixture.input.OperationID ||
+		req.URL.RawQuery!="" || req.Header.Get("Authorization")!="Bearer "+h.outbound || req.Header.Get("X-Unsafe")!="" || req.Header.Get("Cookie")!="" {
+		h.t.Errorf("unexpected outbound request: method=%s path=%s",req.Method,req.URL.Path)
 	}
-	defer closePeerClients(clients)
-	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
-	r := &Reloader{managementSlots: make(chan struct{}, 2)}
-	r.state.Store(state)
-	request := httptest.NewRequest(http.MethodGet, "https://receiver.example/management/v1/operation", nil)
-	request.Header.Set("Authorization", "Bearer "+caller)
-	request.Header.Set("X-Unsafe", "do-not-forward")
-	request.Header.Set("Cookie", "do-not-forward")
-	lookup := func(req *http.Request, s *reloaderState, owner, proposal, op string) (modelconfig.DelegatedOperation, error) {
-		return r.forwardDelegatedOperation(req, s, owner, proposal, op)
+	mode:=h.mode.Load()
+	if h.waitForMode(w,req,mode) {return}
+	writePeerOperationTestResponse(h.t,w,mode,h.operation,h.redirect.URL)
+}
+
+func (h *delegatedOperationTransportHarness) waitForMode(w http.ResponseWriter,req *http.Request,mode int32)bool{
+	switch mode {
+	case 7: http.Redirect(w,req,h.redirect.URL,http.StatusFound); return true
+	case 8: http.Error(w,"secret remote error",http.StatusForbidden); return true
+	case 11: close(h.entered); <-h.release
+	case 13: close(h.cancelEntered); <-req.Context().Done(); return true
 	}
-	record, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID)
-	if err != nil || record.Outcome != "unknown" || record.Owner.NodeID != "owner" {
-		t.Fatalf("valid peer lookup = %+v, %v", record, err)
+	return false
+}
+
+func writePeerOperationTestResponse(t *testing.T,w http.ResponseWriter,mode int32,operation modelconfig.DelegatedOperation,redirectURL string){
+	t.Helper()
+	w.Header().Set("Content-Type","application/json")
+	switch mode {
+	case 1: operation.Owner.NodeID="different"
+	case 2: operation.RequesterNode="other"
+	case 3: operation.OperationID=strings.Repeat("f",32)
+	case 4: _,_=io.WriteString(w,strings.Repeat("x",maxManagementRequest+1)); return
+	case 5: w.Header().Set("Content-Type","text/plain")
+	case 6: w.Header().Set("Content-Encoding","gzip")
+	case 12: operation.CallerScope="individual"
 	}
-	for _, tt := range []struct {
-		mode int32
-		want error
+	data,err:=json.Marshal(operation); if err!=nil {t.Error(err);return}
+	if mode==9 {data=append(bytes.TrimSuffix(data,[]byte("}")),[]byte(`,"outcome":"written"}`)...)}
+	if mode==10 {data=append(bytes.TrimSuffix(data,[]byte("}")),[]byte(`,"unexpected":"secret"}`)...)}
+	_,_=w.Write(data)
+}
+
+func (h *delegatedOperationTransportHarness) assertResponseValidation(){
+	h.t.Helper()
+	record,err:=h.lookupOwner()
+	if err!=nil || record.Outcome!="unknown" || record.Owner.NodeID!="owner" {h.t.Fatalf("valid peer lookup = %+v, %v",record,err)}
+	for _,tt:=range []struct{mode int32;want error}{
+		{1,errDelegationPeerResponse},{2,errDelegationPeerResponse},{3,errDelegationPeerResponse},{4,errDelegationPeerResponse},
+		{5,errDelegationPeerResponse},{6,errDelegationPeerResponse},{7,errDelegationPeerUnavailable},{8,errDelegationPeerUnavailable},
+		{9,errDelegationPeerResponse},{10,errDelegationPeerResponse},{12,errDelegationPeerResponse},
 	}{
-		{1, errDelegationPeerResponse}, {2, errDelegationPeerResponse}, {3, errDelegationPeerResponse},
-		{4, errDelegationPeerResponse}, {5, errDelegationPeerResponse}, {6, errDelegationPeerResponse},
-		{7, errDelegationPeerUnavailable}, {8, errDelegationPeerUnavailable}, {9, errDelegationPeerResponse},
-		{10, errDelegationPeerResponse}, {12, errDelegationPeerResponse},
-	} {
-		mode.Store(tt.mode)
-		result, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID)
-		if !errors.Is(err, tt.want) || result.OperationID != "" || err != nil && strings.Contains(err.Error(), "secret") {
-			t.Fatalf("mode %d: %+v, %v", tt.mode, result, err)
-		}
+		h.mode.Store(tt.mode); result,err:=h.lookupOwner()
+		if !errors.Is(err,tt.want) || result.OperationID!="" || err!=nil && strings.Contains(err.Error(),"secret") {h.t.Fatalf("mode %d: %+v, %v",tt.mode,result,err)}
 	}
-	if redirects.Load() != 0 {
-		t.Fatal("management request followed a redirect")
-	}
-	mode.Store(11)
-	done := make(chan error, 1)
-	go func() {
-		_, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID)
-		done <- err
-	}()
-	<-entered
-	if r.lifecycleMu.TryLock() {
-		r.lifecycleMu.Unlock()
-		close(release)
-		<-done
-		t.Fatal("configuration reload could race an active forwarding operation")
-	}
-	close(release)
-	if err := <-done; err != nil {
-		t.Fatalf("in-flight request failed: %v", err)
-	}
-	mode.Store(13)
-	ctx, cancelInFlight := context.WithCancel(request.Context())
-	go func() {
-		_, err := lookup(request.WithContext(ctx), state, "owner", fixture.input.ProposalID, fixture.input.OperationID)
-		done <- err
-	}()
-	<-cancelEntered
-	cancelInFlight()
-	if err := <-done; !errors.Is(err, errDelegationPeerUnavailable) {
-		t.Fatalf("in-flight cancellation returned %v", err)
-	}
-	mode.Store(0)
-	before := calls.Load()
-	wrong := request.Clone(request.Context())
-	wrong.Header.Set("Authorization", "Bearer "+outbound)
-	duplicate := request.Clone(request.Context())
-	duplicate.Header.Add("Authorization", "Bearer "+caller)
-	plaintext := request.Clone(request.Context())
-	plaintext.TLS = nil
-	canceled, cancel := context.WithCancel(request.Context())
-	cancel()
-	for _, tt := range []struct {
-		name     string
-		request  *http.Request
-		owner    string
-		proposal string
-		want     error
-	}{
-		{"wrong caller", wrong, "owner", fixture.input.ProposalID, errDelegationUnauthorized},
-		{"duplicate caller", duplicate, "owner", fixture.input.ProposalID, errDelegationUnauthorized},
-		{"plaintext", plaintext, "owner", fixture.input.ProposalID, errDelegationUnauthorized},
-		{"canceled", request.WithContext(canceled), "owner", fixture.input.ProposalID, context.Canceled},
-		{"unconfigured owner", request, "other", fixture.input.ProposalID, errDelegationPeerUnavailable},
-		{"invalid ID", request, "owner", "../bad", modelconfig.ErrProposalInvalid},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := lookup(tt.request, state, tt.owner, tt.proposal, fixture.input.OperationID); !errors.Is(err, tt.want) {
-				t.Fatalf("got %v, want %v", err, tt.want)
-			}
-		})
-	}
-	clients["owner"].routeManagement = false
-	if _, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID); !errors.Is(err, errDelegationPeerUnavailable) {
-		t.Fatalf("disabled outbound management accepted: %v", err)
-	}
-	clients["owner"].routeManagement = true
-	r.managementSlots <- struct{}{}
-	r.managementSlots <- struct{}{}
-	if _, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID); !errors.Is(err, errDelegationBusy) {
-		t.Fatalf("unbounded management requests accepted: %v", err)
-	}
-	<-r.managementSlots
-	<-r.managementSlots
-	r.state.Store(&reloaderState{})
-	if _, err := lookup(request, state, "owner", fixture.input.ProposalID, fixture.input.OperationID); !errors.Is(err, errDelegationChanged) {
-		t.Fatalf("stale receiving state accepted: %v", err)
-	}
-	if calls.Load() != before {
-		t.Fatal("rejected requests reached the peer")
-	}
-	updated := *state
-	updated.management = copyManagementConfig(state.management)
-	updated.management.DelegationToken = strings.Repeat("n", 32)
-	r.state.Store(&updated)
-	if _, err := lookup(request, &updated, "owner", fixture.input.ProposalID, fixture.input.OperationID); !errors.Is(err, errDelegationUnauthorized) {
-		t.Fatalf("revoked receiving credential accepted: %v", err)
-	}
-	rotated := request.Clone(request.Context())
-	rotated.Header.Set("Authorization", "Bearer "+updated.management.DelegationToken)
-	if _, err := lookup(rotated, &updated, "owner", fixture.input.ProposalID, fixture.input.OperationID); err != nil {
-		t.Fatalf("rotated receiving credential rejected: %v", err)
-	}
-	server.Close()
-	if _, err := lookup(rotated, &updated, "owner", fixture.input.ProposalID, fixture.input.OperationID); !errors.Is(err, errDelegationPeerUnavailable) {
-		t.Fatalf("peer outage did not return unavailable: %v", err)
-	}
+	if h.redirects.Load()!=0 {h.t.Fatal("management request followed a redirect")}
+}
+
+func (h *delegatedOperationTransportHarness) assertLifecycleAndCancellation(){
+	h.t.Helper()
+	h.mode.Store(11); done:=make(chan error,1)
+	go func(){_,err:=h.lookupOwner();done<-err}()
+	<-h.entered
+	if h.r.lifecycleMu.TryLock(){h.r.lifecycleMu.Unlock();close(h.release);<-done;h.t.Fatal("configuration reload could race an active forwarding operation")}
+	close(h.release);if err:=<-done;err!=nil {h.t.Fatalf("in-flight request failed: %v",err)}
+	h.mode.Store(13);ctx,cancel:=context.WithCancel(h.request.Context())
+	go func(){_,err:=h.lookup(h.request.WithContext(ctx),h.state,"owner",h.fixture.input.ProposalID);done<-err}()
+	<-h.cancelEntered;cancel()
+	if err:=<-done;!errors.Is(err,errDelegationPeerUnavailable){h.t.Fatalf("in-flight cancellation returned %v",err)}
+}
+
+func (h *delegatedOperationTransportHarness) assertPreflightAndCredentials(){
+	h.t.Helper()
+	h.mode.Store(0);before:=h.calls.Load()
+	wrong:=h.request.Clone(h.request.Context());wrong.Header.Set("Authorization","Bearer "+h.outbound)
+	duplicate:=h.request.Clone(h.request.Context());duplicate.Header.Add("Authorization","Bearer "+h.caller)
+	plaintext:=h.request.Clone(h.request.Context());plaintext.TLS=nil
+	canceled,cancel:=context.WithCancel(h.request.Context());cancel()
+	for _,tt:=range []struct{name string;request *http.Request;owner,proposal string;want error}{
+		{"wrong caller",wrong,"owner",h.fixture.input.ProposalID,errDelegationUnauthorized},
+		{"duplicate caller",duplicate,"owner",h.fixture.input.ProposalID,errDelegationUnauthorized},
+		{"plaintext",plaintext,"owner",h.fixture.input.ProposalID,errDelegationUnauthorized},
+		{"canceled",h.request.WithContext(canceled),"owner",h.fixture.input.ProposalID,context.Canceled},
+		{"unconfigured owner",h.request,"other",h.fixture.input.ProposalID,errDelegationPeerUnavailable},
+		{"invalid ID",h.request,"owner","../bad",modelconfig.ErrProposalInvalid},
+	}{h.t.Run(tt.name,func(t *testing.T){if _,err:=h.lookup(tt.request,h.state,tt.owner,tt.proposal);!errors.Is(err,tt.want){t.Fatalf("got %v, want %v",err,tt.want)}})}
+	h.clients["owner"].routeManagement=false
+	if _,err:=h.lookupOwner();!errors.Is(err,errDelegationPeerUnavailable){h.t.Fatalf("disabled outbound management accepted: %v",err)}
+	h.clients["owner"].routeManagement=true
+	h.r.managementSlots<-struct{}{};h.r.managementSlots<-struct{}{}
+	if _,err:=h.lookupOwner();!errors.Is(err,errDelegationBusy){h.t.Fatalf("unbounded management requests accepted: %v",err)}
+	<-h.r.managementSlots; <-h.r.managementSlots
+	h.r.state.Store(&reloaderState{})
+	if _,err:=h.lookupOwner();!errors.Is(err,errDelegationChanged){h.t.Fatalf("stale receiving state accepted: %v",err)}
+	if h.calls.Load()!=before {h.t.Fatal("rejected requests reached the peer")}
+	updated:=*h.state;updated.management=copyManagementConfig(h.state.management);updated.management.DelegationToken=strings.Repeat("n",32);h.r.state.Store(&updated)
+	if _,err:=h.lookup(h.request,&updated,"owner",h.fixture.input.ProposalID);!errors.Is(err,errDelegationUnauthorized){h.t.Fatalf("revoked receiving credential accepted: %v",err)}
+	rotated:=h.request.Clone(h.request.Context());rotated.Header.Set("Authorization","Bearer "+updated.management.DelegationToken)
+	if _,err:=h.lookup(rotated,&updated,"owner",h.fixture.input.ProposalID);err!=nil {h.t.Fatalf("rotated receiving credential rejected: %v",err)}
+	h.server.Close()
+	if _,err:=h.lookup(rotated,&updated,"owner",h.fixture.input.ProposalID);!errors.Is(err,errDelegationPeerUnavailable){h.t.Fatalf("peer outage did not return unavailable: %v",err)}
 }

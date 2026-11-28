@@ -186,36 +186,46 @@ func assertPeerGrantResult(t *testing.T, request *http.Request, state *reloaderS
 	}
 }
 
+type peerRotationContext struct {
+	request *http.Request
+	state   *reloaderState
+	members *federation.PairingStore
+	grants  *federation.CatalogGrantStore
+	rotated *x509.Certificate
+	ca      *x509.Certificate
+	now     time.Time
+}
+
 // rotateAndRegrant replaces the node-b membership fingerprint with the rotated certificate's
 // fingerprint, updates the request TLS state to the rotated certificate, asserts that rotation
 // invalidates prior grants, then grants catalog read and inference to the rotated member and
 // asserts the re-grant outcomes.
-func rotateAndRegrant(t *testing.T, request *http.Request, state *reloaderState, members *federation.PairingStore, grants *federation.CatalogGrantStore, rotated *x509.Certificate, ca *x509.Certificate, now time.Time) {
+func rotateAndRegrant(t *testing.T, rotation peerRotationContext) {
 	t.Helper()
-	if _, err := members.AddMember("node-b", peerCertificateFingerprint(rotated), now.Add(time.Minute)); err != nil {
+	if _, err := rotation.members.AddMember("node-b", peerCertificateFingerprint(rotation.rotated), rotation.now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotated}, VerifiedChains: [][]*x509.Certificate{{rotated, ca}}}
-	if _, ok := authenticatedPeer(request, state, peerCatalog); ok {
+	rotation.request.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{rotation.rotated}, VerifiedChains: [][]*x509.Certificate{{rotation.rotated, rotation.ca}}}
+	if _, ok := authenticatedPeer(rotation.request, rotation.state, peerCatalog); ok {
 		t.Fatal("certificate rotation inherited the previous catalog grant")
 	}
-	if _, ok := authenticatedPeer(request, state, peerInference); ok {
+	if _, ok := authenticatedPeer(rotation.request, rotation.state, peerInference); ok {
 		t.Fatal("certificate rotation inherited the previous inference grant")
 	}
-	rotatedMember, ok, err := members.LookupMember("node-b")
+	rotatedMember, ok, err := rotation.members.LookupMember("node-b")
 	if err != nil || !ok {
 		t.Fatalf("rotated membership lookup = %+v, %v, %v", rotatedMember, ok, err)
 	}
-	if _, err := grants.GrantCatalogRead(rotatedMember, now.Add(time.Minute)); err != nil {
+	if _, err := rotation.grants.GrantCatalogRead(rotatedMember, rotation.now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if nodeID, ok := authenticatedPeer(request, state, peerCatalog); !ok || nodeID != "node-b" {
+	if nodeID, ok := authenticatedPeer(rotation.request, rotation.state, peerCatalog); !ok || nodeID != "node-b" {
 		t.Fatalf("re-granted rotated identity denied: %q %v", nodeID, ok)
 	}
-	if _, err := grants.GrantInference(rotatedMember, true, false, now.Add(time.Minute)); err != nil {
+	if _, err := rotation.grants.GrantInference(rotatedMember, true, false, rotation.now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if nodeID, ok := authenticatedPeer(request, state, peerInference); !ok || nodeID != "node-b" {
+	if nodeID, ok := authenticatedPeer(rotation.request, rotation.state, peerInference); !ok || nodeID != "node-b" {
 		t.Fatalf("re-granted rotated inference identity denied: %q %v", nodeID, ok)
 	}
 }
@@ -344,7 +354,15 @@ func TestMtlSOnlyCatalogReadRequiresExplicitFingerprintBoundGrant(t *testing.T) 
 	request.Header.Del("Authorization")
 
 	// Certificate rotation invalidates old grants; explicit grants restore scopes.
-	rotateAndRegrant(t, request, state, members, grants, rotated, ca, now)
+	rotateAndRegrant(t, peerRotationContext{
+		request: request,
+		state:   state,
+		members: members,
+		grants:  grants,
+		rotated: rotated,
+		ca:      ca,
+		now:     now,
+	})
 
 	// Catalog revoke does not revoke independent inference.
 	if err := grants.RevokeCatalogRead("node-b"); err != nil {

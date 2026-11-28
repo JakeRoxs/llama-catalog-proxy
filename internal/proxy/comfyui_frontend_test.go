@@ -176,9 +176,13 @@ func TestComfyUIUserAndWorkflowReadAllowlist(t *testing.T) {
 	}
 }
 
-func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
-	var schedulerCalls atomic.Int32
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+// newComfyUIFrontendBypassTestBackend returns an httptest server that echoes
+// request URIs and performs the WebSocket handshake. It verifies owner
+// credentials are present on every request and are not leaked to the result
+// backend as a cookie or header.
+func newComfyUIFrontendBypassTestBackend(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Header.Get("Authorization") != "Bearer owner-key" || req.Header.Get("Cookie") != "" || req.Header.Get("Comfy-User") != "owner-user" {
 			t.Errorf("frontend credentials leaked or owner credential missing: %v", req.Header)
 		}
@@ -216,6 +220,22 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 		_, _ = rw.WriteString("\x81\x02ok")
 		_ = rw.Flush()
 	}))
+}
+
+// runComfyUIFrontendBypassPhase exercises one bypass phase (local or peer),
+// verifying endpoints, root, asset fallback, and WebSocket, then closes the server.
+func runComfyUIFrontendBypassPhase(t *testing.T, handler *Handler, owner *Reloader, viaPeer bool, token string, server *httptest.Server, schedulerCalls *atomic.Int32) {
+	t.Helper()
+	assertComfyUIFrontendEndpoints(t, server, comfyUIFrontendEndpoints, viaPeer)
+	assertComfyUIFrontendRoot(t, server, schedulerCalls, viaPeer)
+	assertComfyUIFrontendAssetUnavailable(t, server, schedulerCalls)
+	assertComfyUIFrontendWebSocket(t, server, viaPeer)
+	server.Close()
+}
+
+func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
+	var schedulerCalls atomic.Int32
+	backend := newComfyUIFrontendBypassTestBackend(t)
 	defer backend.Close()
 	scheduler := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		schedulerCalls.Add(1)
@@ -235,11 +255,7 @@ func TestComfyUIFrontendHTTPAndWebSocketBypassScheduler(t *testing.T) {
 	}})
 	for _, viaPeer := range []bool{false, true} {
 		server := serveComfyUIFrontendMode(t, handler, owner, viaPeer, token)
-		assertComfyUIFrontendEndpoints(t, server, comfyUIFrontendEndpoints, viaPeer)
-		assertComfyUIFrontendRoot(t, server, &schedulerCalls, viaPeer)
-		assertComfyUIFrontendAssetUnavailable(t, server, &schedulerCalls)
-		assertComfyUIFrontendWebSocket(t, server, viaPeer)
-		server.Close()
+		runComfyUIFrontendBypassPhase(t, handler, owner, viaPeer, token, server, &schedulerCalls)
 	}
 	if schedulerCalls.Load() != 0 {
 		t.Fatalf("running UI requests unexpectedly hit scheduler: calls=%d", schedulerCalls.Load())
@@ -368,13 +384,12 @@ func assertComfyUIFrontendWebSocket(t *testing.T, server *httptest.Server, viaPe
 	}
 }
 
-func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
-	const page = `<script src="assets/app.js"></script>`
-	responses := map[string]string{
-		"/": page, "/assets/app.js": "// frontend fixture",
-		"/api/history/job-1": `{"job-1":{}}`, "/view?filename=output.png": "image fixture",
-	}
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// newComfyUIRootTestBackend returns an httptest server that serves the ComfyUI
+// result fixture responses and a queue endpoint, mirroring the result backend
+// used by the scheduler fallback test.
+func newComfyUIRootTestBackend(t *testing.T, responses map[string]string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/queue" {
 			_, _ = io.WriteString(w, `{"queue_running":[],"queue_pending":[]}`)
 			return
@@ -385,9 +400,13 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 		}
 		http.NotFound(w, r)
 	}))
-	defer backend.Close()
-	var schedulerCalls atomic.Int32
-	scheduler := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+}
+
+// newComfyUIRootTestScheduler returns an httptest server that counts scheduler
+// calls, serves the UI root on GET /comfyui/, and accepts generation requests.
+func newComfyUIRootTestScheduler(t *testing.T, schedulerCalls *atomic.Int32, page string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		schedulerCalls.Add(1)
 		if r.Method == http.MethodGet && r.URL.Path == "/comfyui/" {
 			_, _ = io.WriteString(w, page)
@@ -398,6 +417,59 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusAccepted)
 	}))
+}
+
+// getComfyUI performs a GET against the proxy and asserts the expected status,
+// returning the resolved request URL and response body.
+func getComfyUI(t *testing.T, client *http.Client, target string, status int) (*url.URL, string) {
+	t.Helper()
+	res, err := client.Get(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, err := io.ReadAll(res.Body)
+	if err != nil || res.StatusCode != status {
+		t.Fatalf("GET %s: status=%d want=%d body=%q err=%v", target, res.StatusCode, status, body, err)
+	}
+	return res.Request.URL, string(body)
+}
+
+// assertComfyUIRootResponses verifies each frontend asset/API response matches
+// the expected fixture, served persistently by the result backend.
+func assertComfyUIRootResponses(t *testing.T, client *http.Client, pageURL *url.URL, responses map[string]string) {
+	t.Helper()
+	for _, target := range []string{"assets/app.js", "api/history/job-1", "view?filename=output.png"} {
+		ref, err := url.Parse(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, body := getComfyUI(t, client, pageURL.ResolveReference(ref).String(), http.StatusOK)
+		if body != responses["/"+target] {
+			t.Fatalf("GET %s returned %q", target, body)
+		}
+	}
+}
+
+// assertComfyUIRootFallback verifies that unavailable assets return 503 from the
+// result backend without hitting the scheduler.
+func assertComfyUIRootFallback(t *testing.T, client *http.Client, proxyURL string) {
+	t.Helper()
+	for _, target := range []string{"/comfyui/assets/app.js", "/comfyui/api/history/job-1", "/comfyui/view?filename=output.png"} {
+		getComfyUI(t, client, proxyURL+target, http.StatusBadGateway)
+	}
+}
+
+func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
+	const page = `<script src="assets/app.js"></script>`
+	responses := map[string]string{
+		"/": page, "/assets/app.js": "// frontend fixture",
+		"/api/history/job-1": `{"job-1":{}}`, "/view?filename=output.png": "image fixture",
+	}
+	backend := newComfyUIRootTestBackend(t, responses)
+	defer backend.Close()
+	var schedulerCalls atomic.Int32
+	scheduler := newComfyUIRootTestScheduler(t, &schedulerCalls, page)
 	defer scheduler.Close()
 	cfg := baseConfig(scheduler.URL)
 	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
@@ -407,47 +479,30 @@ func TestComfyUIRootUsesSchedulerAndResultsDoNotFallBack(t *testing.T) {
 	defer proxyServer.Close()
 	client := proxyServer.Client()
 	client.Timeout = 5 * time.Second
-	get := func(target string, status int) (*url.URL, string) {
-		t.Helper()
-		res, err := client.Get(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer res.Body.Close()
-		body, err := io.ReadAll(res.Body)
-		if err != nil || res.StatusCode != status {
-			t.Fatalf("GET %s: status=%d want=%d body=%q err=%v", target, res.StatusCode, status, body, err)
-		}
-		return res.Request.URL, string(body)
-	}
-	pageURL, body := get(proxyServer.URL+"/comfyui", http.StatusOK)
+
+	// The running UI root must be served persistently by the result backend,
+	// never through the scheduler.
+	pageURL, body := getComfyUI(t, client, proxyServer.URL+"/comfyui", http.StatusOK)
 	if pageURL.Path != "/comfyui/" || body != page {
 		t.Fatalf("unexpected page or redirect: %s %q", pageURL.Path, body)
 	}
 	if schedulerCalls.Load() != 0 {
 		t.Fatalf("running ComfyUI UI root unnecessarily loaded through scheduler: %d", schedulerCalls.Load())
 	}
-	for _, target := range []string{"assets/app.js", "api/history/job-1", "view?filename=output.png"} {
-		ref, err := url.Parse(target)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_, body := get(pageURL.ResolveReference(ref).String(), http.StatusOK)
-		if body != responses["/"+target] {
-			t.Fatalf("GET %s returned %q", target, body)
-		}
-	}
+	assertComfyUIRootResponses(t, client, pageURL, responses)
 
+	// Once the result backend stops, the UI root falls back to the scheduler
+	// exactly once, and assets return 503 without further scheduler calls.
 	backend.Close()
-	if _, body := get(proxyServer.URL+"/comfyui/", http.StatusOK); body != page {
+	if _, body := getComfyUI(t, client, proxyServer.URL+"/comfyui/", http.StatusOK); body != page {
 		t.Fatalf("scheduler UI root after result backend stopped: %q", body)
 	}
-	for _, target := range []string{"/comfyui/assets/app.js", "/comfyui/api/history/job-1", "/comfyui/view?filename=output.png"} {
-		get(proxyServer.URL+target, http.StatusBadGateway)
-	}
+	assertComfyUIRootFallback(t, client, proxyServer.URL)
 	if schedulerCalls.Load() != 1 {
 		t.Fatalf("unavailable ComfyUI root did not fall back exactly once: %d", schedulerCalls.Load())
 	}
+
+	// Generation still uses the scheduler.
 	res, err := client.Post(proxyServer.URL+"/comfyui/api/prompt", "application/json", strings.NewReader(`{}`))
 	if err != nil {
 		t.Fatal(err)

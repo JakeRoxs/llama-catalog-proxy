@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/JakeRoxs/llama-catalog-proxy/internal/config"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/ingestion"
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
@@ -105,12 +106,38 @@ func (r *Reloader) runMutation(state *reloaderState, operation, id string) (mode
 		!separateProposalDirectory(backups, management.Targets) || !separateDirectories(proposals, backups) {
 		return modelconfig.MutationResult{}, modelconfig.ErrTargetWrite
 	}
+	targetID, creation, err := loadMutationTarget(operation, id, proposals, backups)
+	if err != nil {
+		return modelconfig.MutationResult{}, err
+	}
+	target, ok := management.Targets[targetID]
+	if !ok {
+		return modelconfig.MutationResult{}, modelconfig.ErrProposalTarget
+	}
+	if operation != "apply" {
+		return modelconfig.RollbackStoredBackup(target.Directory, target.Filename, targetID, backups, id, management.BackupStore.MaxBackups)
+	}
+	if creation != nil {
+		return r.applyCreationMutation(creationMutationInput{
+			management: management,
+			proposals:  proposals,
+			backups:    backups,
+			targetID:   targetID,
+			target:     target,
+			id:         id,
+			creation:   creation,
+		})
+	}
+	return modelconfig.ApplyStoredProposal(proposals, id, target.Directory, target.Filename, targetID, backups, management.BackupStore.MaxBackups)
+}
+
+func loadMutationTarget(operation, id, proposals, backups string) (string, *modelconfig.CreationProposal, error) {
 	var targetID string
 	var creation *modelconfig.CreationProposal
 	if operation == "apply" {
 		proposal, err := modelconfig.LoadStoredProposal(proposals, id)
 		if err != nil {
-			return modelconfig.MutationResult{}, err
+			return "", nil, err
 		}
 		switch p := proposal.(type) {
 		case modelconfig.Proposal:
@@ -118,64 +145,69 @@ func (r *Reloader) runMutation(state *reloaderState, operation, id string) (mode
 		case modelconfig.CreationProposal:
 			targetID, creation = p.TargetID, &p
 		default:
-			return modelconfig.MutationResult{}, modelconfig.ErrProposalStore
+			return "", nil, modelconfig.ErrProposalStore
 		}
 	} else {
 		backup, err := modelconfig.ReadBackupInfo(backups, id)
 		if err != nil {
-			return modelconfig.MutationResult{}, err
+			return "", nil, err
 		}
 		targetID = backup.TargetID
 	}
-	target, ok := management.Targets[targetID]
-	if !ok {
-		return modelconfig.MutationResult{}, modelconfig.ErrProposalTarget
+	return targetID, creation, nil
+}
+
+type creationMutationInput struct {
+	management *config.ManagementConfig
+	proposals  string
+	backups    string
+	targetID   string
+	target     config.ManagementTarget
+	id         string
+	creation   *modelconfig.CreationProposal
+}
+
+func (r *Reloader) applyCreationMutation(input creationMutationInput) (modelconfig.MutationResult, error) {
+	management := input.management
+	if r.ingestion == nil || r.ingestion.jobs == nil || management.Ingestion == nil ||
+		r.ingestion.config.Directory != management.Ingestion.Directory ||
+		r.ingestion.config.RecordDirectory != management.Ingestion.RecordDirectory ||
+		validateIngestionDirectories(management, nil) != nil {
+		return modelconfig.MutationResult{}, modelconfig.ErrTargetWrite
 	}
-	if operation == "apply" {
-		if creation != nil {
-			if r.ingestion == nil || r.ingestion.jobs == nil || management.Ingestion == nil ||
-				r.ingestion.config.Directory != management.Ingestion.Directory ||
-				r.ingestion.config.RecordDirectory != management.Ingestion.RecordDirectory ||
-				validateIngestionDirectories(management, nil) != nil {
-				return modelconfig.MutationResult{}, modelconfig.ErrTargetWrite
-			}
-			var result modelconfig.MutationResult
-			err := r.ingestion.jobs.WithRecordedArtifact(r.ingestion.config.Directory, creation.ArtifactRecordID,
-				func(evidence ingestion.ArtifactEvidence, recheck func() (ingestion.ArtifactEvidence, error)) error {
-					binding := modelconfig.CreationArtifactBinding{
-						RecordID: evidence.RecordID, Revision: evidence.Revision,
-						ModelPath: filepath.Join(r.ingestion.config.Directory, evidence.Source.Filename),
-						Recheck: func() error {
-							current, err := recheck()
-							if err != nil {
-								return err
-							}
-							if current.Revision != evidence.Revision {
-								return modelconfig.ErrProposalArtifact
-							}
-							return nil
-						},
+	var result modelconfig.MutationResult
+	err := r.ingestion.jobs.WithRecordedArtifact(r.ingestion.config.Directory, input.creation.ArtifactRecordID,
+		func(evidence ingestion.ArtifactEvidence, recheck func() (ingestion.ArtifactEvidence, error)) error {
+			binding := modelconfig.CreationArtifactBinding{
+				RecordID: evidence.RecordID, Revision: evidence.Revision,
+				ModelPath: filepath.Join(r.ingestion.config.Directory, evidence.Source.Filename),
+				Recheck: func() error {
+					current, err := recheck()
+					if err != nil {
+						return err
 					}
-					var err error
-					result, err = modelconfig.ApplyStoredCreationProposal(modelconfig.CreationProposalApplyRequest{
-						ProposalDirectory: proposals,
-						ProposalID:        id,
-						Target: modelconfig.MutationTarget{
-							Directory: target.Directory,
-							Filename:  target.Filename,
-						},
-						TargetID:        targetID,
-						BackupDirectory: backups,
-						Limit:           management.BackupStore.MaxBackups,
-						Artifact:        binding,
-					})
-					return err
-				})
-			return result, err
-		}
-		return modelconfig.ApplyStoredProposal(proposals, id, target.Directory, target.Filename, targetID, backups, management.BackupStore.MaxBackups)
-	}
-	return modelconfig.RollbackStoredBackup(target.Directory, target.Filename, targetID, backups, id, management.BackupStore.MaxBackups)
+					if current.Revision != evidence.Revision {
+						return modelconfig.ErrProposalArtifact
+					}
+					return nil
+				},
+			}
+			var err error
+			result, err = modelconfig.ApplyStoredCreationProposal(modelconfig.CreationProposalApplyRequest{
+				ProposalDirectory: input.proposals,
+				ProposalID:        input.id,
+				Target: modelconfig.MutationTarget{
+					Directory: input.target.Directory,
+					Filename:  input.target.Filename,
+				},
+				TargetID:        input.targetID,
+				BackupDirectory: input.backups,
+				Limit:           management.BackupStore.MaxBackups,
+				Artifact:        binding,
+			})
+			return err
+		})
+	return result, err
 }
 
 func mutationOutcome(result modelconfig.MutationResult, err error) (mutationResponse, int) {

@@ -47,6 +47,15 @@ type commandReplacement struct {
 	value string
 }
 
+// parseStepResult is the outcome of parsing a single command token. ok indicates
+// a parsed option to collect; next is the index of the next token to process.
+type parseStepResult struct {
+	option parsedOption
+	ok     bool
+	next   int
+	err    error
+}
+
 var commandOptions = map[string]commandOption{
 	"-c": {"context", true}, "--ctx-size": {"context", true},
 	"-fit": {"fit", true}, "--fit": {"fit", true},
@@ -78,36 +87,9 @@ func rewriteCommand(command string, settings CommandSettings) (string, []Setting
 }
 
 func planCommandRewrite(command string, settings CommandSettings, editable func(commandToken, commandToken) bool) ([]commandReplacement, []SettingChange, error) {
-	requested := make(map[string]string)
-	if settings.ContextSize != nil {
-		if *settings.ContextSize < 0 {
-			return nil, nil, errors.New("context size must be non-negative")
-		}
-		requested["context"] = strconv.FormatInt(int64(*settings.ContextSize), 10)
-	}
-	if settings.Fit != nil {
-		requested["fit"] = "off"
-		if *settings.Fit {
-			requested["fit"] = "on"
-		}
-	}
-	if settings.FitContext != nil {
-		if *settings.FitContext < 0 {
-			return nil, nil, errors.New("fit context must be non-negative")
-		}
-		requested["fit_context"] = strconv.FormatInt(int64(*settings.FitContext), 10)
-	}
-	if settings.FitTarget != nil {
-		if *settings.FitTarget < 0 {
-			return nil, nil, errors.New("fit target must be non-negative")
-		}
-		requested["fit_target"] = strconv.FormatInt(int64(*settings.FitTarget), 10)
-	}
-	if settings.CacheRAM != nil {
-		if *settings.CacheRAM < -1 {
-			return nil, nil, errors.New("cache RAM must be at least -1")
-		}
-		requested["cache_ram"] = strconv.FormatInt(int64(*settings.CacheRAM), 10)
+	requested, err := requestedSettings(settings)
+	if err != nil {
+		return nil, nil, err
 	}
 	if len(requested) == 0 {
 		return nil, nil, errors.New("at least one command setting is required")
@@ -120,14 +102,12 @@ func planCommandRewrite(command string, settings CommandSettings, editable func(
 	var changes []SettingChange
 	for _, option := range options {
 		if value, ok := requested[option.name]; ok {
-			if editable != nil && !editable(option.option, option.value) {
-				return nil, nil, errors.New("requested setting is defined by a shared macro and cannot be changed per model")
-			}
-			if err := validateExistingSetting(option.name, option.value.text); err != nil {
+			replacement, change, err := applyRequestedOption(option, value, editable)
+			if err != nil {
 				return nil, nil, err
 			}
-			replacements = append(replacements, commandReplacement{token: option.value, value: value})
-			changes = append(changes, SettingChange{Setting: option.name, Before: option.value.text, After: value})
+			replacements = append(replacements, replacement)
+			changes = append(changes, change)
 			delete(requested, option.name)
 		}
 	}
@@ -135,6 +115,50 @@ func planCommandRewrite(command string, settings CommandSettings, editable func(
 		return nil, nil, errors.New("requested option is absent from command")
 	}
 	return replacements, changes, nil
+}
+
+func requestedSettings(settings CommandSettings) (map[string]string, error) {
+	requested := make(map[string]string)
+	if err := requestedNumericSetting(requested, "context", settings.ContextSize, 0, "context size must be non-negative"); err != nil {
+		return nil, err
+	}
+	if settings.Fit != nil {
+		requested["fit"] = "off"
+		if *settings.Fit {
+			requested["fit"] = "on"
+		}
+	}
+	if err := requestedNumericSetting(requested, "fit_context", settings.FitContext, 0, "fit context must be non-negative"); err != nil {
+		return nil, err
+	}
+	if err := requestedNumericSetting(requested, "fit_target", settings.FitTarget, 0, "fit target must be non-negative"); err != nil {
+		return nil, err
+	}
+	if err := requestedNumericSetting(requested, "cache_ram", settings.CacheRAM, -1, "cache RAM must be at least -1"); err != nil {
+		return nil, err
+	}
+	return requested, nil
+}
+
+func requestedNumericSetting(requested map[string]string, key string, value *int32, minValue int32, errMsg string) error {
+	if value == nil {
+		return nil
+	}
+	if *value < minValue {
+		return errors.New(errMsg)
+	}
+	requested[key] = strconv.FormatInt(int64(*value), 10)
+	return nil
+}
+
+func applyRequestedOption(option parsedOption, value string, editable func(commandToken, commandToken) bool) (commandReplacement, SettingChange, error) {
+	if editable != nil && !editable(option.option, option.value) {
+		return commandReplacement{}, SettingChange{}, errors.New("requested setting is defined by a shared macro and cannot be changed per model")
+	}
+	if err := validateExistingSetting(option.name, option.value.text); err != nil {
+		return commandReplacement{}, SettingChange{}, err
+	}
+	return commandReplacement{token: option.value, value: value}, SettingChange{Setting: option.name, Before: option.value.text, After: value}, nil
 }
 
 func applyCommandReplacements(command string, replacements []commandReplacement) string {
@@ -159,59 +183,88 @@ func parseCommand(command string) ([]parsedOption, error) {
 	}
 	seen := make(map[string]bool)
 	var options []parsedOption
-	for i := 1; i < len(tokens); i++ {
-		optionToken := tokens[i]
-		optionName, attachedValue, attached := strings.Cut(optionToken.text, "=")
-		option, ok := commandOptions[optionName]
-		if !ok {
-			if !strings.HasPrefix(optionName, "-") || optionName == "-" || optionName == "--" || optionName == "-1" {
-				return nil, errors.New("unsupported command argument")
-			}
-			if attached {
-				continue
-			}
-			if i+1 < len(tokens) {
-				next := tokens[i+1].text
-				if isKnownCommandOption(next) {
-					return nil, errors.New("ambiguous unknown command option value")
-				}
-				if !strings.HasPrefix(next, "-") || next == "-1" {
-					i++
-				}
-			}
-			continue
+	for i := 1; i < len(tokens); {
+		step := parseNextToken(command, tokens, i, seen)
+		if step.err != nil {
+			return nil, step.err
 		}
-		if seen[option.name] {
-			return nil, errors.New("duplicate command option")
+		if step.ok {
+			options = append(options, step.option)
 		}
-		seen[option.name] = true
-		var valueToken commandToken
-		if attached {
-			if !option.hasValue || attachedValue == "" {
-				return nil, errors.New("invalid or missing command option value")
-			}
-			valueToken = commandToken{text: attachedValue, start: optionToken.start + len(optionName) + 1, end: optionToken.end}
-		} else if !option.hasValue {
-			continue
-		} else {
-			i++
-			if i >= len(tokens) || strings.HasPrefix(tokens[i].text, "-") && tokens[i].text != "-1" {
-				return nil, errors.New("invalid or missing command option value")
-			}
-			valueToken = tokens[i]
-		}
-		if valueToken.start < len(command) && command[valueToken.start] == '\'' && option.name != "model" {
-			return nil, errors.New("unsupported quoted command value")
-		}
-		if option.name == "gpu_layers" && !validCreationValue(option.name, valueToken.text) {
-			return nil, errors.New("unsupported GPU layer setting")
-		}
-		if valueToken.text == "${PORT}" && option.name != "port" {
-			return nil, errors.New("unsupported command expansion")
-		}
-		options = append(options, parsedOption{name: option.name, option: optionToken, value: valueToken})
+		i = step.next
 	}
 	return options, nil
+}
+
+func parseNextToken(command string, tokens []commandToken, i int, seen map[string]bool) parseStepResult {
+	optionToken := tokens[i]
+	optionName, attachedValue, attached := strings.Cut(optionToken.text, "=")
+	option, ok := commandOptions[optionName]
+	if !ok {
+		return parseUnknownOption(optionName, attachedValue, attached, tokens, i)
+	}
+	if seen[option.name] {
+		return parseStepResult{next: i + 1, err: errors.New("duplicate command option")}
+	}
+	seen[option.name] = true
+	if !attached && !option.hasValue {
+		return parseStepResult{next: i + 1}
+	}
+	valueToken, next, err := resolveValueToken(optionName, option, attached, attachedValue, optionToken, tokens, i)
+	if err != nil {
+		return parseStepResult{next: next, err: err}
+	}
+	if err := validateResolvedValue(command, option, valueToken); err != nil {
+		return parseStepResult{next: next, err: err}
+	}
+	return parseStepResult{option: parsedOption{name: option.name, option: optionToken, value: valueToken}, ok: true, next: next}
+}
+
+func parseUnknownOption(optionName string, attachedValue string, attached bool, tokens []commandToken, i int) parseStepResult {
+	if !strings.HasPrefix(optionName, "-") || optionName == "-" || optionName == "--" || optionName == "-1" {
+		return parseStepResult{next: i + 1, err: errors.New("unsupported command argument")}
+	}
+	if attached {
+		return parseStepResult{next: i + 1}
+	}
+	next := i + 1
+	if i+1 < len(tokens) {
+		nextToken := tokens[i+1].text
+		if isKnownCommandOption(nextToken) {
+			return parseStepResult{next: i + 1, err: errors.New("ambiguous unknown command option value")}
+		}
+		if !strings.HasPrefix(nextToken, "-") || nextToken == "-1" {
+			next = i + 2
+		}
+	}
+	return parseStepResult{next: next}
+}
+
+func resolveValueToken(optionName string, option commandOption, attached bool, attachedValue string, optionToken commandToken, tokens []commandToken, i int) (commandToken, int, error) {
+	if attached {
+		if !option.hasValue || attachedValue == "" {
+			return commandToken{}, i + 1, errors.New("invalid or missing command option value")
+		}
+		return commandToken{text: attachedValue, start: optionToken.start + len(optionName) + 1, end: optionToken.end}, i + 1, nil
+	}
+	next := i + 1
+	if next >= len(tokens) || strings.HasPrefix(tokens[next].text, "-") && tokens[next].text != "-1" {
+		return commandToken{}, next, errors.New("invalid or missing command option value")
+	}
+	return tokens[next], next + 1, nil
+}
+
+func validateResolvedValue(command string, option commandOption, valueToken commandToken) error {
+	if valueToken.start < len(command) && command[valueToken.start] == '\'' && option.name != "model" {
+		return errors.New("unsupported quoted command value")
+	}
+	if option.name == "gpu_layers" && !validCreationValue(option.name, valueToken.text) {
+		return errors.New("unsupported GPU layer setting")
+	}
+	if valueToken.text == "${PORT}" && option.name != "port" {
+		return errors.New("unsupported command expansion")
+	}
+	return nil
 }
 
 func isKnownCommandOption(token string) bool {
@@ -298,31 +351,16 @@ func tokenizeCommand(command string) ([]commandToken, error) {
 		start := i
 		var word string
 		if command[i] == '\'' {
-			i++
-			end := strings.IndexByte(command[i:], '\'')
-			if end < 0 {
-				return nil, errors.New("unsupported command quoting")
-			}
-			word = command[i : i+end]
-			i += end + 1
-			if i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
-				return nil, errors.New("unsupported command quoting")
-			}
-			if !safeQuotedCommandValue(word) {
-				return nil, errors.New("unsupported quoted command value")
+			var err error
+			word, i, err = tokenizeQuoted(command, i)
+			if err != nil {
+				return nil, err
 			}
 		} else {
-			for i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
-				i++
-			}
-			word = command[start:i]
+			word, i = tokenizeWord(command, i)
 			if word != "${PORT}" {
-				for j := range len(word) {
-					c := word[j]
-					if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
-						c >= '0' && c <= '9' || strings.ContainsRune("/._,:+-=", rune(c))) {
-						return nil, errors.New("unsupported command character")
-					}
+				if err := validateWord(word); err != nil {
+					return nil, err
 				}
 			}
 		}
@@ -335,4 +373,40 @@ func tokenizeCommand(command string) ([]commandToken, error) {
 		return nil, errors.New("empty command")
 	}
 	return tokens, nil
+}
+
+func tokenizeQuoted(command string, i int) (string, int, error) {
+	i++
+	end := strings.IndexByte(command[i:], '\'')
+	if end < 0 {
+		return "", i, errors.New("unsupported command quoting")
+	}
+	word := command[i : i+end]
+	i += end + 1
+	if i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
+		return "", i, errors.New("unsupported command quoting")
+	}
+	if !safeQuotedCommandValue(word) {
+		return "", i, errors.New("unsupported quoted command value")
+	}
+	return word, i, nil
+}
+
+func tokenizeWord(command string, i int) (string, int) {
+	start := i
+	for i < len(command) && command[i] != ' ' && command[i] != '\t' && command[i] != '\r' && command[i] != '\n' {
+		i++
+	}
+	return command[start:i], i
+}
+
+func validateWord(word string) error {
+	for j := range len(word) {
+		c := word[j]
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+			c >= '0' && c <= '9' || strings.ContainsRune("/._,:+-=", rune(c))) {
+			return errors.New("unsupported command character")
+		}
+	}
+	return nil
 }

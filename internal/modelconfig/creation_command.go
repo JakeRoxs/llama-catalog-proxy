@@ -63,6 +63,16 @@ func BuildCreationCommand(input CreationCommandInput) (CreationCommandReview, er
 	}
 	command := input.Executable + " --port ${PORT} --model " + model
 	options := []CreationOption{{Name: "port", Value: "${PORT}"}}
+	command, options, err = applyExplicitSettings(command, options, input)
+	if err != nil {
+		return CreationCommandReview{}, err
+	}
+	return CreationCommandReview{Options: options, DeviceEnvironment: env, command: command}, nil
+}
+
+// applyExplicitSettings appends supported numeric and fit settings to the
+// command and options. It returns the updated command, options, and any error.
+func applyExplicitSettings(command string, options []CreationOption, input CreationCommandInput) (string, []CreationOption, error) {
 	addNumber := func(name, flag string, value *int32, minimum int32) error {
 		if value == nil {
 			return nil
@@ -87,7 +97,7 @@ func BuildCreationCommand(input CreationCommandInput) (CreationCommandReview, er
 		{"gpu_layers", "--gpu-layers", input.GPULayers, -1},
 	} {
 		if err := addNumber(setting.name, setting.flag, setting.value, setting.minimum); err != nil {
-			return CreationCommandReview{}, err
+			return "", nil, err
 		}
 	}
 	if input.Settings.Fit != nil {
@@ -98,7 +108,7 @@ func BuildCreationCommand(input CreationCommandInput) (CreationCommandReview, er
 		command += " --fit " + value
 		options = append(options, CreationOption{Name: "fit", Value: value})
 	}
-	return CreationCommandReview{Options: options, DeviceEnvironment: env, command: command}, nil
+	return command, options, nil
 }
 
 func hasCreationSettings(s CommandSettings) bool {
@@ -146,6 +156,25 @@ func validDeviceList(values []string) ([]string, error) {
 	return result, nil
 }
 
+// validDeviceValues validates each device in a comma-separated list. "-1"
+// means all devices and is accepted without further per-device checks.
+func validDeviceValues(devices string) error {
+	if devices == "-1" {
+		return nil
+	}
+	for _, device := range strings.Split(devices, ",") {
+		if device == "" {
+			return errors.New("unsupported device environment")
+		}
+		for _, c := range device {
+			if c < '0' || c > '9' {
+				return errors.New("unsupported device environment")
+			}
+		}
+	}
+	return nil
+}
+
 // validDeviceEnvironmentEntry parses a single NAME=devices entry. It validates
 // the allowed device variable name, the device list length, and that each
 // device is a non-negative decimal identifier (or -1 for all devices).
@@ -163,15 +192,8 @@ func validDeviceEnvironmentEntry(value string) (name, devices string, err error)
 		return "", "", errors.New("unsupported device environment")
 	}
 	if devices != "-1" {
-		for _, device := range strings.Split(devices, ",") {
-			if device == "" {
-				return "", "", errors.New("unsupported device environment")
-			}
-			for _, c := range device {
-				if c < '0' || c > '9' {
-					return "", "", errors.New("unsupported device environment")
-				}
-			}
+		if err := validDeviceValues(devices); err != nil {
+			return "", "", err
 		}
 	}
 	return name, devices, nil

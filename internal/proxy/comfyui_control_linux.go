@@ -150,38 +150,73 @@ func (c *comfyUIControl) respond(w http.ResponseWriter, status int, receipt *Com
 	})
 }
 
-func (c *comfyUIControl) serve(w http.ResponseWriter, req *http.Request, timeout time.Duration) {
-	if (req.Host != "localhost" && req.Host != "comfyui-control") || req.Header.Get("Origin") != "" ||
-		req.URL.RawQuery != "" || req.URL.ForceQuery || req.URL.RawPath != "" {
-		c.respond(w, http.StatusBadRequest, nil, "invalid_request", "")
-		return
+// errHandled is a sentinel returned by dispatch helpers when they have already
+// sent an HTTP response and the caller must stop processing.
+var errHandled = errors.New("response already sent")
+
+// isValidControlRequest reports whether the request passes the gateway checks:
+// private host, no origin, no query, no forced query, no raw path.
+func isValidControlRequest(req *http.Request) bool {
+	return (req.Host == "localhost" || req.Host == "comfyui-control") &&
+		req.Header.Get("Origin") == "" &&
+		req.URL.RawQuery == "" &&
+		!req.URL.ForceQuery &&
+		req.URL.RawPath == ""
+}
+
+// handleStatusEndpoint responds to the /v1/lease/status endpoint. It returns
+// true when the request was handled and processing should stop.
+func (c *comfyUIControl) handleStatusEndpoint(w http.ResponseWriter, req *http.Request) bool {
+	if req.URL.Path != "/v1/lease/status" {
+		return false
 	}
-	if req.URL.Path == "/v1/lease/status" {
-		if req.Method != http.MethodGet || req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
-			c.respond(w, http.StatusBadRequest, nil, "invalid_status_request", "")
-			return
-		}
-		c.respond(w, http.StatusOK, nil, "", "")
-		return
+	if req.Method != http.MethodGet || req.ContentLength != 0 || len(req.TransferEncoding) != 0 {
+		c.respond(w, http.StatusBadRequest, nil, "invalid_status_request", "")
+		return true
 	}
-	switch req.URL.Path {
+	c.respond(w, http.StatusOK, nil, "", "")
+	return true
+}
+
+// knownOperation reports whether the path is a recognized control operation.
+func knownOperation(path string) (string, bool) {
+	switch path {
 	case "/v1/lease/acquire", "/v1/lease/activate", "/v1/lease/release", "/v1/lease/invalidate", "/v1/lease/reconcile":
+		return path, true
 	default:
-		c.respond(w, http.StatusNotFound, nil, "unknown_operation", "")
-		return
+		return "", false
 	}
-	if req.Method != http.MethodPost || len(req.Header.Values(contentTypeHeader)) != 1 ||
-		req.Header.Get(contentTypeHeader) != "application/json" || req.Header.Get("Content-Encoding") != "" {
-		c.respond(w, http.StatusBadRequest, nil, "invalid_operation_request", "")
-		return
-	}
+}
+
+// isValidOperationRequest reports whether the request passes operation
+// validation: POST method, exactly one Content-Type header of
+// application/json, no content encoding.
+func isValidOperationRequest(req *http.Request) bool {
+	return req.Method == http.MethodPost &&
+		len(req.Header.Values(contentTypeHeader)) == 1 &&
+		req.Header.Get(contentTypeHeader) == "application/json" &&
+		req.Header.Get("Content-Encoding") == ""
+}
+
+// acquireSlot attempts to reserve one of the bounded concurrency slots. It
+// returns true when a slot was acquired; the caller must release it.
+func (c *comfyUIControl) acquireSlot() bool {
 	select {
 	case c.slots <- struct{}{}:
-		defer func() { <-c.slots }()
+		return true
 	default:
-		c.respond(w, http.StatusServiceUnavailable, nil, "control_busy", "")
-		return
+		return false
 	}
+}
+
+// releaseSlot frees a previously acquired concurrency slot.
+func (c *comfyUIControl) releaseSlot() {
+	<-c.slots
+}
+
+// decodeRequestBody decodes and validates the request body. It responds to the
+// caller directly on error and returns errHandled to stop processing.
+func (c *comfyUIControl) decodeRequestBody(w http.ResponseWriter, req *http.Request) (*comfyUIControlRequest, error) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, req.Body, 2048))
 	decoder.DisallowUnknownFields()
 	var input comfyUIControlRequest
@@ -194,35 +229,57 @@ func (c *comfyUIControl) serve(w http.ResponseWriter, req *http.Request, timeout
 			err = errors.New("extra JSON value")
 		}
 	}
-	if err != nil || input.Version != 1 {
+	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			c.respond(w, http.StatusRequestEntityTooLarge, nil, "request_too_large", "")
 		} else {
 			c.respond(w, http.StatusBadRequest, nil, "invalid_protocol_body", "")
 		}
-		return
+		return nil, errHandled
 	}
-	if req.URL.Path == "/v1/lease/reconcile" {
-		// A local client's assertion is not proof that external load paths are closed.
-		c.respond(w, http.StatusNotImplemented, nil, "exclusive_reconciliation_not_bound", "")
-		return
+	if input.Version != 1 {
+		c.respond(w, http.StatusBadRequest, nil, "invalid_protocol_body", "")
+		return nil, errHandled
 	}
+	return &input, nil
+}
+
+// handleReconcile responds to reconcile requests, which are not bound to
+// exclusive local admission. It returns true when handled.
+func (c *comfyUIControl) handleReconcile(w http.ResponseWriter, req *http.Request) bool {
+	if req.URL.Path != "/v1/lease/reconcile" {
+		return false
+	}
+	// A local client's assertion is not proof that external load paths are closed.
+	c.respond(w, http.StatusNotImplemented, nil, "exclusive_reconciliation_not_bound", "")
+	return true
+}
+
+// dispatchOperation routes the operation to the coordinator. It responds to the
+// caller directly when a terminal response is sent and returns errHandled. On
+// success it returns the operation lease ID to echo in the response.
+func (c *comfyUIControl) dispatchOperation(w http.ResponseWriter, req *http.Request, input *comfyUIControlRequest, operation string, timeout time.Duration) (string, error) {
 	operationID := input.LeaseID
 	if req.URL.Path == "/v1/lease/acquire" {
 		if input.LeaseID != "" {
 			c.respond(w, http.StatusBadRequest, nil, "unexpected_lease_id", "")
-			return
+			return "", errHandled
 		}
+		var err error
 		operationID, err = c.coordinator.beginLease()
+		if err != nil {
+			return "", err
+		}
 	} else {
 		decoded, decodeErr := hex.DecodeString(input.LeaseID)
 		if decodeErr != nil || len(decoded) != 16 {
 			c.respond(w, http.StatusBadRequest, nil, "invalid_lease_id", "")
-			return
+			return "", errHandled
 		}
 		ctx, cancel := context.WithTimeout(req.Context(), timeout)
 		defer cancel()
+		var err error
 		switch req.URL.Path {
 		case "/v1/lease/activate":
 			err = c.coordinator.activate(input.LeaseID)
@@ -233,19 +290,63 @@ func (c *comfyUIControl) serve(w http.ResponseWriter, req *http.Request, timeout
 			receipt, err = c.coordinator.release(ctx, input.LeaseID)
 			if err == nil {
 				c.respond(w, http.StatusOK, &receipt, "", operationID)
-				return
+				return "", errHandled
 			}
 		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return operationID, nil
+}
+
+// respondError maps a coordinator error to an HTTP response.
+func (c *comfyUIControl) respondError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errComfyUIStaleLease):
+		c.respond(w, http.StatusConflict, nil, "stale_lease", "")
+	case errors.Is(err, errComfyUIAdmissionBlocked):
+		c.respond(w, http.StatusConflict, nil, "admission_blocked", "")
+	default:
+		c.respond(w, http.StatusServiceUnavailable, nil, "release_unknown", "")
+	}
+}
+
+func (c *comfyUIControl) serve(w http.ResponseWriter, req *http.Request, timeout time.Duration) {
+	if !isValidControlRequest(req) {
+		c.respond(w, http.StatusBadRequest, nil, "invalid_request", "")
+		return
+	}
+	if c.handleStatusEndpoint(w, req) {
+		return
+	}
+	operation, ok := knownOperation(req.URL.Path)
+	if !ok {
+		c.respond(w, http.StatusNotFound, nil, "unknown_operation", "")
+		return
+	}
+	if !isValidOperationRequest(req) {
+		c.respond(w, http.StatusBadRequest, nil, "invalid_operation_request", "")
+		return
+	}
+	if !c.acquireSlot() {
+		c.respond(w, http.StatusServiceUnavailable, nil, "control_busy", "")
+		return
+	}
+	defer c.releaseSlot()
+	input, err := c.decodeRequestBody(w, req)
+	if err != nil {
+		return
+	}
+	if c.handleReconcile(w, req) {
+		return
+	}
+	operationID, err := c.dispatchOperation(w, req, input, operation, timeout)
+	if err == errHandled {
+		return
 	}
 	if err != nil {
-		switch {
-		case errors.Is(err, errComfyUIStaleLease):
-			c.respond(w, http.StatusConflict, nil, "stale_lease", "")
-		case errors.Is(err, errComfyUIAdmissionBlocked):
-			c.respond(w, http.StatusConflict, nil, "admission_blocked", "")
-		default:
-			c.respond(w, http.StatusServiceUnavailable, nil, "release_unknown", "")
-		}
+		c.respondError(w, err)
 		return
 	}
 	c.respond(w, http.StatusOK, nil, "", operationID)

@@ -77,7 +77,12 @@ func TestComfyUIImageUploadMultipartValidation(t *testing.T) {
 	}
 }
 
-func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
+// newComfyUIImageUploadHarness builds the shared fixture for
+// TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer: a backend that
+// records upload calls, a scheduler that records scheduler calls, a handler
+// wired to the scheduler, and a relayer owner with a path-grant peer config.
+// Callers retain ownership and must close backend and scheduler.
+func newComfyUIImageUploadHarness(t *testing.T) (*Handler, *Reloader, *httptest.Server, *httptest.Server, *atomic.Int32, *atomic.Int32, string, *config.PeerConfig) {
 	var uploadCalls, schedulerCalls atomic.Int32
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Method == http.MethodGet && req.URL.Path == "/queue" {
@@ -109,21 +114,16 @@ func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 		w.Header().Set("Set-Cookie", "backend-secret=value")
 		_, _ = io.WriteString(w, `{"name":"input.png","type":"input"}`)
 	}))
-	defer backend.Close()
 	scheduler := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		schedulerCalls.Add(1)
 		w.WriteHeader(http.StatusAccepted)
 	}))
-	defer scheduler.Close()
 	cfg := baseConfig(scheduler.URL)
 	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
 	cfg.Peer = &config.PeerConfig{NodeID: "owner", Listen: "127.0.0.1:9294", TLSCertFile: "cert.pem", TLSKeyFile: "key.pem", ComfyUIResultRead: &config.ComfyUIResultReadConfig{
 		URL: backend.URL, APIKey: "owner-secret", Headers: map[string]string{"Content-Type": "application/json"},
 	}}
 	handler := newHandler(t, cfg).(*Handler)
-	if handler.comfyUIImageUploadMaxBytes != 16<<20 {
-		t.Fatalf("automatic upload default=%d", handler.comfyUIImageUploadMaxBytes)
-	}
 	token := strings.Repeat("p", 32)
 	owner := &Reloader{logger: discardLogger(), peerSlots: make(chan struct{}, 4), peerPathSlots: make(chan struct{}, 4)}
 	peerConfig := &config.PeerConfig{
@@ -131,25 +131,41 @@ func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 		Peers: map[string]config.PeerGrant{"caller": {Token: token, PathAccess: []string{"comfyui"}}},
 	}
 	owner.state.Store(&reloaderState{handler: handler, peer: peerConfig})
+	return handler, owner, backend, scheduler, &uploadCalls, &schedulerCalls, token, peerConfig
+}
+
+// performUpload issues one multipart image upload either directly to the
+// handler or through the owner's peer path handler, per viaPeer, and returns
+// the response recorder.
+func performUpload(t *testing.T, handler *Handler, owner *Reloader, viaPeer bool, endpoint, token string) *httptest.ResponseRecorder {
+	body, contentType := imageUploadBody(t, "input.png", testUploadPNG, nil)
+	request := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	request.Header.Set("Content-Type", contentType)
+	request.Header.Set("Authorization", "Bearer caller-secret")
+	request.Header.Set("Cookie", "caller=secret")
+	request.Header.Set("X-Caller-Key", "caller-secret")
+	response := httptest.NewRecorder()
+	if viaPeer {
+		request.URL.Path = peerPathEndpoint
+		request.TLS = &tls.ConnectionState{}
+		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set(peerPathServiceHeader, "comfyui")
+		request.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(endpoint)))
+		owner.PeerHandler().ServeHTTP(response, request)
+	} else {
+		handler.ServeHTTP(response, request)
+	}
+	return response
+}
+
+// assertUploadsReachBackendNotScheduler verifies image uploads reach the
+// backend (not the scheduler) both directly and over the peer path, for both
+// endpoints, and that exactly four uploads are recorded with zero scheduler
+// calls.
+func assertUploadsReachBackendNotScheduler(t *testing.T, handler *Handler, owner *Reloader, uploadCalls, schedulerCalls *atomic.Int32, token string) {
 	for _, viaPeer := range []bool{false, true} {
 		for _, endpoint := range []string{"/comfyui/upload/image", "/comfyui/api/upload/image"} {
-			body, contentType := imageUploadBody(t, "input.png", testUploadPNG, nil)
-			request := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-			request.Header.Set("Content-Type", contentType)
-			request.Header.Set("Authorization", "Bearer caller-secret")
-			request.Header.Set("Cookie", "caller=secret")
-			request.Header.Set("X-Caller-Key", "caller-secret")
-			response := httptest.NewRecorder()
-			if viaPeer {
-				request.URL.Path = peerPathEndpoint
-				request.TLS = &tls.ConnectionState{}
-				request.Header.Set("Authorization", "Bearer "+token)
-				request.Header.Set(peerPathServiceHeader, "comfyui")
-				request.Header.Set(peerServicePathHeader, base64.RawURLEncoding.EncodeToString([]byte(endpoint)))
-				owner.PeerHandler().ServeHTTP(response, request)
-			} else {
-				handler.ServeHTTP(response, request)
-			}
+			response := performUpload(t, handler, owner, viaPeer, endpoint, token)
 			if response.Code != http.StatusOK || response.Header().Get("Set-Cookie") != "" {
 				t.Fatalf("peer=%v upload=%s: status=%d body=%s", viaPeer, endpoint, response.Code, response.Body.String())
 			}
@@ -158,6 +174,12 @@ func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 	if uploadCalls.Load() != 4 || schedulerCalls.Load() != 0 {
 		t.Fatalf("uploads=%d scheduler=%d", uploadCalls.Load(), schedulerCalls.Load())
 	}
+}
+
+// assertUploadDeniedWithoutPathGrant verifies an upload over the peer path is
+// rejected with 403 when the caller lacks the path grant, and that it is not
+// forwarded to the backend (upload call count unchanged).
+func assertUploadDeniedWithoutPathGrant(t *testing.T, owner *Reloader, uploadCalls *atomic.Int32, token string, peerConfig *config.PeerConfig) {
 	peerConfig.Peers["caller"] = config.PeerGrant{Token: token, PathAccess: []string{"other"}}
 	body, contentType := imageUploadBody(t, "input.png", testUploadPNG, nil)
 	denied := httptest.NewRequest(http.MethodPost, peerPathEndpoint, bytes.NewReader(body))
@@ -171,6 +193,12 @@ func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 	if response.Code != http.StatusForbidden || uploadCalls.Load() != 4 {
 		t.Fatalf("upload without path grant status=%d calls=%d", response.Code, uploadCalls.Load())
 	}
+}
+
+// assertNonImageOperationsRouteToScheduler verifies non-image operations
+// (prompt, api/prompt, upload/mask) are routed to the scheduler and that
+// exactly three scheduler calls are recorded with four upload calls unchanged.
+func assertNonImageOperationsRouteToScheduler(t *testing.T, handler *Handler, uploadCalls, schedulerCalls *atomic.Int32) {
 	for _, endpoint := range []string{"/comfyui/prompt", "/comfyui/api/prompt", "/comfyui/upload/mask"} {
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, endpoint, strings.NewReader(`{}`)))
@@ -181,6 +209,26 @@ func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
 	if schedulerCalls.Load() != 3 || uploadCalls.Load() != 4 {
 		t.Fatalf("non-upload routing: uploads=%d scheduler=%d", uploadCalls.Load(), schedulerCalls.Load())
 	}
+}
+
+func TestComfyUIImageUploadsBypassSchedulerLocallyAndOverPeer(t *testing.T) {
+	handler, owner, backend, scheduler, uploadCalls, schedulerCalls, token, peerConfig := newComfyUIImageUploadHarness(t)
+	defer backend.Close()
+	defer scheduler.Close()
+
+	if handler.comfyUIImageUploadMaxBytes != 16<<20 {
+		t.Fatalf("automatic upload default=%d", handler.comfyUIImageUploadMaxBytes)
+	}
+
+	t.Run("uploads reach backend not scheduler directly and over peer", func(t *testing.T) {
+		assertUploadsReachBackendNotScheduler(t, handler, owner, uploadCalls, schedulerCalls, token)
+	})
+	t.Run("upload denied without path grant", func(t *testing.T) {
+		assertUploadDeniedWithoutPathGrant(t, owner, uploadCalls, token, peerConfig)
+	})
+	t.Run("non-image operations route to scheduler", func(t *testing.T) {
+		assertNonImageOperationsRouteToScheduler(t, handler, uploadCalls, schedulerCalls)
+	})
 }
 
 func TestComfyUIImageUploadRejectsOversizedAndInvalidBodiesWithoutForwarding(t *testing.T) {

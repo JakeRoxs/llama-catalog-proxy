@@ -69,25 +69,35 @@ func parseSourceURL(input SourceInput) (owner, repository, filename, revision st
 		return "", "", "", "", errors.New("encoded path separators are unsupported")
 	}
 	parts := strings.Split(strings.TrimPrefix(parsed.Path, "/"), "/")
+	return parseSourceURLScheme(parsed, parts, input)
+}
+
+// parseSourceURLScheme routes URL parsing by scheme and path structure.
+func parseSourceURLScheme(parsed *url.URL, parts []string, input SourceInput) (owner, repository, filename, revision string, err error) {
 	switch {
 	case parsed.Scheme == "hf" && parsed.Host != "" && len(parts) == 2:
 		return parsed.Host, parts[0], parts[1], input.Revision, nil
 	case parsed.Scheme == "https" &&
 		(strings.EqualFold(parsed.Host, "huggingface.co") || strings.EqualFold(parsed.Host, "www.huggingface.co")):
-		switch {
-		case len(parts) == 3:
-			return parts[0], parts[1], parts[2], input.Revision, nil
-		case len(parts) == 5 && (parts[2] == "blob" || parts[2] == "resolve"):
-			owner, repository, filename, revision := parts[0], parts[1], parts[4], parts[3]
-			if input.Revision != "" && input.Revision != revision {
-				return "", "", "", "", errors.New("source revisions do not match")
-			}
-			return owner, repository, filename, revision, nil
-		default:
-			return "", "", "", "", errors.New("unsupported Hugging Face artifact path")
-		}
+		return parseHuggingFaceURL(parts, input)
 	default:
 		return "", "", "", "", errors.New("unsupported model source URL")
+	}
+}
+
+// parseHuggingFaceURL parses https:// URLs from huggingface.co.
+func parseHuggingFaceURL(parts []string, input SourceInput) (owner, repository, filename, revision string, err error) {
+	switch {
+	case len(parts) == 3:
+		return parts[0], parts[1], parts[2], input.Revision, nil
+	case len(parts) == 5 && (parts[2] == "blob" || parts[2] == "resolve"):
+		owner, repository, filename, revision := parts[0], parts[1], parts[4], parts[3]
+		if input.Revision != "" && input.Revision != revision {
+			return "", "", "", "", errors.New("source revisions do not match")
+		}
+		return owner, repository, filename, revision, nil
+	default:
+		return "", "", "", "", errors.New("unsupported Hugging Face artifact path")
 	}
 }
 
@@ -129,16 +139,24 @@ func ParseSource(input SourceInput) (Source, error) {
 	if err != nil {
 		return Source{}, err
 	}
-	if err := validateSourceRepository(owner, repository); err != nil {
-		return Source{}, err
-	}
-	if err := validateSourceRevision(revision); err != nil {
-		return Source{}, err
-	}
-	if err := validateSourceFilename(filename); err != nil {
+	if err := validateSourceComponents(owner, repository, filename, revision); err != nil {
 		return Source{}, err
 	}
 	return Source{Repository: owner + "/" + repository, Filename: filename, Revision: revision}, nil
+}
+
+// validateSourceComponents validates the parsed source components.
+func validateSourceComponents(owner, repository, filename, revision string) error {
+	if err := validateSourceRepository(owner, repository); err != nil {
+		return err
+	}
+	if err := validateSourceRevision(revision); err != nil {
+		return err
+	}
+	if err := validateSourceFilename(filename); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validRecordedSource(source Source, operation string) bool {

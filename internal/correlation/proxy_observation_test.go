@@ -768,60 +768,50 @@ func TestCorrelatorAttachObservationFailedReplaceLeavesOldObservation(t *testing
 	assertSizeConsistent(t, c)
 }
 
+// assertPhaseValidity fails when validPhase(v) does not report wantValid.
+func assertPhaseValidity(t *testing.T, v *float64, wantValid bool, msg string) {
+	t.Helper()
+	if validPhase(v) != wantValid {
+		t.Fatal(msg)
+	}
+}
+
+// assertCopyFloat fails when copy(v) does not equal want (nil or *float64).
+func assertCopyFloat(t *testing.T, v *float64, want *float64, copier func(*float64) *float64, msg string) {
+	t.Helper()
+	got := copier(v)
+	if (got == nil) != (want == nil) {
+		t.Fatal(msg)
+	}
+	if got != nil && *got != *want {
+		t.Fatal(msg)
+	}
+}
+
 func TestValidationHelpersNilZeroNaNInfNegative(t *testing.T) {
 	nilV := (*float64)(nil)
 	zeroV := ptrF64(0.0)
 	posV := ptrF64(5.0)
 
-	if !validPhase(nilV) {
-		t.Fatal("nil phase should be valid")
-	}
-	if !validPhase(zeroV) {
-		t.Fatal("zero phase should be valid")
-	}
-	if !validPhase(posV) {
-		t.Fatal("positive phase should be valid")
-	}
-	if validPhase(ptrF64(-1.0)) {
-		t.Fatal("negative phase should be invalid")
-	}
-	if validPhase(ptrF64(math.NaN())) {
-		t.Fatal("NaN phase should be invalid")
-	}
-	if validPhase(ptrF64(math.Inf(1))) {
-		t.Fatal("Inf phase should be invalid")
-	}
-	if validPhase(ptrF64(math.Inf(-1))) {
-		t.Fatal("-Inf phase should be invalid")
-	}
+	assertPhaseValidity(t, nilV, true, "nil phase should be valid")
+	assertPhaseValidity(t, zeroV, true, "zero phase should be valid")
+	assertPhaseValidity(t, posV, true, "positive phase should be valid")
+	assertPhaseValidity(t, ptrF64(-1.0), false, "negative phase should be invalid")
+	assertPhaseValidity(t, ptrF64(math.NaN()), false, "NaN phase should be invalid")
+	assertPhaseValidity(t, ptrF64(math.Inf(1)), false, "Inf phase should be invalid")
+	assertPhaseValidity(t, ptrF64(math.Inf(-1)), false, "-Inf phase should be invalid")
 
 	// copyPhase preserves nil and zero; rejects invalid.
-	if copyPhase(nilV) != nil {
-		t.Fatal("copyPhase(nil) should be nil")
-	}
-	if got := copyPhase(zeroV); got == nil || *got != 0.0 {
-		t.Fatal("copyPhase(zero) should preserve &0")
-	}
-	if copyPhase(ptrF64(-1.0)) != nil {
-		t.Fatal("copyPhase(negative) should be nil")
-	}
-	if copyPhase(ptrF64(math.NaN())) != nil {
-		t.Fatal("copyPhase(NaN) should be nil")
-	}
+	assertCopyFloat(t, nilV, nil, copyPhase, "copyPhase(nil) should be nil")
+	assertCopyFloat(t, zeroV, ptrF64(0.0), copyPhase, "copyPhase(zero) should preserve &0")
+	assertCopyFloat(t, ptrF64(-1.0), nil, copyPhase, "copyPhase(negative) should be nil")
+	assertCopyFloat(t, ptrF64(math.NaN()), nil, copyPhase, "copyPhase(NaN) should be nil")
 
 	// copyFiniteNonnegativeFloat uses the validFiniteNonnegativeFloat predicate.
-	if copyFiniteNonnegativeFloat(nilV) != nil {
-		t.Fatal("copyFiniteNonnegativeFloat(nil) should be nil")
-	}
-	if got := copyFiniteNonnegativeFloat(zeroV); got == nil || *got != 0.0 {
-		t.Fatal("copyFiniteNonnegativeFloat(zero) should preserve &0")
-	}
-	if copyFiniteNonnegativeFloat(ptrF64(-1.0)) != nil {
-		t.Fatal("copyFiniteNonnegativeFloat(negative) should be nil")
-	}
-	if copyFiniteNonnegativeFloat(ptrF64(math.NaN())) != nil {
-		t.Fatal("copyFiniteNonnegativeFloat(NaN) should be nil")
-	}
+	assertCopyFloat(t, nilV, nil, copyFiniteNonnegativeFloat, "copyFiniteNonnegativeFloat(nil) should be nil")
+	assertCopyFloat(t, zeroV, ptrF64(0.0), copyFiniteNonnegativeFloat, "copyFiniteNonnegativeFloat(zero) should preserve &0")
+	assertCopyFloat(t, ptrF64(-1.0), nil, copyFiniteNonnegativeFloat, "copyFiniteNonnegativeFloat(negative) should be nil")
+	assertCopyFloat(t, ptrF64(math.NaN()), nil, copyFiniteNonnegativeFloat, "copyFiniteNonnegativeFloat(NaN) should be nil")
 }
 
 func TestValidatePhases(t *testing.T) {

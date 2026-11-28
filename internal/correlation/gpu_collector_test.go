@@ -224,6 +224,112 @@ func assertSortedByTimestampWithinBackend(t *testing.T, report GPUReport) {
 	}
 }
 
+// sampleExpectation captures the expected contract values for one GPU sample.
+// Grouping the expected values into a struct keeps the assertion helper under
+// the S107 parameter limit while keeping the test call site self-documenting.
+type sampleExpectation struct {
+	backendID string
+	epoch     int64
+	gpuUtil   float64
+	memUtil   float64
+	memUsed   int
+	memTotal  int
+}
+
+// assertGPUSampleFields validates the decoded sample fields for one GPU stat,
+// including the opaque device ID, source timestamp, and utilization/memory
+// units. Expected values are grouped into sampleExpectation so the helper
+// stays within the S107 parameter limit.
+func assertGPUSampleFields(t *testing.T, s GPUSample, want sampleExpectation) {
+	t.Helper()
+	if s.BackendID != want.backendID {
+		t.Fatalf("backend_id = %q, want %q", s.BackendID, want.backendID)
+	}
+	if s.Epoch != want.epoch {
+		t.Fatalf("epoch = %d, want %d", s.Epoch, want.epoch)
+	}
+	if !strings.HasPrefix(s.DeviceID, "gpu-") {
+		t.Fatalf("device_id = %q, want gpu- prefix", s.DeviceID)
+	}
+	// DeviceID must be opaque: no raw name/UUID.
+	if strings.Contains(s.DeviceID, "NVIDIA") || strings.Contains(s.DeviceID, "uuid-0") {
+		t.Fatalf("device_id leaks raw metadata: %q", s.DeviceID)
+	}
+	if s.Timestamp != gpuFixtureTime {
+		t.Fatalf("timestamp = %v, want source timestamp", s.Timestamp)
+	}
+	if s.ObservedAt.IsZero() {
+		t.Fatal("observed_at must be set")
+	}
+	if s.GpuUtilPct == nil || *s.GpuUtilPct != want.gpuUtil {
+		t.Fatalf("gpu_util_pct = %v, want %v (percent)", s.GpuUtilPct, want.gpuUtil)
+	}
+	if s.MemUtilPct == nil || *s.MemUtilPct != want.memUtil {
+		t.Fatalf("mem_util_pct = %v, want %v (percent)", s.MemUtilPct, want.memUtil)
+	}
+	if s.MemUsedMB == nil || *s.MemUsedMB != want.memUsed {
+		t.Fatalf("mem_used_mb = %v, want %d (MB)", s.MemUsedMB, want.memUsed)
+	}
+	if s.MemTotalMB == nil || *s.MemTotalMB != want.memTotal {
+		t.Fatalf("mem_total_mb = %v, want %d (MB)", s.MemTotalMB, want.memTotal)
+	}
+}
+
+// assertNoRawUpstreamFields checks that no raw upstream metadata is leaked
+// into the encoded report.
+func assertNoRawUpstreamFields(t *testing.T, encoded []byte, rawFields ...string) {
+	t.Helper()
+	for _, raw := range rawFields {
+		if strings.Contains(string(encoded), raw) {
+			t.Fatalf("raw upstream field leaked: %q", raw)
+		}
+	}
+}
+
+// assertReportContract validates the report-level attribution and contract
+// fields that are always serialized.
+func assertReportContract(t *testing.T, report GPUReport) {
+	t.Helper()
+	if report.SharedDeviceOnly != true {
+		t.Fatal("shared_device_only should be true")
+	}
+	if report.ExecutionDeviceUnverified != true {
+		t.Fatal("execution_device_unverified should be true")
+	}
+	if report.ResourceScope != "backend_host" {
+		t.Fatalf("resource_scope = %q, want backend_host", report.ResourceScope)
+	}
+	if report.LifecycleState != "unknown" {
+		t.Fatalf("lifecycle_state = %q, want unknown", report.LifecycleState)
+	}
+	if report.EpochScope != "collector" {
+		t.Fatalf("epoch_scope = %q, want collector", report.EpochScope)
+	}
+	if report.ClockAlignmentUnverified != true {
+		t.Fatal("clock_alignment_unverified should be true")
+	}
+	if report.UpstreamGenerationUnknown != gpuUpstreamGenerationUnknown {
+		t.Fatalf("upstream_generation = %q, want %q", report.UpstreamGenerationUnknown, gpuUpstreamGenerationUnknown)
+	}
+	if report.RequestIDMappingUnsupported != gpuRequestIDMappingUnsupported {
+		t.Fatalf("request_id_mapping = %q, want %q", report.RequestIDMappingUnsupported, gpuRequestIDMappingUnsupported)
+	}
+}
+
+// assertUnknownStateNoSamples checks that the backend reports unknown state
+// and no samples, preserving a context-specific detail in the fatal message.
+// It captures the repeated assertion pattern across malformed-body and
+// outage tests without obscuring the per-test setup.
+func assertUnknownStateNoSamples(t *testing.T, report GPUReport, detail string) {
+	t.Helper()
+	if report.BackendStates["backend"].State != gpuUnknownState {
+		t.Fatalf("expected unknown state on %s, got %#v", detail, report.BackendStates["backend"])
+	}
+	if len(report.Samples) != 0 {
+		t.Fatalf("expected 0 samples on %s, got %d", detail, len(report.Samples))
+	}
+}
+
 func TestGpuConstructionMakesNoRequestsAndSkipsDisabledBackends(t *testing.T) {
 	var count atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -296,72 +402,20 @@ func TestCollectSourceRealSchemaAndUnits(t *testing.T) {
 		t.Fatalf("expected 1 sample, got %d", len(report.Samples))
 	}
 	s := report.Samples[0]
-	if s.BackendID != "backend" {
-		t.Fatalf("backend_id = %q, want backend", s.BackendID)
-	}
-	if s.Epoch != 1 {
-		t.Fatalf("epoch = %d, want 1", s.Epoch)
-	}
-	if !strings.HasPrefix(s.DeviceID, "gpu-") {
-		t.Fatalf("device_id = %q, want gpu- prefix", s.DeviceID)
-	}
-	// DeviceID must be opaque: no raw name/UUID.
-	if strings.Contains(s.DeviceID, "NVIDIA") || strings.Contains(s.DeviceID, "uuid-0") {
-		t.Fatalf("device_id leaks raw metadata: %q", s.DeviceID)
-	}
-	if s.Timestamp != gpuFixtureTime {
-		t.Fatalf("timestamp = %v, want source timestamp", s.Timestamp)
-	}
-	if s.ObservedAt.IsZero() {
-		t.Fatal("observed_at must be set")
-	}
-	// Units: percent for utilization, MB for memory. Explicit 0 is preserved
-	// as a non-nil pointer here (values are non-zero).
-	if s.GpuUtilPct == nil || *s.GpuUtilPct != 42.5 {
-		t.Fatalf("gpu_util_pct = %v, want 42.5 (percent)", s.GpuUtilPct)
-	}
-	if s.MemUtilPct == nil || *s.MemUtilPct != 30.0 {
-		t.Fatalf("mem_util_pct = %v, want 30.0 (percent)", s.MemUtilPct)
-	}
-	if s.MemUsedMB == nil || *s.MemUsedMB != 2048 {
-		t.Fatalf("mem_used_mb = %v, want 2048 (MB)", s.MemUsedMB)
-	}
-	if s.MemTotalMB == nil || *s.MemTotalMB != 8192 {
-		t.Fatalf("mem_total_mb = %v, want 8192 (MB)", s.MemTotalMB)
-	}
+	assertGPUSampleFields(t, s, sampleExpectation{
+		backendID: "backend",
+		epoch:     1,
+		gpuUtil:   42.5,
+		memUtil:   30.0,
+		memUsed:   2048,
+		memTotal:  8192,
+	})
 	// No raw upstream fields in output.
 	encoded, _ := json.Marshal(report)
-	for _, raw := range []string{"NVIDIA GPU", "uuid-0", "temp_c", "fan_speed_pct", "power_draw_w"} {
-		if strings.Contains(string(encoded), raw) {
-			t.Fatalf("raw upstream field leaked: %q", raw)
-		}
-	}
+	assertNoRawUpstreamFields(t, encoded, "NVIDIA GPU", "uuid-0", "temp_c", "fan_speed_pct", "power_draw_w")
 	// Attribution limits are always serialized and reflect the collection
 	// contract, not an inference-GPU claim.
-	if report.SharedDeviceOnly != true {
-		t.Fatal("shared_device_only should be true")
-	}
-	if report.ExecutionDeviceUnverified != true {
-		t.Fatal("execution_device_unverified should be true")
-	}
-	if report.ResourceScope != "backend_host" {
-		t.Fatalf("resource_scope = %q, want backend_host", report.ResourceScope)
-	}
-	if report.LifecycleState != "unknown" {
-		t.Fatalf("lifecycle_state = %q, want unknown", report.LifecycleState)
-	}
-	if report.EpochScope != "collector" {
-		t.Fatalf("epoch_scope = %q, want collector", report.EpochScope)
-	}
-	if report.ClockAlignmentUnverified != true {
-		t.Fatal("clock_alignment_unverified should be true")
-	}
-	if report.UpstreamGenerationUnknown != gpuUpstreamGenerationUnknown {
-		t.Fatalf("upstream_generation = %q, want %q", report.UpstreamGenerationUnknown, gpuUpstreamGenerationUnknown)
-	}
-	if report.RequestIDMappingUnsupported != gpuRequestIDMappingUnsupported {
-		t.Fatalf("request_id_mapping = %q, want %q", report.RequestIDMappingUnsupported, gpuRequestIDMappingUnsupported)
-	}
+	assertReportContract(t, report)
 }
 
 func TestDisabledMonitoringReportsDisabledEven503(t *testing.T) {
@@ -561,12 +615,7 @@ func TestMalformedAndOversizedBody(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if report.BackendStates["backend"].State != gpuUnknownState {
-				t.Fatalf("expected unknown state on malformed body, got %#v", report.BackendStates["backend"])
-			}
-			if len(report.Samples) != 0 {
-				t.Fatalf("expected 0 samples on malformed body, got %d", len(report.Samples))
-			}
+			assertUnknownStateNoSamples(t, report, "malformed body")
 		})
 	}
 
@@ -588,12 +637,7 @@ func TestMalformedAndOversizedBody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if report.BackendStates["backend"].State != gpuUnknownState {
-			t.Fatalf("expected unknown state on oversized body, got %#v", report.BackendStates["backend"])
-		}
-		if len(report.Samples) != 0 {
-			t.Fatalf("expected 0 samples on oversized body, got %d", len(report.Samples))
-		}
+		assertUnknownStateNoSamples(t, report, "oversized body")
 	})
 }
 
@@ -611,14 +655,9 @@ func TestMissingEnabledIsUnknown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.BackendStates["backend"].State != gpuUnknownState {
-		t.Fatalf("expected unknown state on missing enabled, got %#v", report.BackendStates["backend"])
-	}
+	assertUnknownStateNoSamples(t, report, "missing enabled")
 	if report.BackendStates["backend"].Coverage != "partial" {
 		t.Fatalf("coverage = %q, want partial", report.BackendStates["backend"].Coverage)
-	}
-	if len(report.Samples) != 0 {
-		t.Fatalf("expected 0 samples on missing enabled, got %d", len(report.Samples))
 	}
 }
 
@@ -636,9 +675,7 @@ func TestMissingGpuStatsIsUnknownPartial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.BackendStates["backend"].State != gpuUnknownState {
-		t.Fatalf("expected unknown state on missing gpu_stats, got %#v", report.BackendStates["backend"])
-	}
+	assertUnknownStateNoSamples(t, report, "missing gpu_stats")
 	if report.BackendStates["backend"].Coverage != "partial" {
 		t.Fatalf("coverage = %q, want partial", report.BackendStates["backend"].Coverage)
 	}

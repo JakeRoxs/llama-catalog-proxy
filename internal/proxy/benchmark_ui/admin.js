@@ -11,7 +11,15 @@ let remoteProposal = null;
 async function adminApi(path, options = {}) {
   const response = await fetch(path, { credentials: "same-origin", cache: "no-store", ...options });
   if (!response.ok) {
-    const error = new Error(response.status === 401 ? "Sign-in required" : response.status === 403 ? "Permission denied" : `Request failed (${response.status})`);
+    let errorMessage;
+    if (response.status === 401) {
+      errorMessage = "Sign-in required";
+    } else if (response.status === 403) {
+      errorMessage = "Permission denied";
+    } else {
+      errorMessage = `Request failed (${response.status})`;
+    }
+    const error = new Error(errorMessage);
     error.status = response.status;
     throw error;
   }
@@ -26,9 +34,10 @@ function pairingNotice(message, isError = false) {
   notice.hidden = !message;
 }
 
-async function pairingRequest(path, method = "GET", body) {
-  const options = { method };
-  if (method !== "GET") {
+async function pairingRequest(path, method, body) {
+  const resolvedMethod = method === undefined ? "GET" : method;
+  const options = { method: resolvedMethod };
+  if (resolvedMethod !== "GET") {
     options.headers = { "X-Llama-Catalog-CSRF": csrfToken };
     if (body !== undefined) {
       options.headers["Content-Type"] = "application/json";
@@ -40,7 +49,13 @@ async function pairingRequest(path, method = "GET", body) {
 
 function peerBadge(status) {
   const span = document.createElement("span");
-  span.className = `peer-state ${status === "fresh" ? "fresh" : status === "stale" ? "stale" : ""}`;
+  let peerStateClass = "";
+  if (status === "fresh") {
+    peerStateClass = "fresh";
+  } else if (status === "stale") {
+    peerStateClass = "stale";
+  }
+  span.className = `peer-state ${peerStateClass}`;
   const dot = document.createElement("span");
   dot.className = "dot";
   span.append(dot, document.createTextNode(status));
@@ -52,59 +67,85 @@ function renderOverview(data) {
   byId("model-count").textContent = String(data.models.length);
   byId("peer-count").textContent = String(data.peers.length);
   byId("snapshot-at").textContent = new Date(data.updated_at).toLocaleTimeString();
-	const requestSummary = data.request_summary;
-	const summaryAvailable = data.request_summary_state === "available" && requestSummary;
-	byId("request-count").textContent = summaryAvailable ? String(requestSummary.count) : "Unknown";
-	byId("request-summary-state").textContent = summaryAvailable ? "Aggregated history" :
-	  data.request_summary_state === "not_configured" ? "Diagnostics API not configured" : "Request history unavailable";
+  renderRequestSummary(data);
+  renderModels(data.models);
+  renderPeers(data.peers);
+  renderFederationPolicy(data.federation_policy);
+}
+
+function renderRequestSummary(data) {
+  const requestSummary = data.request_summary;
+  const summaryAvailable = data.request_summary_state === "available" && requestSummary;
+  byId("request-count").textContent = summaryAvailable ? String(requestSummary.count) : "Unknown";
+  renderRequestSummaryState(summaryAvailable, data.request_summary_state);
   const duration = summaryAvailable ? requestSummary.duration_ms : null;
   byId("request-p50").textContent = duration && typeof duration.p50 === "number" ? `${Math.round(duration.p50)} ms` : "Unknown";
   byId("duration-samples").textContent = duration && typeof duration.sample_count === "number" ? `${duration.sample_count} samples` : "Sample count unknown";
-	const outcomes = byId("request-outcomes");
-	outcomes.replaceChildren();
-	if (!summaryAvailable) {
-		const unknown = document.createElement("p");
-		unknown.className = "empty";
-		unknown.textContent = data.request_summary_state === "not_configured" ? "Unknown until diagnostics API and bounded request history are enabled." : "Request history is unavailable.";
-		outcomes.append(unknown);
-	} else {
-		const entries = Object.entries(requestSummary.outcomes || {}).sort(([a],[b]) => a.localeCompare(b));
-		if (entries.length === 0) {
-			const empty = document.createElement("p");
-			empty.className = "empty";
-			empty.textContent = "No requests recorded in this window.";
-			outcomes.append(empty);
-		} else {
-			for (const [status, count] of entries) {
-				const row = document.createElement("div");
-				row.className = "outcome";
-				const label = document.createElement("span");
-				label.textContent = status;
-				const value = document.createElement("strong");
-				value.textContent = String(count);
-				row.append(label, value);
-				outcomes.append(row);
-			}
-		}
-	}
+  renderRequestOutcomes(data, summaryAvailable, requestSummary);
+}
 
-  const models = byId("models");
-  models.replaceChildren();
-  byId("models-empty").hidden = data.models.length !== 0;
-  for (const model of data.models) {
+function renderRequestSummaryState(summaryAvailable, requestSummaryState) {
+  if (summaryAvailable) {
+    byId("request-summary-state").textContent = "Aggregated history";
+  } else if (requestSummaryState === "not_configured") {
+    byId("request-summary-state").textContent = "Diagnostics API not configured";
+  } else {
+    byId("request-summary-state").textContent = "Request history unavailable";
+  }
+}
+
+function renderRequestOutcomes(data, summaryAvailable, requestSummary) {
+  const outcomes = byId("request-outcomes");
+  outcomes.replaceChildren();
+  if (!summaryAvailable) {
+    const unknown = document.createElement("p");
+    unknown.className = "empty";
+    unknown.textContent = data.request_summary_state === "not_configured" ? "Unknown until diagnostics API and bounded request history are enabled." : "Request history is unavailable.";
+    outcomes.append(unknown);
+  } else {
+    const entries = Object.entries(requestSummary.outcomes || {}).sort(([a], [b]) => a.localeCompare(b));
+    if (entries.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No requests recorded in this window.";
+      outcomes.append(empty);
+    } else {
+      for (const [status, count] of entries) {
+        const row = document.createElement("div");
+        row.className = "outcome";
+        const label = document.createElement("span");
+        label.textContent = status;
+        const value = document.createElement("strong");
+        value.textContent = String(count);
+        row.append(label, value);
+        outcomes.append(row);
+      }
+    }
+  }
+}
+
+
+
+function renderModels(models) {
+  const container = byId("models");
+  container.replaceChildren();
+  byId("models-empty").hidden = models.length !== 0;
+  for (const model of models) {
     const row = document.createElement("tr");
     const id = document.createElement("td");
     const owner = document.createElement("td");
     id.textContent = model.id;
     owner.textContent = model.owned_by || "unknown";
     row.append(id, owner);
-    models.append(row);
+    container.append(row);
   }
+}
 
-  const peers = byId("peers");
-  peers.replaceChildren();
-  byId("peers-empty").hidden = data.peers.length !== 0;
-  for (const peer of data.peers) {
+function renderPeers(peers) {
+  const container = byId("peers");
+  container.replaceChildren();
+  byId("peers-empty").hidden = peers.length !== 0;
+  for (const peer of peers) {
     const row = document.createElement("div");
     row.className = "peer";
     const name = document.createElement("span");
@@ -115,10 +156,11 @@ function renderOverview(data) {
     const scopes = (peer.configured_scopes || []).join(", ") || "none";
     evidence.textContent = `Identity ${peer.identity_state || "unknown"}; scopes ${peer.authorization_state || "unknown"} (${scopes}); model readiness ${peer.model_readiness_state || "unknown"}`;
     row.append(name, peerBadge(peer.status), evidence);
-    peers.append(row);
+    container.append(row);
   }
-  renderFederationPolicy(data.federation_policy);
 }
+
+
 
 function renderFederationPolicy(policy) {
   const state = byId("federation-policy-state");
@@ -128,8 +170,13 @@ function renderFederationPolicy(policy) {
     state.textContent = "No federation CRL policy is configured.";
     return;
   }
-  state.textContent = policy.state === "fresh" ? "Configured CRLs are within their freshness limits; mTLS requests fail closed when they expire." :
-    policy.state === "stale" ? "A CRL is stale; affected mTLS requests are being rejected." : "Federation CRL policy is unavailable.";
+  if (policy.state === "fresh") {
+    state.textContent = "Configured CRLs are within their freshness limits; mTLS requests fail closed when they expire.";
+  } else if (policy.state === "stale") {
+    state.textContent = "A CRL is stale; affected mTLS requests are being rejected.";
+  } else {
+    state.textContent = "Federation CRL policy is unavailable.";
+  }
   const addRow = (direction, entry) => {
     const row = document.createElement("tr");
     const directionCell = document.createElement("td");
@@ -153,9 +200,15 @@ function renderActivity(data) {
   const list = byId("activity");
   list.replaceChildren();
   const state = byId("activity-state");
-  state.textContent = data.state === "not_configured" ? "Unknown until bounded request history is enabled." :
-    data.state !== "available" ? "Request history is unavailable." :
-    data.events.length === 0 ? "No requests recorded in this window." : `${data.events.length} recent request records.`;
+  if (data.state === "not_configured") {
+    state.textContent = "Unknown until bounded request history is enabled.";
+  } else if (data.state !== "available") {
+    state.textContent = "Request history is unavailable.";
+  } else if (data.events.length === 0) {
+    state.textContent = "No requests recorded in this window.";
+  } else {
+    state.textContent = `${data.events.length} recent request records.`;
+  }
   for (const event of data.events) {
     const row = document.createElement("tr");
     const time = document.createElement("td");
@@ -502,6 +555,15 @@ function enableRemoteSettingsAfterTerminal() {
 }
 
 function renderPairing(memberData, invitationData, grantData, catalogGrantData, inferenceGrantData, auditData) {
+  renderMembers(memberData);
+  renderInvitations(invitationData);
+  renderOwnerGrants(grantData);
+  renderCatalogGrants(catalogGrantData);
+  renderInferenceGrants(inferenceGrantData);
+  renderAudit(auditData);
+}
+
+function renderMembers(memberData) {
   const members = byId("paired-members");
   members.replaceChildren();
   const list = memberData.members || [];
@@ -528,7 +590,9 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     row.append(node, fingerprint, paired, action);
     members.append(row);
   }
+}
 
+function renderInvitations(invitationData) {
   const invitations = byId("pending-invitations");
   invitations.replaceChildren();
   const pending = invitationData.invitations || [];
@@ -549,7 +613,9 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     row.append(node, expires, action);
     invitations.append(row);
   }
+}
 
+function renderOwnerGrants(grantData) {
   const grantsTable = byId("owner-grants");
   grantsTable.replaceChildren();
   const grants = grantData?.grants || [];
@@ -579,7 +645,9 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     row.append(requester, scope, expires, action);
     grantsTable.append(row);
   }
+}
 
+function renderCatalogGrants(catalogGrantData) {
   const catalogTable = byId("catalog-read-grants");
   catalogTable.replaceChildren();
   const catalogGrants = catalogGrantData?.grants || [];
@@ -609,7 +677,9 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     row.append(node, fingerprint, state, action);
     catalogTable.append(row);
   }
+}
 
+function renderInferenceGrants(inferenceGrantData) {
   const inferenceTable = byId("inference-grants");
   inferenceTable.replaceChildren();
   const inferenceGrants = inferenceGrantData?.grants || [];
@@ -643,10 +713,12 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     row.append(node, fingerprint, incoming, outgoing, state, action);
     inferenceTable.append(row);
   }
+}
 
+function renderAudit(auditData) {
   const auditTable = byId("audit-events");
   auditTable.replaceChildren();
-  if (!auditData || auditData.state !== "available") {
+  if (auditData?.state !== "available") {
     byId("audit-state").textContent = "Audit trail unavailable.";
     return;
   }
@@ -660,9 +732,15 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     const target = document.createElement("td");
     const outcome = document.createElement("td");
     time.textContent = new Date(event.at).toLocaleString();
-    actor.textContent = event.user_identity_state === "verified_local" ? `${event.verified_user_subject} (${event.role})` :
-      event.requester_node_id ? `${event.requester_node_id} (human unknown)` :
-        event.local_account ? `local CLI ${event.local_account}` : `${event.principal_type} (human unknown)`;
+    if (event.user_identity_state === "verified_local") {
+      actor.textContent = `${event.verified_user_subject} (${event.role})`;
+    } else if (event.requester_node_id) {
+      actor.textContent = `${event.requester_node_id} (human unknown)`;
+    } else if (event.local_account) {
+      actor.textContent = `local CLI ${event.local_account}`;
+    } else {
+      actor.textContent = `${event.principal_type} (human unknown)`;
+    }
     action.textContent = event.action;
     target.textContent = [event.target_id, event.model_id].filter(Boolean).join(" / ") || "-";
     outcome.textContent = `${event.phase}: ${event.outcome}`;
@@ -670,6 +748,7 @@ function renderPairing(memberData, invitationData, grantData, catalogGrantData, 
     auditTable.append(row);
   }
 }
+
 
 async function removeCatalogGrant(nodeID) {
   try {
@@ -860,4 +939,9 @@ byId("remote-create-proposal").addEventListener("click", () => receiveRemoteProp
 byId("remote-recover-proposal").addEventListener("click", () => receiveRemoteProposal(true));
 byId("remote-apply").addEventListener("click", applyRemoteProposal);
 byId("remote-check-operation").addEventListener("click", checkRemoteOperation);
-void refreshDashboard();
+// Top-level await is not usable here: admin.js is loaded as a regular
+// <script defer> (text/javascript, no type=module) and the test harness
+// compiles it as a VM script. refreshDashboard swallows its own errors,
+// so it never rejects; the catch keeps the fire-and-forget call explicit
+// and avoids an unhandled rejection.
+refreshDashboard().catch(() => {});

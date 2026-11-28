@@ -51,6 +51,26 @@ func assertSizeConsistent(t *testing.T, c *Correlator) {
 	}
 }
 
+// checkReaderResult validates a single concurrent reader's Query result and
+// returns an error describing the first problem found, or nil when the result
+// is acceptable. Extracting this pure check out of runConcurrentReaders
+// flattens the goroutine's control flow, reducing its cognitive complexity.
+func checkReaderResult(result []*CorrelationRecord, expectCount, maxRecords int) error {
+	if expectCount >= 0 {
+		if len(result) != expectCount {
+			return errors.New("unexpected result count")
+		}
+	} else if len(result) > maxRecords {
+		return errors.New("unexpected result count")
+	}
+	for _, r := range result {
+		if r.RequestID == "" {
+			return errors.New("empty request ID")
+		}
+	}
+	return nil
+}
+
 // runConcurrentReaders launches n goroutines that each query the correlator
 // and validate the returned records, sending any validation errors to the
 // returned channel. The channel is buffered with capacity n so readers never
@@ -67,19 +87,7 @@ func runConcurrentReaders(t *testing.T, c *Correlator, n, maxRecords, expectCoun
 	for i := 0; i < n; i++ {
 		go func() {
 			result := c.Query(QueryFilter{})
-			if expectCount >= 0 {
-				if len(result) != expectCount {
-					done <- errors.New("unexpected result count")
-				}
-			} else if len(result) > maxRecords {
-				done <- errors.New("unexpected result count")
-			}
-			for _, r := range result {
-				if r.RequestID == "" {
-					done <- errors.New("empty request ID")
-				}
-			}
-			done <- nil
+			done <- checkReaderResult(result, expectCount, maxRecords)
 		}()
 	}
 	return done
@@ -332,18 +340,22 @@ func TestCorrelatorGetByRequestID(t *testing.T) {
 }
 
 func TestCorrelatorGetByActivityID(t *testing.T) {
-	c := newTestCorrelator(t)
+	for _, activity := range []string{"act-1", "act-shared"} {
+		t.Run(activity, func(t *testing.T) {
+			c := newTestCorrelator(t)
 
-	c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
-	c.RegisterRequest("req-2", "backend-A", "model-2", fixtureTime.Add(time.Minute))
-	c.CorrelateActivity("act-1", "req-1", fixtureTime.Add(2*time.Minute), nil)
-	c.CorrelateActivity("act-1", "req-2", fixtureTime.Add(3*time.Minute), nil)
+			c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
+			c.RegisterRequest("req-2", "backend-A", "model-2", fixtureTime.Add(time.Minute))
+			c.CorrelateActivity(activity, "req-1", fixtureTime.Add(2*time.Minute), nil)
+			c.CorrelateActivity(activity, "req-2", fixtureTime.Add(3*time.Minute), nil)
 
-	result := c.GetByActivityID("act-1")
-	if len(result) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(result))
+			result := c.GetByActivityID(activity)
+			if len(result) != 2 {
+				t.Fatalf("expected 2 results, got %d", len(result))
+			}
+			assertSizeConsistent(t, c)
+		})
 	}
-	assertSizeConsistent(t, c)
 }
 
 func TestCorrelatorStats(t *testing.T) {
@@ -491,21 +503,6 @@ func TestCorrelatorConcurrentWritesAndReads(t *testing.T) {
 		if err := <-done; err != nil {
 			t.Fatal(err)
 		}
-	}
-	assertSizeConsistent(t, c)
-}
-
-func TestCorrelatorGetByActivityIDMultipleRequests(t *testing.T) {
-	c := newTestCorrelator(t)
-
-	c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
-	c.RegisterRequest("req-2", "backend-A", "model-2", fixtureTime.Add(time.Minute))
-	c.CorrelateActivity("act-shared", "req-1", fixtureTime.Add(2*time.Minute), nil)
-	c.CorrelateActivity("act-shared", "req-2", fixtureTime.Add(3*time.Minute), nil)
-
-	result := c.GetByActivityID("act-shared")
-	if len(result) != 2 {
-		t.Fatalf("expected 2 results, got %d", len(result))
 	}
 	assertSizeConsistent(t, c)
 }

@@ -151,9 +151,47 @@ func DecodeReport(input io.Reader, authenticatedNodeID string, receivedAt time.T
 }
 
 func (r Report) validate(authenticatedNodeID string) error {
+	if err := r.validateProtocolVersion(); err != nil {
+		return err
+	}
+	if err := r.validateRequiredFeatures(); err != nil {
+		return err
+	}
+	if err := r.validateSource(authenticatedNodeID); err != nil {
+		return err
+	}
+	if err := r.validateGeneratedAtAndCoverage(); err != nil {
+		return err
+	}
+	if err := r.validateCapabilityCount(); err != nil {
+		return err
+	}
+	if err := r.validatePathServices(); err != nil {
+		return err
+	}
+	if err := r.validateCapabilities(); err != nil {
+		return err
+	}
+	if err := r.validateObservations(); err != nil {
+		return err
+	}
+	if err := r.validateBackendReadiness(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateProtocolVersion enforces the version 1 protocol contract.
+func (r Report) validateProtocolVersion() error {
 	if r.ProtocolVersion.Major != 1 || r.ProtocolVersion.Minor < 0 {
 		return errors.New("unsupported node report protocol version")
 	}
+	return nil
+}
+
+// validateRequiredFeatures enforces that version 1 reports declare no
+// required extension features.
+func (r Report) validateRequiredFeatures() error {
 	if r.RequiredFeatures == nil || len(r.RequiredFeatures) > maxFeatures {
 		return errors.New("invalid required features")
 	}
@@ -161,18 +199,51 @@ func (r Report) validate(authenticatedNodeID string) error {
 	if len(r.RequiredFeatures) != 0 {
 		return errors.New("unsupported required node report feature")
 	}
+	return nil
+}
+
+// validateSource checks the report source against the authenticated peer.
+func (r Report) validateSource(authenticatedNodeID string) error {
 	if !validNodeID(r.Source.NodeID) || r.Source.NodeID != authenticatedNodeID {
 		return errors.New("node report source does not match authenticated peer")
 	}
 	if !validInstanceID(r.Source.ProxyInstanceID) || r.Source.ConfigGeneration == 0 {
 		return errors.New("invalid proxy incarnation or config generation")
 	}
+	return nil
+}
+
+// validateGeneratedAtAndCoverage checks report timing and coverage.
+func (r Report) validateGeneratedAtAndCoverage() error {
 	if r.GeneratedAt.IsZero() || !validCoverage(r.Coverage) {
 		return errors.New("invalid report generation time or coverage")
 	}
+	return nil
+}
+
+// validateCapabilityCount checks the advertised capability count.
+func (r Report) validateCapabilityCount() error {
 	if len(r.Capabilities) > maxCapabilities {
 		return errors.New("too many advertised capabilities")
 	}
+	return nil
+}
+
+// validateCapabilities checks required advertised states.
+func (r Report) validateCapabilities() error {
+	for _, name := range capabilityNames {
+		if r.Capabilities[name] != "enabled" && r.Capabilities[name] != "disabled" {
+			return errors.New("missing or invalid advertised capability")
+		}
+	}
+	if r.Coverage == "complete" && r.Capabilities["catalog_read"] != "enabled" {
+		return errors.New("complete report requires catalog capability")
+	}
+	return nil
+}
+
+// validatePathServices checks path service count, validity, and uniqueness.
+func (r Report) validatePathServices() error {
 	if len(r.PathServices) > 32 {
 		return errors.New("too many advertised path services")
 	}
@@ -183,68 +254,97 @@ func (r Report) validate(authenticatedNodeID string) error {
 		}
 		pathServices[service] = true
 	}
-	for _, name := range capabilityNames {
-		if r.Capabilities[name] != "enabled" && r.Capabilities[name] != "disabled" {
-			return errors.New("missing or invalid advertised capability")
-		}
-	}
-	if r.Coverage == "complete" && r.Capabilities["catalog_read"] != "enabled" {
-		return errors.New("complete report requires catalog capability")
-	}
+	return nil
+}
+
+// validateObservations checks observation identities, aliases, and evidence.
+func (r Report) validateObservations() error {
 	if r.Observations == nil || len(r.Observations) > MaxObservations {
 		return errors.New("invalid number of observations")
 	}
 	seen := make(map[ModelIdentity]struct{}, len(r.Observations))
 	for _, observation := range r.Observations {
-		id := observation.Identity
-		if id.OwnerNodeID != r.Source.NodeID || id.BackendID == "" || id.LocalID == "" ||
-			!(provenance.ModelIdentity{BackendID: id.BackendID, LocalID: id.LocalID, PublicID: id.LocalID}).Valid() {
-			return errors.New("invalid or non-local model identity")
+		if err := r.validateObservationIdentity(observation); err != nil {
+			return err
 		}
-		if _, exists := seen[id]; exists {
+		if _, exists := seen[observation.Identity]; exists {
 			return errors.New("ambiguous duplicate model identity")
 		}
-		seen[id] = struct{}{}
-		if len(observation.Aliases) > MaxModelAliases {
-			return errors.New("too many model aliases")
+		seen[observation.Identity] = struct{}{}
+		if err := r.validateAliases(observation.Aliases); err != nil {
+			return err
 		}
-		seenAliases := make(map[string]struct{}, len(observation.Aliases))
-		for _, alias := range observation.Aliases {
-			if alias == "" || !identity.ValidModelComponent(alias) {
-				return errors.New("invalid model alias")
-			}
-			if _, exists := seenAliases[alias]; exists {
-				return errors.New("duplicate model alias")
-			}
-			seenAliases[alias] = struct{}{}
-		}
-		if !validState(observation.State) || !validCoverage(observation.Coverage) ||
-			!validFreshness(observation.Freshness) ||
-			(observation.ObservedAt != nil && observation.ObservedAt.IsZero()) ||
-			(observation.ExpiresAt != nil && (observation.ExpiresAt.IsZero() || observation.ObservedAt == nil || !observation.ExpiresAt.After(*observation.ObservedAt))) ||
-			(observation.ObservedAt == nil && observation.Freshness != "unknown") ||
-			((observation.State == "supported" || observation.State == "partial") && observation.ObservedAt == nil) {
-			return errors.New("invalid observation evidence")
+		if err := r.validateObservationEvidence(observation); err != nil {
+			return err
 		}
 		if r.Coverage == "complete" && (observation.Coverage != "complete" || observation.State != "supported") {
 			return errors.New("complete report contains incomplete coverage")
 		}
 	}
-	if r.BackendReadiness != nil {
-		if r.Capabilities["diagnostics_read"] != "enabled" || len(*r.BackendReadiness) > maxLocalBackends {
-			return errors.New("invalid backend readiness scope")
+	return nil
+}
+
+// validateObservationIdentity checks that an observation refers to a local
+// model owned by the reporting node.
+func (r Report) validateObservationIdentity(observation Observation) error {
+	id := observation.Identity
+	if id.OwnerNodeID != r.Source.NodeID || id.BackendID == "" || id.LocalID == "" ||
+		!(provenance.ModelIdentity{BackendID: id.BackendID, LocalID: id.LocalID, PublicID: id.LocalID}).Valid() {
+		return errors.New("invalid or non-local model identity")
+	}
+	return nil
+}
+
+// validateAliases checks observation alias count, validity, and uniqueness.
+func (r Report) validateAliases(aliases []string) error {
+	if len(aliases) > MaxModelAliases {
+		return errors.New("too many model aliases")
+	}
+	seenAliases := make(map[string]struct{}, len(aliases))
+	for _, alias := range aliases {
+		if alias == "" || !identity.ValidModelComponent(alias) {
+			return errors.New("invalid model alias")
 		}
-		seenBackends := make(map[string]bool, len(*r.BackendReadiness))
-		for _, readiness := range *r.BackendReadiness {
-			if readiness.BackendID == "" || !identity.ValidModelComponent(readiness.BackendID) || seenBackends[readiness.BackendID] ||
-				(readiness.Status != "ready" && readiness.Status != "unavailable" && readiness.Status != "unknown") ||
-				!validFreshness(readiness.Freshness) ||
-				(readiness.ObservedAt == nil && (readiness.Status != "unknown" || readiness.Freshness != "unknown")) ||
-				(readiness.ObservedAt != nil && (readiness.ObservedAt.IsZero() || readiness.Status == "unknown")) {
-				return errors.New("invalid backend readiness evidence")
-			}
-			seenBackends[readiness.BackendID] = true
+		if _, exists := seenAliases[alias]; exists {
+			return errors.New("duplicate model alias")
 		}
+		seenAliases[alias] = struct{}{}
+	}
+	return nil
+}
+
+// validateObservationEvidence checks an observation's state, coverage,
+// freshness, and timing invariants.
+func (r Report) validateObservationEvidence(observation Observation) error {
+	if !validState(observation.State) || !validCoverage(observation.Coverage) ||
+		!validFreshness(observation.Freshness) ||
+		(observation.ObservedAt != nil && observation.ObservedAt.IsZero()) ||
+		(observation.ExpiresAt != nil && (observation.ExpiresAt.IsZero() || observation.ObservedAt == nil || !observation.ExpiresAt.After(*observation.ObservedAt))) ||
+		(observation.ObservedAt == nil && observation.Freshness != "unknown") ||
+		((observation.State == "supported" || observation.State == "partial") && observation.ObservedAt == nil) {
+		return errors.New("invalid observation evidence")
+	}
+	return nil
+}
+
+// validateBackendReadiness checks backend readiness evidence when present.
+func (r Report) validateBackendReadiness() error {
+	if r.BackendReadiness == nil {
+		return nil
+	}
+	if r.Capabilities["diagnostics_read"] != "enabled" || len(*r.BackendReadiness) > maxLocalBackends {
+		return errors.New("invalid backend readiness scope")
+	}
+	seenBackends := make(map[string]bool, len(*r.BackendReadiness))
+	for _, readiness := range *r.BackendReadiness {
+		if readiness.BackendID == "" || !identity.ValidModelComponent(readiness.BackendID) || seenBackends[readiness.BackendID] ||
+			(readiness.Status != "ready" && readiness.Status != "unavailable" && readiness.Status != "unknown") ||
+			!validFreshness(readiness.Freshness) ||
+			(readiness.ObservedAt == nil && (readiness.Status != "unknown" || readiness.Freshness != "unknown")) ||
+			(readiness.ObservedAt != nil && (readiness.ObservedAt.IsZero() || readiness.Status == "unknown")) {
+			return errors.New("invalid backend readiness evidence")
+		}
+		seenBackends[readiness.BackendID] = true
 	}
 	return nil
 }

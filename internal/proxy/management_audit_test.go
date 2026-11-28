@@ -67,90 +67,170 @@ func newAdminAuthWithSession(t *testing.T, subject string, roles []string) *admi
 	return auth
 }
 
+type auditEventInput struct {
+	token  string
+	query  url.Values
+	cookie *http.Cookie
+	config *config.ManagementConfig
+	peer   *config.PeerConfig
+	auth   *adminAuth
+}
+
+// newAuditEvent centralizes the repeated reloader/state/request setup used by
+// the management audit event tests.
+func newAuditEvent(t *testing.T, input auditEventInput) auditlog.Event {
+	t.Helper()
+	r := newAuditTestReloader(t, input.auth)
+	state := newAuditTestState(input.config, input.peer)
+	req := newAuditRequest(t, input.token, input.query, input.cookie)
+	return r.managementAuditEvent(req, state)
+}
+
+type principalExpectation struct {
+	principalType string
+	userIdentity  string
+	issuer        string
+	subject       string
+	role          string
+	emptyOIDC     bool
+}
+
+func assertPrincipalEvent(t *testing.T, event auditlog.Event, want principalExpectation) {
+	t.Helper()
+	if event.PrincipalType != want.principalType {
+		t.Fatalf("principal type = %q, want %q", event.PrincipalType, want.principalType)
+	}
+	if event.UserIdentityState != want.userIdentity {
+		t.Fatalf("user identity state = %q, want %q", event.UserIdentityState, want.userIdentity)
+	}
+	if want.emptyOIDC && (event.VerifiedUserSubject != "" || event.IdentityIssuer != "" || event.Role != "") {
+		t.Fatalf("unexpected oidc fields set for %q: %+v", want.principalType, event)
+	}
+	assertOIDCPrincipalEvent(t, event, want)
+}
+
+func assertOIDCPrincipalEvent(t *testing.T, event auditlog.Event, want principalExpectation) {
+	t.Helper()
+	if want.principalType != "oidc" {
+		return
+	}
+	if event.IdentityIssuer != want.issuer {
+		t.Fatalf("identity issuer = %q, want %q", event.IdentityIssuer, want.issuer)
+	}
+	if event.VerifiedUserSubject != want.subject {
+		t.Fatalf("verified user subject = %q, want %q", event.VerifiedUserSubject, want.subject)
+	}
+	if event.Role != want.role {
+		t.Fatalf("role = %q, want %q", event.Role, want.role)
+	}
+}
+
 func TestManagementAuditEventPrincipalClassification(t *testing.T) {
 	delegationToken := strings.Repeat("d", 32)
 	previewToken := strings.Repeat("p", 32)
 
-	t.Run("delegation token wins over machine token", func(t *testing.T) {
-		r := newAuditTestReloader(t, nil)
-		state := newAuditTestState(&config.ManagementConfig{
-			DelegationToken: delegationToken,
-			PreviewToken:    previewToken,
-		}, nil)
-		req := newAuditRequest(t, delegationToken, nil, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.PrincipalType != "delegation_token" {
-			t.Fatalf("principal type = %q, want delegation_token", event.PrincipalType)
-		}
-		if event.UserIdentityState != "unknown" {
-			t.Fatalf("user identity state = %q, want unknown", event.UserIdentityState)
-		}
-		if event.VerifiedUserSubject != "" || event.IdentityIssuer != "" || event.Role != "" {
-			t.Fatalf("unexpected oidc fields set for delegation token: %+v", event)
-		}
-	})
+	tests := []struct {
+		name        string
+		config      *config.ManagementConfig
+		token       string
+		cookie      *http.Cookie
+		oidcSubject string
+		oidcRoles   []string
+		want        principalExpectation
+	}{
+		{
+			name: "delegation token wins over machine token",
+			config: &config.ManagementConfig{
+				DelegationToken: delegationToken,
+				PreviewToken:    previewToken,
+			},
+			token: delegationToken,
+			want:  principalExpectation{principalType: "delegation_token", userIdentity: "unknown", emptyOIDC: true},
+		},
+		{
+			name: "machine token when no delegation token",
+			config: &config.ManagementConfig{
+				PreviewToken: previewToken,
+			},
+			token: previewToken,
+			want:  principalExpectation{principalType: "machine_token", userIdentity: "unknown"},
+		},
+		{
+			name:   "unknown when no credentials",
+			config: &config.ManagementConfig{},
+			want:   principalExpectation{principalType: "unknown", userIdentity: "unknown", emptyOIDC: true},
+		},
+		{
+			name:        "oidc verified_local when configure_models role",
+			config:      &config.ManagementConfig{},
+			oidcSubject: "operator",
+			oidcRoles:   []string{"configure_models"},
+			cookie:      &http.Cookie{Name: adminSessionCookie, Value: "session-operator"},
+			want: principalExpectation{
+				principalType: "oidc",
+				userIdentity:  "verified_local",
+				issuer:        "https://issuer.example",
+				subject:       "operator",
+				role:          "configure_models",
+			},
+		},
+		{
+			name:        "oidc not set when session lacks configure_models role",
+			config:      &config.ManagementConfig{},
+			oidcSubject: "viewer",
+			oidcRoles:   []string{"view"},
+			cookie:      &http.Cookie{Name: adminSessionCookie, Value: "session-viewer"},
+			want:        principalExpectation{principalType: "unknown", userIdentity: "unknown", emptyOIDC: true},
+		},
+	}
 
-	t.Run("machine token when no delegation token", func(t *testing.T) {
-		r := newAuditTestReloader(t, nil)
-		state := newAuditTestState(&config.ManagementConfig{
-			PreviewToken: previewToken,
-		}, nil)
-		req := newAuditRequest(t, previewToken, nil, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.PrincipalType != "machine_token" {
-			t.Fatalf("principal type = %q, want machine_token", event.PrincipalType)
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var auth *adminAuth
+			if tc.oidcSubject != "" {
+				auth = newAdminAuthWithSession(t, tc.oidcSubject, tc.oidcRoles)
+			}
+			event := newAuditEvent(t, auditEventInput{
+				token: tc.token, cookie: tc.cookie, config: tc.config, auth: auth,
+			})
 
-	t.Run("unknown when no credentials", func(t *testing.T) {
-		r := newAuditTestReloader(t, nil)
-		state := newAuditTestState(&config.ManagementConfig{}, nil)
-		req := newAuditRequest(t, "", nil, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.PrincipalType != "unknown" {
-			t.Fatalf("principal type = %q, want unknown", event.PrincipalType)
-		}
-		if event.UserIdentityState != "unknown" {
-			t.Fatalf("user identity state = %q, want unknown", event.UserIdentityState)
-		}
-	})
+			assertPrincipalEvent(t, event, tc.want)
+		})
+	}
+}
 
-	t.Run("oidc verified_local when configure_models role", func(t *testing.T) {
-		auth := newAdminAuthWithSession(t, "operator", []string{"configure_models"})
-		r := newAuditTestReloader(t, auth)
-		state := newAuditTestState(&config.ManagementConfig{}, nil)
-		req := newAuditRequest(t, "", nil, &http.Cookie{Name: adminSessionCookie, Value: "session-operator"})
-		event := r.managementAuditEvent(req, state)
-		if event.PrincipalType != "oidc" {
-			t.Fatalf("principal type = %q, want oidc", event.PrincipalType)
-		}
-		if event.UserIdentityState != "verified_local" {
-			t.Fatalf("user identity state = %q, want verified_local", event.UserIdentityState)
-		}
-		if event.IdentityIssuer != "https://issuer.example" {
-			t.Fatalf("identity issuer = %q, want https://issuer.example", event.IdentityIssuer)
-		}
-		if event.VerifiedUserSubject != "operator" {
-			t.Fatalf("verified user subject = %q, want operator", event.VerifiedUserSubject)
-		}
-		if event.Role != "configure_models" {
-			t.Fatalf("role = %q, want configure_models", event.Role)
-		}
-	})
+type queryIDExpectation struct {
+	targetID      string
+	modelID       string
+	correlationID string
+}
 
-	t.Run("oidc not set when session lacks configure_models role", func(t *testing.T) {
-		auth := newAdminAuthWithSession(t, "viewer", []string{"view"})
-		r := newAuditTestReloader(t, auth)
-		state := newAuditTestState(&config.ManagementConfig{}, nil)
-		req := newAuditRequest(t, "", nil, &http.Cookie{Name: adminSessionCookie, Value: "session-viewer"})
-		event := r.managementAuditEvent(req, state)
-		if event.PrincipalType != "unknown" {
-			t.Fatalf("principal type = %q, want unknown", event.PrincipalType)
+type auditTransactionExpectation struct {
+	tx      *auditlog.Transaction
+	err     error
+	wantErr bool
+}
+
+func assertAuditTransaction(t *testing.T, result auditTransactionExpectation) {
+	t.Helper()
+	if result.wantErr && (result.tx != nil || result.err == nil) {
+		t.Fatalf("expected (nil, error), got tx=%v err=%v", result.tx, result.err)
+	}
+	if !result.wantErr && (result.tx != nil || result.err != nil) {
+		t.Fatalf("expected (nil, nil), got tx=%v err=%v", result.tx, result.err)
+	}
+}
+
+func assertManagementAuditOutcomes(t *testing.T, cases []struct {
+	status int
+	want   string
+}) {
+	t.Helper()
+	for _, tc := range cases {
+		if got := managementAuditOutcome(tc.status); got != tc.want {
+			t.Errorf("status %d = %q, want %q", tc.status, got, tc.want)
 		}
-		if event.UserIdentityState != "unknown" {
-			t.Fatalf("user identity state = %q, want unknown", event.UserIdentityState)
-		}
-	})
+	}
 }
 
 func TestManagementAuditEventQueryIDs(t *testing.T) {
@@ -158,63 +238,74 @@ func TestManagementAuditEventQueryIDs(t *testing.T) {
 	state := newAuditTestState(&config.ManagementConfig{}, nil)
 	operationID := strings.Repeat("a", 32)
 
-	t.Run("single valued target/model/operation extracted", func(t *testing.T) {
-		query := url.Values{
-			"target_id":    []string{"node-a"},
-			"model_id":     []string{"model-a"},
-			"operation_id": []string{operationID},
-		}
-		req := newAuditRequest(t, "", query, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.TargetID != "node-a" {
-			t.Fatalf("target ID = %q, want node-a", event.TargetID)
-		}
-		if event.ModelID != "model-a" {
-			t.Fatalf("model ID = %q, want model-a", event.ModelID)
-		}
-		if event.CorrelationID != operationID {
-			t.Fatalf("correlation ID = %q, want %s", event.CorrelationID, operationID)
-		}
-	})
+	if !identity.ValidNodeID("node-a") {
+		t.Fatal("test fixture node-a should be valid")
+	}
 
-	t.Run("multi valued query ids ignored", func(t *testing.T) {
-		query := url.Values{"target_id": []string{"node-a", "node-b"}}
-		req := newAuditRequest(t, "", query, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.TargetID != "" {
-			t.Fatalf("target ID = %q, want empty (multi-valued)", event.TargetID)
-		}
-	})
+	tests := []struct {
+		name  string
+		query url.Values
+		want  queryIDExpectation
+	}{
+		{
+			name: "single valued target/model/operation extracted",
+			query: url.Values{
+				"target_id":    []string{"node-a"},
+				"model_id":     []string{"model-a"},
+				"operation_id": []string{operationID},
+			},
+			want: queryIDExpectation{
+				targetID:      "node-a",
+				modelID:       "model-a",
+				correlationID: operationID,
+			},
+		},
+		{
+			name:  "multi valued query ids ignored",
+			query: url.Values{"target_id": []string{"node-a", "node-b"}},
+			want: queryIDExpectation{
+				targetID: "",
+			},
+		},
+		{
+			name:  "invalid node id ignored",
+			query: url.Values{"target_id": []string{"invalid id!"}},
+			want: queryIDExpectation{
+				targetID: "",
+			},
+		},
+		{
+			name:  "model id over max bytes ignored",
+			query: url.Values{"model_id": []string{strings.Repeat("x", identity.MaxModelComponentBytes+1)}},
+			want: queryIDExpectation{
+				modelID: "",
+			},
+		},
+		{
+			name:  "invalid operation id ignored",
+			query: url.Values{"operation_id": []string{"not-hex"}},
+			want: queryIDExpectation{
+				correlationID: "",
+			},
+		},
+	}
 
-	t.Run("invalid node id ignored", func(t *testing.T) {
-		query := url.Values{"target_id": []string{"invalid id!"}}
-		req := newAuditRequest(t, "", query, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.TargetID != "" {
-			t.Fatalf("target ID = %q, want empty (invalid)", event.TargetID)
-		}
-		if !identity.ValidNodeID("node-a") {
-			t.Fatal("test fixture node-a should be valid")
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := newAuditRequest(t, "", tc.query, nil)
+			event := r.managementAuditEvent(req, state)
 
-	t.Run("model id over max bytes ignored", func(t *testing.T) {
-		query := url.Values{"model_id": []string{strings.Repeat("x", identity.MaxModelComponentBytes+1)}}
-		req := newAuditRequest(t, "", query, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.ModelID != "" {
-			t.Fatalf("model ID = %q, want empty (too long)", event.ModelID)
-		}
-	})
-
-	t.Run("invalid operation id ignored", func(t *testing.T) {
-		query := url.Values{"operation_id": []string{"not-hex"}}
-		req := newAuditRequest(t, "", query, nil)
-		event := r.managementAuditEvent(req, state)
-		if event.CorrelationID != "" {
-			t.Fatalf("correlation ID = %q, want empty (invalid)", event.CorrelationID)
-		}
-	})
+			if event.TargetID != tc.want.targetID {
+				t.Fatalf("target ID = %q, want %q", event.TargetID, tc.want.targetID)
+			}
+			if event.ModelID != tc.want.modelID {
+				t.Fatalf("model ID = %q, want %q", event.ModelID, tc.want.modelID)
+			}
+			if event.CorrelationID != tc.want.correlationID {
+				t.Fatalf("correlation ID = %q, want %q", event.CorrelationID, tc.want.correlationID)
+			}
+		})
+	}
 }
 
 func TestManagementAuditEventNilHandlingAndDefaults(t *testing.T) {
@@ -256,37 +347,39 @@ func TestManagementAuditEventNilHandlingAndDefaults(t *testing.T) {
 func TestManagementAuditAuditedHelpers(t *testing.T) {
 	r := newAuditTestReloader(t, nil)
 
-	t.Run("beginManagementAudit nil state", func(t *testing.T) {
-		tx, err := r.beginManagementAudit(nil, nil)
-		if tx != nil || err != nil {
-			t.Fatalf("expected (nil, nil), got tx=%v err=%v", tx, err)
-		}
-	})
+	tests := []struct {
+		name    string
+		state   *reloaderState
+		wantErr bool
+	}{
+		{
+			name:    "nil state",
+			state:   nil,
+			wantErr: false,
+		},
+		{
+			name:    "fail closed peer federation no store",
+			state:   &reloaderState{peer: &config.PeerConfig{NodeID: "peer-node", FederationID: "fed"}},
+			wantErr: true,
+		},
+		{
+			name:    "no store no federation continues",
+			state:   &reloaderState{peer: &config.PeerConfig{NodeID: "peer-node"}},
+			wantErr: false,
+		},
+		{
+			name:    "store begin error fails closed",
+			state:   &reloaderState{auditStore: &auditlog.Store{}},
+			wantErr: true,
+		},
+	}
 
-	t.Run("beginManagementAudit fail closed peer federation no store", func(t *testing.T) {
-		state := &reloaderState{peer: &config.PeerConfig{NodeID: "peer-node", FederationID: "fed"}}
-		tx, err := r.beginManagementAudit(nil, state)
-		if tx != nil || err == nil {
-			t.Fatalf("expected (nil, error), got tx=%v err=%v", tx, err)
-		}
-	})
-
-	t.Run("beginManagementAudit no store no federation continues", func(t *testing.T) {
-		state := &reloaderState{peer: &config.PeerConfig{NodeID: "peer-node"}}
-		tx, err := r.beginManagementAudit(nil, state)
-		if tx != nil || err != nil {
-			t.Fatalf("expected (nil, nil), got tx=%v err=%v", tx, err)
-		}
-	})
-
-	t.Run("beginManagementAudit store begin error fails closed", func(t *testing.T) {
-		// A zero store fails validation in Begin, so Begin returns an error.
-		state := &reloaderState{auditStore: &auditlog.Store{}}
-		tx, err := r.beginManagementAudit(nil, state)
-		if tx != nil || err == nil {
-			t.Fatalf("expected (nil, error), got tx=%v err=%v", tx, err)
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := r.beginManagementAudit(nil, tc.state)
+			assertAuditTransaction(t, auditTransactionExpectation{tx: tx, err: err, wantErr: tc.wantErr})
+		})
+	}
 
 	t.Run("managementAuditOutcome mapping", func(t *testing.T) {
 		cases := []struct {
@@ -303,11 +396,7 @@ func TestManagementAuditAuditedHelpers(t *testing.T) {
 			{500, "unknown"},
 			{599, "unknown"},
 		}
-		for _, c := range cases {
-			if got := managementAuditOutcome(c.status); got != c.want {
-				t.Fatalf("status %d = %q, want %q", c.status, got, c.want)
-			}
-		}
+		assertManagementAuditOutcomes(t, cases)
 	})
 
 	t.Run("finishManagementAudit nil tx no-op", func(t *testing.T) {

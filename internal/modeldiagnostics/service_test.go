@@ -228,6 +228,33 @@ func assertDraftRateUnknown(t *testing.T, act *ActivityMeasurement) {
 	}
 }
 
+// snapshotWithSourcesOneActivity assembles the standard single-activity
+// (act-1, http_success, no metrics) sources, invokes SnapshotWithSources, and
+// returns the validated snapshot. It fails the test on error or unexpected
+// count. localID selects the model and activity identity. countFormat formats
+// the unexpected-count failure message.
+func snapshotWithSourcesOneActivity(t *testing.T, backendModels []BackendModel, sources SnapshotSources, localID string, countFormat string) []*ModelSnapshot {
+	t.Helper()
+	_, _ = correlation.ModelReference("default", localID)
+	identities := []correlation.ActivityModelIdentity{
+		identityFor("default", localID, epoch1, "act-1"),
+	}
+	activities := []*correlation.ActivityRecord{
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+	}
+	sources.Activities = activities
+	sources.Identities = identities
+
+	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 1 {
+		t.Fatalf(countFormat, len(result))
+	}
+	return result
+}
+
 func TestSnapshotWithSourcesBasicAttribution(t *testing.T) {
 	backendModels, _, sources := basicSources()
 	localID := "local-model"
@@ -714,25 +741,7 @@ func TestSnapshotWithSourcesNoRawMetadataOutput(t *testing.T) {
 			"default": backendState("collected", "complete", false, fixtureTime),
 		},
 	}
-	localID := "model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
-
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	m := result[0]
+	m := snapshotWithSourcesOneActivity(t, backendModels, sources, "model", "expected 1 snapshot, got %d")[0]
 	// Catalog projection must not contain raw metadata keys.
 	_ = m
 	// Verify via JSON that no raw secrets/meta/command/aliases appear.
@@ -762,25 +771,8 @@ func TestSnapshotWithSourcesMalformedContextUnknown(t *testing.T) {
 			"default": backendState("collected", "complete", false, fixtureTime),
 		},
 	}
-	localID := "model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
-
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	if result[0].Catalog == nil || result[0].Catalog.ContextLength != nil {
+	m := snapshotWithSourcesOneActivity(t, backendModels, sources, "model", "expected 1 snapshot, got %d")[0]
+	if m.Catalog == nil || m.Catalog.ContextLength != nil {
 		t.Fatal("fractional context_length should be unknown (nil)")
 	}
 }
@@ -797,41 +789,14 @@ func TestSnapshotWithSourcesContextNegativeUnknown(t *testing.T) {
 			"default": backendState("collected", "complete", false, fixtureTime),
 		},
 	}
-	localID := "model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
-
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	if result[0].Catalog == nil || result[0].Catalog.ContextLength != nil {
+	m := snapshotWithSourcesOneActivity(t, backendModels, sources, "model", "expected 1 snapshot, got %d")[0]
+	if m.Catalog == nil || m.Catalog.ContextLength != nil {
 		t.Fatal("negative context_length should be unknown (nil)")
 	}
 }
 
 func TestSnapshotWithSourcesGPUSharedUnknownOwnership(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// GPU sample for a device within the association window, but adjacency is
 	// not proof of ownership.
@@ -847,14 +812,7 @@ func TestSnapshotWithSourcesGPUSharedUnknownOwnership(t *testing.T) {
 		deviceAssoc("default", epoch1, "act-1", "gpu-abc", ws, we),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	gw := result[0].GPUWindow
+	gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow
 	if gw == nil {
 		t.Fatal("GPU window should be present")
 	}
@@ -874,16 +832,6 @@ func TestSnapshotWithSourcesGPUSharedUnknownOwnership(t *testing.T) {
 
 func TestSnapshotWithSourcesGPUNoTimestampOnlyJoin(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// GPU sample outside the association window -> no match.
 	ws := fixtureTime.Add(-time.Second)
@@ -898,30 +846,14 @@ func TestSnapshotWithSourcesGPUNoTimestampOnlyJoin(t *testing.T) {
 		deviceAssoc("default", epoch1, "act-1", "gpu-abc", ws, we),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	if result[0].GPUWindow == nil || result[0].GPUWindow.SampleCount != 0 || result[0].GPUWindow.State != MeasurementUnknown || result[0].GPUWindow.GpuUtilKnownSamples != 0 {
-		t.Fatalf("missing matched sample should be an explicit unknown, not a fabricated reading: %#v", result[0].GPUWindow)
+	gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow
+	if gw == nil || gw.SampleCount != 0 || gw.State != MeasurementUnknown || gw.GpuUtilKnownSamples != 0 {
+		t.Fatalf("missing matched sample should be an explicit unknown, not a fabricated reading: %#v", gw)
 	}
 }
 
 func TestSnapshotWithSourcesGPUAssociationUnavailable(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// Association kind unavailable -> no GPU measurements.
 	sources.DeviceAssociations = []correlation.ActivityDeviceAssociation{
@@ -937,14 +869,7 @@ func TestSnapshotWithSourcesGPUAssociationUnavailable(t *testing.T) {
 		},
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	if result[0].GPUWindow != nil {
+	if gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow; gw != nil {
 		t.Fatal("GPU window should be nil when association kind is unavailable")
 	}
 }
@@ -953,14 +878,6 @@ func TestSnapshotWithSourcesLifecycleCurrentSnapshot(t *testing.T) {
 	backendModels, _, sources := basicSources()
 	localID := "local-model"
 	expectedRef, _ := correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// Current lifecycle model matches the canonical ref.
 	sources.LifecycleReport = &correlation.LifecycleReport{
@@ -968,14 +885,7 @@ func TestSnapshotWithSourcesLifecycleCurrentSnapshot(t *testing.T) {
 			lifecycleModel("default", epoch1, expectedRef, "ready", fixtureTime),
 		},
 	}
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	lc := result[0].Lifecycle
+	lc := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].Lifecycle
 	if lc == nil {
 		t.Fatal("lifecycle should be present")
 	}
@@ -1016,16 +926,6 @@ func TestSnapshotCurrentCatalogStatusIsTimedSnapshotNotHistory(t *testing.T) {
 
 func TestSnapshotWithSourcesLifecycleAbsentNotUnloaded(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// Lifecycle report has a different (valid) model ref (absent for our model).
 	otherRef, _ := correlation.ModelReference("default", "other-model")
@@ -1038,11 +938,7 @@ func TestSnapshotWithSourcesLifecycleAbsentNotUnloaded(t *testing.T) {
 		lifecycleAssoc("default", epoch1, "act-1", "approximate_lifecycle_window", 1),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lc := result[0].Lifecycle
+	lc := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].Lifecycle
 	if lc.CurrentState != "unknown" {
 		t.Fatalf("current_state = %s, want unknown (absent)", lc.CurrentState)
 	}
@@ -1323,26 +1219,10 @@ func TestSnapshotWithSourcesHugeIdentifierSkippedBeforePublicID(t *testing.T) {
 			"default": backendState("collected", "complete", false, fixtureTime),
 		},
 	}
-	localID := "valid-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot (huge id skipped), got %d", len(result))
-	}
-	if result[0].Identity.PublicID != "valid-model" {
-		t.Fatalf("public id = %q, want valid-model", result[0].Identity.PublicID)
+	m := snapshotWithSourcesOneActivity(t, backendModels, sources, "valid-model", "expected 1 snapshot (huge id skipped), got %d")[0]
+	if m.Identity.PublicID != "valid-model" {
+		t.Fatalf("public id = %q, want valid-model", m.Identity.PublicID)
 	}
 }
 
@@ -1546,16 +1426,6 @@ func TestSnapshotWithSourcesGPUOverlappingSampleDedup(t *testing.T) {
 
 func TestSnapshotWithSourcesGPUExplicitZeroPreserved(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	ws := fixtureTime.Add(-time.Second)
 	we := fixtureTime.Add(time.Second)
@@ -1570,14 +1440,7 @@ func TestSnapshotWithSourcesGPUExplicitZeroPreserved(t *testing.T) {
 		deviceAssoc("default", epoch1, "act-1", "gpu-abc", ws, we),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	gw := result[0].GPUWindow
+	gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow
 	if gw == nil {
 		t.Fatal("GPU window should be present")
 	}
@@ -1597,16 +1460,6 @@ func TestSnapshotWithSourcesGPUExplicitZeroPreserved(t *testing.T) {
 
 func TestSnapshotWithSourcesGPUBackendStateEpochIsolation(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	ws := fixtureTime.Add(-time.Second)
 	we := fixtureTime.Add(time.Second)
@@ -1627,14 +1480,7 @@ func TestSnapshotWithSourcesGPUBackendStateEpochIsolation(t *testing.T) {
 		deviceAssoc("default", epoch1, "act-1", "gpu-abc", ws, we),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	gw := result[0].GPUWindow
+	gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow
 	if gw == nil {
 		t.Fatal("GPU window should be present")
 	}
@@ -1658,16 +1504,6 @@ func TestSnapshotWithSourcesGPUBackendStateEpochIsolation(t *testing.T) {
 
 func TestSnapshotWithSourcesGPUMissingSamplesUnknown(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	// Enabled+complete report but no matching sample -> unknown, explicit zero
 	// counts (not fabricated values).
@@ -1685,14 +1521,7 @@ func TestSnapshotWithSourcesGPUMissingSamplesUnknown(t *testing.T) {
 		deviceAssoc("default", epoch1, "act-1", "gpu-abc", ws, we),
 	}
 
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	gw := result[0].GPUWindow
+	gw := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")[0].GPUWindow
 	if gw == nil {
 		t.Fatal("GPU window should be present")
 	}
@@ -1709,16 +1538,6 @@ func TestSnapshotWithSourcesGPUMissingSamplesUnknown(t *testing.T) {
 
 func TestSnapshotWithSourcesGPUBackendStateDrivesState(t *testing.T) {
 	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	_, _ = correlation.ModelReference("default", localID)
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
 
 	ws := fixtureTime.Add(-time.Second)
 	we := fixtureTime.Add(time.Second)
@@ -1735,14 +1554,14 @@ func TestSnapshotWithSourcesGPUBackendStateDrivesState(t *testing.T) {
 
 	// unavailable -> unavailable
 	sources.GPUReport = newReport(correlation.GPUBackendState{State: "unavailable", Coverage: "complete"})
-	result, _ := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
+	result := snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")
 	if result[0].GPUWindow.State != MeasurementUnavailable {
 		t.Fatalf("unavailable -> %s, want unavailable", result[0].GPUWindow.State)
 	}
 
 	// partial coverage -> partial
 	sources.GPUReport = newReport(correlation.GPUBackendState{State: "enabled", Coverage: "partial"})
-	result, _ = New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
+	result = snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")
 	if result[0].GPUWindow.State != MeasurementPartial {
 		t.Fatalf("partial -> %s, want partial", result[0].GPUWindow.State)
 	}
@@ -1750,7 +1569,7 @@ func TestSnapshotWithSourcesGPUBackendStateDrivesState(t *testing.T) {
 	// global truncation -> partial (conservative)
 	sources.GPUReport = newReport(correlation.GPUBackendState{State: "enabled", Coverage: "complete"})
 	sources.GPUReport.Truncated = true
-	result, _ = New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
+	result = snapshotWithSourcesOneActivity(t, backendModels, sources, "local-model", "expected 1 snapshot, got %d")
 	if result[0].GPUWindow.State != MeasurementPartial {
 		t.Fatalf("truncated -> %s, want partial", result[0].GPUWindow.State)
 	}

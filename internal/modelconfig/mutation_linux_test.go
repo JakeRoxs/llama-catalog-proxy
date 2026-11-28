@@ -36,25 +36,39 @@ func mutationFixture(t *testing.T) (string, string, []byte, Proposal) {
 func TestReviewedMutationAndReversibleRollback(t *testing.T) {
 	targetDir, backupDir, source, proposal := mutationFixture(t)
 	path := filepath.Join(targetDir, "config.yaml")
-	applied, current := verifyMutationApplied(t, targetDir, path, source, backupDir, proposal)
-	verifyRollbackAndReverse(t, targetDir, path, source, backupDir, proposal, applied, current)
+	ctx := mutationCheck{t, targetDir, path, source, backupDir, proposal}
+	applied, current := verifyMutationApplied(ctx)
+	verifyRollbackAndReverse(ctx, applied, current)
+}
+
+// mutationCheck groups the target, source, and backup context shared by the
+// mutation verification helpers so verifyRollbackAndReverse does not thread
+// eight separate arguments (Sonar go:S107: too many parameters).
+type mutationCheck struct {
+	t         *testing.T
+	targetDir string
+	path      string
+	source    []byte
+	backupDir string
+	proposal  Proposal
 }
 
 // verifyMutationApplied applies the reviewed proposal and verifies the applied
 // result, the on-disk content, and the backup contents. It returns the applied
 // result and the post-apply content for later reverse-rollback comparisons.
-func verifyMutationApplied(t *testing.T, targetDir, path string, source []byte, backupDir string, proposal Proposal) (MutationResult, []byte) {
+func verifyMutationApplied(ctx mutationCheck) (MutationResult, []byte) {
+	t := ctx.t
 	t.Helper()
-	applied, err := applyReviewedProposal(targetDir, "config.yaml", "local", backupDir, 1, proposal)
+	applied, err := applyReviewedProposal(ctx.targetDir, "config.yaml", "local", ctx.backupDir, 1, ctx.proposal)
 	if err != nil || !applied.Written || !applied.Durable || applied.BackupID == "" {
 		t.Fatalf("apply = %+v, %v", applied, err)
 	}
-	current, err := os.ReadFile(path)
-	if err != nil || bytes.Equal(current, source) || sourceRevision(current) != applied.Revision {
+	current, err := os.ReadFile(ctx.path)
+	if err != nil || bytes.Equal(current, ctx.source) || sourceRevision(current) != applied.Revision {
 		t.Fatalf("apply content: %v", err)
 	}
-	backup, err := loadBackup(backupDir, applied.BackupID)
-	if err != nil || !bytes.Equal(backup.Source, source) {
+	backup, err := loadBackup(ctx.backupDir, applied.BackupID)
+	if err != nil || !bytes.Equal(backup.Source, ctx.source) {
 		t.Fatalf("apply backup: %v", err)
 	}
 	return applied, current
@@ -64,35 +78,36 @@ func verifyMutationApplied(t *testing.T, targetDir, path string, source []byte, 
 // backup retention, the reverse backup, the reverse rollback, and the target
 // permissions. Source bytes, revisions, backup retention, rollback order, and
 // mode checks are preserved verbatim.
-func verifyRollbackAndReverse(t *testing.T, targetDir, path string, source []byte, backupDir string, proposal Proposal, applied MutationResult, current []byte) {
+func verifyRollbackAndReverse(ctx mutationCheck, applied MutationResult, current []byte) {
+	t := ctx.t
 	t.Helper()
-	if _, err := applyReviewedProposal(targetDir, "config.yaml", "local", backupDir, 1, proposal); !errors.Is(err, ErrProposalStale) {
+	if _, err := applyReviewedProposal(ctx.targetDir, "config.yaml", "local", ctx.backupDir, 1, ctx.proposal); !errors.Is(err, ErrProposalStale) {
 		t.Fatalf("replayed proposal: %v", err)
 	}
-	rolledBack, err := rollbackBackup(targetDir, "config.yaml", "local", backupDir, applied.BackupID, 1)
-	if err != nil || !rolledBack.Written || !rolledBack.Durable || rolledBack.Revision != sourceRevision(source) {
+	rolledBack, err := rollbackBackup(ctx.targetDir, "config.yaml", "local", ctx.backupDir, applied.BackupID, 1)
+	if err != nil || !rolledBack.Written || !rolledBack.Durable || rolledBack.Revision != sourceRevision(ctx.source) {
 		t.Fatalf("rollback = %+v, %v", rolledBack, err)
 	}
-	restored, err := os.ReadFile(path)
-	if err != nil || !bytes.Equal(restored, source) {
+	restored, err := os.ReadFile(ctx.path)
+	if err != nil || !bytes.Equal(restored, ctx.source) {
 		t.Fatalf("rollback content: %v", err)
 	}
-	if _, err := loadBackup(backupDir, applied.BackupID); !errors.Is(err, errBackupStore) {
+	if _, err := loadBackup(ctx.backupDir, applied.BackupID); !errors.Is(err, errBackupStore) {
 		t.Fatalf("oldest backup was not rotated: %v", err)
 	}
-	reverse, err := loadBackup(backupDir, rolledBack.BackupID)
+	reverse, err := loadBackup(ctx.backupDir, rolledBack.BackupID)
 	if err != nil || !bytes.Equal(reverse.Source, current) {
 		t.Fatalf("rollback did not back up replaced config: %v", err)
 	}
-	undone, err := rollbackBackup(targetDir, "config.yaml", "local", backupDir, rolledBack.BackupID, 1)
+	undone, err := rollbackBackup(ctx.targetDir, "config.yaml", "local", ctx.backupDir, rolledBack.BackupID, 1)
 	if err != nil || !undone.Written || !undone.Durable {
 		t.Fatalf("reverse rollback = %+v, %v", undone, err)
 	}
-	got, err := os.ReadFile(path)
+	got, err := os.ReadFile(ctx.path)
 	if err != nil || !bytes.Equal(got, current) {
 		t.Fatalf("reverse rollback content: %v", err)
 	}
-	info, err := os.Stat(path)
+	info, err := os.Stat(ctx.path)
 	if err != nil || info.Mode().Perm() != 0o640 {
 		t.Fatalf("target permissions: %v", err)
 	}
@@ -259,7 +274,13 @@ func TestBackupMutationRechecksTargetAfterStaging(t *testing.T) {
 	}
 }
 
-func TestBackupRotationFailureReportsDurableWrite(t *testing.T) {
+// backupMutationFixture builds the shared backup fixture used by
+// TestBackupRotationFailureReportsDurableWrite and runBackupMutationCase: a
+// temp directory with the initial backup stored, plus the proposal and the
+// candidate for the next mutation. Extracting this shared setup removes the
+// duplicated 17-line block reported by the duplicated-lines rule.
+func backupMutationFixture(t *testing.T) (string, Proposal, backupRecord, backupRecord, []byte) {
+	t.Helper()
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -274,8 +295,13 @@ func TestBackupRotationFailureReportsDurableWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	return dir, proposal, old, next, preview.candidate
+}
+
+func TestBackupRotationFailureReportsDurableWrite(t *testing.T) {
+	dir, _, old, next, candidate := backupMutationFixture(t)
 	result, err := commitWithBackup(dir, 1, func(*os.Root) (backupRecord, []byte, error) {
-		return next, preview.candidate, nil
+		return next, candidate, nil
 	}, func([]byte) (bool, error) {
 		oldPath := filepath.Join(dir, backupFilename(old.Info.ID))
 		if err := os.Remove(oldPath); err != nil {
@@ -329,22 +355,9 @@ func TestBackupMutationFailureAndUncertainCommit(t *testing.T) {
 // verbatim.
 func runBackupMutationCase(t *testing.T, tc backupMutationCase) {
 	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	source := []byte("models: {m: {cmd: 'llama-server -c 1024'}}")
-	proposal, old := backupFixture(t, source)
-	_, next := backupFixture(t, source)
-	if err := saveBackup(dir, old, 1); err != nil {
-		t.Fatal(err)
-	}
-	preview, err := PreviewDocument("local", "m", source, proposal.Settings)
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir, _, old, next, candidate := backupMutationFixture(t)
 	result, err := commitWithBackup(dir, 1, func(*os.Root) (backupRecord, []byte, error) {
-		return next, preview.candidate, nil
+		return next, candidate, nil
 	}, func([]byte) (bool, error) {
 		return tc.written, tc.replaceErr
 	})
