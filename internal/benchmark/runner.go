@@ -288,7 +288,7 @@ func runSingleWorkload(runCtx context.Context, client *APIClient, workload synth
 		Category:        workload.Category,
 		Version:         workload.Version,
 		ReasoningEffort: workload.ReasoningEffort,
-		Samples:         make([]SampleResult, 0, config.Repetitions),
+		Samples:         make([]SampleResult, 0, MaxRepetitions),
 	}
 	for iteration := 1; iteration <= config.Repetitions; iteration++ {
 		if runCtx.Err() != nil {

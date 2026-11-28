@@ -298,6 +298,9 @@ func decodeBenchmarkJobRequest(req *http.Request, client *benchmark.APIClient) (
 	if options.MaxOutput < 1 || options.Repetitions < 1 || options.TokenBudget < 1 {
 		return benchmark.RunOptions{}, errors.New("benchmark limits must be positive")
 	}
+	if options.Repetitions > benchmark.MaxRepetitions {
+		return benchmark.RunOptions{}, errors.New("repetitions exceeds maximum allowed value")
+	}
 	return options, nil
 }
 
