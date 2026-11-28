@@ -263,35 +263,44 @@ func runWorkloads(runCtx context.Context, client *APIClient, config RequestedCon
 		if runCtx.Err() != nil {
 			break
 		}
-		workloadResult := WorkloadResult{
-			Name:            workload.Name,
-			Category:        workload.Category,
-			Version:         workload.Version,
-			ReasoningEffort: workload.ReasoningEffort,
-			Samples:         make([]SampleResult, 0, config.Repetitions),
-		}
-		budgetExhausted := false
-		for iteration := 1; iteration <= config.Repetitions; iteration++ {
-			if runCtx.Err() != nil {
-				break
-			}
-			sample, exhausted := runSample(runCtx, client, workload, config, iteration, record)
-			workloadResult.Samples = append(workloadResult.Samples, sample)
+		workloadResult, budgetExhausted := runSingleWorkload(runCtx, client, workload, config, record)
+		workloads = append(workloads, workloadResult)
+		for _, sample := range workloadResult.Samples {
 			if sample.Status != SampleCompleted {
 				partial = true
 			}
-			if exhausted {
-				partial = true
-				budgetExhausted = true
-				break
-			}
 		}
-		workloads = append(workloads, workloadResult)
 		if budgetExhausted {
+			partial = true
 			break
 		}
 	}
 	return workloads, partial
+}
+
+// runSingleWorkload executes all repetitions for one workload. It stops at the
+// first context cancellation or budget exhaustion. The returned workload result
+// contains the samples gathered so far; budgetExhausted is true when the sample
+// budget ran out before all repetitions completed.
+func runSingleWorkload(runCtx context.Context, client *APIClient, workload syntheticWorkload, config RequestedConfiguration, record *RunRecord) (WorkloadResult, bool) {
+	workloadResult := WorkloadResult{
+		Name:            workload.Name,
+		Category:        workload.Category,
+		Version:         workload.Version,
+		ReasoningEffort: workload.ReasoningEffort,
+		Samples:         make([]SampleResult, 0, config.Repetitions),
+	}
+	for iteration := 1; iteration <= config.Repetitions; iteration++ {
+		if runCtx.Err() != nil {
+			break
+		}
+		sample, exhausted := runSample(runCtx, client, workload, config, iteration, record)
+		workloadResult.Samples = append(workloadResult.Samples, sample)
+		if exhausted {
+			return workloadResult, true
+		}
+	}
+	return workloadResult, false
 }
 
 // sampleRequestRunner holds the request-scoped state shared by sendRequest and

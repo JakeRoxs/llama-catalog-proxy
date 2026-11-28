@@ -18,28 +18,7 @@ func TestLlamaSwapUIAndControlPassThroughModelRoutesUseLease(t *testing.T) {
 		verifications.Add(1)
 		return confirmedCoordinatorEvidence(), nil
 	})
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backendCalls.Add(1)
-		switch r.URL.Path {
-		case "/":
-			http.Redirect(w, r, "/ui/", http.StatusFound)
-		case "/ui/":
-			_, _ = w.Write([]byte("llama-swap-ui"))
-		case "/ui/assets/app.js":
-			_, _ = w.Write([]byte("app"))
-		case "/api/version":
-			_, _ = w.Write([]byte(`{"version":"test"}`))
-		case "/api/models/unload":
-			w.WriteHeader(http.StatusNoContent)
-		case "/v1/chat/completions":
-			if state := coordinator.snapshot(); state.State != "released" || state.Competing != 1 {
-				t.Errorf("model dispatch forwarded without released lease: %+v", state)
-			}
-			w.WriteHeader(http.StatusNoContent)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	backend := newLlamaSwapUILeaseBackend(t, coordinator, &backendCalls)
 	defer backend.Close()
 	cfg := baseConfig(backend.URL)
 	h := newHandler(t, cfg).(*Handler)
@@ -78,6 +57,32 @@ func TestLlamaSwapUIAndControlPassThroughModelRoutesUseLease(t *testing.T) {
 	if model.Code != http.StatusNoContent || backendCalls.Load() != 7 || verifications.Load() != 1 {
 		t.Fatalf("model request did not hand off through the lease: status=%d backend=%d verify=%d", model.Code, backendCalls.Load(), verifications.Load())
 	}
+}
+
+func newLlamaSwapUILeaseBackend(t *testing.T, coordinator *comfyUICoordinator, calls *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		switch r.URL.Path {
+		case "/":
+			http.Redirect(w, r, "/ui/", http.StatusFound)
+		case "/ui/":
+			_, _ = w.Write([]byte("llama-swap-ui"))
+		case "/ui/assets/app.js":
+			_, _ = w.Write([]byte("app"))
+		case "/api/version":
+			_, _ = w.Write([]byte(`{"version":"test"}`))
+		case "/api/models/unload":
+			w.WriteHeader(http.StatusNoContent)
+		case "/v1/chat/completions":
+			if state := coordinator.snapshot(); state.State != "released" || state.Competing != 1 {
+				t.Errorf("model dispatch forwarded without released lease: %+v", state)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
 }
 
 func TestComfyUIDomainFirstPromptActivation(t *testing.T) {
@@ -137,7 +142,27 @@ func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantSta
 	if _, err := c.reconcile(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	backend := newFirstPromptActivationBackend(t, c, status, &sends)
+	defer backend.Close()
+	cfg := baseConfig(backend.URL)
+	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
+	h := newHandler(t, cfg).(*Handler)
+	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.backendAdmission = admit
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", nil))
+	assertFirstPromptResponse(t, c, w, sends.Load(), wantState, wantStatus)
+	if wantState == "unknown" {
+		assertFailedPromptRecoversBeforeCompetingAdmission(t, c, admit)
+	}
+}
+
+func newFirstPromptActivationBackend(t *testing.T, c *comfyUICoordinator, status int, sends *atomic.Int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		sends.Add(1)
 		state := c.snapshot()
 		if state.State != "acquiring" || state.Submissions != 1 || state.LeaseID == "" {
@@ -151,30 +176,27 @@ func runComfyUIDomainFirstPromptActivationCase(t *testing.T, status int, wantSta
 		}
 		w.WriteHeader(status)
 	}))
-	defer backend.Close()
-	cfg := baseConfig(backend.URL)
-	cfg.PathRoutes = map[string]string{"/comfyui": "default"}
-	h := newHandler(t, cfg).(*Handler)
-	admit, err := newComfyUIDomainAdmission(c, []string{"default"}, "default", time.Second)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func assertFirstPromptResponse(t *testing.T, c *comfyUICoordinator, w *httptest.ResponseRecorder, sends int32, wantState string, wantStatus int) {
+	t.Helper()
+	if state := c.snapshot(); w.Code != wantStatus || sends != 1 || state.State != wantState || state.Submissions != 0 {
+		t.Fatalf("first prompt status=%d sends=%d state=%+v", w.Code, sends, state)
 	}
-	h.backendAdmission = admit
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/comfyui/prompt", nil))
-	if state := c.snapshot(); w.Code != wantStatus || sends.Load() != 1 || state.State != wantState || state.Submissions != 0 {
-		t.Fatalf("first prompt status=%d sends=%d state=%+v", w.Code, sends.Load(), state)
+}
+
+func assertFailedPromptRecoversBeforeCompetingAdmission(
+	t *testing.T, c *comfyUICoordinator, admit func(*http.Request, string) (func(), bool),
+) {
+	t.Helper()
+	done, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default")
+	if !allowed || done == nil {
+		t.Fatal("failed first prompt did not trigger verified release before competing admission")
 	}
-	if wantState == "unknown" {
-		done, allowed := admit(httptest.NewRequest(http.MethodGet, "/props", nil), "default")
-		if !allowed || done == nil {
-			t.Fatal("failed first prompt did not trigger verified release before competing admission")
-		}
-		if state := c.snapshot(); state.State != "released" || state.Competing != 1 {
-			t.Fatalf("competing admission was not backed by confirmed release: %+v", state)
-		}
-		done()
+	if state := c.snapshot(); state.State != "released" || state.Competing != 1 {
+		t.Fatalf("competing admission was not backed by confirmed release: %+v", state)
 	}
+	done()
 }
 
 func TestComfyUIDomainAdmissionBootstrapsWhenComfyUIIsStopped(t *testing.T) {

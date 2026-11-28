@@ -1330,11 +1330,45 @@ func TestRecordJSONIncludesMetricsOmitsNil(t *testing.T) {
 	}
 }
 
+// malformedMetricsCase describes one normalizeActivity malformed-metrics case.
+// The tokens/duration fields vary per case; every other entry field uses the
+// standard boilerplate built by malformedEntry.
+type malformedMetricsCase struct {
+	name        string
+	tokens      activityTokenMetrics
+	durationMs  *int
+	expectValid bool
+	// nilMsg is the exact fatal message when the row is unexpectedly rejected.
+	nilMsg string
+	// okMsg is the exact fatal message when metricsValid does not match.
+	okMsg string
+	// fieldChecks validates the normalized record for this case.
+	fieldChecks func(t *testing.T, r *ActivityRecord)
+}
+
+// malformedEntry builds an activityLogEntry with the standard boilerplate
+// fields shared by every malformed-metrics case.
+func malformedEntry(tokens activityTokenMetrics, durationMs *int) activityLogEntry {
+	return activityLogEntry{
+		ID:             1,
+		Timestamp:      activityFixtureTime,
+		Src:            "ip:127.0.0.1",
+		Model:          "m",
+		Task:           "chat",
+		Route:          "local",
+		PeerID:         "peer-1",
+		ReqPath:        "/v1/chat/completions",
+		RespStatusCode: 200,
+		Tokens:         tokens,
+		DurationMs:     durationMs,
+	}
+}
+
 // checkMalformedMetricsCase validates one normalizeActivity malformed-metrics case.
 // It asserts the record is non-nil, the validity flag matches expectValid, and
 // then runs the provided field checks. The nilMsg and okMsg preserve the exact
 // fatal messages from the original test.
-func checkMalformedMetricsCase(t *testing.T, c *ActivityCollector, entry activityLogEntry, expectValid bool, nilMsg, okMsg string, fieldChecks func(r *ActivityRecord)) {
+func checkMalformedMetricsCase(t *testing.T, c *ActivityCollector, entry activityLogEntry, expectValid bool, nilMsg, okMsg string, fieldChecks func(t *testing.T, r *ActivityRecord)) {
 	r, ok := c.normalizeActivity("backend", entry)
 	if r == nil {
 		t.Fatal(nilMsg)
@@ -1342,175 +1376,154 @@ func checkMalformedMetricsCase(t *testing.T, c *ActivityCollector, entry activit
 	if ok != expectValid {
 		t.Fatal(okMsg)
 	}
-	fieldChecks(r)
+	fieldChecks(t, r)
 }
+
+// checkNegativeNonSentinel validates the negative non-sentinel malformed case.
+func checkNegativeNonSentinel(t *testing.T, r *ActivityRecord) {
+	if r.DurationMS != nil {
+		t.Fatal("DurationMS should be nil (negative non-sentinel)")
+	}
+	if r.InputTokens != nil {
+		t.Fatal("InputTokens should be nil (negative non-sentinel)")
+	}
+	if r.OutputTokens == nil || *r.OutputTokens != 5 {
+		t.Fatalf("OutputTokens = %#v, want pointer(5)", r.OutputTokens)
+	}
+}
+
+// checkNaNInf validates the NaN/Inf malformed case.
+func checkNaNInf(t *testing.T, r *ActivityRecord) {
+	if r.PromptTokensPerSecond != nil {
+		t.Fatal("PromptTokensPerSecond should be nil (NaN)")
+	}
+	if r.TokensPerSecond != nil {
+		t.Fatal("TokensPerSecond should be nil (Inf)")
+	}
+}
+
+// checkRateAboveBound validates the rate-above-bound malformed case.
+func checkRateAboveBound(t *testing.T, r *ActivityRecord) {
+	if r.PromptTokensPerSecond != nil {
+		t.Fatal("PromptTokensPerSecond should be nil (rate above bound)")
+	}
+}
+
+// checkMaxInt64 validates the MaxInt64 valid case.
+func checkMaxInt64(t *testing.T, r *ActivityRecord) {
+	if r.InputTokens == nil || *r.InputTokens != math.MaxInt64 {
+		t.Fatalf("InputTokens = %#v, want pointer(%d)", r.InputTokens, math.MaxInt64)
+	}
+	if r.DurationMS == nil || *r.DurationMS != math.MaxInt64 {
+		t.Fatalf("DurationMS = %#v, want pointer(%d)", r.DurationMS, math.MaxInt64)
+	}
+}
+
+// checkRateAtBound validates the rate-at-bound valid case (no field assertions).
+func checkRateAtBound(t *testing.T, r *ActivityRecord) {}
 
 func TestMalformedMetricsDirect(t *testing.T) {
 	c := newTestCollector(t, nil)
 
-	// Negative non-sentinel -> nil, malformed.
-	checkMalformedMetricsCase(t, c, activityLogEntry{
-		ID:             1,
-		Timestamp:      activityFixtureTime,
-		Src:            "ip:127.0.0.1",
-		Model:          "m",
-		Task:           "chat",
-		Route:          "local",
-		PeerID:         "peer-1",
-		ReqPath:        "/v1/chat/completions",
-		RespStatusCode: 200,
-		Tokens: activityTokenMetrics{
-			InputTokens:     -5,
-			OutputTokens:    5,
-			CachedTokens:    2,
-			DraftTokens:     3,
-			DraftAccTokens:  1,
-			ReasoningTokens: 0,
-			PromptPerSecond: 1.5,
-			TokensPerSecond: 2.5,
+	cases := []malformedMetricsCase{
+		{
+			name: "negative non-sentinel metrics are malformed",
+			tokens: activityTokenMetrics{
+				InputTokens:     -5,
+				OutputTokens:    5,
+				CachedTokens:    2,
+				DraftTokens:     3,
+				DraftAccTokens:  1,
+				ReasoningTokens: 0,
+				PromptPerSecond: 1.5,
+				TokensPerSecond: 2.5,
+			},
+			durationMs:  activityDuration(-10),
+			expectValid: false,
+			nilMsg:      "expected valid record (entry not rejected for bad metrics)",
+			okMsg:       "expected metricsValid=false for negative non-sentinel metrics",
+			fieldChecks: checkNegativeNonSentinel,
 		},
-		DurationMs: activityDuration(-10),
-	}, false,
-		"expected valid record (entry not rejected for bad metrics)",
-		"expected metricsValid=false for negative non-sentinel metrics",
-		func(r *ActivityRecord) {
-			if r.DurationMS != nil {
-				t.Fatal("DurationMS should be nil (negative non-sentinel)")
-			}
-			if r.InputTokens != nil {
-				t.Fatal("InputTokens should be nil (negative non-sentinel)")
-			}
-			if r.OutputTokens == nil || *r.OutputTokens != 5 {
-				t.Fatalf("OutputTokens = %#v, want pointer(5)", r.OutputTokens)
-			}
-		})
+		{
+			name: "NaN/Inf metrics are malformed",
+			tokens: activityTokenMetrics{
+				InputTokens:     5,
+				OutputTokens:    5,
+				CachedTokens:    2,
+				DraftTokens:     3,
+				DraftAccTokens:  1,
+				ReasoningTokens: 0,
+				PromptPerSecond: math.NaN(),
+				TokensPerSecond: math.Inf(1),
+			},
+			durationMs:  activityDuration(100),
+			expectValid: false,
+			nilMsg:      "expected valid record (entry not rejected for bad metrics)",
+			okMsg:       "expected metricsValid=false for NaN/Inf metrics",
+			fieldChecks: checkNaNInf,
+		},
+		{
+			name: "rate above bound is malformed",
+			tokens: activityTokenMetrics{
+				InputTokens:     5,
+				OutputTokens:    5,
+				CachedTokens:    2,
+				DraftTokens:     3,
+				DraftAccTokens:  1,
+				ReasoningTokens: 0,
+				PromptPerSecond: 1e9 + 1,
+				TokensPerSecond: 2.5,
+			},
+			durationMs:  activityDuration(100),
+			expectValid: false,
+			nilMsg:      "expected valid record (entry not rejected for bad metrics)",
+			okMsg:       "expected metricsValid=false for rate above bound",
+			fieldChecks: checkRateAboveBound,
+		},
+		{
+			name: "MaxInt64 values are valid",
+			tokens: activityTokenMetrics{
+				InputTokens:     math.MaxInt64,
+				OutputTokens:    5,
+				CachedTokens:    2,
+				DraftTokens:     3,
+				DraftAccTokens:  1,
+				ReasoningTokens: 0,
+				PromptPerSecond: 1.5,
+				TokensPerSecond: 2.5,
+			},
+			durationMs:  activityDuration(math.MaxInt),
+			expectValid: true,
+			nilMsg:      "expected valid record with MaxInt64 values",
+			okMsg:       "expected metricsValid=true for MaxInt64 values",
+			fieldChecks: checkMaxInt64,
+		},
+		{
+			name: "rate at bound is valid",
+			tokens: activityTokenMetrics{
+				InputTokens:     5,
+				OutputTokens:    5,
+				CachedTokens:    2,
+				DraftTokens:     3,
+				DraftAccTokens:  1,
+				ReasoningTokens: 0,
+				PromptPerSecond: 1e9,
+				TokensPerSecond: 1e9,
+			},
+			durationMs:  activityDuration(100),
+			expectValid: true,
+			nilMsg:      "expected valid record with rate at bound",
+			okMsg:       "expected metricsValid=true for rate at bound",
+			fieldChecks: checkRateAtBound,
+		},
+	}
 
-	// NaN/Inf -> nil, malformed.
-	checkMalformedMetricsCase(t, c, activityLogEntry{
-		ID:             1,
-		Timestamp:      activityFixtureTime,
-		Src:            "ip:127.0.0.1",
-		Model:          "m",
-		Task:           "chat",
-		Route:          "local",
-		PeerID:         "peer-1",
-		ReqPath:        "/v1/chat/completions",
-		RespStatusCode: 200,
-		Tokens: activityTokenMetrics{
-			InputTokens:     5,
-			OutputTokens:    5,
-			CachedTokens:    2,
-			DraftTokens:     3,
-			DraftAccTokens:  1,
-			ReasoningTokens: 0,
-			PromptPerSecond: math.NaN(),
-			TokensPerSecond: math.Inf(1),
-		},
-		DurationMs: activityDuration(100),
-	}, false,
-		"expected valid record (entry not rejected for bad metrics)",
-		"expected metricsValid=false for NaN/Inf metrics",
-		func(r *ActivityRecord) {
-			if r.PromptTokensPerSecond != nil {
-				t.Fatal("PromptTokensPerSecond should be nil (NaN)")
-			}
-			if r.TokensPerSecond != nil {
-				t.Fatal("TokensPerSecond should be nil (Inf)")
-			}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := malformedEntry(tc.tokens, tc.durationMs)
+			checkMalformedMetricsCase(t, c, entry, tc.expectValid, tc.nilMsg, tc.okMsg, tc.fieldChecks)
 		})
-
-	// Rate above bound -> nil, malformed.
-	checkMalformedMetricsCase(t, c, activityLogEntry{
-		ID:             1,
-		Timestamp:      activityFixtureTime,
-		Src:            "ip:127.0.0.1",
-		Model:          "m",
-		Task:           "chat",
-		Route:          "local",
-		PeerID:         "peer-1",
-		ReqPath:        "/v1/chat/completions",
-		RespStatusCode: 200,
-		Tokens: activityTokenMetrics{
-			InputTokens:     5,
-			OutputTokens:    5,
-			CachedTokens:    2,
-			DraftTokens:     3,
-			DraftAccTokens:  1,
-			ReasoningTokens: 0,
-			PromptPerSecond: 1e9 + 1,
-			TokensPerSecond: 2.5,
-		},
-		DurationMs: activityDuration(100),
-	}, false,
-		"expected valid record (entry not rejected for bad metrics)",
-		"expected metricsValid=false for rate above bound",
-		func(r *ActivityRecord) {
-			if r.PromptTokensPerSecond != nil {
-				t.Fatal("PromptTokensPerSecond should be nil (rate above bound)")
-			}
-		})
-
-	// MaxInt64 is valid (<= saneInt64Bound).
-	checkMalformedMetricsCase(t, c, activityLogEntry{
-		ID:             1,
-		Timestamp:      activityFixtureTime,
-		Src:            "ip:127.0.0.1",
-		Model:          "m",
-		Task:           "chat",
-		Route:          "local",
-		PeerID:         "peer-1",
-		ReqPath:        "/v1/chat/completions",
-		RespStatusCode: 200,
-		Tokens: activityTokenMetrics{
-			InputTokens:     math.MaxInt64,
-			OutputTokens:    5,
-			CachedTokens:    2,
-			DraftTokens:     3,
-			DraftAccTokens:  1,
-			ReasoningTokens: 0,
-			PromptPerSecond: 1.5,
-			TokensPerSecond: 2.5,
-		},
-		DurationMs: activityDuration(math.MaxInt),
-	}, true,
-		"expected valid record with MaxInt64 values",
-		"expected metricsValid=true for MaxInt64 values",
-		func(r *ActivityRecord) {
-			if r.InputTokens == nil || *r.InputTokens != math.MaxInt64 {
-				t.Fatalf("InputTokens = %#v, want pointer(%d)", r.InputTokens, math.MaxInt64)
-			}
-			if r.DurationMS == nil || *r.DurationMS != math.MaxInt64 {
-				t.Fatalf("DurationMS = %#v, want pointer(%d)", r.DurationMS, math.MaxInt64)
-			}
-		})
-
-	// Rate at bound (1e9) is valid.
-	checkMalformedMetricsCase(t, c, activityLogEntry{
-		ID:             1,
-		Timestamp:      activityFixtureTime,
-		Src:            "ip:127.0.0.1",
-		Model:          "m",
-		Task:           "chat",
-		Route:          "local",
-		PeerID:         "peer-1",
-		ReqPath:        "/v1/chat/completions",
-		RespStatusCode: 200,
-		Tokens: activityTokenMetrics{
-			InputTokens:     5,
-			OutputTokens:    5,
-			CachedTokens:    2,
-			DraftTokens:     3,
-			DraftAccTokens:  1,
-			ReasoningTokens: 0,
-			PromptPerSecond: 1e9,
-			TokensPerSecond: 1e9,
-		},
-		DurationMs: activityDuration(100),
-	}, true,
-		"expected valid record with rate at bound",
-		"expected metricsValid=true for rate at bound",
-		func(r *ActivityRecord) {
-		})
+	}
 }
 
 func TestMalformedMetricsWithCoverage(t *testing.T) {

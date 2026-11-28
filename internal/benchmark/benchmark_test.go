@@ -419,10 +419,33 @@ func TestRunCancellationProducesValidPartialReport(t *testing.T) {
 }
 
 func TestJobManagerRequiresConsentAndSerializesCancellation(t *testing.T) {
-	started, release := make(chan struct{}), make(chan struct{})
-	server := httptest.NewServer(fakeProxyHandler(t, true, started, release))
+	server, manager, directory, client, started, release := newConsentHarness(t)
 	defer server.Close()
 	defer close(release)
+	defer manager.Stop()
+
+	options := testRunOptions(client)
+	options.AllowInterference = false
+	assertStartRejectedWithoutConsent(t, manager, options, started)
+	options.AllowInterference = true
+	job := assertStartSucceedsWithConsent(t, manager, options, started)
+	assertConcurrentStartRejected(t, manager, options)
+	if err := manager.Cancel(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	status := waitForJobState(t, manager, job.ID, "canceled", time.Now().Add(5*time.Second))
+	assertCanceledJob(t, status, directory)
+	assertReCancelRejected(t, manager, job.ID)
+	manager.Stop()
+	assertStartRejectedAfterStop(t, manager, options)
+}
+
+// newConsentHarness builds the server, client, temp directory, and JobManager for the
+// consent/cancellation test. The fake proxy blocks chat until the started channel is
+// released, so the test can observe whether inference was launched.
+func newConsentHarness(t *testing.T) (*httptest.Server, *JobManager, string, *APIClient, chan struct{}, chan struct{}) {
+	started, release := make(chan struct{}), make(chan struct{})
+	server := httptest.NewServer(fakeProxyHandler(t, true, started, release))
 	client, err := NewAPIClient(server.URL, "test-key")
 	if err != nil {
 		t.Fatal(err)
@@ -433,9 +456,12 @@ func TestJobManagerRequiresConsentAndSerializesCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer manager.Stop()
-	options := testRunOptions(client)
-	options.AllowInterference = false
+	return server, manager, directory, client, started, release
+}
+
+// assertStartRejectedWithoutConsent verifies that Start is rejected when
+// AllowInterference is false and that no inference request is issued to the proxy.
+func assertStartRejectedWithoutConsent(t *testing.T, manager *JobManager, options RunOptions, started chan struct{}) {
 	if _, err := manager.Start(options); err == nil {
 		t.Fatal("started a job without consent")
 	}
@@ -444,7 +470,11 @@ func TestJobManagerRequiresConsentAndSerializesCancellation(t *testing.T) {
 		t.Fatal("inference started without consent")
 	default:
 	}
-	options.AllowInterference = true
+}
+
+// assertStartSucceedsWithConsent verifies that Start succeeds when consent is given
+// and that the fake proxy receives the inference request before returning the job.
+func assertStartSucceedsWithConsent(t *testing.T, manager *JobManager, options RunOptions, started chan struct{}) JobStatus {
 	job, err := manager.Start(options)
 	if err != nil {
 		t.Fatal(err)
@@ -454,24 +484,20 @@ func TestJobManagerRequiresConsentAndSerializesCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("fake inference did not start")
 	}
+	return job
+}
+
+// assertConcurrentStartRejected verifies that a second Start while a job is active
+// is rejected with ErrJobActive.
+func assertConcurrentStartRejected(t *testing.T, manager *JobManager, options RunOptions) {
 	if _, err := manager.Start(options); !errors.Is(err, ErrJobActive) {
 		t.Fatalf("concurrent job error = %v", err)
 	}
-	if err := manager.Cancel(job.ID); err != nil {
-		t.Fatal(err)
-	}
-	var status JobStatus
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		status, err = manager.Status(job.ID)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if status.State == "canceled" {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+}
+
+// assertCanceledJob verifies the job transitions to canceled and the persisted
+// report reflects cancellation.
+func assertCanceledJob(t *testing.T, status JobStatus, directory string) {
 	if status.State != "canceled" || status.RunID == "" || status.ErrorCode != "" {
 		t.Fatalf("canceled job = %+v", status)
 	}
@@ -479,10 +505,17 @@ func TestJobManagerRequiresConsentAndSerializesCancellation(t *testing.T) {
 	if err != nil || record.Status != RunCanceled {
 		t.Fatalf("canceled report = %s, %v", record.Status, err)
 	}
-	if err := manager.Cancel(job.ID); err == nil {
+}
+
+// assertReCancelRejected verifies that canceling a finished job is rejected.
+func assertReCancelRejected(t *testing.T, manager *JobManager, jobID string) {
+	if err := manager.Cancel(jobID); err == nil {
 		t.Fatal("finished job accepted cancellation")
 	}
-	manager.Stop()
+}
+
+// assertStartRejectedAfterStop verifies that starting a stopped manager is rejected.
+func assertStartRejectedAfterStop(t *testing.T, manager *JobManager, options RunOptions) {
 	if _, err := manager.Start(options); !errors.Is(err, ErrJobStopped) {
 		t.Fatalf("stopped job manager error = %v", err)
 	}
@@ -608,137 +641,188 @@ func newFakeProxy(t *testing.T, blockChat bool) *httptest.Server {
 
 func fakeProxyHandler(t *testing.T, blockChat bool, channels ...chan struct{}) http.Handler {
 	t.Helper()
-	var requestID atomic.Uint64
-	var mu sync.Mutex
-	observations := make(map[string]*correlation.ProxyObservation)
-	var active atomic.Int32
-	var maxActive atomic.Int32
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/diagnostics/") {
-			if r.Header.Get("Authorization") != "Bearer test-key" {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-		}
-		switch {
-		case r.URL.Path == "/diagnostics/v1/models":
-			snapshot := modeldiagnostics.ModelSnapshot{
-				Identity: modeldiagnostics.ModelIdentity{
-					PublicID: "test-model", BackendID: "default", LocalID: "test-model",
-				},
-				Lifecycle: &modeldiagnostics.ModelLifecycleSnapshot{
-					CurrentState: "ready", Observed: true, StateAtActivity: "unknown",
-					TransitionEvidence: "unsupported",
-					ObservedAt:         timePointer(time.Now().UTC()),
-				},
-				Activity: &modeldiagnostics.ActivityMeasurement{
-					DraftRate: &modeldiagnostics.DraftRateSummary{
-						Rate: floatPointer(0.5), ProposedTokens: int64Pointer(10),
-						AcceptedTokens: int64Pointer(5), State: modeldiagnostics.MeasurementSupported,
-					},
-				},
-				GPUWindow: &modeldiagnostics.SharedGPUWindow{
-					SampleCount: 2, MinMemUsedMB: intPointer(7000), MaxMemUsedMB: intPointer(8000),
-					SharedDeviceOnly: true, ExecutionDeviceUnverified: true,
-				},
-			}
-			_ = json.NewEncoder(w).Encode(modelsResponse{
-				Records:     []*modeldiagnostics.ModelSnapshot{&snapshot},
-				GeneratedAt: time.Now().UTC(),
-				Coverage:    "complete",
-			})
-		case r.URL.Path == "/v1/chat/completions":
-			if r.Header.Get("Authorization") != "" {
-				t.Error("diagnostics key was sent to inference endpoint")
-			}
-			current := active.Add(1)
-			defer active.Add(-1)
-			for current > maxActive.Load() && !maxActive.CompareAndSwap(maxActive.Load(), current) {
-			}
-			if blockChat {
-				if len(channels) > 0 {
-					select {
-					case <-channels[0]:
-					default:
-						close(channels[0])
-					}
-				}
-				if len(channels) > 1 {
-					select {
-					case <-r.Context().Done():
-					case <-channels[1]:
-					}
-				} else {
-					<-r.Context().Done()
-				}
-				return
-			}
-			var body struct {
-				Messages []chatMessage `json:"messages"`
-				Tools    []any         `json:"tools"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Error(err)
-				http.Error(w, "invalid", http.StatusBadRequest)
-				return
-			}
-			id := fmt.Sprintf("%032x", requestID.Add(1))
-			w.Header().Set("X-Request-ID", id)
-			mu.Lock()
-			observations[id] = &correlation.ProxyObservation{
-				UpstreamHeaderMs:  floatPointer(100),
-				FirstByteMs:       floatPointer(120),
-				FirstOutputMs:     floatPointer(130),
-				FirstAnswerMs:     floatPointer(140),
-				TotalDurationMs:   floatPointer(200),
-				PromptTokens:      int64Pointer(12),
-				CompletionTokens:  int64Pointer(3),
-				PromptN:           int64Pointer(12),
-				PromptMS:          floatPointer(20),
-				PredictedN:        int64Pointer(3),
-				PredictedMS:       floatPointer(30),
-				TransportOutcome:  "returned",
-				GenerationOutcome: "completed",
-				InspectionState:   "complete",
-			}
-			mu.Unlock()
-			if len(body.Tools) > 0 {
-				_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"benchmark_echo","arguments":"{\"message\":\"TOOL_ROUND_TRIP_OK\"}"}}]}}]}`)
-				return
-			}
-			message := "2"
-			last := body.Messages[len(body.Messages)-1]
-			switch {
-			case last.Role == "tool":
-				message = "TOOL_ROUND_TRIP_OK"
-			case strings.Contains(last.Content, "REASONING_CONTROL_OK"):
-				message = "REASONING_CONTROL_OK"
-			case strings.Contains(last.Content, "</think>"):
-				message = "</think>"
-			case strings.Contains(last.Content, "SYSTEM_DEFAULTS_OK"):
-				message = "SYSTEM_DEFAULTS_OK"
-			case strings.Contains(last.Content, "PRIVATE_RESPONSE_SENTINEL"):
-				message = "PRIVATE_RESPONSE_SENTINEL"
-			}
-			response, _ := json.Marshal(map[string]any{
-				"choices": []any{map[string]any{"message": map[string]string{"content": message}}},
-			})
-			_, _ = w.Write(response)
-		case strings.HasPrefix(r.URL.Path, "/diagnostics/v1/requests/"):
-			id := strings.TrimPrefix(r.URL.Path, "/diagnostics/v1/requests/")
-			mu.Lock()
-			observation := observations[id]
-			mu.Unlock()
-			if observation == nil {
-				http.NotFound(w, r)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(requestRecord{
-				RequestID: id, BackendID: "default", ProxyObservation: observation,
-			})
+	return &fakeProxyState{
+		t: t, blockChat: blockChat, channels: channels,
+		observations: make(map[string]*correlation.ProxyObservation),
+	}
+}
+
+type fakeProxyState struct {
+	t            *testing.T
+	blockChat    bool
+	channels     []chan struct{}
+	requestID    atomic.Uint64
+	mu           sync.Mutex
+	observations map[string]*correlation.ProxyObservation
+	active       atomic.Int32
+	maxActive    atomic.Int32
+}
+
+func (s *fakeProxyState) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeDiagnostics(w, r) {
+		return
+	}
+	switch {
+	case r.URL.Path == "/diagnostics/v1/models":
+		s.serveModels(w)
+	case r.URL.Path == "/v1/chat/completions":
+		s.serveChat(w, r)
+	case strings.HasPrefix(r.URL.Path, "/diagnostics/v1/requests/"):
+		s.serveRequestObservation(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *fakeProxyState) authorizeDiagnostics(w http.ResponseWriter, r *http.Request) bool {
+	if strings.HasPrefix(r.URL.Path, "/diagnostics/") && r.Header.Get("Authorization") != "Bearer test-key" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+func (s *fakeProxyState) serveModels(w http.ResponseWriter) {
+	snapshot := modeldiagnostics.ModelSnapshot{
+		Identity: modeldiagnostics.ModelIdentity{
+			PublicID: "test-model", BackendID: "default", LocalID: "test-model",
+		},
+		Lifecycle: &modeldiagnostics.ModelLifecycleSnapshot{
+			CurrentState: "ready", Observed: true, StateAtActivity: "unknown",
+			TransitionEvidence: "unsupported",
+			ObservedAt:         timePointer(time.Now().UTC()),
+		},
+		Activity: &modeldiagnostics.ActivityMeasurement{
+			DraftRate: &modeldiagnostics.DraftRateSummary{
+				Rate: floatPointer(0.5), ProposedTokens: int64Pointer(10),
+				AcceptedTokens: int64Pointer(5), State: modeldiagnostics.MeasurementSupported,
+			},
+		},
+		GPUWindow: &modeldiagnostics.SharedGPUWindow{
+			SampleCount: 2, MinMemUsedMB: intPointer(7000), MaxMemUsedMB: intPointer(8000),
+			SharedDeviceOnly: true, ExecutionDeviceUnverified: true,
+		},
+	}
+	_ = json.NewEncoder(w).Encode(modelsResponse{
+		Records:     []*modeldiagnostics.ModelSnapshot{&snapshot},
+		GeneratedAt: time.Now().UTC(),
+		Coverage:    "complete",
+	})
+}
+
+func (s *fakeProxyState) serveChat(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "" {
+		s.t.Error("diagnostics key was sent to inference endpoint")
+	}
+	current := s.active.Add(1)
+	defer s.active.Add(-1)
+	s.recordMaxActive(current)
+	if s.blockChat {
+		s.waitForChatRelease(r)
+		return
+	}
+	var body struct {
+		Messages []chatMessage `json:"messages"`
+		Tools    []any         `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		s.t.Error(err)
+		http.Error(w, "invalid", http.StatusBadRequest)
+		return
+	}
+	id := fmt.Sprintf("%032x", s.requestID.Add(1))
+	w.Header().Set("X-Request-ID", id)
+	s.storeObservation(id)
+	s.writeChatResult(w, body)
+}
+
+func (s *fakeProxyState) recordMaxActive(current int32) {
+	for current > s.maxActive.Load() && !s.maxActive.CompareAndSwap(s.maxActive.Load(), current) {
+	}
+}
+
+func (s *fakeProxyState) waitForChatRelease(r *http.Request) {
+	if len(s.channels) > 0 {
+		select {
+		case <-s.channels[0]:
 		default:
-			http.NotFound(w, r)
+			close(s.channels[0])
 		}
+	}
+	if len(s.channels) > 1 {
+		select {
+		case <-r.Context().Done():
+		case <-s.channels[1]:
+		}
+		return
+	}
+	<-r.Context().Done()
+}
+
+func (s *fakeProxyState) storeObservation(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observations[id] = &correlation.ProxyObservation{
+		UpstreamHeaderMs:  floatPointer(100),
+		FirstByteMs:       floatPointer(120),
+		FirstOutputMs:     floatPointer(130),
+		FirstAnswerMs:     floatPointer(140),
+		TotalDurationMs:   floatPointer(200),
+		PromptTokens:      int64Pointer(12),
+		CompletionTokens:  int64Pointer(3),
+		PromptN:           int64Pointer(12),
+		PromptMS:          floatPointer(20),
+		PredictedN:        int64Pointer(3),
+		PredictedMS:       floatPointer(30),
+		TransportOutcome:  "returned",
+		GenerationOutcome: "completed",
+		InspectionState:   "complete",
+	}
+}
+
+func (s *fakeProxyState) writeChatResult(w http.ResponseWriter, body struct {
+	Messages []chatMessage `json:"messages"`
+	Tools    []any         `json:"tools"`
+}) {
+	if len(body.Tools) > 0 {
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"benchmark_echo","arguments":"{\"message\":\"TOOL_ROUND_TRIP_OK\"}"}}]}}]}`)
+		return
+	}
+	message := benchmarkFakeReply(body.Messages[len(body.Messages)-1])
+	response, _ := json.Marshal(map[string]any{
+		"choices": []any{map[string]any{"message": map[string]string{"content": message}}},
+	})
+	_, _ = w.Write(response)
+}
+
+func benchmarkFakeReply(last chatMessage) string {
+	switch {
+	case last.Role == "tool":
+		return "TOOL_ROUND_TRIP_OK"
+	case strings.Contains(last.Content, "REASONING_CONTROL_OK"):
+		return "REASONING_CONTROL_OK"
+	case strings.Contains(last.Content, "</think>"):
+		return "</think>"
+	case strings.Contains(last.Content, "SYSTEM_DEFAULTS_OK"):
+		return "SYSTEM_DEFAULTS_OK"
+	case strings.Contains(last.Content, "PRIVATE_RESPONSE_SENTINEL"):
+		return "PRIVATE_RESPONSE_SENTINEL"
+	default:
+		return "2"
+	}
+}
+
+func (s *fakeProxyState) serveRequestObservation(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/diagnostics/v1/requests/")
+	s.mu.Lock()
+	observation := s.observations[id]
+	s.mu.Unlock()
+	if observation == nil {
+		http.NotFound(w, r)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(requestRecord{
+		RequestID: id, BackendID: "default", ProxyObservation: observation,
 	})
 }
 

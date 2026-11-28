@@ -140,31 +140,82 @@ type RunRecord struct {
 }
 
 func (r RunRecord) Validate() error {
-	if r.SchemaVersion != SchemaVersion || !runIDPattern.MatchString(r.RunID) ||
-		r.WorkloadVersion != WorkloadVersion || r.StartedAt.IsZero() {
-		return errors.New("invalid benchmark run metadata")
+	if err := r.validateRunMetadata(); err != nil {
+		return err
 	}
 	if err := r.Requested.Validate(); err != nil {
 		return err
 	}
+	if err := r.validateOutputTokens(); err != nil {
+		return err
+	}
+	if err := r.validateCompletedAt(); err != nil {
+		return err
+	}
+	if err := r.validateRunStatus(); err != nil {
+		return err
+	}
+	if err := r.validateModelObservations(); err != nil {
+		return err
+	}
+	if err := r.validateLimitations(); err != nil {
+		return err
+	}
+	if err := r.validateWorkloadCount(); err != nil {
+		return err
+	}
+	return r.validateRequestAndTokenBudgets()
+}
+
+// validateRunMetadata checks the run identity, version, and start timestamp.
+func (r RunRecord) validateRunMetadata() error {
+	if r.SchemaVersion != SchemaVersion || !runIDPattern.MatchString(r.RunID) ||
+		r.WorkloadVersion != WorkloadVersion || r.StartedAt.IsZero() {
+		return errors.New("invalid benchmark run metadata")
+	}
+	return nil
+}
+
+// validateOutputTokens checks the reserved output token budget.
+func (r RunRecord) validateOutputTokens() error {
 	if r.OutputTokensReserved < 0 || r.OutputTokensReserved > r.Requested.TokenBudget {
 		return errors.New("benchmark output token budget exceeded")
 	}
+	return nil
+}
+
+// validateCompletedAt checks the completion timestamp semantics.
+func (r RunRecord) validateCompletedAt() error {
 	if r.CompletedAt.IsZero() && r.Status != RunCanceled {
 		return errors.New("incomplete benchmark run must be marked canceled")
 	}
 	if !r.CompletedAt.IsZero() && r.CompletedAt.Before(r.StartedAt) {
 		return errors.New("benchmark run completion precedes start")
 	}
+	return nil
+}
+
+// validateRunStatus checks the run status enumeration.
+func (r RunRecord) validateRunStatus() error {
 	if r.Status != RunCompleted && r.Status != RunCanceled && r.Status != RunPartial {
 		return errors.New("invalid benchmark run status")
 	}
+	return nil
+}
+
+// validateModelObservations checks the pre- and post-run model observations.
+func (r RunRecord) validateModelObservations() error {
 	if !validModelObservation(r.ModelBefore, r.Requested.Backend, r.Requested.Model) {
 		return errors.New("benchmark run contains an invalid pre-run model observation")
 	}
 	if r.ModelAfter != nil && !validModelObservation(r.ModelAfter, r.Requested.Backend, r.Requested.Model) {
 		return errors.New("benchmark run contains an invalid post-run model observation")
 	}
+	return nil
+}
+
+// validateLimitations checks the limitations list count and each entry.
+func (r RunRecord) validateLimitations() error {
 	if len(r.Limitations) > 16 {
 		return errors.New("benchmark run contains too many limitations")
 	}
@@ -173,10 +224,21 @@ func (r RunRecord) Validate() error {
 			return errors.New("benchmark run contains an invalid limitation")
 		}
 	}
+	return nil
+}
+
+// validateWorkloadCount checks the workload count against the run status.
+func (r RunRecord) validateWorkloadCount() error {
 	if len(r.Workloads) > len(syntheticWorkloads) ||
 		(r.Status == RunCompleted && len(r.Workloads) != len(syntheticWorkloads)) {
 		return errors.New("benchmark run has an unexpected workload count")
 	}
+	return nil
+}
+
+// validateRequestAndTokenBudgets accumulates per-workload request and reserved
+// token counts and checks them against the configured limits.
+func (r RunRecord) validateRequestAndTokenBudgets() error {
 	requests := 0
 	reservedTokens := 0
 	for i := range r.Workloads {
