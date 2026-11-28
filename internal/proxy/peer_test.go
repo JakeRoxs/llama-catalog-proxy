@@ -364,7 +364,7 @@ management:
 	newToken := strings.Repeat("c", 32)
 	allowDiagnostics = false
 	write(newToken, "node-a", certPath)
-	assertReloadOK(t, r.reload())
+	assertNoErr(t, r.reload())
 	assertDiagnosticsRevoked(t, getDiagnostics())
 	old := get(token)
 	_ = old.Body.Close()
@@ -382,12 +382,12 @@ management:
 	if err := os.WriteFile(path, []byte(fmt.Sprintf("default_backend: local\nbackends:\n  local: {url: %q}\n", local.URL)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	assertReloadOK(t, r.reload())
+	assertNoErr(t, r.reload())
 	response = get(newToken)
 	_ = response.Body.Close()
 	assertStatus(t, response, http.StatusUnauthorized)
 	write(newToken, "node-a", certPath)
-	assertReloadOK(t, r.reload())
+	assertNoErr(t, r.reload())
 	response = get(newToken)
 	receipt = assertReportDecodeOnly(t, response)
 	assertReloadSourceIncremented(t, receipt, initial)
@@ -513,13 +513,6 @@ func assertMisroutedRoute(t *testing.T, clientSide *httptest.ResponseRecorder, b
 	t.Helper()
 	if clientSide.Code != http.StatusNotFound || backendRequests.Load() != before {
 		t.Fatalf("client listener exposed peer route: %d", clientSide.Code)
-	}
-}
-
-func assertReloadOK(t *testing.T, err error) {
-	t.Helper()
-	if err != nil {
-		t.Fatal(err)
 	}
 }
 

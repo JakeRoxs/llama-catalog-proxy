@@ -83,40 +83,14 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "TLS required", http.StatusForbidden)
 		return
 	}
-	if req.URL.Path == peerEnrollmentPath {
-		r.servePeerEnrollment(w, req)
-		return
-	}
-	if req.URL.Path == peerPathEndpoint {
-		r.servePeerPath(w, req)
+	if r.dispatchPeerDirectRoute(w, req) {
 		return
 	}
 	if req.URL.RawQuery != "" {
 		http.NotFound(w, req)
 		return
 	}
-	if req.URL.Path == "/peer/v1/inference" {
-		r.servePeerInference(w, req)
-		return
-	}
-	switch req.URL.Path {
-	case peerSettingsGrantsPath:
-		r.servePeerDelegatedSettingsGrants(w, req)
-		return
-	case peerSettingsSnapshotPath:
-		r.servePeerDelegatedSettingsSnapshot(w, req)
-		return
-	case peerSettingsPreviewPath:
-		r.servePeerDelegatedSettingsPreview(w, req)
-		return
-	case peerSettingsProposalPath:
-		r.servePeerDelegatedSettingsProposal(w, req)
-		return
-	case peerSettingsProposalRecoveryPath:
-		r.servePeerDelegatedSettingsProposalRecovery(w, req)
-		return
-	case peerSettingsApplyPath:
-		r.servePeerDelegatedSettingsApply(w, req)
+	if r.dispatchPeerManagementRoute(w, req) {
 		return
 	}
 	if strings.HasPrefix(req.URL.Path, peerOperationPath) {
@@ -127,6 +101,46 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		http.NotFound(w, req)
 		return
 	}
+	r.servePeerReport(w, req)
+}
+
+func (r *Reloader) dispatchPeerDirectRoute(w http.ResponseWriter, req *http.Request) bool {
+	switch req.URL.Path {
+	case peerEnrollmentPath:
+		r.servePeerEnrollment(w, req)
+		return true
+	case peerPathEndpoint:
+		r.servePeerPath(w, req)
+		return true
+	case "/peer/v1/inference":
+		r.servePeerInference(w, req)
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Reloader) dispatchPeerManagementRoute(w http.ResponseWriter, req *http.Request) bool {
+	switch req.URL.Path {
+	case peerSettingsGrantsPath:
+		r.servePeerDelegatedSettingsGrants(w, req)
+	case peerSettingsSnapshotPath:
+		r.servePeerDelegatedSettingsSnapshot(w, req)
+	case peerSettingsPreviewPath:
+		r.servePeerDelegatedSettingsPreview(w, req)
+	case peerSettingsProposalPath:
+		r.servePeerDelegatedSettingsProposal(w, req)
+	case peerSettingsProposalRecoveryPath:
+		r.servePeerDelegatedSettingsProposalRecovery(w, req)
+	case peerSettingsApplyPath:
+		r.servePeerDelegatedSettingsApply(w, req)
+	default:
+		return false
+	}
+	return true
+}
+
+func (r *Reloader) servePeerReport(w http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -145,17 +159,25 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "peer service busy", http.StatusServiceUnavailable)
 		return
 	}
+	report, state, ok := r.buildPeerReport(req, w)
+	if !ok {
+		return
+	}
+	r.writePeerReport(w, report, state)
+}
+
+func (r *Reloader) buildPeerReport(req *http.Request, w http.ResponseWriter) (nodecontract.Report, *reloaderState, bool) {
 	state := r.state.Load()
 	peer := state.peer
 	if peer == nil || !peerAuthorized(req, state, peerCatalog) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-		return
+		return nodecontract.Report{}, nil, false
 	}
 	handler, ok := state.handler.(*Handler)
 	if !ok {
 		r.logger.Error("peer report unavailable: unexpected handler type")
 		http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
-		return
+		return nodecontract.Report{}, nil, false
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), peerReportTimeout)
 	defer cancel()
@@ -165,8 +187,21 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		r.logger.Warn(peerReportUnavailable, "error", err)
 		http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
-		return
+		return nodecontract.Report{}, nil, false
 	}
+	report = addPeerReportCapabilities(report, peer, state)
+	if peerAuthorized(req, state, peerDiagnostics) {
+		report, err = addPeerReportReadiness(report, handler, peer, state)
+		if err != nil {
+			r.logger.Warn("peer readiness report unavailable", "error", err)
+			http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
+			return nodecontract.Report{}, nil, false
+		}
+	}
+	return report, state, true
+}
+
+func addPeerReportCapabilities(report nodecontract.Report, peer *config.PeerConfig, state *reloaderState) nodecontract.Report {
 	for service := range peer.ExposedPathRoutes {
 		report.PathServices = append(report.PathServices, service)
 	}
@@ -180,14 +215,14 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 		// The peer's manage_settings grant is still checked independently per request.
 		report.Capabilities["config_write"] = "enabled"
 	}
-	if peerAuthorized(req, state, peerDiagnostics) {
-		report, err = nodecontract.AddBackendReadiness(report, handler.catalog.CachedBackendReadiness(peer.LocalBackends), state.cacheTTL)
-		if err != nil {
-			r.logger.Warn("peer readiness report unavailable", "error", err)
-			http.Error(w, peerReportUnavailable, http.StatusServiceUnavailable)
-			return
-		}
-	}
+	return report
+}
+
+func addPeerReportReadiness(report nodecontract.Report, handler *Handler, peer *config.PeerConfig, state *reloaderState) (nodecontract.Report, error) {
+	return nodecontract.AddBackendReadiness(report, handler.catalog.CachedBackendReadiness(peer.LocalBackends), state.cacheTTL)
+}
+
+func (r *Reloader) writePeerReport(w http.ResponseWriter, report nodecontract.Report, state *reloaderState) {
 	data, err := json.Marshal(report)
 	if err != nil {
 		r.logger.Error("encode peer report failed", "error", err)
@@ -211,21 +246,8 @@ func (r *Reloader) servePeerHTTP(w http.ResponseWriter, req *http.Request) {
 func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	if req.Method != http.MethodPost {
-		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if req.URL.RawQuery != "" || req.URL.RawPath != "" || req.ContentLength != 0 || len(req.TransferEncoding) != 0 ||
-		len(req.Header.Values("Authorization")) != 0 {
-		req.Close = true
-		w.Header().Set("Connection", "close")
-		http.Error(w, "invalid enrollment request", http.StatusBadRequest)
-		return
-	}
-	codes := req.Header.Values(peerInvitationHeader)
-	if len(codes) != 1 || len(codes[0]) > 64 {
-		http.Error(w, "invalid invitation", http.StatusUnauthorized)
+	codes, ok := peerEnrollmentRequest(w, req)
+	if !ok {
 		return
 	}
 	r.lifecycleMu.Lock()
@@ -235,8 +257,8 @@ func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request)
 		return
 	}
 	state := r.state.Load()
-	if state == nil || state.peer == nil || state.peer.FederationID == "" || state.pairingStore == nil || req.TLS == nil ||
-		len(req.TLS.VerifiedChains) == 0 || len(req.TLS.PeerCertificates) == 0 {
+	if state == nil || state.peer == nil || state.peer.FederationID == "" || state.pairingStore == nil ||
+		req.TLS == nil || len(req.TLS.VerifiedChains) == 0 || len(req.TLS.PeerCertificates) == 0 {
 		http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
 		return
 	}
@@ -246,28 +268,65 @@ func (r *Reloader) servePeerEnrollment(w http.ResponseWriter, req *http.Request)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	member, ok := r.consumePeerEnrollment(w, state, nodeID, peerCertificateFingerprint(clientCert), codes[0])
+	if !ok {
+		return
+	}
+	writePeerEnrollmentResponse(w, state, member)
+}
+
+func peerEnrollmentRequest(w http.ResponseWriter, req *http.Request) ([]string, bool) {
+	if req.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return nil, false
+	}
+	if req.URL.RawQuery != "" || req.URL.RawPath != "" || req.ContentLength != 0 ||
+		len(req.TransferEncoding) != 0 || len(req.Header.Values("Authorization")) != 0 {
+		req.Close = true
+		w.Header().Set("Connection", "close")
+		http.Error(w, "invalid enrollment request", http.StatusBadRequest)
+		return nil, false
+	}
+	codes := req.Header.Values(peerInvitationHeader)
+	if len(codes) != 1 || len(codes[0]) > 64 {
+		http.Error(w, "invalid invitation", http.StatusUnauthorized)
+		return nil, false
+	}
+	return codes, true
+}
+
+func (r *Reloader) consumePeerEnrollment(w http.ResponseWriter, state *reloaderState, nodeID, fingerprint, code string) (federation.Membership, bool) {
 	auditTx, auditErr := beginPeerAudit(state, state.auditStore, nodeID, "pairing.accept", nodeID, "", "")
 	if auditErr != nil {
 		http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
-		return
+		return federation.Membership{}, false
 	}
-	member, err := state.pairingStore.ConsumeInvitation(codes[0], nodeID, peerCertificateFingerprint(clientCert), time.Now())
+	member, err := state.pairingStore.ConsumeInvitation(code, nodeID, fingerprint, time.Now())
 	if finishAudit(auditTx, auditOutcomeForError(err), nodeID, "", "") != nil {
 		http.Error(w, "peer enrollment outcome unknown", http.StatusServiceUnavailable)
-		return
+		return federation.Membership{}, false
 	}
 	if err != nil {
-		if errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitationFull) {
-			http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
-			return
-		}
-		if errors.Is(err, federation.ErrMemberExists) {
-			http.Error(w, "identity already paired", http.StatusConflict)
-			return
-		}
-		http.Error(w, "invalid invitation", http.StatusUnauthorized)
+		writePeerEnrollmentError(w, err)
+		return federation.Membership{}, false
+	}
+	return member, true
+}
+
+func writePeerEnrollmentError(w http.ResponseWriter, err error) {
+	if errors.Is(err, federation.ErrPairingStore) || errors.Is(err, federation.ErrInvitationFull) {
+		http.Error(w, peerEnrollmentUnavailable, http.StatusServiceUnavailable)
 		return
 	}
+	if errors.Is(err, federation.ErrMemberExists) {
+		http.Error(w, "identity already paired", http.StatusConflict)
+		return
+	}
+	http.Error(w, "invalid invitation", http.StatusUnauthorized)
+}
+
+func writePeerEnrollmentResponse(w http.ResponseWriter, state *reloaderState, member federation.Membership) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(struct {
@@ -316,45 +375,70 @@ func authenticatedPeer(req *http.Request, state *reloaderState, scope peerScope)
 	if len(values) == 0 {
 		return authenticatedDynamicPeer(req, state, scope)
 	}
+	token, ok := peerBearerToken(values)
+	if !ok {
+		return "", false
+	}
+	nodeID, ok := peerTokenIdentity(state.peer, token, scope)
+	if !ok {
+		return "", false
+	}
+	if state.peer.FederationID != "" && !verifiedFederatedPeer(req, state, nodeID) {
+		return "", false
+	}
+	return nodeID, true
+}
+
+func peerBearerToken(values []string) (string, bool) {
 	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") {
 		return "", false
 	}
 	token := strings.TrimPrefix(values[0], "Bearer ")
-	if len(token) < 32 || len(token) > 256 {
-		return "", false
-	}
+	return token, len(token) >= 32 && len(token) <= 256
+}
+
+func peerTokenIdentity(peerConfig *config.PeerConfig, token string, scope peerScope) (string, bool) {
 	hash := sha256.Sum256([]byte(token))
 	var nodeID string
 	matches := 0
 	authorized := false
-	for id, peer := range state.peer.Peers {
+	for id, peer := range peerConfig.Peers {
 		expected := sha256.Sum256([]byte(peer.Token))
-		match := subtle.ConstantTimeCompare(hash[:], expected[:])
-		if match == 1 {
+		if subtle.ConstantTimeCompare(hash[:], expected[:]) == 1 {
 			matches++
 			nodeID = id
-			authorized = (scope == peerCatalog && peer.CatalogRead) ||
-				(scope == peerDiagnostics && peer.DiagnosticsRead) ||
-				(scope == peerInference && peer.Inference) ||
-				(scope == peerManageSettings && peer.ManageSettings) ||
-				(scope == peerPathService && len(peer.PathAccess) != 0)
+			authorized = peerHasScope(peer, scope)
 		}
 	}
-	if matches != 1 || !authorized {
-		return "", false
+	return nodeID, matches == 1 && authorized
+}
+
+func peerHasScope(peer config.PeerGrant, scope peerScope) bool {
+	switch scope {
+	case peerCatalog:
+		return peer.CatalogRead
+	case peerDiagnostics:
+		return peer.DiagnosticsRead
+	case peerInference:
+		return peer.Inference
+	case peerManageSettings:
+		return peer.ManageSettings
+	case peerPathService:
+		return len(peer.PathAccess) != 0
+	default:
+		return false
 	}
-	if state.peer.FederationID != "" {
-		if req.TLS == nil || len(req.TLS.VerifiedChains) == 0 ||
-			verifyPeerClientIdentity(req.TLS.PeerCertificates, state.peerClientCAs, state.peerClientCRLs, state.peer.RevocationMaxAge(), state.peer.FederationID, nodeID) != nil ||
-			state.pairingStore == nil {
-			return "", false
-		}
-		member, paired := state.pairingStore.GetMember(nodeID)
-		if !paired || member.Fingerprint != peerCertificateFingerprint(req.TLS.PeerCertificates[0]) {
-			return "", false
-		}
+}
+
+func verifiedFederatedPeer(req *http.Request, state *reloaderState, nodeID string) bool {
+	if req.TLS == nil || len(req.TLS.VerifiedChains) == 0 ||
+		verifyPeerClientIdentity(req.TLS.PeerCertificates, state.peerClientCAs, state.peerClientCRLs,
+			state.peer.RevocationMaxAge(), state.peer.FederationID, nodeID) != nil ||
+		state.pairingStore == nil {
+		return false
 	}
-	return nodeID, true
+	member, paired := state.pairingStore.GetMember(nodeID)
+	return paired && member.Fingerprint == peerCertificateFingerprint(req.TLS.PeerCertificates[0])
 }
 
 func authenticatedDynamicPeer(req *http.Request, state *reloaderState, scope peerScope) (string, bool) {

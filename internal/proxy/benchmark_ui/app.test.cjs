@@ -43,8 +43,14 @@ function createUI(publicReadOnly = false) {
       return { ok: true, json: async () => url.endsWith("/runs") ? { runs: [], truncated: false } : ({}) };
     },
   });
-  vm.runInContext(readFileSync(join(__dirname, "app.js"), "utf8"), context);
-  return { context, content: document.getElementById("evidence-content"), requests };
+  const source = readFileSync(join(__dirname, "app.js"), "utf8");
+  const ready = vm.runInContext(`(async function () {
+    globalThis.api = api;
+    globalThis.displayRun = displayRun;
+    globalThis.displayComparison = displayComparison;
+    ${source}
+  })()`, context);
+  return { context, content: document.getElementById("evidence-content"), requests, ready };
 }
 
 function text(node) {
@@ -52,8 +58,8 @@ function text(node) {
 }
 
 test("public read-only mode lists saved summaries without a benchmark token or write controls", async () => {
-  const { context, requests } = createUI(true);
-  await new Promise((resolve) => setImmediate(resolve));
+  const { context, requests, ready } = createUI(true);
+  await ready;
   assert.equal(requests.length, 1);
   assert.equal(requests[0].url, "/benchmark/v1/runs");
   assert.equal(requests[0].options.method || "GET", "GET");

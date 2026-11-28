@@ -252,38 +252,44 @@ func (p *metadataParser) parseChoices(choices []any, streamed bool) (meaningful,
 	p.recognized = true
 	for _, raw := range choices {
 		choice := obj(raw)
-		if reason, ok := choice["finish_reason"].(string); ok {
-			switch reason {
-			case "stop", "length", "tool_calls", "function_call", "content_filter":
-				// A choice may finish before other choices or a terminal usage
-				// event. SSE completion requires its explicit [DONE] boundary.
-				if !streamed {
-					p.terminal = true
-				}
-				p.usage.FinishReason = reason
-				if reason == "length" {
-					p.truncated = true
-				}
-			}
-		}
-		if streamed {
-			delta := obj(choice["delta"])
-			if deltaContent(delta, choice) {
-				meaningful = true
-				answer = true
-			}
-			if deltaReasoning(delta) {
-				meaningful = true
-			}
-			if deltaToolCalls(delta) {
-				meaningful = true
-			}
-			if deltaFunctionCall(delta) {
-				meaningful = true
-			}
-		}
+		p.parseFinishReason(choice, streamed)
+		deltaMeaningful, deltaAnswer := parseChoiceDelta(choice, streamed)
+		meaningful = meaningful || deltaMeaningful
+		answer = answer || deltaAnswer
 	}
 	return
+}
+
+func (p *metadataParser) parseFinishReason(choice map[string]any, streamed bool) {
+	reason, ok := choice["finish_reason"].(string)
+	if !ok || !recognizedFinishReason(reason) {
+		return
+	}
+	// A choice may finish before other choices or a terminal usage event.
+	// SSE completion requires its explicit [DONE] boundary.
+	if !streamed {
+		p.terminal = true
+	}
+	p.usage.FinishReason = reason
+	p.truncated = p.truncated || reason == "length"
+}
+
+func recognizedFinishReason(reason string) bool {
+	switch reason {
+	case "stop", "length", "tool_calls", "function_call", "content_filter":
+		return true
+	default:
+		return false
+	}
+}
+
+func parseChoiceDelta(choice map[string]any, streamed bool) (meaningful, answer bool) {
+	if !streamed {
+		return false, false
+	}
+	delta := obj(choice["delta"])
+	answer = deltaContent(delta, choice)
+	return answer || deltaReasoning(delta) || deltaToolCalls(delta) || deltaFunctionCall(delta), answer
 }
 
 func (p *metadataParser) parse(data []byte, streamed bool) (meaningful, answer bool) {

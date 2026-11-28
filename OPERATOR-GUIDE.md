@@ -1414,6 +1414,14 @@ queue/VRAM verifier. A successful first ComfyUI prompt response activates its le
 leave admission unknown. Competing requests reserve the released domain while being forwarded. This
 process-local state is reset to unknown on proxy restart or config reload; it is not durable recovery.
 
+With one `admission_backends` entry, startup recovery for model requests automatically checks that
+backend's llama-swap `/running` endpoint. The proxy can resume admission without `/free` if two snapshots
+show the same sole ready model (other than `comfyui_auto`) and the direct ComfyUI queue stays
+empty across the configured samples between them. This is scheduler evidence, not proof of
+VRAM ownership or protection against renders submitted outside the scheduler. An inconclusive
+response or multiple admission backends falls back to the full release verifier. An active or
+ambiguous ComfyUI handoff still requires the normal release checks.
+
 An explicit ComfyUI prompt or the llama-swap UI's `GET /upstream/comfyui_auto/` can acquire the
 initial lease without checking free VRAM first. These requests still go to llama-swap so it can
 evict a resident model before forwarding to ComfyUI. This does not reopen admission after an

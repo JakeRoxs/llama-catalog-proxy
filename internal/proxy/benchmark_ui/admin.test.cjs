@@ -21,7 +21,7 @@ class Element {
   querySelectorAll() { return []; }
 }
 
-function createDashboard(fetchImpl) {
+async function createDashboard(fetchImpl) {
   const elements = new Map();
   const document = {
     getElementById(id) {
@@ -36,7 +36,7 @@ function createDashboard(fetchImpl) {
     crypto: { getRandomValues(bytes) { bytes.fill(0x2a); return bytes; } },
   };
   const source = fs.readFileSync(path.join(__dirname, "admin.js"), "utf8");
-  vm.runInNewContext(source, context, { filename: "admin.js" });
+  await vm.runInNewContext(`(async () => {\n${source}\n})()`, context, { filename: "admin.js" });
   return { context, elements };
 }
 
@@ -101,7 +101,7 @@ test("admin dashboard uses OIDC session and renders only the safe overview field
     calls.push({ url, options });
     return { ok: true, status: 200, json: async () => responses[url] };
   };
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(calls.map((call) => call.url), ["/admin/api/v1/session", "/admin/api/v1/overview", "/admin/api/v1/activity", "/admin/api/v1/federation/members", "/admin/api/v1/federation/invitations", "/admin/api/v1/federation/grants", "/admin/api/v1/federation/catalog-grants", "/admin/api/v1/federation/inference-grants", "/admin/api/v1/audit/events?limit=50"]);
   assert.ok(calls.every((call) => call.options.credentials === "same-origin"));
@@ -139,7 +139,7 @@ test("admin dashboard does not query sensitive endpoints", async () => {
         ? { node_id: "udms", updated_at: "2026-11-16T00:00:00Z", models: [], peers: [], request_summary_state: "not_configured" }
         : { state: "not_configured", events: [] } };
   };
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(calls.map((call) => call.url), ["/admin/api/v1/session", "/admin/api/v1/overview", "/admin/api/v1/activity"]);
   assert.ok(calls.every((call) => !/config|logs|benchmark|management|federation\/grants/i.test(call.url)));
@@ -152,7 +152,7 @@ test("admin dashboard does not query sensitive endpoints", async () => {
 test("catalog-read grant UI requires explicit confirmation and uses CSRF-protected API", async () => {
   const calls = [];
   const fetchImpl = adminGrantFetch(calls, { state: "available", members: [{ node_id: "node-b", certificate_sha256: "a".repeat(64), paired_at: "2026-11-16T00:00:00Z" }] });
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   elements.set("catalog-read-node", new Element("input"));
   elements.set("catalog-read-confirm", new Element("input"));
@@ -170,7 +170,7 @@ test("catalog-read grant UI requires explicit confirmation and uses CSRF-protect
 test("inference grant UI submits independent directions with CSRF protection", async () => {
   const calls = [];
   const fetchImpl = adminGrantFetch(calls, { state: "available", members: [{ node_id: "node-b" }] });
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   elements.set("inference-grant-node", new Element("input"));
   elements.set("inference-grant-incoming", new Element("input"));
@@ -212,7 +212,7 @@ test("federation administrator creates a one-time invitation through the protect
     }
     return { ok: true, status: 200, json: async () => responses[url] };
   };
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setImmediate(resolve));
   elements.set("invite-node-id", new Element("input"));
   elements.get("invite-node-id").value = "node-b";
@@ -275,7 +275,7 @@ test("configure_models user reviews typed remote settings and inspects an operat
     else throw new Error(`unexpected request: ${url}`);
     return { ok: status < 400, status, json: async () => body };
   };
-  const { elements } = createDashboard(fetchImpl);
+  const { elements } = await createDashboard(fetchImpl);
   await new Promise((resolve) => setTimeout(resolve, 0));
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));

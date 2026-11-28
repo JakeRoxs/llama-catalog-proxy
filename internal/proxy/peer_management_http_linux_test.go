@@ -70,8 +70,12 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 		return response.StatusCode, data, response.Header
 	}
 	status, data, headers := get(caller, "")
-	assertDelegatedLookupResponse(t, status, data, headers, http.StatusOK, "unknown",
-		owner.input.OperationID, []byte(caller), []byte(peerToken), []byte("confidential"), []byte(owner.target))
+	assertDelegatedLookupResponse(t, status, data, headers, delegatedLookupExpectation{
+		status:      http.StatusOK,
+		outcome:     "unknown",
+		operationID: owner.input.OperationID,
+		secrets:     [][]byte{[]byte(caller), []byte(peerToken), []byte("confidential"), []byte(owner.target)},
+	})
 	if status, _, _ := get(peerToken, ""); status != http.StatusUnauthorized {
 		t.Fatalf("peer credential accepted as caller: %d", status)
 	}
@@ -83,7 +87,10 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 		t.Fatal(err)
 	}
 	status, data, _ = get(caller, "")
-	assertDelegatedLookupResponse(t, status, data, nil, http.StatusOK, "not_written", "")
+	assertDelegatedLookupResponse(t, status, data, nil, delegatedLookupExpectation{
+		status:  http.StatusOK,
+		outcome: "not_written",
+	})
 	updated := *owner.state
 	updated.peer = copyPeerConfig(owner.state.peer)
 	updated.peer.Peers["requester"] = config.PeerGrant{Token: peerToken, CatalogRead: true}
@@ -113,27 +120,36 @@ func TestDelegatedOperationLookupAcrossTLSHandlers(t *testing.T) {
 	}
 }
 
+// delegatedLookupExpectation groups the expected status, outcome, operation ID,
+// and secrets for a delegated-operation lookup response assertion. Bundling
+// these keeps the assertion signature short and the call sites self-documenting.
+type delegatedLookupExpectation struct {
+	status      int
+	outcome     string
+	operationID string
+	secrets     [][]byte
+}
+
 // assertDelegatedLookupResponse verifies a delegated-operation lookup response: HTTP status, JSON
 // record shape, expected outcome, and (when secrets are provided) cache-control/no-sniff headers
 // plus the absence of those secrets from the body.
-func assertDelegatedLookupResponse(t *testing.T, status int, data []byte, headers http.Header,
-	wantStatus int, wantOutcome, wantOperationID string, secrets ...[]byte) {
+func assertDelegatedLookupResponse(t *testing.T, status int, data []byte, headers http.Header, expect delegatedLookupExpectation) {
 	t.Helper()
-	if status != wantStatus {
-		t.Fatalf("lookup status=%d, want=%d, body=%q", status, wantStatus, data)
+	if status != expect.status {
+		t.Fatalf("lookup status=%d, want=%d, body=%q", status, expect.status, data)
 	}
 	var record modelconfig.DelegatedOperation
-	if json.Unmarshal(data, &record) != nil || record.Outcome != wantOutcome {
+	if json.Unmarshal(data, &record) != nil || record.Outcome != expect.outcome {
 		t.Fatalf("lookup outcome=%q status=%d body=%q", record.Outcome, status, data)
 	}
-	if wantOperationID != "" && record.OperationID != wantOperationID {
-		t.Fatalf("lookup operationID=%q, want=%q, body=%q", record.OperationID, wantOperationID, data)
+	if expect.operationID != "" && record.OperationID != expect.operationID {
+		t.Fatalf("lookup operationID=%q, want=%q, body=%q", record.OperationID, expect.operationID, data)
 	}
-	if len(secrets) > 0 {
+	if len(expect.secrets) > 0 {
 		if headers.Get("Cache-Control") != "no-store" || headers.Get("X-Content-Type-Options") != "nosniff" {
 			t.Fatalf("unsafe lookup response headers: %v", headers)
 		}
-		for _, secret := range secrets {
+		for _, secret := range expect.secrets {
 			if bytes.Contains(data, secret) {
 				t.Fatalf("secret leaked in lookup response: %q", secret)
 			}

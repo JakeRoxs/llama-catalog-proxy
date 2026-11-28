@@ -66,7 +66,7 @@ func admitComfyUIDomainRequest(
 	if prompt || isComfyUISchedulerStart(req) {
 		return admitComfyUISchedulerPrompt(coordinator, req, true)
 	}
-	if !ensureComfyUIAdmissionState(coordinator, req, releaseTimeout) {
+	if !ensureComfyUIAdmissionState(coordinator, req, releaseTimeout, !comfyUIRequest) {
 		return nil, false
 	}
 	if comfyUIRequest {
@@ -84,7 +84,7 @@ func isComfyUIDomainRoute(req *http.Request) (bool, bool) {
 }
 
 func isComfyUISchedulerStart(req *http.Request) bool {
-	return req.Method == http.MethodGet && req.URL.Path == "/upstream/comfyui_auto/"
+	return req.Method == http.MethodGet && req.URL.Path == "/upstream/"+comfyUISchedulerModel+"/"
 }
 
 func validComfyUIBackend(comfyUIRequest, prompt bool, req *http.Request, backendID, promptBackend string) bool {
@@ -95,13 +95,13 @@ func validComfyUIBackend(comfyUIRequest, prompt bool, req *http.Request, backend
 }
 
 func ensureComfyUIAdmissionState(
-	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration,
+	coordinator *comfyUICoordinator, req *http.Request, releaseTimeout time.Duration, allowSchedulerProbe bool,
 ) bool {
 	if coordinator.snapshot().State != "unknown" {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), releaseTimeout)
-	_, err := coordinator.reconcileInitial(ctx)
+	_, err := coordinator.reconcileInitial(ctx, allowSchedulerProbe)
 	if errors.Is(err, errComfyUIAdmissionBlocked) {
 		// Initial reconciliation is one-shot when its outcome may be ambiguous.
 		// A later request may try again, but only by repeating the full queue,

@@ -364,7 +364,7 @@ func TestLlamaSwapModelStartRecoversWhenActiveComfyUIIsStopped(t *testing.T) {
 		}
 		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIServiceUnavailable
 	})
-	if _, err := c.reconcileInitial(context.Background()); err != nil {
+	if _, err := c.reconcileInitial(context.Background(), false); err != nil {
 		t.Fatal(err)
 	}
 	leaseID, finishPrompt, err := c.admitPrompt()

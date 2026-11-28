@@ -310,8 +310,42 @@ func (c *AliasCollector) Collect(ctx context.Context, epoch int64) (AliasReport,
 		return AliasReport{}, err
 	}
 
-	// Snapshot the backend jobs under the lock, then release it so collection
-	// can proceed without holding the lock across HTTP.
+	jobs := c.snapshotBackendJobs()
+	results := c.runBackendWorkers(ctx, jobs, epoch)
+
+	states := make(map[string]AliasBackendState, len(c.backendStates))
+	for id, state := range c.backendStates {
+		states[id] = state
+	}
+	edges := make([]AliasEdge, 0, c.maxEdges)
+	states, edges, globalTruncated := c.mergeAliasResults(states, edges, results)
+
+	// Honor parent cancellation: never return partial success on cancel.
+	if err := ctx.Err(); err != nil {
+		return AliasReport{}, err
+	}
+
+	report := AliasReport{
+		BackendStates:               states,
+		Edges:                       edges,
+		UpstreamGenerationUnknown:   aliasUpstreamGenerationUnknown,
+		RequestIDMappingUnsupported: aliasRequestIDMappingUnsupported,
+		EpochScopeCollector:         aliasEpochScopeCollector,
+		ProvenanceCatalog:           aliasProvenanceCatalogDeclared,
+		MaxEdges:                    aliasMaxEdgesGlobal,
+		MaxEdgesPerBackend:          aliasMaxRowsPerBackend,
+	}
+
+	coverage, truncated := determineCoverage(states, globalTruncated)
+	report.Coverage = coverage
+	report.Truncated = truncated
+	report.TotalEdges = len(report.Edges)
+	return report, nil
+}
+
+// snapshotBackendJobs returns the configured backends as sorted jobs for
+// deterministic collection order. It holds the lock only for the snapshot.
+func (c *AliasCollector) snapshotBackendJobs() []aliasBackendJob {
 	c.mu.Lock()
 	jobs := make([]aliasBackendJob, 0, len(c.backends))
 	for id, b := range c.backends {
@@ -319,10 +353,13 @@ func (c *AliasCollector) Collect(ctx context.Context, epoch int64) (AliasReport,
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
 	c.mu.Unlock()
+	return jobs
+}
 
-	// Run the bounded worker pool: at most 4 goroutines reading from a bounded
-	// job channel and sending to a bounded result channel. No goroutine is
-	// dedicated to a backend.
+// runBackendWorkers runs at most aliasNumWorkers concurrent fetches. It feeds
+// jobs into a bounded channel, honors context cancellation, and returns a
+// result channel that is closed once all workers have finished.
+func (c *AliasCollector) runBackendWorkers(ctx context.Context, jobs []aliasBackendJob, epoch int64) <-chan aliasBackendResult {
 	n := aliasNumWorkers
 	if n > len(jobs) {
 		n = len(jobs)
@@ -353,16 +390,17 @@ func (c *AliasCollector) Collect(ctx context.Context, epoch int64) (AliasReport,
 		close(jobChan)
 		wg.Wait()
 	}()
+	return resultChan
+}
 
-	// Merge each result into the report. Edges are sorted deterministically.
-	// The global edge cap is applied after draining all results.
-	states := make(map[string]AliasBackendState, len(c.backendStates))
-	for id, state := range c.backendStates {
-		states[id] = state
-	}
-	edges := make([]AliasEdge, 0, c.maxEdges)
+// mergeAliasResults drains the result channel, merging each backend's state
+// and edges into the report. Edges are sorted deterministically after each
+// backend's edges are appended; the global edge cap is applied after every
+// append. It returns the merged states, edges, and whether the global cap was
+// reached.
+func (c *AliasCollector) mergeAliasResults(states map[string]AliasBackendState, edges []AliasEdge, results <-chan aliasBackendResult) (map[string]AliasBackendState, []AliasEdge, bool) {
 	globalTruncated := false
-	for r := range resultChan {
+	for r := range results {
 		states[r.id] = r.state
 		edges = append(edges, r.edges...)
 		sort.Slice(edges, func(i, j int) bool {
@@ -380,26 +418,15 @@ func (c *AliasCollector) Collect(ctx context.Context, epoch int64) (AliasReport,
 			globalTruncated = true
 		}
 	}
-	// Honor parent cancellation: never return partial success on cancel.
-	if err := ctx.Err(); err != nil {
-		return AliasReport{}, err
-	}
+	return states, edges, globalTruncated
+}
 
-	report := AliasReport{
-		BackendStates:               states,
-		Edges:                       edges,
-		UpstreamGenerationUnknown:   aliasUpstreamGenerationUnknown,
-		RequestIDMappingUnsupported: aliasRequestIDMappingUnsupported,
-		EpochScopeCollector:         aliasEpochScopeCollector,
-		ProvenanceCatalog:           aliasProvenanceCatalogDeclared,
-		MaxEdges:                    aliasMaxEdgesGlobal,
-		MaxEdgesPerBackend:          aliasMaxRowsPerBackend,
-	}
-
-	// Determine coverage from per-backend states and global truncation.
-	coverage := "complete"
-	truncated := globalTruncated
-	for _, st := range report.BackendStates {
+// determineCoverage computes the coverage string and truncated flag from
+// per-backend states and the global truncation flag.
+func determineCoverage(states map[string]AliasBackendState, globalTruncated bool) (coverage string, truncated bool) {
+	coverage = "complete"
+	truncated = globalTruncated
+	for _, st := range states {
 		if st.State != aliasEnabledState && st.State != aliasDisabledState {
 			coverage = "unknown"
 		}
@@ -420,107 +447,121 @@ func (c *AliasCollector) Collect(ctx context.Context, epoch int64) (AliasReport,
 	if truncated {
 		coverage = "truncated"
 	}
-	report.Coverage = coverage
-	report.Truncated = truncated
-	report.TotalEdges = len(report.Edges)
-	return report, nil
+	return coverage, truncated
 }
 
 // collect fetches one page of /v1/models from a backend and normalizes it.
 // It never follows redirects, never leaks credentials, and bounds the response
 // body and row count. The only allowed upstream path is GET /v1/models.
 func (c *AliasCollector) collect(ctx context.Context, id string, b *aliasBackendInfo, epoch int64) ([]AliasEdge, AliasBackendState) {
-	state := AliasBackendState{
-		State:         aliasUnknownState,
-		Reason:        "not_collected",
-		ObservedAt:    c.now(),
-		LastAttemptAt: c.now(),
-	}
+	state := c.newAliasBackendState()
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	u := b.url.JoinPath(aliasPath)
-	req, err := newBackendJSONRequest(ctx, u.String(), b.config.Headers, b.config.APIKey)
-	if err != nil {
-		state.State, state.Reason = aliasUnsupportedState, "invalid_request"
+
+	page, state, ok := c.fetchAliasPage(ctx, b, state)
+	if !ok {
 		return nil, state
 	}
-	response, err := c.client.Do(req)
+	edges, truncated := c.normalizeAliasPage(id, epoch, page)
+	state.State, state.Reason = aliasEnabledState, "ok"
+	state.Rows = min(len(page.Data), c.maxRowsPerBackend)
+	state.Truncated = truncated
+	state.Coverage = "complete"
+	if truncated {
+		state.Coverage = "truncated"
+	}
+	return edges, state
+}
+
+func (c *AliasCollector) newAliasBackendState() AliasBackendState {
+	return AliasBackendState{
+		State: aliasUnknownState, Reason: "not_collected",
+		ObservedAt: c.now(), LastAttemptAt: c.now(),
+	}
+}
+
+func (c *AliasCollector) fetchAliasPage(ctx context.Context, backend *aliasBackendInfo, state AliasBackendState) (aliasModelPage, AliasBackendState, bool) {
+	request, err := newBackendJSONRequest(ctx, backend.url.JoinPath(aliasPath).String(), backend.config.Headers, backend.config.APIKey)
+	if err != nil {
+		state.State, state.Reason = aliasUnsupportedState, "invalid_request"
+		return aliasModelPage{}, state, false
+	}
+	response, err := c.client.Do(request)
 	if err != nil {
 		state.State, state.Reason = aliasUnavailableState, "request_failed"
 		state.HTTPStatus = 0
-		return nil, state
+		return aliasModelPage{}, state, false
 	}
 	defer response.Body.Close()
 	state.HTTPStatus = response.StatusCode
-
-	// Check HTTP status codes first. 401/403, 404/405, 3xx, and other
-	// non-200 statuses are returned without parsing the body.
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		state.State, state.Reason = aliasUnauthorizedState, "authorization_required"
-		return nil, state
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		state.State, state.Reason = aliasUnsupportedState, "not_available"
-		return nil, state
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		state.State, state.Reason = aliasUnknownState, "redirect_refused"
-		return nil, state
-	case response.StatusCode != http.StatusOK:
-		state.State, state.Reason = aliasUnavailableState, "http_error"
-		return nil, state
+	if state, ok := classifyAliasResponseStatus(response.StatusCode, state); !ok {
+		return aliasModelPage{}, state, false
 	}
+	return c.decodeAliasResponse(response.Body, state)
+}
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+func classifyAliasResponseStatus(statusCode int, state AliasBackendState) (AliasBackendState, bool) {
+	switch {
+	case statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden:
+		state.State, state.Reason = aliasUnauthorizedState, "authorization_required"
+	case statusCode == http.StatusNotFound || statusCode == http.StatusMethodNotAllowed:
+		state.State, state.Reason = aliasUnsupportedState, "not_available"
+	case statusCode >= 300 && statusCode < 400:
+		state.State, state.Reason = aliasUnknownState, "redirect_refused"
+	case statusCode != http.StatusOK:
+		state.State, state.Reason = aliasUnavailableState, "http_error"
+	default:
+		return state, true
+	}
+	return state, false
+}
+
+func (c *AliasCollector) decodeAliasResponse(bodyReader io.Reader, state AliasBackendState) (aliasModelPage, AliasBackendState, bool) {
+	body, err := io.ReadAll(io.LimitReader(bodyReader, c.maxResponseBytes+1))
 	if err != nil {
 		state.State, state.Reason = aliasUnavailableState, "response_read_failed"
-		return nil, state
+		return aliasModelPage{}, state, false
 	}
 	if len(body) > int(c.maxResponseBytes) {
 		state.State, state.Reason = aliasUnknownState, "response_too_large"
-		return nil, state
+		return aliasModelPage{}, state, false
 	}
-
 	var page aliasModelPage
 	if err := json.Unmarshal(body, &page); err != nil {
 		state.State, state.Reason = aliasUnknownState, "invalid_json"
-		return nil, state
+		return aliasModelPage{}, state, false
 	}
-	// Validate required page field: data must be an array (non-nil). A bare
-	// {} or {"data":null} is malformed.
 	if page.Data == nil {
 		state.State, state.Reason = aliasUnknownState, "malformed_page"
-		return nil, state
+		return aliasModelPage{}, state, false
 	}
+	return page, state, true
+}
 
-	// Bound rows per backend; detect truncation vs the row cap.
+func (c *AliasCollector) normalizeAliasPage(backendID string, epoch int64, page aliasModelPage) ([]AliasEdge, bool) {
 	rows := page.Data
-	rowsTruncated := len(rows) > c.maxRowsPerBackend
-	if len(rows) > c.maxRowsPerBackend {
+	truncated := len(rows) > c.maxRowsPerBackend
+	if truncated {
 		rows = rows[:c.maxRowsPerBackend]
 	}
-
-	edges, edgesTruncated := buildEdges(id, rows, epoch)
-	state.State = aliasEnabledState
-	state.Reason = "ok"
-	state.Rows = len(rows)
-	// Row-cap truncation and edge-cap truncation both signal a partial
-	// collection; neither may hide conflicts (each ref's edge is complete).
-	truncated := rowsTruncated || edgesTruncated
+	edges, edgeLimitReached := buildEdges(backendID, rows, epoch)
+	truncated = truncated || edgeLimitReached
 	if truncated {
-		// A clipped catalog can hide a later conflicting declaration. Preserve
-		// ambiguity, but never advertise a unique mapping from an incomplete graph.
+		// A clipped catalog may hide a later conflicting declaration. Preserve
+		// ambiguity, but do not advertise a unique mapping from an incomplete graph.
 		for i := range edges {
-			if edges[i].State == aliasStateExact {
-				edges[i].State = aliasStateUnknown
-				edges[i].CanonicalRef = ""
-			}
+			edges[i] = markIncompleteAliasEdge(edges[i])
 		}
-		state.Coverage = "truncated"
-		state.Truncated = true
-	} else {
-		state.Coverage = "complete"
 	}
-	return edges, state
+	return edges, truncated
+}
+
+func markIncompleteAliasEdge(edge AliasEdge) AliasEdge {
+	if edge.State == aliasStateExact {
+		edge.State = aliasStateUnknown
+		edge.CanonicalRef = ""
+	}
+	return edge
 }
 
 // buildEdges converts one backend's /v1/models rows into typed alias edges.
@@ -538,86 +579,119 @@ func (c *AliasCollector) collect(ctx context.Context, id string, b *aliasBackend
 // If the bound is reached, truncated is true and remaining rows are not
 // inspected.
 func buildEdges(backendID string, rows []aliasRow, epoch int64) ([]AliasEdge, bool) {
-	// aliasTargets maps a ref to the set of canonical refs it is declared to
-	// point at. modelRefs tracks refs that are explicit models (self edges).
-	// rowRefs tracks refs that appear as row IDs and therefore produce an edge.
-	aliasTargets := make(map[string]map[string]struct{})
-	modelRefs := make(map[string]struct{})
-	rowRefs := make(map[string]struct{})
-	// refSeen bounds every distinct ref (row IDs, aliases, canonical targets)
-	// so a large response cannot allocate an unbounded map.
-	refSeen := make(map[string]struct{})
-	truncated := false
-
-	addRef := func(ref string) bool {
-		if _, ok := refSeen[ref]; ok {
-			return true
-		}
-		if len(refSeen) >= aliasMaxEdgesGlobal {
-			truncated = true
-			return false
-		}
-		refSeen[ref] = struct{}{}
-		return true
-	}
-
+	builder := newAliasEdgeBuilder(backendID)
 	for _, row := range rows {
-		ref, ok := ModelReference(backendID, row.ID)
-		if !ok {
-			// Invalid or overlong ID: never retained.
-			continue
-		}
-		if !addRef(ref) {
+		if builder.processRow(row) {
 			break
 		}
-		rowRefs[ref] = struct{}{}
-		rowType := row.Meta.LLaMaSwap.Type
-		modelID := row.Meta.LLaMaSwap.ModelID
-		aliases := row.Meta.LLaMaSwap.Aliases
-
-		if rowType == "model" {
-			// Explicit canonical model: a self edge is always a candidate.
-			modelRefs[ref] = struct{}{}
-			// Canonical metadata lists aliases even when the source suppresses
-			// separate alias rows (IncludeAliasesInList=false).
-			for _, alias := range aliases {
-				aliasRef, ok := ModelReference(backendID, alias)
-				if !ok {
-					continue
-				}
-				if !addRef(aliasRef) {
-					break
-				}
-				rowRefs[aliasRef] = struct{}{}
-				if aliasTargets[aliasRef] == nil {
-					aliasTargets[aliasRef] = make(map[string]struct{})
-				}
-				if len(aliasTargets[aliasRef]) < 2 {
-					aliasTargets[aliasRef][ref] = struct{}{}
-				}
-			}
-		} else if rowType == "alias" {
-			// Explicit alias -> canonical mapping via modelID.
-			if modelID == "" {
-				continue
-			}
-			canonicalRef, ok := ModelReference(backendID, modelID)
-			if !ok {
-				continue
-			}
-			if !addRef(canonicalRef) {
-				break
-			}
-			if aliasTargets[ref] == nil {
-				aliasTargets[ref] = make(map[string]struct{})
-			}
-			if len(aliasTargets[ref]) < 2 {
-				aliasTargets[ref][canonicalRef] = struct{}{}
-			}
-		}
-		// Other/missing types produce no edge; the ref is unknown below.
 	}
+	edges := buildAliasEdges(backendID, epoch, builder.rowRefs, builder.modelRefs, builder.aliasTargets)
+	return edges, builder.truncated
+}
 
+type aliasEdgeBuilder struct {
+	backendID    string
+	aliasTargets map[string]map[string]struct{}
+	modelRefs    map[string]struct{}
+	rowRefs      map[string]struct{}
+	refSeen      map[string]struct{}
+	truncated    bool
+}
+
+func newAliasEdgeBuilder(backendID string) *aliasEdgeBuilder {
+	return &aliasEdgeBuilder{
+		backendID:    backendID,
+		aliasTargets: make(map[string]map[string]struct{}),
+		modelRefs:    make(map[string]struct{}),
+		rowRefs:      make(map[string]struct{}),
+		refSeen:      make(map[string]struct{}),
+	}
+}
+
+// addRef registers a distinct ref, bounding the total count so a large
+// response cannot allocate an unbounded map. It returns true if the ref was
+// registered (or already seen), false if the cap was reached and the ref was
+// not inspected.
+func addRef(refSeen map[string]struct{}, ref string, truncated *bool) bool {
+	if _, ok := refSeen[ref]; ok {
+		return true
+	}
+	if len(refSeen) >= aliasMaxEdgesGlobal {
+		*truncated = true
+		return false
+	}
+	refSeen[ref] = struct{}{}
+	return true
+}
+
+// registerAliasTarget records that aliasRef points to targetRef, capping the
+// number of targets at 2 so a third target flips the edge to ambiguous.
+func registerAliasTarget(aliasTargets map[string]map[string]struct{}, aliasRef, targetRef string) {
+	if aliasTargets[aliasRef] == nil {
+		aliasTargets[aliasRef] = make(map[string]struct{})
+	}
+	if len(aliasTargets[aliasRef]) < 2 {
+		aliasTargets[aliasRef][targetRef] = struct{}{}
+	}
+}
+
+// processAliasRow processes one /v1/models row, updating the catalog maps. It
+// returns true if the ref bound was reached and remaining rows must not be
+// inspected.
+func (b *aliasEdgeBuilder) processRow(row aliasRow) bool {
+	ref, ok := ModelReference(b.backendID, row.ID)
+	if !ok {
+		// Invalid or overlong ID: never retained.
+		return false
+	}
+	if !addRef(b.refSeen, ref, &b.truncated) {
+		return true // cap reached
+	}
+	b.rowRefs[ref] = struct{}{}
+	switch row.Meta.LLaMaSwap.Type {
+	case "model":
+		return b.processCanonicalRow(ref, row.Meta.LLaMaSwap.Aliases)
+	case "alias":
+		return b.processAliasMapping(ref, row.Meta.LLaMaSwap.ModelID)
+	}
+	// Other/missing types produce no edge; the ref is unknown below.
+	return false
+}
+
+func (b *aliasEdgeBuilder) processCanonicalRow(ref string, aliases []string) bool {
+	b.modelRefs[ref] = struct{}{}
+	for _, alias := range aliases {
+		aliasRef, ok := ModelReference(b.backendID, alias)
+		if !ok {
+			continue
+		}
+		if !addRef(b.refSeen, aliasRef, &b.truncated) {
+			return true
+		}
+		b.rowRefs[aliasRef] = struct{}{}
+		registerAliasTarget(b.aliasTargets, aliasRef, ref)
+	}
+	return false
+}
+
+func (b *aliasEdgeBuilder) processAliasMapping(ref, modelID string) bool {
+	if modelID == "" {
+		return false
+	}
+	canonicalRef, ok := ModelReference(b.backendID, modelID)
+	if !ok {
+		return false
+	}
+	if !addRef(b.refSeen, canonicalRef, &b.truncated) {
+		return true
+	}
+	registerAliasTarget(b.aliasTargets, ref, canonicalRef)
+	return false
+}
+
+// buildAliasEdges builds one edge per distinct ref and sorts them
+// deterministically by (Ref, CanonicalRef).
+func buildAliasEdges(backendID string, epoch int64, rowRefs, modelRefs map[string]struct{}, aliasTargets map[string]map[string]struct{}) []AliasEdge {
 	edges := make([]AliasEdge, 0, len(rowRefs))
 	// Row IDs and aliases explicitly declared on canonical rows produce edges.
 	for ref := range rowRefs {
@@ -631,7 +705,7 @@ func buildEdges(backendID string, rows []aliasRow, epoch int64) ([]AliasEdge, bo
 		}
 		return edges[i].CanonicalRef < edges[j].CanonicalRef
 	})
-	return edges, truncated
+	return edges
 }
 
 // edgeForRef builds one edge for a ref given its candidate canonical targets
@@ -691,25 +765,56 @@ func ResolveActivityAliases(activities []*ActivityRecord, report AliasReport) ([
 	if len(activities) > aliasMaxActivities {
 		return nil, errors.New("activity count exceeds bound")
 	}
-	// Bound the reported edges before allocating the lookup.
 	edges := report.Edges
 	if len(edges) > aliasMaxEdgesGlobal {
 		return nil, errors.New("alias edge count exceeds bound")
 	}
+	if err := validateAliasEdges(edges); err != nil {
+		return nil, err
+	}
+	if err := validateAliasActivities(activities); err != nil {
+		return nil, err
+	}
+	lookup := buildAliasLookup(edges)
+
+	identities := make([]ActivityModelIdentity, 0, len(activities))
+	for _, a := range activities {
+		if a == nil {
+			continue
+		}
+		identities = append(identities, resolveAliasActivity(a, lookup))
+	}
+	return identities, nil
+}
+
+// validateAliasEdges validates each edge in the report. It returns a finite
+// error (without caller data) if any edge is malformed.
+func validateAliasEdges(edges []AliasEdge) error {
 	for _, e := range edges {
 		if !validIdentifier(e.BackendID) || e.Epoch <= 0 || !isModelReference(e.Ref) ||
 			(e.CanonicalRef != "" && !isModelReference(e.CanonicalRef)) {
-			return nil, errors.New("invalid alias evidence")
+			return errors.New("invalid alias evidence")
 		}
 	}
+	return nil
+}
+
+// validateAliasActivities validates each activity's identity fields. Nil
+// activities are skipped. It returns a finite error if any activity is
+// malformed.
+func validateAliasActivities(activities []*ActivityRecord) error {
 	for _, a := range activities {
 		if a != nil && (!validIdentifier(a.BackendID) || !validIdentifier(a.ActivityID) || a.Epoch <= 0 ||
 			(a.ReportedModelRef != "" && !isModelReference(a.ReportedModelRef))) {
-			return nil, errors.New("invalid activity identity")
+			return errors.New("invalid activity identity")
 		}
 	}
-	// Build a lookup keyed by (backendID, epoch, ref). Duplicate refs in the
-	// same scope are ambiguous: no winner is picked.
+	return nil
+}
+
+// buildAliasLookup builds a lookup keyed by (backendID, epoch, ref). Duplicate
+// refs in the same scope are ambiguous: no winner is picked.
+func buildAliasLookup(edges []AliasEdge) map[string]AliasEdge {
 	lookup := make(map[string]AliasEdge, len(edges))
 	for _, e := range edges {
 		key := aliasEdgeKey(e.BackendID, e.Epoch, e.Ref)
@@ -724,46 +829,42 @@ func ResolveActivityAliases(activities []*ActivityRecord, report AliasReport) ([
 			lookup[key] = e
 		}
 	}
-
-	identities := make([]ActivityModelIdentity, 0, len(activities))
-	for _, a := range activities {
-		if a == nil {
-			continue
-		}
-		identity := ActivityModelIdentity{
-			BackendID:          a.BackendID,
-			Epoch:              a.Epoch,
-			ActivityID:         a.ActivityID,
-			ReportedModelRef:   a.ReportedModelRef,
-			Source:             aliasSourceCatalogMetadata,
-			Provenance:         activityProvenanceCatalogDeclared,
-			RequestIDMapping:   aliasRequestIDMappingUnsupported,
-			UpstreamGeneration: upstreamGenerationUnknown,
-		}
-		// A conflicting (duplicate) activity identity is never merged; it is
-		// reported unknown rather than attributed to a catalog ref.
-		if a.IdentityConflict {
-			identity.State = aliasStateUnknown
-			identities = append(identities, identity)
-			continue
-		}
-		key := aliasEdgeKey(a.BackendID, a.Epoch, a.ReportedModelRef)
-		edge, ok := lookup[key]
-		if !ok {
-			// No catalog edge for this ref: unknown finite state.
-			identity.State = aliasStateUnknown
-		} else {
-			identity.State = edge.State
-			if edge.State == aliasStateExact && edge.CanonicalRef != "" {
-				identity.CanonicalRef = edge.CanonicalRef
-			}
-			// Ambiguous or unknown: canonical_ref is omitted.
-		}
-		identities = append(identities, identity)
-	}
-	return identities, nil
+	return lookup
 }
 
+// resolveAliasActivity resolves one activity against the lookup, returning its
+// identity. Conflicting identities are reported unknown.
+func resolveAliasActivity(a *ActivityRecord, lookup map[string]AliasEdge) ActivityModelIdentity {
+	identity := ActivityModelIdentity{
+		BackendID:          a.BackendID,
+		Epoch:              a.Epoch,
+		ActivityID:         a.ActivityID,
+		ReportedModelRef:   a.ReportedModelRef,
+		Source:             aliasSourceCatalogMetadata,
+		Provenance:         activityProvenanceCatalogDeclared,
+		RequestIDMapping:   aliasRequestIDMappingUnsupported,
+		UpstreamGeneration: upstreamGenerationUnknown,
+	}
+	// A conflicting (duplicate) activity identity is never merged; it is
+	// reported unknown rather than attributed to a catalog ref.
+	if a.IdentityConflict {
+		identity.State = aliasStateUnknown
+		return identity
+	}
+	key := aliasEdgeKey(a.BackendID, a.Epoch, a.ReportedModelRef)
+	edge, ok := lookup[key]
+	if !ok {
+		// No catalog edge for this ref: unknown finite state.
+		identity.State = aliasStateUnknown
+		return identity
+	}
+	identity.State = edge.State
+	if edge.State == aliasStateExact && edge.CanonicalRef != "" {
+		identity.CanonicalRef = edge.CanonicalRef
+	}
+	// Ambiguous or unknown: canonical_ref is omitted.
+	return identity
+}
 func isModelReference(ref string) bool {
 	if len(ref) != len(modelReferencePrefix)+32 || !strings.HasPrefix(ref, modelReferencePrefix) {
 		return false

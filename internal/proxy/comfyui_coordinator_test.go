@@ -68,13 +68,13 @@ func TestComfyUICoordinatorRetriesInitialCheckOnlyBeforeFree_PreFreeFailureCanRe
 		}
 		return confirmedCoordinatorEvidence(), nil
 	})
-	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
+	if _, err := c.reconcileInitial(context.Background(), false); !errors.Is(err, ErrComfyUIReleaseUnknown) {
 		t.Fatalf("first check error=%v, want unknown release", err)
 	}
 	if state := c.snapshot(); state.State != "unknown" {
 		t.Fatalf("failed pre-free check changed admission state: %+v", state)
 	}
-	if _, err := c.reconcileInitial(context.Background()); err != nil {
+	if _, err := c.reconcileInitial(context.Background(), false); err != nil {
 		t.Fatalf("retry failed: %v", err)
 	}
 	if state := c.snapshot(); state.State != "released" || calls.Load() != 2 {
@@ -88,10 +88,10 @@ func TestComfyUICoordinatorRetriesInitialCheckOnlyBeforeFree_PostFreeFailureRema
 		calls.Add(1)
 		return ComfyUIReleaseResult{State: "unknown", FreeRequested: true}, ErrComfyUIReleaseUnknown
 	})
-	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, ErrComfyUIReleaseUnknown) {
+	if _, err := c.reconcileInitial(context.Background(), false); !errors.Is(err, ErrComfyUIReleaseUnknown) {
 		t.Fatalf("first check error=%v, want unknown release", err)
 	}
-	if _, err := c.reconcileInitial(context.Background()); !errors.Is(err, errComfyUIAdmissionBlocked) {
+	if _, err := c.reconcileInitial(context.Background(), false); !errors.Is(err, errComfyUIAdmissionBlocked) {
 		t.Fatalf("post-free retry error=%v, want admission blocked", err)
 	}
 	if calls.Load() != 1 || c.snapshot().State != "unknown" {

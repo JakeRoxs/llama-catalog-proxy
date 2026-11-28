@@ -30,33 +30,46 @@ func TestBackendAdmissionDenialLogOmitsRequestPath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const path = "/private-request-path"
-			var logs bytes.Buffer
-			h := &Handler{
-				logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
-				backendAdmission:       func(*http.Request, string) (func(), bool) { return nil, false },
-				backendAdmissionStatus: tc.status,
-			}
-			requestID := generateRequestID()
-			req := httptest.NewRequestWithContext(context.WithValue(t.Context(), requestIDKey{}, requestID), http.MethodPost, path, nil)
-			w := httptest.NewRecorder()
-			h.dispatchBackend(w, req, "test-backend")
-
+			logs, w, requestID := runDenialScenario(t, path, tc.status)
 			if w.Code != http.StatusServiceUnavailable {
 				t.Fatalf("denial status = %d, want %d", w.Code, http.StatusServiceUnavailable)
 			}
-			logged := logs.String()
-			if strings.Contains(logged, " path=") || strings.Contains(logged, path) || strings.Contains(logged, "private-lease-id") {
-				t.Fatalf("denial log includes a request path or lease ID: %s", logged)
-			}
-			for _, want := range []string{"backend admission denied", "backend_id=test-backend", "request_id=" + requestID} {
-				if !strings.Contains(logged, want) {
-					t.Errorf("denial log missing %q: %s", want, logged)
-				}
-			}
-			if tc.status != nil && !strings.Contains(logged, "lease_id_present=true") {
-				t.Errorf("denial log missing lease presence: %s", logged)
-			}
+			assertDenialLogOmitsRequestPath(t, logs.String(), path, requestID, tc.status != nil)
 		})
+	}
+}
+
+// runDenialScenario builds a Handler whose admission always denies, dispatches a
+// POST to the given path, and returns the captured logs, response, and request ID.
+func runDenialScenario(t *testing.T, path string, status func() comfyUICoordinatorStatus) (bytes.Buffer, *httptest.ResponseRecorder, string) {
+	t.Helper()
+	var logs bytes.Buffer
+	h := &Handler{
+		logger:                 slog.New(slog.NewTextHandler(&logs, nil)),
+		backendAdmission:       func(*http.Request, string) (func(), bool) { return nil, false },
+		backendAdmissionStatus: status,
+	}
+	requestID := generateRequestID()
+	req := httptest.NewRequestWithContext(context.WithValue(t.Context(), requestIDKey{}, requestID), http.MethodPost, path, nil)
+	w := httptest.NewRecorder()
+	h.dispatchBackend(w, req, "test-backend")
+	return logs, w, requestID
+}
+
+// assertDenialLogOmitsRequestPath verifies the denial log scrubs the request path
+// and lease ID while retaining the request ID, backend ID, and denial message.
+func assertDenialLogOmitsRequestPath(t *testing.T, logged, path, requestID string, leasePresent bool) {
+	t.Helper()
+	if strings.Contains(logged, " path=") || strings.Contains(logged, path) || strings.Contains(logged, "private-lease-id") {
+		t.Fatalf("denial log includes a request path or lease ID: %s", logged)
+	}
+	for _, want := range []string{"backend admission denied", "backend_id=test-backend", "request_id=" + requestID} {
+		if !strings.Contains(logged, want) {
+			t.Errorf("denial log missing %q: %s", want, logged)
+		}
+	}
+	if leasePresent && !strings.Contains(logged, "lease_id_present=true") {
+		t.Errorf("denial log missing lease presence: %s", logged)
 	}
 }
 

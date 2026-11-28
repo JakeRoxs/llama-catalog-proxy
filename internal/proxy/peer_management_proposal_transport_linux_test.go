@@ -45,17 +45,21 @@ type tlsProposalHarness struct {
 	cleanup   func()
 }
 
+type proposalHarnessServerConfig struct {
+	owner     delegatedApplyFixture
+	mode      *atomic.Int32
+	calls     *atomic.Int32
+	redirects *atomic.Int32
+	entered   chan struct{}
+	release   chan struct{}
+	peerToken string
+	redirect  *httptest.Server
+}
+
 func newTLSProposalHarness(t *testing.T) (tlsProposalHarness, func()) {
 	t.Helper()
 	owner := newDelegatedApplyFixture(t)
-	existing, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := delegatedSettingsRequest{
-		Owner: existing.Owner, Backend: existing.BackendID, Model: existing.Proposal.ModelID,
-		Revision: existing.Proposal.Revision, Settings: existing.Proposal.Settings,
-	}
+	_, input := loadDelegatedProposalRequest(t, owner)
 	owner.r.logger = discardLogger()
 	owner.r.peerSlots = make(chan struct{}, 2)
 	var mode, calls, redirects atomic.Int32
@@ -64,92 +68,13 @@ func newTLSProposalHarness(t *testing.T) (tlsProposalHarness, func()) {
 		redirects.Add(1)
 	}))
 	peerToken, caller := strings.Repeat("p", 32), strings.Repeat("c", 32)
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == peerSettingsApplyPath {
-			owner.r.servePeerDelegatedSettingsApply(w, req)
-			return
-		}
-		calls.Add(1)
-		if req.Method != http.MethodPost || req.URL.Path != peerSettingsProposalPath ||
-			req.Header.Get("Authorization") != "Bearer "+peerToken ||
-			req.Header.Get("Cookie") != "" || req.Header.Get("X-Unsafe") != "" ||
-			req.Header.Get("Idempotency-Key") != "" {
-			t.Errorf("unexpected proposal request: %s %s", req.Method, req.URL.Path)
-		}
-		response := httptest.NewRecorder()
-		owner.r.servePeerDelegatedSettingsProposal(response, req)
-		if mode.Load() == 12 {
-			close(entered)
-			<-release
-		}
-		switch m := mode.Load(); m {
-		case 1:
-			connection, _, err := w.(http.Hijacker).Hijack()
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			_ = connection.Close()
-		case 2, 3, 4, 5, 6, 7, 8, 11:
-			var proposal modelconfig.DelegatedProposal
-			if err := json.Unmarshal(response.Body.Bytes(), &proposal); err != nil {
-				t.Error(err)
-				return
-			}
-			lifetime := delegatedProposalLifetime
-			switch m {
-			case 2:
-				proposal.Owner.ConfigGeneration++
-			case 3:
-				proposal.RequesterNode = "another-requester"
-			case 4:
-				proposal.BackendID = "another-backend"
-			case 5:
-				proposal.Proposal.ModelID = "another-model"
-			case 6:
-				proposal.Proposal.Revision = strings.Repeat("b", 64)
-			case 7:
-				size := int32(8192)
-				proposal.Proposal.Settings.ContextSize = &size
-				proposal.Proposal.Changes[0].After = "8192"
-			case 8:
-				lifetime += time.Minute
-			case 11:
-				proposal.Proposal.CreatedAt = time.Now().Add(time.Minute)
-			}
-			forged, err := modelconfig.NewDelegatedProposal(proposal.Owner, proposal.RequesterNode, proposal.BackendID, proposal.Proposal, lifetime)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			w.Header().Set("Content-Type", "application/json")
-			if err := json.NewEncoder(w).Encode(forged); err != nil {
-				t.Error(err)
-			}
-		case 9:
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, response.Body.String()+strings.Repeat(" ", maxManagementRequest))
-		case 10:
-			http.Redirect(w, req, redirect.URL, http.StatusTemporaryRedirect)
-		default:
-			for key, values := range response.Header() {
-				w.Header()[key] = values
-			}
-			w.WriteHeader(response.Code)
-			_, _ = w.Write(response.Body.Bytes())
-		}
-	}))
-	caPath := filepath.Join(t.TempDir(), "peer-ca.pem")
-	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
+	serverConfig := proposalHarnessServerConfig{
+		owner: owner, mode: &mode, calls: &calls, redirects: &redirects,
+		entered: entered, release: release, peerToken: peerToken, redirect: redirect,
 	}
-	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
-		"owner": {URL: server.URL, OutboundToken: peerToken, CAFile: caPath, RouteManagement: true},
-	}}
-	clients, _, err := newPeerClients(peer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := httptest.NewTLSServer(newProposalHarnessHandler(t, serverConfig))
+	caPath := writeProposalPeerCA(t, server)
+	peer, clients := newProposalPeerClient(t, server, peerToken, caPath)
 	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
 	receiver := &Reloader{managementSlots: make(chan struct{}, 2)}
 	receiver.state.Store(state)
@@ -192,11 +117,153 @@ func newTLSProposalHarness(t *testing.T) (tlsProposalHarness, func()) {
 	return h, cleanup
 }
 
+func loadDelegatedProposalRequest(t *testing.T, owner delegatedApplyFixture) (modelconfig.DelegatedProposal, delegatedSettingsRequest) {
+	t.Helper()
+	proposal, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := delegatedSettingsRequest{
+		Owner: proposal.Owner, Backend: proposal.BackendID, Model: proposal.Proposal.ModelID,
+		Revision: proposal.Proposal.Revision, Settings: proposal.Proposal.Settings,
+	}
+	return proposal, input
+}
+
+func writeProposalPeerCA(t *testing.T, server *httptest.Server) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "peer-ca.pem")
+	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func newProposalPeerClient(t *testing.T, server *httptest.Server, peerToken, caPath string) (*config.PeerConfig, map[string]*peerClient) {
+	t.Helper()
+	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
+		"owner": {URL: server.URL, OutboundToken: peerToken, CAFile: caPath, RouteManagement: true},
+	}}
+	clients, _, err := newPeerClients(peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return peer, clients
+}
+
+func newProposalHarnessHandler(t *testing.T, cfg proposalHarnessServerConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == peerSettingsApplyPath {
+			cfg.owner.r.servePeerDelegatedSettingsApply(w, req)
+			return
+		}
+		cfg.calls.Add(1)
+		assertProposalHarnessRequest(t, req, cfg.peerToken)
+		response := httptest.NewRecorder()
+		cfg.owner.r.servePeerDelegatedSettingsProposal(response, req)
+		if cfg.mode.Load() == 12 {
+			close(cfg.entered)
+			<-cfg.release
+		}
+		writeProposalHarnessResponse(t, w, req, response, cfg.mode.Load(), cfg.redirect.URL)
+	})
+}
+
+func assertProposalHarnessRequest(t *testing.T, req *http.Request, peerToken string) {
+	t.Helper()
+	if req.Method != http.MethodPost || req.URL.Path != peerSettingsProposalPath ||
+		req.Header.Get("Authorization") != "Bearer "+peerToken ||
+		req.Header.Get("Cookie") != "" || req.Header.Get("X-Unsafe") != "" ||
+		req.Header.Get("Idempotency-Key") != "" {
+		t.Errorf("unexpected proposal request: %s %s", req.Method, req.URL.Path)
+	}
+}
+
+func writeProposalHarnessResponse(t *testing.T, w http.ResponseWriter, req *http.Request, response *httptest.ResponseRecorder, mode int32, redirectURL string) {
+	t.Helper()
+	switch mode {
+	case 1:
+		closeProposalHarnessConnection(t, w)
+	case 2, 3, 4, 5, 6, 7, 8, 11:
+		writeForgedProposal(t, w, response, mode)
+	case 9:
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, response.Body.String()+strings.Repeat(" ", maxManagementRequest))
+	case 10:
+		http.Redirect(w, req, redirectURL, http.StatusTemporaryRedirect)
+	default:
+		copyProposalHarnessResponse(w, response)
+	}
+}
+
+func closeProposalHarnessConnection(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	connection, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	_ = connection.Close()
+}
+
+func writeForgedProposal(t *testing.T, w http.ResponseWriter, response *httptest.ResponseRecorder, mode int32) {
+	t.Helper()
+	var proposal modelconfig.DelegatedProposal
+	if err := json.Unmarshal(response.Body.Bytes(), &proposal); err != nil {
+		t.Error(err)
+		return
+	}
+	lifetime := delegatedProposalLifetime
+	switch mode {
+	case 2:
+		proposal.Owner.ConfigGeneration++
+	case 3:
+		proposal.RequesterNode = "another-requester"
+	case 4:
+		proposal.BackendID = "another-backend"
+	case 5:
+		proposal.Proposal.ModelID = "another-model"
+	case 6:
+		proposal.Proposal.Revision = strings.Repeat("b", 64)
+	case 7:
+		size := int32(8192)
+		proposal.Proposal.Settings.ContextSize = &size
+		proposal.Proposal.Changes[0].After = "8192"
+	case 8:
+		lifetime += time.Minute
+	case 11:
+		proposal.Proposal.CreatedAt = time.Now().Add(time.Minute)
+	}
+	forged, err := modelconfig.NewDelegatedProposal(proposal.Owner, proposal.RequesterNode, proposal.BackendID, proposal.Proposal, lifetime)
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(forged); err != nil {
+		t.Error(err)
+	}
+}
+
+func copyProposalHarnessResponse(w http.ResponseWriter, response *httptest.ResponseRecorder) {
+	for key, values := range response.Header() {
+		w.Header()[key] = values
+	}
+	w.WriteHeader(response.Code)
+	_, _ = w.Write(response.Body.Bytes())
+}
+
 func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	h, cleanup := newTLSProposalHarness(t)
 	defer cleanup()
+	assertProposalPreflightRejections(t, h)
+	assertProposalTransportFailures(t, h)
+	assertProposalInFlightAndSuccess(t, h)
+	assertProposalUnregisteredRouteAndOutage(t, h)
+}
 
-	for _, tt := range []struct {
+func assertProposalPreflightRejections(t *testing.T, h tlsProposalHarness) {
+	for _, tc := range []struct {
 		name  string
 		req   *http.Request
 		state *reloaderState
@@ -207,8 +274,8 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 		{"canceled", h.request.WithContext(h.canceled), h.state, context.Canceled},
 		{"stale state", h.request, &reloaderState{}, errDelegationChanged},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			assertProposalRejected(t, h, tt.req, tt.state, h.input, tt.want)
+		t.Run(tc.name, func(t *testing.T) {
+			assertProposalRejected(t, h, tc.req, tc.state, h.input, tc.want)
 		})
 	}
 
@@ -230,11 +297,12 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	oversized := h.input
 	oversized.Model = strings.Repeat("a", maxBenchmarkJSONBytes)
 	assertProposalRejected(t, h, h.request, h.state, oversized, modelconfig.ErrDelegatedProposalInvalid)
-
 	if h.calls.Load() != 0 {
 		t.Fatal("rejected request reached owner")
 	}
+}
 
+func assertProposalTransportFailures(t *testing.T, h tlsProposalHarness) {
 	revoked := *h.owner.state
 	revoked.peer = copyPeerConfig(h.owner.state.peer)
 	revoked.peer.Peers["requester"] = config.PeerGrant{Token: h.peerToken, CatalogRead: true}
@@ -246,18 +314,8 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	h.owner.r.state.Store(h.owner.state)
 	h.owner.r.lifecycleMu.Unlock()
 
-	staleOwner := h.input
-	staleOwner.Owner.ConfigGeneration++
-	assertProposalRejected(t, h, h.request, h.state, staleOwner, errDelegationProposalUnknown)
-
-	staleSource := h.input
-	staleSource.Revision = strings.Repeat("b", 64)
-	assertProposalRejected(t, h, h.request, h.state, staleSource, errDelegationProposalUnknown)
-
-	ids, err := modelconfig.ListDelegatedProposals(h.owner.proposals)
-	if err != nil || len(ids) != 1 {
-		t.Fatalf("rejected owner request persisted a review: %v, %v", ids, err)
-	}
+	assertStaleProposalBindingsRejected(t, h)
+	assertProposalStoredCount(t, h.owner.proposals, 1, "rejected owner request persisted a review")
 
 	h.mode.Store(1)
 	before := h.calls.Load()
@@ -265,20 +323,36 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	if h.calls.Load() != before+1 {
 		t.Fatalf("proposal request automatically retried: %d additional calls", h.calls.Load()-before)
 	}
-	ids, err = modelconfig.ListDelegatedProposals(h.owner.proposals)
-	if err != nil || len(ids) != 2 {
-		t.Fatalf("lost response did not leave exactly one stored review: %v, %v", ids, err)
-	}
+	assertProposalStoredCount(t, h.owner.proposals, 2, "lost response did not leave exactly one stored review")
 
-	for _, m := range []int32{2, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
-		h.mode.Store(m)
+	for _, mode := range []int32{2, 3, 4, 5, 6, 7, 8, 9, 10, 11} {
+		h.mode.Store(mode)
 		assertProposalRejected(t, h, h.request, h.state, h.input, errDelegationProposalUnknown)
 	}
-
 	if h.redirects.Load() != 0 {
 		t.Fatal("proposal request followed a redirect")
 	}
+}
 
+func assertStaleProposalBindingsRejected(t *testing.T, h tlsProposalHarness) {
+	staleOwner := h.input
+	staleOwner.Owner.ConfigGeneration++
+	assertProposalRejected(t, h, h.request, h.state, staleOwner, errDelegationProposalUnknown)
+
+	staleSource := h.input
+	staleSource.Revision = strings.Repeat("b", 64)
+	assertProposalRejected(t, h, h.request, h.state, staleSource, errDelegationProposalUnknown)
+}
+
+func assertProposalStoredCount(t *testing.T, store string, count int, message string) {
+	t.Helper()
+	ids, err := modelconfig.ListDelegatedProposals(store)
+	if err != nil || len(ids) != count {
+		t.Fatalf("%s: %v, %v", message, ids, err)
+	}
+}
+
+func assertProposalInFlightAndSuccess(t *testing.T, h tlsProposalHarness) {
 	h.mode.Store(12)
 	done := make(chan error, 1)
 	go func() {
@@ -300,17 +374,19 @@ func TestForwardDelegatedProposalAcrossTLS(t *testing.T) {
 	h.mode.Store(0)
 	proposal, err := h.receiver.forwardDelegatedSettingsProposal(h.request, h.state, h.input)
 	if err != nil || proposal.Owner != h.input.Owner || proposal.RequesterNode != "requester" ||
-		proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != h.input.Model || proposal.Proposal.Revision != h.input.Revision ||
+		proposal.Proposal.TargetID != "swap" || proposal.Proposal.ModelID != h.input.Model ||
+		proposal.Proposal.Revision != h.input.Revision ||
 		proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) != delegatedProposalLifetime {
 		t.Fatalf("proposal = %+v, %v", proposal, err)
 	}
 	assertProposalValidated(t, h, &proposal)
-
 	operation, err := h.receiver.forwardDelegatedSettingsApply(h.request, h.state, proposal, strings.Repeat("f", 32), true, true, true)
 	if err != nil || operation.Outcome != "written" || operation.ProposalID != proposal.Proposal.ID {
 		t.Fatalf("created review could not be applied: %+v, %v", operation, err)
 	}
+}
 
+func assertProposalUnregisteredRouteAndOutage(t *testing.T, h tlsProposalHarness) {
 	unregistered := httptest.NewRequest(http.MethodPost, "https://owner.example"+peerSettingsProposalPath, nil)
 	unregistered.Header.Set("Authorization", "Bearer "+h.peerToken)
 	recorder := httptest.NewRecorder()
@@ -364,28 +440,12 @@ func assertProposalValidated(t *testing.T, h tlsProposalHarness, proposal *model
 func TestForwardDelegatedProposalRecoveryAcrossTLS(t *testing.T) {
 	owner := newDelegatedApplyFixture(t)
 	owner.r.peerSlots = make(chan struct{}, 1)
-	proposal, err := modelconfig.LoadDelegatedProposal(owner.proposals, owner.input.ProposalID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input := delegatedSettingsRequest{
-		Owner: proposal.Owner, Backend: proposal.BackendID, Model: proposal.Proposal.ModelID,
-		Revision: proposal.Proposal.Revision, Settings: proposal.Proposal.Settings,
-	}
+	proposal, input := loadDelegatedProposalRequest(t, owner)
 	peerToken, caller := strings.Repeat("p", 32), strings.Repeat("c", 32)
 	server := httptest.NewTLSServer(owner.r.PeerHandler())
 	defer server.Close()
-	caPath := filepath.Join(t.TempDir(), "peer-ca.pem")
-	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	peer := &config.PeerConfig{NodeID: "requester", Peers: map[string]config.PeerGrant{
-		"owner": {URL: server.URL, OutboundToken: peerToken, CAFile: caPath, RouteManagement: true},
-	}}
-	clients, _, err := newPeerClients(peer)
-	if err != nil {
-		t.Fatal(err)
-	}
+	caPath := writeProposalPeerCA(t, server)
+	peer, clients := newProposalPeerClient(t, server, peerToken, caPath)
 	defer closePeerClients(clients)
 	state := &reloaderState{peer: peer, peerClients: clients, management: &config.ManagementConfig{DelegationToken: caller}}
 	receiver := &Reloader{logger: discardLogger(), managementSlots: make(chan struct{}, 1)}

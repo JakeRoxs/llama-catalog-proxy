@@ -176,49 +176,68 @@ func groupSamples(samples []TimedDeviceSample) (map[sampleKey][]time.Time, map[s
 	devicesByPair := make(map[string]map[int64]map[string]bool)
 
 	for _, s := range samples {
-		if !validIdentifier(s.BackendID) {
-			return nil, nil, errors.New("invalid backend id in sample: explicit unavailable")
+		if err := validateSample(s); err != nil {
+			return nil, nil, err
 		}
-		if !validIdentifier(s.DeviceID) {
-			return nil, nil, errors.New("invalid device id in sample: explicit unavailable")
+		if err := trackDevice(devicesByPair, s.BackendID, s.Epoch, s.DeviceID); err != nil {
+			return nil, nil, err
 		}
-		if !isGPUDeviceID(s.DeviceID) {
-			return nil, nil, errors.New("invalid device id: must be canonical gpu- ID: explicit unavailable")
-		}
-		if s.Timestamp.IsZero() {
-			return nil, nil, errors.New("zero timestamp in sample: explicit unavailable")
-		}
-		if s.Epoch <= 0 {
-			return nil, nil, errors.New("non-positive epoch in sample: explicit unavailable")
-		}
-
-		if devicesByPair[s.BackendID] == nil {
-			devicesByPair[s.BackendID] = make(map[int64]map[string]bool)
-		}
-		if devicesByPair[s.BackendID][s.Epoch] == nil {
-			devicesByPair[s.BackendID][s.Epoch] = make(map[string]bool)
-		}
-		devicesByPair[s.BackendID][s.Epoch][s.DeviceID] = true
-		if len(devicesByPair[s.BackendID][s.Epoch]) > 8 {
-			return nil, nil, errors.New("too many devices per backend/epoch: max 8")
-		}
-
 		key := sampleKey{s.BackendID, s.Epoch, s.DeviceID}
 		ts := s.Timestamp.UTC().Round(0)
-		existing := samplesByKey[key]
-		found := false
-		for _, ets := range existing {
-			if ets.Equal(ts) {
-				found = true
-				break
-			}
-		}
-		if !found {
-			samplesByKey[key] = append(samplesByKey[key], ts)
-		}
+		appendUniqueTimestamp(samplesByKey, key, ts)
 	}
 
 	return samplesByKey, devicesByPair, nil
+}
+
+// validateSample validates a single TimedDeviceSample. It is pure: it does not
+// mutate the sample. Checks are ordered backend ID, device ID, GPU device ID
+// format, timestamp, epoch. Returns the first failing check's error.
+func validateSample(s TimedDeviceSample) error {
+	if !validIdentifier(s.BackendID) {
+		return errors.New("invalid backend id in sample: explicit unavailable")
+	}
+	if !validIdentifier(s.DeviceID) {
+		return errors.New("invalid device id in sample: explicit unavailable")
+	}
+	if !isGPUDeviceID(s.DeviceID) {
+		return errors.New("invalid device id: must be canonical gpu- ID: explicit unavailable")
+	}
+	if s.Timestamp.IsZero() {
+		return errors.New("zero timestamp in sample: explicit unavailable")
+	}
+	if s.Epoch <= 0 {
+		return errors.New("non-positive epoch in sample: explicit unavailable")
+	}
+	return nil
+}
+
+// trackDevice records a device for a backend+epoch pair and enforces the
+// per-pair device cap of 8. It mutates devicesByPair in place.
+func trackDevice(devicesByPair map[string]map[int64]map[string]bool, backendID string, epoch int64, deviceID string) error {
+	if devicesByPair[backendID] == nil {
+		devicesByPair[backendID] = make(map[int64]map[string]bool)
+	}
+	if devicesByPair[backendID][epoch] == nil {
+		devicesByPair[backendID][epoch] = make(map[string]bool)
+	}
+	devicesByPair[backendID][epoch][deviceID] = true
+	if len(devicesByPair[backendID][epoch]) > 8 {
+		return errors.New("too many devices per backend/epoch: max 8")
+	}
+	return nil
+}
+
+// appendUniqueTimestamp appends ts to the key's timestamp list if it is not
+// already present. Distinct timestamps are deduplicated; the list is not
+// sorted here (callers sort before use).
+func appendUniqueTimestamp(samplesByKey map[sampleKey][]time.Time, key sampleKey, ts time.Time) {
+	for _, ets := range samplesByKey[key] {
+		if ets.Equal(ts) {
+			return
+		}
+	}
+	samplesByKey[key] = append(samplesByKey[key], ts)
 }
 
 // buildBaseAssociation builds the unavailable base association for one
@@ -267,63 +286,80 @@ func computeIntervalStats(matched []time.Time) (*int64, *int64) {
 // associateActivity associates one activity with all devices for its
 // backend+epoch. It appends one association per device to result.
 func associateActivity(a *ActivityRecord, samplesByKey map[sampleKey][]time.Time, devicesByPair map[string]map[int64]map[string]bool, window AssociationWindow, result *[]ActivityDeviceAssociation) {
+	for _, deviceID := range sortedDeviceIDs(a, devicesByPair) {
+		associateDevice(a, deviceID, samplesByKey, window, result)
+	}
+}
+
+// sortedDeviceIDs returns the sorted device IDs for an activity's backend+epoch
+// pair. It returns nil when no devices exist for that pair, so callers can
+// range over the result safely.
+func sortedDeviceIDs(a *ActivityRecord, devicesByPair map[string]map[int64]map[string]bool) []string {
 	epochDevices, hasEpoch := devicesByPair[a.BackendID]
 	if !hasEpoch {
-		return
+		return nil
 	}
 	deviceMap, hasDevices := epochDevices[a.Epoch]
 	if !hasDevices {
-		return
+		return nil
 	}
-
-	// Collect and sort device IDs for deterministic output.
 	var deviceIDs []string
 	for deviceID := range deviceMap {
 		deviceIDs = append(deviceIDs, deviceID)
 	}
 	sort.Strings(deviceIDs)
+	return deviceIDs
+}
 
-	for _, deviceID := range deviceIDs {
-		timestamps := samplesByKey[sampleKey{a.BackendID, a.Epoch, deviceID}]
+// associateDevice processes one device for an activity and appends the
+// association to result. It is pure with respect to its inputs (result is the
+// only mutation site).
+func associateDevice(a *ActivityRecord, deviceID string, samplesByKey map[sampleKey][]time.Time, window AssociationWindow, result *[]ActivityDeviceAssociation) {
+	timestamps := samplesByKey[sampleKey{a.BackendID, a.Epoch, deviceID}]
+	assoc := buildBaseAssociation(a, deviceID, window)
 
-		assoc := buildBaseAssociation(a, deviceID, window)
-
-		// Identity conflict: no valid association.
-		if a.IdentityConflict {
-			*result = append(*result, assoc)
-			continue
-		}
-
-		// Window: [activity.Timestamp - Before, activity.Timestamp + After] inclusive.
-		// Reuse the base association's window bounds.
-		windowStart := assoc.WindowStart
-		windowEnd := assoc.WindowEnd
-
-		var matched []time.Time
-		for _, ts := range timestamps {
-			if !ts.Before(windowStart) && !ts.After(windowEnd) {
-				matched = append(matched, ts)
-			}
-		}
-
-		if len(matched) == 0 {
-			*result = append(*result, assoc)
-			continue
-		}
-
-		assoc.Kind = "approximate_time_window"
-		assoc.MatchedSampleCount = len(matched)
-		assoc.FirstSampleTime = matched[0]
-		assoc.LastSampleTime = matched[len(matched)-1]
-
-		if len(matched) >= 2 {
-			minMS, maxMS := computeIntervalStats(matched)
-			assoc.ObservedMinIntervalMS = minMS
-			assoc.ObservedMaxIntervalMS = maxMS
-		}
-
+	// Identity conflict: no valid association.
+	if a.IdentityConflict {
 		*result = append(*result, assoc)
+		return
 	}
+
+	// Window: [activity.Timestamp - Before, activity.Timestamp + After] inclusive.
+	// Reuse the base association's window bounds.
+	windowStart := assoc.WindowStart
+	windowEnd := assoc.WindowEnd
+
+	matched := samplesInWindow(timestamps, windowStart, windowEnd)
+
+	if len(matched) == 0 {
+		*result = append(*result, assoc)
+		return
+	}
+
+	assoc.Kind = "approximate_time_window"
+	assoc.MatchedSampleCount = len(matched)
+	assoc.FirstSampleTime = matched[0]
+	assoc.LastSampleTime = matched[len(matched)-1]
+
+	if len(matched) >= 2 {
+		minMS, maxMS := computeIntervalStats(matched)
+		assoc.ObservedMinIntervalMS = minMS
+		assoc.ObservedMaxIntervalMS = maxMS
+	}
+
+	*result = append(*result, assoc)
+}
+
+// samplesInWindow returns the timestamps within [windowStart, windowEnd]
+// inclusive. The input slice is not mutated.
+func samplesInWindow(timestamps []time.Time, windowStart, windowEnd time.Time) []time.Time {
+	var matched []time.Time
+	for _, ts := range timestamps {
+		if !ts.Before(windowStart) && !ts.After(windowEnd) {
+			matched = append(matched, ts)
+		}
+	}
+	return matched
 }
 
 // isGPUDeviceID checks that the device ID is a canonical 'gpu-' prefixed ASCII

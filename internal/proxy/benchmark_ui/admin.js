@@ -939,9 +939,4 @@ byId("remote-create-proposal").addEventListener("click", () => receiveRemoteProp
 byId("remote-recover-proposal").addEventListener("click", () => receiveRemoteProposal(true));
 byId("remote-apply").addEventListener("click", applyRemoteProposal);
 byId("remote-check-operation").addEventListener("click", checkRemoteOperation);
-// Top-level await is not usable here: admin.js is loaded as a regular
-// <script defer> (text/javascript, no type=module) and the test harness
-// compiles it as a VM script. refreshDashboard swallows its own errors,
-// so it never rejects; the catch keeps the fire-and-forget call explicit
-// and avoids an unhandled rejection.
-refreshDashboard().catch(() => {});
+await refreshDashboard();

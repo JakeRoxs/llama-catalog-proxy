@@ -421,6 +421,75 @@ func assertEndpointLANIP(t *testing.T, name, ipString string, want bool) {
 	}
 }
 
+// TestIsReservedOrDocumentationRange verifies the shared reserved/documentation
+// range predicate rejects the reserved IPv4 range 240.0.0.0/4, the RFC 5737
+// documentation ranges (TEST-NET-1/2/3), and IPv6 documentation ranges, while
+// allowing addresses immediately outside each range. It mirrors the policy
+// applied by validEndpointHost, validEndpointIP and validEndpointLANIP.
+func TestIsReservedOrDocumentationRange(t *testing.T) {
+	cases := []struct {
+		name string
+		ip   string
+		want bool
+	}{
+		// Reserved IPv4 range 240.0.0.0/4.
+		{"below reserved 240.0.0.0/4", "239.255.255.255", false},
+		{"reserved 240.0.0.0", "240.0.0.0", true},
+		{"reserved 240.0.0.1", "240.0.0.1", true},
+		{"reserved 255.255.255.255", "255.255.255.255", true},
+		// Shared address space 100.64.0.0/10.
+		{"below shared 100.64.0.0/10", "100.63.255.255", false},
+		{"shared 100.64.0.0", "100.64.0.0", true},
+		{"shared 100.64.0.1", "100.64.0.1", true},
+		{"shared 100.127.255.255", "100.127.255.255", true},
+		{"above shared 100.64.0.0/10", "100.128.0.0", false},
+		// TEST-NET-2 198.51.100.0/24.
+		{"below TEST-NET-2", "198.51.99.255", false},
+		{"TEST-NET-2 198.51.100.0", "198.51.100.0", true},
+		{"TEST-NET-2 198.51.100.1", "198.51.100.1", true},
+		{"TEST-NET-2 198.51.100.255", "198.51.100.255", true},
+		{"above TEST-NET-2", "198.51.101.0", false},
+		// TEST-NET-1 192.0.2.0/24.
+		{"below TEST-NET-1", "192.0.1.255", false},
+		{"TEST-NET-1 192.0.2.0", "192.0.2.0", true},
+		{"TEST-NET-1 192.0.2.1", "192.0.2.1", true},
+		{"TEST-NET-1 192.0.2.255", "192.0.2.255", true},
+		{"above TEST-NET-1", "192.0.3.0", false},
+		// TEST-NET-3 203.0.113.0/24.
+		{"below TEST-NET-3", "203.0.112.255", false},
+		{"TEST-NET-3 203.0.113.0", "203.0.113.0", true},
+		{"TEST-NET-3 203.0.113.1", "203.0.113.1", true},
+		{"TEST-NET-3 203.0.113.255", "203.0.113.255", true},
+		{"above TEST-NET-3", "203.0.114.0", false},
+		// IPv6 documentation ranges.
+		{"IPv6 doc 2001::1", "2001::1", true},
+		{"IPv6 doc 2002::1", "2002::1", true},
+		{"IPv6 doc 2001:db8::1", "2001:db8::1", true},
+		{"IPv6 non-doc 2001:0200::1", "2001:0200::1", false},
+		{"IPv6 non-doc 2003::1", "2003::1", false},
+		{"IPv6 non-doc 2001:db9::1", "2001:db9::1", false},
+		// Addresses handled by other policy branches, not this helper.
+		{"public 1.2.3.4", "1.2.3.4", false},
+		{"public 8.8.8.8", "8.8.8.8", false},
+		{"private 10.0.0.5", "10.0.0.5", false},
+		{"loopback 127.0.0.1", "127.0.0.1", false},
+		{"link-local fe80::1", "fe80::1", false},
+		{"multicast 224.0.0.1", "224.0.0.1", false},
+		{"unspecified 0.0.0.0", "0.0.0.0", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ip := net.ParseIP(tc.ip)
+			if ip == nil {
+				t.Fatalf("could not parse %q", tc.ip)
+			}
+			if got := isReservedOrDocumentationRange(ip); got != tc.want {
+				t.Fatalf("isReservedOrDocumentationRange(%q) = %t, want %t", tc.ip, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestValidEndpointLiteralIPs verifies validEndpoint rejects literal private/reserved
 // IP addresses in the endpoint URL while allowing public IPs and loopback.
 func TestValidEndpointLiteralIPs(t *testing.T) {

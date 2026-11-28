@@ -469,98 +469,47 @@ func newTestReloader(benchmark *benchmarkRuntime, adminAuth *adminAuth, peerList
 }
 
 func TestServeHTTPRouteDispatch(t *testing.T) {
-	t.Run("benchmark route handled before fallback", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(&benchmarkRuntime{}, nil, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/benchmark", nil))
-		if recorder.Code != http.StatusTemporaryRedirect {
-			t.Fatalf("benchmark /benchmark not handled by benchmark route: %d", recorder.Code)
-		}
-		if handler.called {
-			t.Fatal("current state handler invoked for benchmark route")
-		}
-	})
+	for _, tc := range routeDispatchCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			assertRouteDispatchCase(t, tc)
+		})
+	}
+}
 
-	t.Run("benchmark nil falls through to current handler", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/benchmark", nil))
-		if !handler.called {
-			t.Fatal("current state handler not invoked for /benchmark with nil benchmark")
-		}
-	})
+type routeDispatchCase struct {
+	name             string
+	path             string
+	benchmark        *benchmarkRuntime
+	auth             *adminAuth
+	peerListen       string
+	managementListen string
+	wantStatus       int
+	wantHandlerCall  bool
+}
 
-	t.Run("admin prefix with nil auth is 404", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin", nil))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("admin /admin with nil auth: %d", recorder.Code)
-		}
-		if handler.called {
-			t.Fatal("current state handler invoked for admin route with nil auth")
-		}
-	})
+func routeDispatchCases() []routeDispatchCase {
+	return []routeDispatchCase{
+		{name: "benchmark route handled before fallback", path: "/benchmark", benchmark: &benchmarkRuntime{}, wantStatus: http.StatusTemporaryRedirect},
+		{name: "benchmark nil falls through to current handler", path: "/benchmark", wantStatus: http.StatusOK, wantHandlerCall: true},
+		{name: "admin prefix with nil auth is 404", path: "/admin", wantStatus: http.StatusNotFound},
+		{name: "admin unmatched path falls through to adminAuth", path: "/admin/api/v1/session", auth: &adminAuth{}, wantStatus: http.StatusUnauthorized},
+		{name: "reserved peer prefix 404 when enabled", path: "/peer", peerListen: "127.0.0.1:1234", wantStatus: http.StatusNotFound},
+		{name: "reserved management prefix 404 when enabled", path: "/management", managementListen: "127.0.0.1:5678", wantStatus: http.StatusNotFound},
+		{name: "reserved prefix disabled falls through to current handler", path: "/peer", wantStatus: http.StatusOK, wantHandlerCall: true},
+		{name: "unmatched path falls through to current handler", path: "/v1/models", wantStatus: http.StatusOK, wantHandlerCall: true},
+	}
+}
 
-	t.Run("admin unmatched path falls through to adminAuth", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, &adminAuth{}, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/v1/session", nil))
-		if recorder.Code != http.StatusUnauthorized {
-			t.Fatalf("admin session fallback: %d", recorder.Code)
-		}
-		if handler.called {
-			t.Fatal("current state handler invoked for admin fallback path")
-		}
-	})
-
-	t.Run("reserved peer prefix 404 when enabled", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "127.0.0.1:1234", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/peer", nil))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("peer 404: %d", recorder.Code)
-		}
-		if handler.called {
-			t.Fatal("current state handler invoked for peer route")
-		}
-	})
-
-	t.Run("reserved management prefix 404 when enabled", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "", "127.0.0.1:5678", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/management", nil))
-		if recorder.Code != http.StatusNotFound {
-			t.Fatalf("management 404: %d", recorder.Code)
-		}
-		if handler.called {
-			t.Fatal("current state handler invoked for management route")
-		}
-	})
-
-	t.Run("reserved prefix disabled falls through to current handler", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/peer", nil))
-		if !handler.called {
-			t.Fatal("current state handler not invoked for /peer with peer listener disabled")
-		}
-	})
-
-	t.Run("unmatched path falls through to current handler", func(t *testing.T) {
-		handler := &recordingHandler{}
-		r := newTestReloader(nil, nil, "", "", handler)
-		recorder := httptest.NewRecorder()
-		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-		if !handler.called {
-			t.Fatal("current state handler not invoked for unmatched path")
-		}
-	})
+func assertRouteDispatchCase(t *testing.T, tc routeDispatchCase) {
+	t.Helper()
+	handler := &recordingHandler{}
+	reloader := newTestReloader(tc.benchmark, tc.auth, tc.peerListen, tc.managementListen, handler)
+	response := httptest.NewRecorder()
+	reloader.ServeHTTP(response, httptest.NewRequest(http.MethodGet, tc.path, nil))
+	if response.Code != tc.wantStatus {
+		t.Fatalf("status = %d, want %d", response.Code, tc.wantStatus)
+	}
+	if handler.called != tc.wantHandlerCall {
+		t.Fatalf("current state handler called = %t, want %t", handler.called, tc.wantHandlerCall)
+	}
 }

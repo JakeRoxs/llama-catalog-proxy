@@ -72,11 +72,7 @@ func observationRequest(t *testing.T, backend *httptest.Server, enabled bool) (*
 
 func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var request map[string]any
-		_ = json.NewDecoder(r.Body).Decode(&request)
-		if request["stream_options"] != nil {
-			t.Error("usage settings were forced")
-		}
+		assertObservationRequestUnchanged(t, r)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("X-Private", "PRIVATE_HEADER")
 		_, _ = io.WriteString(w, observedStream)
@@ -85,9 +81,7 @@ func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 
 	t.Run("disabled default off does not observe", func(t *testing.T) {
 		w, logs := observationRequest(t, backend, false)
-		if w.Body.String() != observedStream || w.Header().Get("X-Private") != "PRIVATE_HEADER" || w.Code != 200 {
-			t.Fatal("passthrough changed")
-		}
+		assertObservedPassthrough(t, w)
 		if strings.Contains(logs, "request_observation") {
 			t.Fatal("default-off still observed")
 		}
@@ -95,23 +89,49 @@ func TestObservationDefaultOffAndSafeSummary(t *testing.T) {
 
 	t.Run("enabled observes safe summary", func(t *testing.T) {
 		w, logs := observationRequest(t, backend, true)
-		if w.Body.String() != observedStream || w.Header().Get("X-Private") != "PRIVATE_HEADER" || w.Code != 200 {
-			t.Fatal("passthrough changed")
-		}
+		assertObservedPassthrough(t, w)
 		s := loggedObservation(t, logs)
-		if s["generation_outcome"] != "completed" || s["transport_outcome"] != "returned" {
-			t.Fatalf("bad outcomes: %+v", s)
-		}
-		u := s["usage"].(map[string]any)
-		if u["prompt_tokens"] != float64(0) || u["completion_tokens"] != float64(2) {
-			t.Fatal("late usage lost")
-		}
-		for _, secret := range []string{"PRIVATE_COMPLETION", "PRIVATE_MODEL", "PRIVATE_PROMPT", "PRIVATE_AUTH", "PRIVATE_HEADER"} {
-			if strings.Contains(logs, secret) {
-				t.Fatal("secret in request logs")
-			}
-		}
+		assertObservedSummary(t, s, logs)
 	})
+}
+
+func assertObservationRequestUnchanged(t *testing.T, req *http.Request) {
+	t.Helper()
+	var body map[string]any
+	_ = json.NewDecoder(req.Body).Decode(&body)
+	if body["stream_options"] != nil {
+		t.Error("usage settings were forced")
+	}
+}
+
+func assertObservedPassthrough(t *testing.T, response *httptest.ResponseRecorder) {
+	t.Helper()
+	if response.Body.String() != observedStream ||
+		response.Header().Get("X-Private") != "PRIVATE_HEADER" ||
+		response.Code != http.StatusOK {
+		t.Fatal("passthrough changed")
+	}
+}
+
+func assertObservedSummary(t *testing.T, summary map[string]any, logs string) {
+	t.Helper()
+	if summary["generation_outcome"] != "completed" || summary["transport_outcome"] != "returned" {
+		t.Fatalf("bad outcomes: %+v", summary)
+	}
+	usage := summary["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(0) || usage["completion_tokens"] != float64(2) {
+		t.Fatal("late usage lost")
+	}
+	assertObservationSecretsAbsent(t, logs, "PRIVATE_COMPLETION", "PRIVATE_MODEL", "PRIVATE_PROMPT", "PRIVATE_AUTH", "PRIVATE_HEADER")
+}
+
+func assertObservationSecretsAbsent(t *testing.T, logs string, secrets ...string) {
+	t.Helper()
+	for _, secret := range secrets {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("secret %q in request logs", secret)
+		}
+	}
 }
 
 func TestObservationFlushBeforeCompletionAndHeaderPhase(t *testing.T) {
@@ -378,32 +398,36 @@ func assertFourFlagHistory(t *testing.T, handler *Handler, requestID string, his
 
 func assertFourFlagObservationMetadata(t *testing.T, record *correlation.CorrelationRecord, observation bool) {
 	t.Helper()
-	if observation {
-		if record.ProxyObservation == nil {
-			t.Fatal("ProxyObservation should be present")
-		}
-		if record.ProxyObservation.Source != "proxy" {
-			t.Fatalf("source = %q, want proxy", record.ProxyObservation.Source)
-		}
-		if record.ProxyObservation.Scope != "proxy_request_only" {
-			t.Fatalf("scope = %q, want proxy_request_only", record.ProxyObservation.Scope)
-		}
-		if record.ProxyObservation.UpstreamRequestMapping != "not_established" {
-			t.Fatalf("mapping = %q, want not_established", record.ProxyObservation.UpstreamRequestMapping)
-		}
-		if record.ActivityID != "" {
-			t.Fatalf("activity ID should be empty, got %q", record.ActivityID)
-		}
-		if record.ModelID != "" {
-			t.Fatalf("model ID should be empty, got %q", record.ModelID)
-		}
-	} else {
+	if !observation {
 		if record.ProxyObservation != nil {
 			t.Fatal("ProxyObservation should be nil when observation disabled")
 		}
+		return
+	}
+	if record.ProxyObservation == nil {
+		t.Fatal("ProxyObservation should be present")
+	}
+	assertProxyObservationMetadata(t, record.ProxyObservation)
+	if record.ActivityID != "" {
+		t.Fatalf("activity ID should be empty, got %q", record.ActivityID)
+	}
+	if record.ModelID != "" {
+		t.Fatalf("model ID should be empty, got %q", record.ModelID)
 	}
 }
 
+func assertProxyObservationMetadata(t *testing.T, observation *correlation.ProxyObservation) {
+	t.Helper()
+	if observation.Source != "proxy" {
+		t.Fatalf("source = %q, want proxy", observation.Source)
+	}
+	if observation.Scope != "proxy_request_only" {
+		t.Fatalf("scope = %q, want proxy_request_only", observation.Scope)
+	}
+	if observation.UpstreamRequestMapping != "not_established" {
+		t.Fatalf("mapping = %q, want not_established", observation.UpstreamRequestMapping)
+	}
+}
 func TestObservationFourFlagCombos(t *testing.T) {
 	backend := newObservedStreamBackend(t)
 	defer backend.Close()
@@ -458,131 +482,139 @@ func assertOpenAIStyleSecrets(t *testing.T, logs string) {
 }
 
 func TestObservationOpenAIStyles(t *testing.T) {
-	sseUsage0 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n")
-	}))
-	defer sseUsage0.Close()
+	for _, tc := range openAIStyleCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			assertOpenAIStyleCase(t, tc)
+		})
+	}
+}
 
-	sseUsageMissing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
-	}))
-	defer sseUsageMissing.Close()
+type openAIStyleCase struct {
+	name     string
+	backend  *httptest.Server
+	wantCode int
+	check    func(t *testing.T, summary map[string]any, code int)
+}
 
-	sseTruncated := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"length\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n")
-	}))
-	defer sseTruncated.Close()
+func openAIStyleCases(t *testing.T) []openAIStyleCase {
+	sseUsage0 := newObservationBackend(t, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n\n")
+	t.Cleanup(sseUsage0.Close)
 
-	jsonBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0}}`)
-	}))
-	defer jsonBackend.Close()
+	sseUsageMissing := newObservationBackend(t, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	t.Cleanup(sseUsageMissing.Close)
 
-	http200Backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, `{"ok":true}`)
-	}))
-	defer http200Backend.Close()
+	sseTruncated := newObservationBackend(t, "text/event-stream", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"length\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n")
+	t.Cleanup(sseTruncated.Close)
+
+	jsonBackend := newObservationBackend(t, "application/json", `{"choices":[{"message":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":0,"completion_tokens":0}}`)
+	t.Cleanup(jsonBackend.Close)
+
+	http200Backend := newObservationBackend(t, "", `{"ok":true}`)
+	t.Cleanup(http200Backend.Close)
 
 	abortBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		panic("boom")
 	}))
-	defer abortBackend.Close()
+	t.Cleanup(abortBackend.Close)
 
-	tests := []struct {
-		name     string
-		backend  *httptest.Server
-		wantCode int
-		check    func(t *testing.T, summary map[string]any, code int)
-	}{
+	return []openAIStyleCase{
 		{
 			name:     "sse usage0",
 			backend:  sseUsage0,
 			wantCode: http.StatusOK,
-			check: func(t *testing.T, summary map[string]any, code int) {
-				u := summary["usage"].(map[string]any)
-				if u["prompt_tokens"] != float64(0) || u["completion_tokens"] != float64(0) {
-					t.Fatalf("usage = %+v, want 0/0", u)
-				}
-				if summary["generation_outcome"] != "completed" {
-					t.Fatalf("generation_outcome = %q, want completed", summary["generation_outcome"])
-				}
-			},
+			check:    assertUsageZeroCompleted,
 		},
 		{
 			name:     "sse usage missing",
 			backend:  sseUsageMissing,
 			wantCode: http.StatusOK,
-			check: func(t *testing.T, summary map[string]any, code int) {
-				if summary["usage"] == nil {
-					t.Fatal("usage should be present (nil map)")
-				}
-				u := summary["usage"].(map[string]any)
-				if u["prompt_tokens"] != nil || u["completion_tokens"] != nil {
-					t.Fatalf("usage should be unknown (nil pointers), got %+v", u)
-				}
-			},
+			check:    assertUsageUnknown,
 		},
 		{
 			name:     "sse truncated",
 			backend:  sseTruncated,
 			wantCode: http.StatusOK,
-			check: func(t *testing.T, summary map[string]any, code int) {
-				if summary["generation_outcome"] != "truncated" {
-					t.Fatalf("generation_outcome = %q, want truncated", summary["generation_outcome"])
-				}
-			},
+			check:    assertGenerationTruncated,
 		},
 		{
 			name:     "json usage0",
 			backend:  jsonBackend,
 			wantCode: http.StatusOK,
-			check: func(t *testing.T, summary map[string]any, code int) {
-				u := summary["usage"].(map[string]any)
-				if u["prompt_tokens"] != float64(0) || u["completion_tokens"] != float64(0) {
-					t.Fatalf("usage = %+v, want 0/0", u)
-				}
-				if summary["generation_outcome"] != "completed" {
-					t.Fatalf("generation_outcome = %q, want completed", summary["generation_outcome"])
-				}
-			},
+			check:    assertUsageZeroCompleted,
 		},
 		{
 			name:     "http200 protected",
 			backend:  http200Backend,
 			wantCode: http.StatusOK,
-			check: func(t *testing.T, summary map[string]any, code int) {
-				if code != http.StatusOK {
-					t.Fatalf("code = %d, want 200", code)
-				}
-				if summary["transport_outcome"] != "returned" {
-					t.Fatalf("transport_outcome = %q, want returned", summary["transport_outcome"])
-				}
-				if summary["generation_outcome"] == "completed" {
-					t.Fatal("HTTP 200 alone established generation completion")
-				}
-			},
+			check:    assertHTTP200IsNotCompletion,
 		},
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w, logs := openAIStyleRequest(t, tt.backend)
-			if w.Code != tt.wantCode {
-				t.Fatalf("code = %d, want %d", w.Code, tt.wantCode)
-			}
-			if w.Body.String() == "" {
-				t.Fatal("empty body")
-			}
-			s := loggedObservation(t, logs)
-			tt.check(t, s, w.Code)
-			assertOpenAIStyleSecrets(t, logs)
-		})
+func newObservationBackend(t *testing.T, contentType, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+	}))
+}
+
+func assertUsageZeroCompleted(t *testing.T, summary map[string]any, _ int) {
+	t.Helper()
+	usage := summary["usage"].(map[string]any)
+	if usage["prompt_tokens"] != float64(0) || usage["completion_tokens"] != float64(0) {
+		t.Fatalf("usage = %+v, want 0/0", usage)
 	}
+	if summary["generation_outcome"] != "completed" {
+		t.Fatalf("generation_outcome = %q, want completed", summary["generation_outcome"])
+	}
+}
+
+func assertUsageUnknown(t *testing.T, summary map[string]any, _ int) {
+	t.Helper()
+	if summary["usage"] == nil {
+		t.Fatal("usage should be present (nil map)")
+	}
+	usage := summary["usage"].(map[string]any)
+	if usage["prompt_tokens"] != nil || usage["completion_tokens"] != nil {
+		t.Fatalf("usage should be unknown (nil pointers), got %+v", usage)
+	}
+}
+
+func assertGenerationTruncated(t *testing.T, summary map[string]any, _ int) {
+	t.Helper()
+	if summary["generation_outcome"] != "truncated" {
+		t.Fatalf("generation_outcome = %q, want truncated", summary["generation_outcome"])
+	}
+}
+
+func assertHTTP200IsNotCompletion(t *testing.T, summary map[string]any, code int) {
+	t.Helper()
+	if code != http.StatusOK {
+		t.Fatalf("code = %d, want 200", code)
+	}
+	if summary["transport_outcome"] != "returned" {
+		t.Fatalf("transport_outcome = %q, want returned", summary["transport_outcome"])
+	}
+	if summary["generation_outcome"] == "completed" {
+		t.Fatal("HTTP 200 alone established generation completion")
+	}
+}
+
+func assertOpenAIStyleCase(t *testing.T, tc openAIStyleCase) {
+	t.Helper()
+	w, logs := openAIStyleRequest(t, tc.backend)
+	if w.Code != tc.wantCode {
+		t.Fatalf("code = %d, want %d", w.Code, tc.wantCode)
+	}
+	if w.Body.String() == "" {
+		t.Fatal("empty body")
+	}
+	tc.check(t, loggedObservation(t, logs), w.Code)
+	assertOpenAIStyleSecrets(t, logs)
 }
 
 func TestObservationUnknownFormatRetainsNoGenerationEvidence(t *testing.T) {

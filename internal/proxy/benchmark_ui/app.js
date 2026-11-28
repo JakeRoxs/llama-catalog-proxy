@@ -368,5 +368,5 @@ if (!window.isSecureContext) {
   byId("security-warning").hidden = false;
   byId("unlock-form").querySelector("button").disabled = true;
 } else {
-  enterPublicReadOnlyView().catch(() => {});
+  await enterPublicReadOnlyView();
 }

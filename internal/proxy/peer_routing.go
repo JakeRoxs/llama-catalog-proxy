@@ -88,7 +88,7 @@ func (h *Handler) servePeerModelRoute(w http.ResponseWriter, r *http.Request, in
 	if !matched {
 		return false
 	}
-	rewritten, handled := h.rewritePeerModelBody(w, r, body, mediaType, params, model, object, requestedLocalID)
+	rewritten, handled := h.rewritePeerModelBody(w, body, mediaType, params, model, object, requestedLocalID)
 	if handled {
 		return true
 	}
@@ -254,7 +254,7 @@ func (h *Handler) resolvePeerModel(w http.ResponseWriter, r *http.Request, model
 // ID. It returns the rewritten body and whether the route is handled (an
 // encoding error was written). The caller restores the request body before
 // proxying.
-func (h *Handler) rewritePeerModelBody(w http.ResponseWriter, r *http.Request, body []byte, mediaType string, params map[string]string, model string, object map[string]any, requestedLocalID string) ([]byte, bool) {
+func (h *Handler) rewritePeerModelBody(w http.ResponseWriter, body []byte, mediaType string, params map[string]string, model string, object map[string]any, requestedLocalID string) ([]byte, bool) {
 	var rewritten []byte
 	var err error
 	if mediaType == multipartFormDataMediaType {
@@ -271,50 +271,94 @@ func (h *Handler) rewritePeerModelBody(w http.ResponseWriter, r *http.Request, b
 }
 
 func jsonPeerModel(body []byte, isPeerModel func(string) bool) (string, map[string]any, bool, error) {
-	var object map[string]any
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	if err := decoder.Decode(&object); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return "", nil, false, errors.New("invalid JSON")
+	object, err := decodePeerModelObject(body)
+	if err != nil {
+		return "", nil, false, err
 	}
 	scanner := json.NewDecoder(bytes.NewReader(body))
 	if _, err := scanner.Token(); err != nil {
 		return "", nil, false, err
 	}
-	count := 0
-	found := ""
-	peerFound := false
+	matches := peerModelMatches{isPeerModel: isPeerModel}
 	for scanner.More() {
-		token, err := scanner.Token()
-		if err != nil {
+		if err := scanPeerModelField(scanner, &matches); err != nil {
 			return "", nil, false, err
-		}
-		key, ok := token.(string)
-		if !ok {
-			return "", nil, false, errors.New("invalid JSON object key")
-		}
-		var raw json.RawMessage
-		if err := scanner.Decode(&raw); err != nil {
-			return "", nil, false, err
-		}
-		if strings.EqualFold(key, "model") {
-			count++
-			var value string
-			if json.Unmarshal(raw, &value) == nil {
-				if found == "" {
-					found = value
-				}
-				if isPeerModel(value) {
-					found = value
-					peerFound = true
-					if key != "model" {
-						count++
-					}
-				}
-			}
 		}
 	}
-	return found, object, peerFound && count != 1, nil
+	return matches.found, object, matches.peerFound && matches.count != 1, nil
+}
+
+func decodePeerModelObject(body []byte) (map[string]any, error) {
+	var object map[string]any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	if err := decoder.Decode(&object); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		return nil, errors.New("invalid JSON")
+	}
+	return object, nil
+}
+
+func scanPeerModelField(scanner *json.Decoder, matches *peerModelMatches) error {
+	token, err := scanner.Token()
+	if err != nil {
+		return err
+	}
+	key, ok := token.(string)
+	if !ok {
+		return errors.New("invalid JSON object key")
+	}
+	var raw json.RawMessage
+	if err := scanner.Decode(&raw); err != nil {
+		return err
+	}
+	matches.addJSON(key, raw)
+	return nil
+}
+
+type peerModelMatches struct {
+	isPeerModel func(string) bool
+	count       int
+	found       string
+	peerFound   bool
+}
+
+func (m *peerModelMatches) addJSON(key string, raw json.RawMessage) {
+	if !strings.EqualFold(key, "model") {
+		return
+	}
+	m.count++
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return
+	}
+	if m.found == "" {
+		m.found = value
+	}
+	if m.isPeerModel(value) {
+		m.found = value
+		m.peerFound = true
+		if key != "model" {
+			m.count++
+		}
+	}
+}
+
+func (m *peerModelMatches) addMultipart(key string, value []byte) {
+	if !strings.EqualFold(key, "model") {
+		return
+	}
+	m.count++
+	model := string(value)
+	if m.found == "" {
+		m.found = model
+	}
+	if m.isPeerModel(model) {
+		m.found = model
+		m.peerFound = true
+		if key != "model" {
+			m.count++
+		}
+	}
 }
 
 func multipartPeerModel(body []byte, boundary string, isPeerModel func(string) bool) (string, bool, error) {
@@ -322,9 +366,7 @@ func multipartPeerModel(body []byte, boundary string, isPeerModel func(string) b
 		return "", false, errors.New("missing multipart boundary")
 	}
 	reader := multipart.NewReader(bytes.NewReader(body), boundary)
-	count := 0
-	found := ""
-	peerFound := false
+	matches := peerModelMatches{isPeerModel: isPeerModel}
 	for {
 		part, err := reader.NextPart()
 		if err == io.EOF {
@@ -333,27 +375,24 @@ func multipartPeerModel(body []byte, boundary string, isPeerModel func(string) b
 		if err != nil {
 			return "", false, err
 		}
-		if strings.EqualFold(part.FormName(), "model") {
-			count++
-			value, err := io.ReadAll(io.LimitReader(part, 1025))
-			if err != nil {
-				return "", false, err
-			}
-			model := string(value)
-			if found == "" {
-				found = model
-			}
-			if isPeerModel(model) {
-				found = model
-				peerFound = true
-				if part.FormName() != "model" {
-					count++
-				}
-			}
+		if err := scanMultipartPeerModel(part, &matches); err != nil {
+			return "", false, err
 		}
 		_ = part.Close()
 	}
-	return found, peerFound && count != 1, nil
+	return matches.found, matches.peerFound && matches.count != 1, nil
+}
+
+func scanMultipartPeerModel(part *multipart.Part, matches *peerModelMatches) error {
+	if !strings.EqualFold(part.FormName(), "model") {
+		return nil
+	}
+	value, err := io.ReadAll(io.LimitReader(part, 1025))
+	if err != nil {
+		return err
+	}
+	matches.addMultipart(part.FormName(), value)
+	return nil
 }
 
 func (h *Handler) isPeerPublicModelID(publicID string) bool {

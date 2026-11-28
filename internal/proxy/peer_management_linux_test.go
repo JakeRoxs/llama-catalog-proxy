@@ -72,7 +72,19 @@ func TestCreateDelegatedSettingsProposal(t *testing.T) {
 	assertDelegatedProposalPersisted(t, store, proposal.Proposal.ID, input.Owner, proposal.Proposal.CreatedAt)
 	assertDelegatedProposalNoLeak(t, proposal, token)
 	assertTargetUnchanged(t, targetPath, source)
-	assertAllDelegatedProposalRejections(t, state, r, request, input, store, proposal, token, targetDir, targetAlias, storeAlias)
+	assertAllDelegatedProposalRejections(&delegatedProposalRejectionScenario{
+		t:           t,
+		state:       state,
+		r:           r,
+		req:         request,
+		input:       input,
+		store:       store,
+		proposal:    proposal,
+		token:       token,
+		targetDir:   targetDir,
+		targetAlias: targetAlias,
+		storeAlias:  storeAlias,
+	})
 	r.state.Store(&reloaderState{})
 	if _, err := r.createDelegatedSettingsProposal(request, state, input, 15*time.Minute); !errors.Is(err, errDelegationChanged) {
 		t.Fatalf("stale configuration accepted: %v", err)
@@ -111,7 +123,23 @@ func assertTargetUnchanged(t *testing.T, path, source string) {
 	}
 }
 
-func assertAllDelegatedProposalRejections(t *testing.T, state *reloaderState, r *Reloader, request *http.Request, input delegatedSettingsRequest, store string, proposal modelconfig.DelegatedProposal, token, targetDir, targetAlias, storeAlias string) {
+// delegatedProposalRejectionScenario bundles the fixtures reused by every
+// rejection sub-case so the helper signature stays under the parameter limit.
+type delegatedProposalRejectionScenario struct {
+	t           *testing.T
+	state       *reloaderState
+	r           *Reloader
+	req         *http.Request
+	input       delegatedSettingsRequest
+	store       string
+	proposal    modelconfig.DelegatedProposal
+	token       string
+	targetDir   string
+	targetAlias string
+	storeAlias  string
+}
+
+func assertAllDelegatedProposalRejections(scenario *delegatedProposalRejectionScenario) {
 	for _, tt := range []struct {
 		name   string
 		change func(*reloaderState, *http.Request, *delegatedSettingsRequest) string
@@ -119,76 +147,76 @@ func assertAllDelegatedProposalRejections(t *testing.T, state *reloaderState, r 
 	}{
 		{"missing TLS", func(_ *reloaderState, req *http.Request, _ *delegatedSettingsRequest) string {
 			req.TLS = nil
-			return store
+			return scenario.store
 		}, errDelegationUnauthorized},
 		{"ungranted peer", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			s.peer.Peers["requester"] = config.PeerGrant{Token: token, CatalogRead: true}
-			return store
+			s.peer.Peers["requester"] = config.PeerGrant{Token: scenario.token, CatalogRead: true}
+			return scenario.store
 		}, errDelegationUnauthorized},
 		{"wrong token", func(_ *reloaderState, req *http.Request, _ *delegatedSettingsRequest) string {
 			req.Header.Set("Authorization", "Bearer "+strings.Repeat("x", 32))
-			return store
+			return scenario.store
 		}, errDelegationUnauthorized},
 		{"owner restarted", func(_ *reloaderState, _ *http.Request, in *delegatedSettingsRequest) string {
 			in.Owner.ProxyInstanceID = strings.Repeat("b", 32)
-			return store
+			return scenario.store
 		}, errDelegationChanged},
 		{"source changed", func(_ *reloaderState, _ *http.Request, in *delegatedSettingsRequest) string {
 			in.Revision = strings.Repeat("b", 64)
-			return store
+			return scenario.store
 		}, errDelegationChanged},
 		{"unowned backend", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
 			s.peer.LocalBackends = nil
-			return store
+			return scenario.store
 		}, errDelegationTarget},
 		{"mapping removed", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
 			delete(s.peer.ManagementTargets, "backend")
-			return store
+			return scenario.store
 		}, errDelegationTarget},
 		{"missing target", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
 			delete(s.management.Targets, "swap")
-			return store
+			return scenario.store
 		}, errDelegationTarget},
 		{"delegated stores disabled", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
 			s.management.DelegatedStore = nil
-			return store
+			return scenario.store
 		}, modelconfig.ErrProposalStore},
 		{"store aliases target", func(_ *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			return targetDir
+			return scenario.targetDir
 		}, modelconfig.ErrProposalStore},
 		{"store symlinks to target", func(_ *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			return targetAlias
+			return scenario.targetAlias
 		}, modelconfig.ErrProposalStore},
 		{"store aliases local proposals", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			s.management.ProposalStore = &config.ProposalStoreConfig{Directory: storeAlias}
-			return store
+			s.management.ProposalStore = &config.ProposalStoreConfig{Directory: scenario.storeAlias}
+			return scenario.store
 		}, modelconfig.ErrProposalStore},
 		{"store aliases backups", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			s.management.BackupStore = &config.BackupStoreConfig{Directory: storeAlias}
-			return store
+			s.management.BackupStore = &config.BackupStoreConfig{Directory: scenario.storeAlias}
+			return scenario.store
 		}, modelconfig.ErrProposalStore},
 		{"store aliases ingestion", func(s *reloaderState, _ *http.Request, _ *delegatedSettingsRequest) string {
-			s.management.Ingestion = &config.IngestionConfig{Directory: storeAlias, RecordDirectory: t.TempDir()}
-			return store
+			s.management.Ingestion = &config.IngestionConfig{Directory: scenario.storeAlias, RecordDirectory: scenario.t.TempDir()}
+			return scenario.store
 		}, modelconfig.ErrProposalStore},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
-			s := *state
-			s.peer = copyPeerConfig(state.peer)
-			s.management = copyManagementConfig(state.management)
-			req := request.Clone(request.Context())
-			in := input
-			r.state.Store(&s)
+		scenario.t.Run(tt.name, func(t *testing.T) {
+			s := *scenario.state
+			s.peer = copyPeerConfig(s.peer)
+			s.management = copyManagementConfig(s.management)
+			req := scenario.req.Clone(scenario.req.Context())
+			in := scenario.input
+			scenario.r.state.Store(&s)
 			directory := tt.change(&s, req, &in)
 			if s.management.DelegatedStore != nil {
 				s.management.DelegatedStore.ProposalDirectory = directory
 			}
-			_, err := r.createDelegatedSettingsProposal(req, &s, in, 15*time.Minute)
+			_, err := scenario.r.createDelegatedSettingsProposal(req, &s, in, 15*time.Minute)
 			if !errors.Is(err, tt.want) {
 				t.Fatalf("got %v, want %v", err, tt.want)
 			}
-			ids, err := modelconfig.ListDelegatedProposals(store)
-			if err != nil || len(ids) != 1 || ids[0] != proposal.Proposal.ID {
+			ids, err := modelconfig.ListDelegatedProposals(scenario.store)
+			if err != nil || len(ids) != 1 || ids[0] != scenario.proposal.Proposal.ID {
 				t.Fatalf("rejected action modified store: %v, %v", ids, err)
 			}
 		})

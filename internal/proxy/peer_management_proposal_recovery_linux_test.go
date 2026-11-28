@@ -17,11 +17,23 @@ import (
 	"github.com/JakeRoxs/llama-catalog-proxy/internal/modelconfig"
 )
 
-func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
-	f := newDelegatedApplyFixture(t)
-	f.r.logger = discardLogger()
-	f.r.managementSlots = make(chan struct{}, 1)
-	f.state.management.PreviewToken = strings.Repeat("v", 32)
+// cleanupLifecycleContext bundles the state needed to verify the delegated
+// proposal cleanup lifecycle: the expired candidate to remove, the credentials
+// and stores involved, and the operation-backed proposal that must be preserved.
+type cleanupLifecycleContext struct {
+	expired    modelconfig.DelegatedProposal
+	active     modelconfig.DelegatedProposal
+	token      string
+	writeToken string
+	proposals  string
+	operations string
+}
+
+// setupExpiredDelegatedProposal loads the active proposal, creates an expired
+// eligible copy, saves it, and verifies the operation-backed review remains
+// ineligible even after expiry. It returns the active and expired proposals.
+func setupExpiredDelegatedProposal(t *testing.T, f delegatedApplyFixture) (active, expired modelconfig.DelegatedProposal) {
+	t.Helper()
 	active, err := modelconfig.LoadDelegatedProposal(f.proposals, f.input.ProposalID)
 	if err != nil {
 		t.Fatal(err)
@@ -29,7 +41,7 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 	current := active
 	current.Proposal.ID = strings.Repeat("c", 32)
 	current.Proposal.CreatedAt = time.Now().Add(-time.Hour)
-	expired, err := modelconfig.NewDelegatedProposal(current.Owner, current.RequesterNode, current.BackendID, current.Proposal, 15*time.Minute)
+	expired, err = modelconfig.NewDelegatedProposal(current.Owner, current.RequesterNode, current.BackendID, current.Proposal, 15*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,6 +52,15 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 	if _, reserved, err := modelconfig.ReserveDelegatedOperation(f.operations, active, f.input.OperationID, active.Proposal.CreatedAt); err != nil || !reserved {
 		t.Fatalf("reserve operation = %v, %v", reserved, err)
 	}
+	return active, expired
+}
+
+func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
+	f := newDelegatedApplyFixture(t)
+	f.r.logger = discardLogger()
+	f.r.managementSlots = make(chan struct{}, 1)
+	f.state.management.PreviewToken = strings.Repeat("v", 32)
+	active, expired := setupExpiredDelegatedProposal(t, f)
 
 	server := httptest.NewTLSServer(f.r.ManagementHandler())
 	defer server.Close()
@@ -75,7 +96,14 @@ func TestOwnerDelegatedProposalInspectionAndExplicitCleanup(t *testing.T) {
 
 	// Invalid credentials or origins are rejected; cleanup removes the expired proposal once, is
 	// idempotent on repeat, and preserves the operation-backed proposal and its ledger.
-	assertCleanupLifecycle(t, call, expired, token, f.target, f.proposals, f.operations, f.state.management.WriteToken, active)
+	assertCleanupLifecycle(t, call, cleanupLifecycleContext{
+		expired:    expired,
+		active:     active,
+		token:      token,
+		writeToken: f.state.management.WriteToken,
+		proposals:  f.proposals,
+		operations: f.operations,
+	})
 
 	// An unregistered route must still enforce the backup credential.
 	unregistered := httptest.NewRequest(http.MethodGet, "https://owner.example"+ownerProposalsPath, nil)
@@ -109,7 +137,7 @@ func assertCleanupCandidateInspection(t *testing.T, call func(method, credential
 // assertCleanupLifecycle verifies the four invalid credential/origin cases are rejected, that cleanup
 // removes the expired proposal exactly once, is idempotent on a second call, and preserves the
 // operation-backed proposal and its ledger.
-func assertCleanupLifecycle(t *testing.T, call func(method, credential, origin, body string) (int, []byte, http.Header), expired modelconfig.DelegatedProposal, token, target, proposals, operations, writeToken string, active modelconfig.DelegatedProposal) {
+func assertCleanupLifecycle(t *testing.T, call func(method, credential, origin, body string) (int, []byte, http.Header), ctx cleanupLifecycleContext) {
 	t.Helper()
 	for _, tt := range []struct {
 		name       string
@@ -119,8 +147,8 @@ func assertCleanupLifecycle(t *testing.T, call func(method, credential, origin, 
 	}{
 		{"wrong credential", strings.Repeat("x", 32), "", http.StatusUnauthorized},
 		{"peer credential", strings.Repeat("p", 32), "", http.StatusUnauthorized},
-		{"write credential", writeToken, "", http.StatusUnauthorized},
-		{"cross origin", token, "https://different.example", http.StatusForbidden},
+		{"write credential", ctx.writeToken, "", http.StatusUnauthorized},
+		{"cross origin", ctx.token, "https://different.example", http.StatusForbidden},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			status, _, _ := call(http.MethodGet, tt.credential, tt.origin, "")
@@ -129,23 +157,23 @@ func assertCleanupLifecycle(t *testing.T, call func(method, credential, origin, 
 			}
 		})
 	}
-	cleanupBody := `{"proposal_ids":["` + expired.Proposal.ID + `"]}`
-	status, body, _ := call(http.MethodPost, token, "", cleanupBody)
+	cleanupBody := `{"proposal_ids":["` + ctx.expired.Proposal.ID + `"]}`
+	status, body, _ := call(http.MethodPost, ctx.token, "", cleanupBody)
 	var cleanupResponse struct {
 		Removed []string `json:"removed"`
 	}
 	if status != http.StatusOK || json.Unmarshal(body, &cleanupResponse) != nil || len(cleanupResponse.Removed) != 1 ||
-		cleanupResponse.Removed[0] != expired.Proposal.ID {
+		cleanupResponse.Removed[0] != ctx.expired.Proposal.ID {
 		t.Fatalf("cleanup status=%d response=%+v body=%q", status, cleanupResponse, body)
 	}
-	status, body, _ = call(http.MethodPost, token, "", cleanupBody)
+	status, body, _ = call(http.MethodPost, ctx.token, "", cleanupBody)
 	if status != http.StatusOK || json.Unmarshal(body, &cleanupResponse) != nil || len(cleanupResponse.Removed) != 0 {
 		t.Fatalf("repeated cleanup status=%d response=%+v body=%q", status, cleanupResponse, body)
 	}
-	if _, err := modelconfig.LoadDelegatedProposal(proposals, active.Proposal.ID); err != nil {
+	if _, err := modelconfig.LoadDelegatedProposal(ctx.proposals, ctx.active.Proposal.ID); err != nil {
 		t.Fatalf("operation-backed proposal was removed: %v", err)
 	}
-	if _, err := modelconfig.LoadDelegatedOperation(operations, active.Proposal.ID); err != nil {
+	if _, err := modelconfig.LoadDelegatedOperation(ctx.operations, ctx.active.Proposal.ID); err != nil {
 		t.Fatalf("operation ledger was changed: %v", err)
 	}
 }

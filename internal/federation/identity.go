@@ -165,20 +165,7 @@ func validEndpointHost(host string) bool {
 		if ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsMulticast() {
 			return false
 		}
-		// Reject the reserved IPv4 range 240.0.0.0/4 and RFC 5737
-		// documentation ranges (TEST-NET-1/2/3).
-		if ip4 := ip.To4(); ip4 != nil {
-			if ip4[0] >= 240 ||
-				(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
-				(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
-				(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
-				(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
-				return false
-			}
-		}
-		// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
-		// 2001:db8::/32), consistent with internal/ingestion/download.go.
-		if isDocumentationIPv6(ip) {
+		if isReservedOrDocumentationRange(ip) {
 			return false
 		}
 		return true
@@ -235,20 +222,7 @@ func validEndpointIP(ip net.IP) bool {
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return false
 	}
-	// Reject the reserved IPv4 range 240.0.0.0/4 and RFC 5737 documentation
-	// ranges (TEST-NET-1/2/3).
-	if ip4 := ip.To4(); ip4 != nil {
-		if ip4[0] >= 240 ||
-			(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
-			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
-			(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
-			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
-			return false
-		}
-	}
-	// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
-	// 2001:db8::/32), consistent with internal/ingestion/download.go.
-	if isDocumentationIPv6(ip) {
+	if isReservedOrDocumentationRange(ip) {
 		return false
 	}
 	return true
@@ -271,23 +245,34 @@ func validEndpointLANIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsMulticast() || ip.IsUnspecified() {
 		return false
 	}
-	// Reject reserved IPv4 range 240.0.0.0/4 and RFC 5737 documentation
-	// ranges (TEST-NET-1/2/3).
+	if isReservedOrDocumentationRange(ip) {
+		return false
+	}
+	return true
+}
+
+// isReservedOrDocumentationRange reports whether ip is in a reserved or
+// documentation address range that must not be used as a peer endpoint
+// destination. It covers the reserved IPv4 range 240.0.0.0/4 and the RFC 5737
+// documentation ranges (TEST-NET-1/2/3: 100.64.0.0/10, 198.51.100.0/24,
+// 192.0.2.0/24, 203.0.113.0/24) and the IPv6 documentation ranges
+// (2001::/23, 2002::/16, 2001:db8::/32), consistent with the special-range
+// policy in internal/ingestion/download.go. It is shared by the endpoint IP
+// policies so the identical allow/deny decision is made in one place.
+func isReservedOrDocumentationRange(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
 	if ip4 := ip.To4(); ip4 != nil {
 		if ip4[0] >= 240 ||
 			(ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127) ||
 			(ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100) ||
 			(ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2) ||
 			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) {
-			return false
+			return true
 		}
 	}
-	// Reject IPv6 documentation ranges (2001::/23, 2002::/16,
-	// 2001:db8::/32), consistent with internal/ingestion/download.go.
-	if isDocumentationIPv6(ip) {
-		return false
-	}
-	return true
+	return isDocumentationIPv6(ip)
 }
 
 // isDocumentationIPv6 reports whether ip is an IPv6 documentation address

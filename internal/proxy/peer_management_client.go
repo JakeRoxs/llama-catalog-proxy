@@ -183,7 +183,16 @@ func (r *Reloader) forwardDelegatedSettingsProposal(req *http.Request, state *re
 	}
 	var proposal modelconfig.DelegatedProposal
 	if err := decodeDelegatedPeerJSON(response, &proposal); err != nil ||
-		!validateDelegatedProposalResponse(proposal, input.Owner, state.peer.NodeID, input.Backend, input.Model, input.Revision, input.Settings, time.Now()) {
+		!validateDelegatedProposalResponse(delegatedProposalValidation{
+			proposal:        proposal,
+			owner:           input.Owner,
+			requesterNodeID: state.peer.NodeID,
+			backendID:       input.Backend,
+			modelID:         input.Model,
+			revision:        input.Revision,
+			settings:        input.Settings,
+			now:             time.Now(),
+		}) {
 		return modelconfig.DelegatedProposal{}, errDelegationProposalUnknown
 	}
 	return proposal, nil
@@ -228,6 +237,13 @@ func (r *Reloader) forwardDelegatedSettingsGrants(req *http.Request, state *relo
 	if response.StatusCode != http.StatusOK {
 		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerUnavailable
 	}
+	return validateDelegatedGrantsResponse(response, owner, state.peer.NodeID)
+}
+
+// validateDelegatedGrantsResponse checks the decoded grants response: it
+// verifies the owner identity, bounds the grant list, and validates each grant
+// against the requester and expiry. It performs no transport.
+func validateDelegatedGrantsResponse(response *http.Response, owner, requesterNodeID string) (modelconfig.DelegatedOwner, []modelconfig.OwnerGrant, error) {
 	var result struct {
 		Owner  modelconfig.DelegatedOwner `json:"owner"`
 		Grants []modelconfig.OwnerGrant   `json:"grants"`
@@ -236,7 +252,7 @@ func (r *Reloader) forwardDelegatedSettingsGrants(req *http.Request, state *relo
 		return modelconfig.DelegatedOwner{}, nil, errDelegationPeerResponse
 	}
 	for _, grant := range result.Grants {
-		if !modelconfig.ValidOwnerGrant(grant) || grant.RequesterNodeID != state.peer.NodeID || grant.Action != "manage_settings" || !time.Now().Before(grant.ExpiresAt) {
+		if !modelconfig.ValidOwnerGrant(grant) || grant.RequesterNodeID != requesterNodeID || grant.Action != "manage_settings" || !time.Now().Before(grant.ExpiresAt) {
 			return modelconfig.DelegatedOwner{}, nil, errDelegationPeerResponse
 		}
 	}
@@ -366,20 +382,36 @@ func validDelegatedSettingChanges(changes []modelconfig.SettingChange) bool {
 	return true
 }
 
+// delegatedProposalValidation groups the bindings and request content used to
+// validate a delegated proposal response against its originating request.
+// Grouping the context keeps each validator's parameter list within the rule
+// threshold while preserving every validation predicate and the call-site time
+// source.
+type delegatedProposalValidation struct {
+	proposal        modelconfig.DelegatedProposal
+	owner           modelconfig.DelegatedOwner
+	requesterNodeID string
+	backendID       string
+	modelID         string
+	revision        string
+	settings        modelconfig.CommandSettings
+	now             time.Time
+}
+
 // validateDelegatedProposalResponse checks that a decoded proposal response is
 // bound to the requesting owner and matches the request settings, revision, and
 // lifetime. It performs no transport or state mutation.
-func validateDelegatedProposalResponse(proposal modelconfig.DelegatedProposal, owner modelconfig.DelegatedOwner, requesterNodeID, backendID, modelID, revision string, settings modelconfig.CommandSettings, now time.Time) bool {
-	if err := modelconfig.ValidateDelegatedProposal(proposal, owner, requesterNodeID, backendID, proposal.Proposal.TargetID, now); err != nil {
+func validateDelegatedProposalResponse(ctx delegatedProposalValidation) bool {
+	if err := modelconfig.ValidateDelegatedProposal(ctx.proposal, ctx.owner, ctx.requesterNodeID, ctx.backendID, ctx.proposal.Proposal.TargetID, ctx.now); err != nil {
 		return false
 	}
-	if proposal.Proposal.ModelID != modelID || proposal.Proposal.Revision != revision {
+	if ctx.proposal.Proposal.ModelID != ctx.modelID || ctx.proposal.Proposal.Revision != ctx.revision {
 		return false
 	}
-	if !reflect.DeepEqual(proposal.Proposal.Settings, settings) {
+	if !reflect.DeepEqual(ctx.proposal.Proposal.Settings, ctx.settings) {
 		return false
 	}
-	if proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
+	if ctx.proposal.ExpiresAt.Sub(ctx.proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
 		return false
 	}
 	return true
@@ -388,20 +420,20 @@ func validateDelegatedProposalResponse(proposal modelconfig.DelegatedProposal, o
 // validateDelegatedProposalRecoveryResponse checks that a decoded recovery
 // proposal response matches the request bindings and carries a non-empty
 // recovery audit. It performs no transport or state mutation.
-func validateDelegatedProposalRecoveryResponse(proposal modelconfig.DelegatedProposal, owner modelconfig.DelegatedOwner, requesterNodeID, backendID, modelID, revision string, settings modelconfig.CommandSettings, now time.Time) bool {
-	if err := modelconfig.ValidateDelegatedProposal(proposal, owner, requesterNodeID, backendID, proposal.Proposal.TargetID, now); err != nil {
+func validateDelegatedProposalRecoveryResponse(ctx delegatedProposalValidation) bool {
+	if err := modelconfig.ValidateDelegatedProposal(ctx.proposal, ctx.owner, ctx.requesterNodeID, ctx.backendID, ctx.proposal.Proposal.TargetID, ctx.now); err != nil {
 		return false
 	}
-	if proposal.Proposal.ModelID != modelID || proposal.Proposal.Revision != revision {
+	if ctx.proposal.Proposal.ModelID != ctx.modelID || ctx.proposal.Proposal.Revision != ctx.revision {
 		return false
 	}
-	if !reflect.DeepEqual(proposal.Proposal.Settings, settings) {
+	if !reflect.DeepEqual(ctx.proposal.Proposal.Settings, ctx.settings) {
 		return false
 	}
-	if proposal.ExpiresAt.Sub(proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
+	if ctx.proposal.ExpiresAt.Sub(ctx.proposal.Proposal.CreatedAt) > delegatedProposalLifetime {
 		return false
 	}
-	if len(proposal.RecoveryAudit) == 0 {
+	if len(ctx.proposal.RecoveryAudit) == 0 {
 		return false
 	}
 	return true
@@ -476,7 +508,16 @@ func (r *Reloader) forwardDelegatedSettingsProposalRecovery(req *http.Request, s
 	}
 	var proposal modelconfig.DelegatedProposal
 	if err := decodeDelegatedPeerJSON(response, &proposal); err != nil ||
-		!validateDelegatedProposalRecoveryResponse(proposal, input.Owner, state.peer.NodeID, input.Backend, input.Model, input.Revision, input.Settings, proposal.Proposal.CreatedAt) {
+		!validateDelegatedProposalRecoveryResponse(delegatedProposalValidation{
+			proposal:        proposal,
+			owner:           input.Owner,
+			requesterNodeID: state.peer.NodeID,
+			backendID:       input.Backend,
+			modelID:         input.Model,
+			revision:        input.Revision,
+			settings:        input.Settings,
+			now:             proposal.Proposal.CreatedAt,
+		}) {
 		return modelconfig.DelegatedProposal{}, errDelegationPeerResponse
 	}
 	if !validateRecoveryAudit(proposal.RecoveryAudit[len(proposal.RecoveryAudit)-1], state.peer.NodeID, input.Owner.NodeID) {

@@ -27,6 +27,9 @@ type comfyUICoordinator struct {
 	status  comfyUICoordinatorStatus
 	changed chan struct{}
 	verify  func(context.Context) (ComfyUIReleaseResult, error)
+	// startupReady is an optional read-only scheduler check, never used for
+	// a handoff or after an ambiguous operation.
+	startupReady func(context.Context) bool
 
 	verifying        bool
 	cancel           context.CancelFunc
@@ -55,6 +58,7 @@ func (c *comfyUICoordinator) blockAdmission() {
 	defer c.mu.Unlock()
 	c.status.State, c.status.LeaseID = "unknown", ""
 	c.initialReconcile = false
+	c.initialPrompt = false
 	c.receipt = ComfyUIReleaseResult{}
 	if c.cancel != nil {
 		c.cancel()
@@ -65,10 +69,10 @@ func (c *comfyUICoordinator) blockAdmission() {
 // Reconciliation is explicit: constructing the coordinator never invokes /free.
 // The eventual owner must establish external exclusivity before calling this.
 func (c *comfyUICoordinator) reconcile(ctx context.Context) (ComfyUIReleaseResult, error) {
-	return c.reconcileWithMode(ctx, false)
+	return c.reconcileWithMode(ctx, false, false)
 }
 
-func (c *comfyUICoordinator) reconcileWithMode(ctx context.Context, initialOnly bool) (ComfyUIReleaseResult, error) {
+func (c *comfyUICoordinator) reconcileWithMode(ctx context.Context, initialOnly, allowSchedulerProbe bool) (ComfyUIReleaseResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ComfyUIReleaseResult{State: "unknown"}, err
 	}
@@ -78,6 +82,13 @@ func (c *comfyUICoordinator) reconcileWithMode(ctx context.Context, initialOnly 
 		c.mu.Unlock()
 		return ComfyUIReleaseResult{State: "unknown"}, errComfyUIAdmissionBlocked
 	}
+	var startupReady func(context.Context) bool
+	if allowSchedulerProbe && initialOnly && c.initialPrompt && c.status.LeaseID == "" {
+		startupReady = c.startupReady
+	}
+	if !initialOnly {
+		c.initialPrompt = false
+	}
 	c.initialReconcile = false
 	operationCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -85,13 +96,13 @@ func (c *comfyUICoordinator) reconcileWithMode(ctx context.Context, initialOnly 
 	c.status.State = "reconciling"
 	c.signalLocked()
 	c.mu.Unlock()
-	return c.finishVerification(operationCtx, "reconciling")
+	return c.finishVerificationWithStartup(operationCtx, "reconciling", startupReady)
 }
 
 // reconcileInitial permits request-triggered startup verification. Failed
 // checks may be retried only when they prove /free was not requested.
-func (c *comfyUICoordinator) reconcileInitial(ctx context.Context) (ComfyUIReleaseResult, error) {
-	return c.reconcileWithMode(ctx, true)
+func (c *comfyUICoordinator) reconcileInitial(ctx context.Context, allowSchedulerProbe bool) (ComfyUIReleaseResult, error) {
+	return c.reconcileWithMode(ctx, true, allowSchedulerProbe)
 }
 
 // assumeInitialStopped records the narrow best-effort case where the first
@@ -387,15 +398,33 @@ func (c *comfyUICoordinator) invalidate(leaseID string) error {
 }
 
 func (c *comfyUICoordinator) finishVerification(ctx context.Context, expectedState string) (ComfyUIReleaseResult, error) {
+	return c.finishVerificationWithStartup(ctx, expectedState, nil)
+}
+
+func (c *comfyUICoordinator) finishVerificationWithStartup(ctx context.Context, expectedState string, startupReady func(context.Context) bool) (ComfyUIReleaseResult, error) {
 	// No lock is held across network verification or callback execution.
-	result, err := c.verify(ctx)
+	var result ComfyUIReleaseResult
+	var err error
+	fromScheduler := startupReady != nil && startupReady(ctx)
+	switch {
+	case ctx.Err() != nil:
+		err = ctx.Err()
+	case fromScheduler:
+		// This is admission evidence, not a GPU release receipt.
+		result = ComfyUIReleaseResult{State: "scheduler_ready"}
+	default:
+		result, err = c.verify(ctx)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err == nil && (ctx.Err() != nil || c.status.State != expectedState || !confirmedComfyUIRelease(result)) {
+	if err == nil && (ctx.Err() != nil || c.status.State != expectedState || (!fromScheduler && !confirmedComfyUIRelease(result))) {
 		err = ErrComfyUIReleaseUnknown
 	}
 	c.verifying, c.cancel = false, nil
 	if err != nil {
+		if result.FreeRequested {
+			c.initialPrompt = false
+		}
 		mayRetry := c.status.State == "reconciling" && expectedState == "reconciling" &&
 			!result.FreeRequested && !errors.Is(err, errComfyUIServiceUnavailable)
 		c.status.State = "unknown"
@@ -408,6 +437,7 @@ func (c *comfyUICoordinator) finishVerification(ctx context.Context, expectedSta
 		c.signalLocked()
 		return ComfyUIReleaseResult{State: "unknown"}, errors.Join(ErrComfyUIReleaseUnknown, err)
 	}
+	c.initialPrompt = false
 	c.status.State = "released"
 	c.receipt = cloneComfyUIReleaseResult(result)
 	c.signalLocked()

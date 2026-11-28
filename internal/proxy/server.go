@@ -236,6 +236,13 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 		coordinator := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
 			return VerifyComfyUIRelease(ctx, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
 		})
+		if len(cfg.Peer.ComfyUILease.AdmissionBackends) == 1 {
+			backend := cfg.Backends[cfg.PathRoutes[comfyUIPathPrefix]]
+			coordinator.startupReady, err = newComfyUISchedulerStartupProbe(backend, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
+			if err != nil {
+				return handlerDependencies{}, err
+			}
+		}
 		backendAdmissionStatus = coordinator.snapshot
 		backendAdmission, err = newComfyUIDomainAdmission(coordinator,
 			cfg.Peer.ComfyUILease.AdmissionBackends, cfg.PathRoutes[comfyUIPathPrefix],
