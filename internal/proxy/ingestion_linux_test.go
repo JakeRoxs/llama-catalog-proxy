@@ -559,9 +559,9 @@ func newIngestionRecordsTestHarness(t *testing.T) *ingestionRecordsTestHarness {
 		t.Fatalf("job manager: %v", err)
 	}
 	harness := &ingestionRecordsTestHarness{
-		t:           t,
-		recordsDir:  recordsDir,
-		jobManager:  jobManager,
+		t:          t,
+		recordsDir: recordsDir,
+		jobManager: jobManager,
 	}
 	r := &Reloader{
 		logger:    discardLogger(),
