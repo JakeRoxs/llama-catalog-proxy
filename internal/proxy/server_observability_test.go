@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -74,7 +73,11 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/custom", nil))
+	request := httptest.NewRequest(http.MethodGet, "/custom", nil)
+	request.RemoteAddr = "192.0.2.12:54321"
+	request.Header.Set("X-Forwarded-For", "198.51.100.8")
+	request.Header.Set("User-Agent", "ComfyUI-Test/1.0")
+	handler.ServeHTTP(recorder, request)
 	requestID := recorder.Header().Get("X-Request-ID")
 	if requestID == "" {
 		t.Fatal("no X-Request-ID returned to client")
@@ -90,6 +93,15 @@ func TestRequestIDGeneratedAndReturnedToClient(t *testing.T) {
 	}
 	if !logContains(logs.String(), "route_kind", "default") {
 		t.Fatalf("default route kind not logged: %s", logs.String())
+	}
+	for key, value := range map[string]string{
+		"client_addr":     "192.0.2.12:54321",
+		"x_forwarded_for": "198.51.100.8",
+		"user_agent":      "ComfyUI-Test/1.0",
+	} {
+		if !logContains(logs.String(), key, value) {
+			t.Fatalf("%s not present in request summary log: %s", key, logs.String())
+		}
 	}
 }
 
@@ -388,31 +400,7 @@ func TestWebSocketUpgradePreserved(t *testing.T) {
 	proxyServer := httptest.NewServer(handler)
 	defer proxyServer.Close()
 
-	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyServer.URL, "http://"), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = io.WriteString(connection, "GET /ws HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(connection)
-	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
-		t.Fatalf("upgrade status = %q, error = %v", status, err)
-	}
-	for {
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			break
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	_, _ = io.WriteString(connection, "ping\n")
-	if echo, readErr := reader.ReadString('\n'); readErr != nil || echo != "echo:ping\n" {
-		t.Fatalf("websocket tunnel response = %q, error = %v", echo, readErr)
-	}
+	assertRawWebSocketEcho(t, proxyServer.URL, "/ws", false)
 }
 
 func TestRedactionOmitsQueryBodyAndSecret(t *testing.T) {

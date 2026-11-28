@@ -136,10 +136,7 @@ func TestAliasCollectProjectsTypedFieldsOnly(t *testing.T) {
 			t.Fatalf("secret leaked in output: %q", secret)
 		}
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
+	byRef := edgesByRef(report)
 	canonRef, _ := ModelReference("backend", "canon")
 	aliasRef, _ := ModelReference("backend", "a")
 	// Canonical model: exact self edge.
@@ -183,27 +180,14 @@ func TestAliasEdgeMapsAliasToCanonical(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges, got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
 	canonRef, _ := ModelReference("backend", "canon")
 	aliasRef, _ := ModelReference("backend", "alias1")
 	// Canonical model: exact self edge.
-	canon := byRef[canonRef]
-	if canon == nil || canon.State != aliasStateExact || canon.CanonicalRef != canonRef {
-		t.Fatalf("canonical self edge wrong: %#v", canon)
-	}
+	requireAliasEdge(t, report, "backend", 1, canonRef, canonRef)
 	// Alias: exact edge to canonical.
-	aliasEdge := byRef[aliasRef]
-	if aliasEdge == nil || aliasEdge.State != aliasStateExact || aliasEdge.CanonicalRef != canonRef {
-		t.Fatalf("alias edge wrong: %#v", aliasEdge)
-	}
+	requireAliasEdge(t, report, "backend", 1, aliasRef, canonRef)
 	// Alias chains are not inferred: alias1 resolves directly to canon, and
 	// canon resolves to itself; no transitive hop is followed.
-	if aliasEdge.CanonicalRef != canonRef {
-		t.Fatal("alias should resolve directly to canonical")
-	}
 }
 
 func TestAliasAliasMapsToTwoTargetsAmbiguous(t *testing.T) {
@@ -228,10 +212,7 @@ func TestAliasAliasMapsToTwoTargetsAmbiguous(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges, got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
+	byRef := edgesByRef(report)
 	aRef, _ := ModelReference("backend", "A")
 	a := byRef[aRef]
 	if a == nil || a.State != aliasStateAmbiguous {
@@ -272,10 +253,7 @@ func TestAliasCanonicalAliasCollisionAmbiguous(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges (collision ref + alias target), got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
+	byRef := edgesByRef(report)
 	aRef, _ := ModelReference("backend", "A")
 	bRef, _ := ModelReference("backend", "B")
 	a := byRef[aRef]
@@ -324,6 +302,51 @@ func TestAliasUnknownRows(t *testing.T) {
 	}
 }
 
+// aliasEdgeForRef returns the edge with the given ref in the report, or nil.
+func aliasEdgeForRef(report AliasReport, ref string) *AliasEdge {
+	for i := range report.Edges {
+		if report.Edges[i].Ref == ref {
+			return &report.Edges[i]
+		}
+	}
+	return nil
+}
+
+// edgesByRef builds a map from edge Ref to *AliasEdge for a report, replacing
+// the repeated 4-line map build used across alias tests.
+func edgesByRef(report AliasReport) map[string]*AliasEdge {
+	byRef := make(map[string]*AliasEdge, len(report.Edges))
+	for i := range report.Edges {
+		byRef[report.Edges[i].Ref] = &report.Edges[i]
+	}
+	return byRef
+}
+
+// requireAliasEdge validates that the report contains an exact edge for ref
+// scoped to backendID and epoch, resolving to canonicalRef.
+func requireAliasEdge(t *testing.T, report AliasReport, backendID string, epoch int64, ref, canonicalRef string) {
+	t.Helper()
+	e := aliasEdgeForRef(report, ref)
+	if e == nil || e.BackendID != backendID || e.Epoch != epoch {
+		t.Fatalf("%s edge for %q wrong: %#v", backendID, ref, report.Edges)
+	}
+	if e.State != aliasStateExact || e.CanonicalRef != canonicalRef {
+		t.Fatalf("%s should resolve %q->%q exact: %#v", backendID, ref, canonicalRef, e)
+	}
+}
+
+// requireActivityIdentity validates that an activity identity has the given
+// state and canonical ref, and preserves the reported model ref.
+func requireActivityIdentity(t *testing.T, id ActivityModelIdentity, reportedModelRef, canonicalRef string, state string) {
+	t.Helper()
+	if id.State != state || id.CanonicalRef != canonicalRef {
+		t.Fatalf("activity identity wrong: %#v", id)
+	}
+	if id.ReportedModelRef != reportedModelRef {
+		t.Fatalf("reported_model_ref should be preserved: %q", id.ReportedModelRef)
+	}
+}
+
 func TestAliasCrossBackendAndEpochGuard(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -350,44 +373,19 @@ func TestAliasCrossBackendAndEpochGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report1.Edges) != 2 || len(report2.Edges) != 2 {
-		t.Fatalf("expected 2 edges each (canonical self + alias), got %d and %d", len(report1.Edges), len(report2.Edges))
-	}
+
 	xRef1, _ := ModelReference("b1", "X")
 	aRef1, _ := ModelReference("b1", "A")
 	xRef2, _ := ModelReference("b2", "X")
 	aRef2, _ := ModelReference("b2", "A")
-	edgeForRef := func(report AliasReport, ref string) *AliasEdge {
-		for i := range report.Edges {
-			if report.Edges[i].Ref == ref {
-				return &report.Edges[i]
-			}
-		}
-		return nil
-	}
-	e1 := edgeForRef(report1, aRef1)
-	e2 := edgeForRef(report2, aRef2)
-	if e1 == nil || e1.BackendID != "b1" || e1.Epoch != 1 {
-		t.Fatalf("report1 A edge wrong: %#v", report1.Edges)
-	}
-	if e1.State != aliasStateExact || e1.CanonicalRef != xRef1 {
-		t.Fatalf("report1 should resolve A->X exact: %#v", e1)
-	}
-	if e2 == nil || e2.BackendID != "b2" || e2.Epoch != 2 {
-		t.Fatalf("report2 A edge wrong: %#v", report2.Edges)
-	}
-	if e2.State != aliasStateExact || e2.CanonicalRef != xRef2 {
-		t.Fatalf("report2 should resolve A->X exact: %#v", e2)
-	}
-	// The canonical self edges are also present and exact.
-	x1 := edgeForRef(report1, xRef1)
-	x2 := edgeForRef(report2, xRef2)
-	if x1 == nil || x1.State != aliasStateExact || x1.CanonicalRef != xRef1 {
-		t.Fatalf("report1 X self edge wrong: %#v", x1)
-	}
-	if x2 == nil || x2.State != aliasStateExact || x2.CanonicalRef != xRef2 {
-		t.Fatalf("report2 X self edge wrong: %#v", x2)
-	}
+
+	// Each backend/epoch must expose exactly the canonical self edge and the
+	// alias edge, both exact, scoped to that backend+epoch.
+	requireAliasEdge(t, report1, "b1", 1, aRef1, xRef1)
+	requireAliasEdge(t, report1, "b1", 1, xRef1, xRef1)
+	requireAliasEdge(t, report2, "b2", 2, aRef2, xRef2)
+	requireAliasEdge(t, report2, "b2", 2, xRef2, xRef2)
+
 	// ResolveActivityAliases is scoped by backend+epoch+ref.
 	acts := []*ActivityRecord{
 		{BackendID: "b1", Epoch: 1, ActivityID: "1", ReportedModelRef: aRef1},
@@ -402,19 +400,10 @@ func TestAliasCrossBackendAndEpochGuard(t *testing.T) {
 		t.Fatalf("expected 3 identities, got %d", len(identities))
 	}
 	// Only the first matches report1's (b1, epoch 1, ref).
-	if identities[0].State != aliasStateExact || identities[0].CanonicalRef != xRef1 {
-		t.Fatalf("first should resolve exact: %#v", identities[0])
-	}
-	if identities[0].ReportedModelRef != aRef1 {
-		t.Fatalf("reported_model_ref should be preserved: %q", identities[0].ReportedModelRef)
-	}
+	requireActivityIdentity(t, identities[0], aRef1, xRef1, aliasStateExact)
 	// Second (wrong backend) and third (wrong epoch) have no matching edge -> unknown.
-	if identities[1].State != aliasStateUnknown || identities[1].CanonicalRef != "" {
-		t.Fatalf("second should be unknown: %#v", identities[1])
-	}
-	if identities[2].State != aliasStateUnknown || identities[2].CanonicalRef != "" {
-		t.Fatalf("third (wrong epoch) should be unknown: %#v", identities[2])
-	}
+	requireActivityIdentity(t, identities[1], aRef2, "", aliasStateUnknown)
+	requireActivityIdentity(t, identities[2], aRef1, "", aliasStateUnknown)
 }
 
 func TestAliasEdgeChainToAliasIsUnknown(t *testing.T) {
@@ -440,10 +429,7 @@ func TestAliasEdgeChainToAliasIsUnknown(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges (one per row ID), got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
+	byRef := edgesByRef(report)
 	aRef, _ := ModelReference("backend", "A")
 	bRef, _ := ModelReference("backend", "B")
 	a := byRef[aRef]
@@ -485,20 +471,10 @@ func TestAliasTrueCanonicalWithOptionalAliasRow(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges, got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
 	xRef, _ := ModelReference("backend", "X")
 	aRef, _ := ModelReference("backend", "A")
-	x := byRef[xRef]
-	a := byRef[aRef]
-	if x == nil || x.State != aliasStateExact || x.CanonicalRef != xRef {
-		t.Fatalf("canonical self edge wrong: %#v", x)
-	}
-	if a == nil || a.State != aliasStateExact || a.CanonicalRef != xRef {
-		t.Fatalf("alias edge wrong: %#v", a)
-	}
+	requireAliasEdge(t, report, "backend", 1, xRef, xRef)
+	requireAliasEdge(t, report, "backend", 1, aRef, xRef)
 }
 
 // TestAliasCanonicalOnlyNoAliasRow covers a true canonical model that declares
@@ -527,20 +503,10 @@ func TestAliasCanonicalOnlyNoAliasRow(t *testing.T) {
 	if len(report.Edges) != 2 {
 		t.Fatalf("expected 2 edges (canonical self + alias), got %d", len(report.Edges))
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
 	xRef, _ := ModelReference("backend", "X")
 	aRef, _ := ModelReference("backend", "A")
-	x := byRef[xRef]
-	if x == nil || x.State != aliasStateExact || x.CanonicalRef != xRef {
-		t.Fatalf("canonical self edge wrong: %#v", x)
-	}
-	a := byRef[aRef]
-	if a == nil || a.State != aliasStateExact || a.CanonicalRef != xRef {
-		t.Fatalf("alias edge wrong: %#v", a)
-	}
+	requireAliasEdge(t, report, "backend", 1, xRef, xRef)
+	requireAliasEdge(t, report, "backend", 1, aRef, xRef)
 }
 
 func TestAliasEdgeCapDoesNotHideConflict(t *testing.T) {
@@ -574,10 +540,7 @@ func TestAliasEdgeCapDoesNotHideConflict(t *testing.T) {
 	if !report.Truncated {
 		t.Fatal("expected report to be truncated by edge cap")
 	}
-	byRef := make(map[string]*AliasEdge)
-	for i := range report.Edges {
-		byRef[report.Edges[i].Ref] = &report.Edges[i]
-	}
+	byRef := edgesByRef(report)
 	kRef, _ := ModelReference("backend", "K")
 	k := byRef[kRef]
 	if k == nil {

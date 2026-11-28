@@ -67,6 +67,14 @@ var validCatalogStatus = map[string]bool{
 // hashed, or used as a map key.
 const maxIdentityRunes = 256
 
+// modelRefPrefix is the opaque bounded model reference prefix. It is applied
+// consistently by isModelReference; changing it changes the public ID scheme.
+const modelRefPrefix = "model-"
+
+// modelCatalogSource is the source label used in provenance and lifecycle
+// records for model catalog observations from the /v1/models endpoint.
+const modelCatalogSource = "/v1/models"
+
 // ModelIdentity stably and boundedly identifies a model. The public ID is the
 // catalog-visible ID (backend prefix + local ID). Backend ID and local ID are
 // the stable internal identifiers; prefix collisions are resolved by the
@@ -413,110 +421,102 @@ func (s *Service) Snapshot(ctx context.Context, backendModels []BackendModel, ba
 		return nil, err
 	}
 
-	snapByBackend := make(map[string]*diagnostics.Snapshot, len(backendSnapshots))
-	duplicateBackends := make(map[string]bool)
-	snapCounts := make(map[string]int)
-	for _, snap := range backendSnapshots {
-		if snap == nil || snap.Backend == "" || !validIdentityComponent(snap.Backend) {
-			continue
-		}
-		snapCounts[snap.Backend]++
-		if snapCounts[snap.Backend] > 1 {
-			duplicateBackends[snap.Backend] = true
-		}
-		snapByBackend[snap.Backend] = snap
-	}
+	// Index backend diagnostics snapshots. Nil, empty-backend, or invalid
+	// backend snapshots are skipped before indexing so they never appear in
+	// the output.
+	snapByBackend, duplicateBackends := buildLegacyBackendSnapshotIndices(backendSnapshots)
 
-	models := append([]BackendModel(nil), backendModels...)
-	for i := range models {
-		models[i].Models = append([]map[string]any(nil), models[i].Models...)
-		sort.SliceStable(models[i].Models, func(a, b int) bool {
-			left, _ := models[i].Models[a]["id"].(string)
-			right, _ := models[i].Models[b]["id"].(string)
-			return left < right
-		})
-	}
-	sort.SliceStable(models, func(i, j int) bool {
-		if models[i].BackendID != models[j].BackendID {
-			return models[i].BackendID < models[j].BackendID
-		}
-		return models[i].Prefix < models[j].Prefix
-	})
-	publicCounts := make(map[string]int)
-	for _, bm := range models {
-		for _, model := range bm.Models {
-			localID, _ := model["id"].(string)
-			if !validCatalogIdentityParts(bm.BackendID, bm.Prefix, localID) {
-				continue
-			}
-			identity := ModelIdentity{PublicID: bm.Prefix + localID, BackendID: bm.BackendID, LocalID: localID, Prefix: bm.Prefix}
-			if identity.Valid() {
-				publicCounts[identity.PublicID]++
-			}
-		}
-	}
+	// Sort and deduplicate catalog models.
+	models := sortCatalogModels(backendModels)
+
+	// Public ID duplication for provenance resolution.
+	publicCounts := catalogPublicCounts(models)
 
 	var result []*ModelSnapshot
 	for _, bm := range models {
 		diag := summarizeDiagnostics(snapByBackend[bm.BackendID])
+		snap := snapByBackend[bm.BackendID]
+		if duplicateBackends[bm.BackendID] {
+			snap = nil
+		}
 
 		for _, model := range bm.Models {
-			localID, _ := model["id"].(string)
-			if !validCatalogIdentityParts(bm.BackendID, bm.Prefix, localID) {
-				continue
-			}
-			publicID := bm.Prefix + localID
-
-			// Build provenance via the shared provenance.Build API.
-			provIdentity := provenance.ModelIdentity{
-				PublicID:  publicID,
-				BackendID: bm.BackendID,
-				LocalID:   localID,
-				Prefix:    bm.Prefix,
-			}
-			snap := snapByBackend[bm.BackendID]
-			if duplicateBackends[bm.BackendID] {
-				snap = nil
-			}
-			prov := provenance.Build(provIdentity, model, snap, bm.ObservedAt)
-			if !provIdentity.Valid() {
-				continue
-			}
-			if publicCounts[publicID] > 1 {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: "/v1/models", Verification: provenance.Conflicting}
-			} else {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: "/v1/models", Verification: provenance.Declared}
-			}
-			modelRef, ok := correlation.ModelReference(bm.BackendID, localID)
+			snapshot, ok := assembleLegacyModelSnapshot(bm, model, snap, diag, publicCounts)
 			if !ok {
 				continue
 			}
-			lifecycle := buildLifecycle(bm.BackendID, modelRef, map[refKey][]correlation.LifecycleModel{}, map[refKey]bool{}, catalogStatus(model["status"]), bm.ObservedAt)
-
-			result = append(result, &ModelSnapshot{
-				Identity: ModelIdentity{
-					PublicID:  publicID,
-					BackendID: bm.BackendID,
-					LocalID:   localID,
-					Prefix:    bm.Prefix,
-				},
-				Catalog:     projectCatalog(model),
-				Diagnostics: diag,
-				Lifecycle:   lifecycle,
-				Provenance: &Provenance{
-					Identity: ModelIdentity{
-						PublicID:  publicID,
-						BackendID: bm.BackendID,
-						LocalID:   localID,
-						Prefix:    bm.Prefix,
-					},
-					Fields: prov.Fields,
-				},
-			})
+			result = append(result, snapshot)
 		}
 	}
 
 	return result, nil
+}
+
+// buildLegacyBackendSnapshotIndices indexes backend diagnostics snapshots for
+// the legacy Snapshot API. Nil, empty-backend, or invalid backend snapshots
+// are skipped before indexing so they never appear in the output.
+func buildLegacyBackendSnapshotIndices(snapshots []*diagnostics.Snapshot) (map[string]*diagnostics.Snapshot, map[string]bool) {
+	snapByBackend := make(map[string]*diagnostics.Snapshot, len(snapshots))
+	duplicateBackends := make(map[string]bool)
+	snapCounts := make(map[string]int)
+	for _, snap := range snapshots {
+		if snap == nil || snap.Backend == "" || !validIdentityComponent(snap.Backend) {
+			continue
+		}
+		diagnostics.IndexBackendSnapshot(snap, snapByBackend, snapCounts, duplicateBackends)
+	}
+	return snapByBackend, duplicateBackends
+}
+
+// assembleLegacyModelSnapshot builds one legacy ModelSnapshot from a resolved
+// catalog model and pre-computed diagnostics. It preserves the old API output
+// shape: no Activity/GPUWindow fields, legacy Diagnostics block, and empty
+// lifecycle maps.
+func assembleLegacyModelSnapshot(bm BackendModel, model map[string]any, snap *diagnostics.Snapshot, diag BackendDiagnostics, publicCounts map[string]int) (*ModelSnapshot, bool) {
+	localID, _ := model["id"].(string)
+	if !validCatalogIdentityParts(bm.BackendID, bm.Prefix, localID) {
+		return nil, false
+	}
+	publicID := bm.Prefix + localID
+
+	// Build provenance via the shared provenance.Build API.
+	provIdentity := provenance.ModelIdentity{
+		PublicID:  publicID,
+		BackendID: bm.BackendID,
+		LocalID:   localID,
+		Prefix:    bm.Prefix,
+	}
+	prov := provenance.Build(provIdentity, model, snap, bm.ObservedAt)
+	if !provIdentity.Valid() {
+		return nil, false
+	}
+	prov.Fields["public_id_resolution"] = provenance.PublicIDResolutionField(publicID, publicCounts)
+	modelRef, ok := correlation.ModelReference(bm.BackendID, localID)
+	if !ok {
+		return nil, false
+	}
+	lifecycle := buildLifecycle(bm.BackendID, modelRef, map[refKey][]correlation.LifecycleModel{}, map[refKey]bool{}, catalogStatus(model["status"]), bm.ObservedAt)
+
+	return &ModelSnapshot{
+		Identity: ModelIdentity{
+			PublicID:  publicID,
+			BackendID: bm.BackendID,
+			LocalID:   localID,
+			Prefix:    bm.Prefix,
+		},
+		Catalog:     projectCatalog(model),
+		Diagnostics: diag,
+		Lifecycle:   lifecycle,
+		Provenance: &Provenance{
+			Identity: ModelIdentity{
+				PublicID:  publicID,
+				BackendID: bm.BackendID,
+				LocalID:   localID,
+				Prefix:    bm.Prefix,
+			},
+			Fields: prov.Fields,
+		},
+	}, true
 }
 
 // SnapshotWithSources produces per-model snapshots combining catalog metadata
@@ -531,135 +531,273 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 	}
 
 	// Validate input bounds before any allocation.
-	if len(sources.Activities) > 1000 {
-		return nil, errors.New("too many activities: max 1000")
-	}
-	if len(sources.Identities) > 1000 {
-		return nil, errors.New("too many identities: max 1000")
-	}
-	if len(sources.BackendStates) > 256 {
-		return nil, errors.New("too many backend states: max 256")
-	}
-	if sources.GPUReport != nil && len(sources.GPUReport.Samples) > 4096 {
-		return nil, errors.New("too many GPU samples: max 4096")
-	}
-	if len(sources.DeviceAssociations) > 8000 {
-		return nil, errors.New("too many device associations: max 8000")
-	}
-	if len(sources.LifecycleAssociations) > 8000 {
-		return nil, errors.New("too many lifecycle associations: max 8000")
-	}
-	if sources.LifecycleReport != nil && len(sources.LifecycleReport.Models) > 1000 {
-		return nil, errors.New("too many lifecycle models: max 1000")
-	}
-	modelCount := 0
-	for _, bm := range backendModels {
-		modelCount += len(bm.Models)
-	}
-	if modelCount > 1000 {
-		return nil, errors.New("too many model records: max 1000")
+	if err := validateSnapshotBounds(sources, backendModels); err != nil {
+		return nil, err
 	}
 
 	// Validate all untrusted input identifiers and opaque refs before any
 	// indexing map is created or any public ID is materialized. Invalid
 	// scopes are rejected with a bounded generic error; no raw values are
 	// echoed.
-	for _, id := range sources.Identities {
+	if err := validateSnapshotIdentifiers(sources); err != nil {
+		return nil, err
+	}
+
+	// Build all bounded index maps before the model loop.
+	indices := buildSnapshotIndices(sources, backendSnapshots)
+
+	// Sort and deduplicate catalog models.
+	models := sortCatalogModels(backendModels)
+
+	// Public ID duplication for provenance resolution.
+	publicCounts := catalogPublicCounts(models)
+
+	var result []*ModelSnapshot
+	for _, bm := range models {
+		snap := indices.snapByBackend[bm.BackendID]
+		if indices.duplicateBackends[bm.BackendID] {
+			snap = nil
+		}
+		bs := indices.backendStates[bm.BackendID]
+
+		for _, model := range bm.Models {
+			snapshot, ok := assembleModelSnapshot(bm, model, snap, bs, indices, publicCounts)
+			if !ok {
+				continue
+			}
+			result = append(result, snapshot)
+		}
+	}
+
+	return result, nil
+}
+
+// snapshotIndices holds all bounded lookup indexes built from the cached inputs
+// before the model loop. Building them up front keeps the per-model assembler
+// focused and below the cognitive complexity threshold.
+type snapshotIndices struct {
+	snapByBackend           map[string]*diagnostics.Snapshot
+	duplicateBackends       map[string]bool
+	backendStates           map[string]correlation.BackendState
+	identitiesByRef         map[refKey][]correlation.ActivityModelIdentity
+	identityAmbiguous       map[identityKey]bool
+	activitiesByKey         map[activityKey]*correlation.ActivityRecord
+	activityConflict        map[activityKey]bool
+	gpuSamplesByDevice      map[gpuSampleKey][]correlation.GPUSample
+	deviceAssocsByActivity  map[activityKey][]correlation.ActivityDeviceAssociation
+	lifecycleModelsByKey    map[refKey][]correlation.LifecycleModel
+	lifecycleModelDuplicate map[refKey]bool
+	gpuReport               *correlation.GPUReport
+}
+
+// validateSnapshotBounds enforces input bounds before any allocation. Exceeding
+// a bound returns a bounded generic error; no raw values are echoed.
+func validateSnapshotBounds(sources SnapshotSources, backendModels []BackendModel) error {
+	if len(sources.Activities) > 1000 {
+		return errors.New("too many activities: max 1000")
+	}
+	if len(sources.Identities) > 1000 {
+		return errors.New("too many identities: max 1000")
+	}
+	if len(sources.BackendStates) > 256 {
+		return errors.New("too many backend states: max 256")
+	}
+	if sources.GPUReport != nil && len(sources.GPUReport.Samples) > 4096 {
+		return errors.New("too many GPU samples: max 4096")
+	}
+	if len(sources.DeviceAssociations) > 8000 {
+		return errors.New("too many device associations: max 8000")
+	}
+	if len(sources.LifecycleAssociations) > 8000 {
+		return errors.New("too many lifecycle associations: max 8000")
+	}
+	if sources.LifecycleReport != nil && len(sources.LifecycleReport.Models) > 1000 {
+		return errors.New("too many lifecycle models: max 1000")
+	}
+	modelCount := 0
+	for _, bm := range backendModels {
+		modelCount += len(bm.Models)
+	}
+	if modelCount > 1000 {
+		return errors.New("too many model records: max 1000")
+	}
+	return nil
+}
+
+// validateSnapshotIdentifiers validates all untrusted input identifiers and
+// opaque refs before any indexing map is created or any public ID is
+// materialized. Validation is split by input family so each validator stays
+// below the cognitive complexity threshold.
+func validateSnapshotIdentifiers(sources SnapshotSources) error {
+	if err := validateSnapshotIdentities(sources.Identities); err != nil {
+		return err
+	}
+	if err := validateSnapshotBackendStateKeys(sources.BackendStates); err != nil {
+		return err
+	}
+	if err := validateSnapshotActivities(sources.Activities); err != nil {
+		return err
+	}
+	if err := validateSnapshotGPU(sources.GPUReport); err != nil {
+		return err
+	}
+	if err := validateSnapshotDeviceAssociations(sources.DeviceAssociations); err != nil {
+		return err
+	}
+	if err := validateSnapshotLifecycleAssociations(sources.LifecycleAssociations); err != nil {
+		return err
+	}
+	if err := validateSnapshotLifecycleReport(sources.LifecycleReport); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSnapshotIdentities(identities []correlation.ActivityModelIdentity) error {
+	for _, id := range identities {
 		if id.BackendID == "" || !validIdentityComponent(id.BackendID) ||
 			id.ActivityID == "" || !validIdentityComponent(id.ActivityID) || id.Epoch <= 0 {
-			return nil, errors.New("invalid activity identity key")
+			return errors.New("invalid activity identity key")
 		}
 		if id.ReportedModelRef != "" && !isModelReference(id.ReportedModelRef) {
-			return nil, errors.New("invalid reported model ref")
+			return errors.New("invalid reported model ref")
 		}
 		if id.CanonicalRef != "" && !isModelReference(id.CanonicalRef) {
-			return nil, errors.New("invalid canonical model ref")
+			return errors.New("invalid canonical model ref")
 		}
 	}
-	for backendID := range sources.BackendStates {
+	return nil
+}
+
+func validateSnapshotBackendStateKeys(backendStates map[string]correlation.BackendState) error {
+	for backendID := range backendStates {
 		if backendID == "" || !validIdentityComponent(backendID) {
-			return nil, errors.New("invalid activity backend state key")
+			return errors.New("invalid activity backend state key")
 		}
 	}
-	for _, r := range sources.Activities {
+	return nil
+}
+
+func validateSnapshotActivities(activities []*correlation.ActivityRecord) error {
+	for _, r := range activities {
 		if r == nil {
-			return nil, errors.New("nil activity record")
+			return errors.New("nil activity record")
 		}
 		if r.BackendID == "" || !validIdentityComponent(r.BackendID) ||
 			r.ActivityID == "" || !validIdentityComponent(r.ActivityID) || r.Epoch <= 0 || r.Timestamp.IsZero() {
-			return nil, errors.New("invalid activity key")
+			return errors.New("invalid activity key")
 		}
 		if !validActivityMetrics(r) {
-			return nil, errors.New("invalid activity measurement")
+			return errors.New("invalid activity measurement")
 		}
 	}
-	if sources.GPUReport != nil {
-		if len(sources.GPUReport.BackendStates) > 256 {
-			return nil, errors.New("too many GPU backend states: max 256")
-		}
-		for backendID := range sources.GPUReport.BackendStates {
-			if backendID == "" || !validIdentityComponent(backendID) {
-				return nil, errors.New("invalid GPU backend state key")
-			}
-		}
-		for _, s := range sources.GPUReport.Samples {
-			if s.BackendID == "" || !validIdentityComponent(s.BackendID) ||
-				s.DeviceID == "" || !validIdentityComponent(s.DeviceID) || s.Epoch <= 0 || s.Timestamp.IsZero() {
-				return nil, errors.New("invalid GPU sample key")
-			}
-			if !isGPUDeviceID(s.DeviceID) {
-				return nil, errors.New("invalid GPU device id")
-			}
-			if !validGPUValue(s) {
-				return nil, errors.New("invalid GPU measurement")
-			}
+	return nil
+}
+
+func validateSnapshotGPU(report *correlation.GPUReport) error {
+	if report == nil {
+		return nil
+	}
+	if len(report.BackendStates) > 256 {
+		return errors.New("too many GPU backend states: max 256")
+	}
+	for backendID := range report.BackendStates {
+		if backendID == "" || !validIdentityComponent(backendID) {
+			return errors.New("invalid GPU backend state key")
 		}
 	}
-	for _, a := range sources.DeviceAssociations {
+	for _, s := range report.Samples {
+		if s.BackendID == "" || !validIdentityComponent(s.BackendID) ||
+			s.DeviceID == "" || !validIdentityComponent(s.DeviceID) || s.Epoch <= 0 || s.Timestamp.IsZero() {
+			return errors.New("invalid GPU sample key")
+		}
+		if !isGPUDeviceID(s.DeviceID) {
+			return errors.New("invalid GPU device id")
+		}
+		if !validGPUValue(s) {
+			return errors.New("invalid GPU measurement")
+		}
+	}
+	return nil
+}
+
+func validateSnapshotDeviceAssociations(associations []correlation.ActivityDeviceAssociation) error {
+	for _, a := range associations {
 		if a.BackendID == "" || !validIdentityComponent(a.BackendID) ||
 			a.ActivityID == "" || !validIdentityComponent(a.ActivityID) || a.Epoch <= 0 {
-			return nil, errors.New("invalid device association key")
+			return errors.New("invalid device association key")
 		}
 		if !a.WindowStart.IsZero() && !a.WindowEnd.IsZero() && a.WindowEnd.Before(a.WindowStart) {
-			return nil, errors.New("invalid association window order")
+			return errors.New("invalid association window order")
 		}
 	}
-	for _, a := range sources.LifecycleAssociations {
+	return nil
+}
+
+func validateSnapshotLifecycleAssociations(associations []correlation.ActivityLifecycleAssociation) error {
+	for _, a := range associations {
 		if a.BackendID == "" || !validIdentityComponent(a.BackendID) ||
 			a.ActivityID == "" || !validIdentityComponent(a.ActivityID) || a.Epoch <= 0 {
-			return nil, errors.New("invalid lifecycle association key")
+			return errors.New("invalid lifecycle association key")
 		}
 	}
-	if sources.LifecycleReport != nil {
-		for _, m := range sources.LifecycleReport.Models {
-			if m.BackendID == "" || !validIdentityComponent(m.BackendID) || m.Epoch <= 0 {
-				return nil, errors.New("invalid lifecycle model key")
-			}
-			if m.ModelRef != "" && !isModelReference(m.ModelRef) {
-				return nil, errors.New("invalid lifecycle model ref")
-			}
+	return nil
+}
+
+func validateSnapshotLifecycleReport(report *correlation.LifecycleReport) error {
+	if report == nil {
+		return nil
+	}
+	for _, m := range report.Models {
+		if m.BackendID == "" || !validIdentityComponent(m.BackendID) || m.Epoch <= 0 {
+			return errors.New("invalid lifecycle model key")
 		}
+		if m.ModelRef != "" && !isModelReference(m.ModelRef) {
+			return errors.New("invalid lifecycle model ref")
+		}
+	}
+	return nil
+}
+
+// buildSnapshotIndices builds all bounded lookup indexes from the cached inputs
+// before the model loop.
+func buildSnapshotIndices(sources SnapshotSources, backendSnapshots []*diagnostics.Snapshot) *snapshotIndices {
+	indices := &snapshotIndices{
+		snapByBackend:           make(map[string]*diagnostics.Snapshot, len(backendSnapshots)),
+		duplicateBackends:       make(map[string]bool),
+		backendStates:           sources.BackendStates,
+		identitiesByRef:         make(map[refKey][]correlation.ActivityModelIdentity, len(sources.Identities)),
+		identityAmbiguous:       make(map[identityKey]bool),
+		activitiesByKey:         make(map[activityKey]*correlation.ActivityRecord, len(sources.Activities)),
+		activityConflict:        make(map[activityKey]bool),
+		gpuSamplesByDevice:      make(map[gpuSampleKey][]correlation.GPUSample, 4096),
+		deviceAssocsByActivity:  make(map[activityKey][]correlation.ActivityDeviceAssociation, len(sources.DeviceAssociations)),
+		lifecycleModelsByKey:    make(map[refKey][]correlation.LifecycleModel, 1000),
+		lifecycleModelDuplicate: make(map[refKey]bool),
+		gpuReport:               sources.GPUReport,
 	}
 
-	// Backend diagnostics snapshots by backend. Duplicate snapshots are
-	// ambiguous: treat such backends as having no diagnostics.
-	snapByBackend := make(map[string]*diagnostics.Snapshot, len(backendSnapshots))
-	duplicateBackends := make(map[string]bool)
+	buildBackendSnapshotIndices(backendSnapshots, indices.snapByBackend, indices.duplicateBackends)
+	buildIdentityIndices(sources.Identities, indices.identitiesByRef, indices.identityAmbiguous)
+	buildActivityIndices(sources.Activities, indices.activitiesByKey, indices.activityConflict)
+	buildGPUIndices(sources.GPUReport, indices.gpuSamplesByDevice)
+	buildDeviceAssociationIndices(sources.DeviceAssociations, indices.deviceAssocsByActivity)
+	buildLifecycleIndices(sources.LifecycleReport, indices.lifecycleModelsByKey, indices.lifecycleModelDuplicate)
+
+	return indices
+}
+
+func buildBackendSnapshotIndices(snapshots []*diagnostics.Snapshot, snapByBackend map[string]*diagnostics.Snapshot, duplicateBackends map[string]bool) {
 	snapCounts := make(map[string]int)
-	for _, snap := range backendSnapshots {
-		snapCounts[snap.Backend]++
-		if snapCounts[snap.Backend] > 1 {
-			duplicateBackends[snap.Backend] = true
-		}
-		snapByBackend[snap.Backend] = snap
+	for _, snap := range snapshots {
+		diagnostics.IndexBackendSnapshot(snap, snapByBackend, snapCounts, duplicateBackends)
 	}
+}
 
-	// Index identities by (backendID, epoch, activityID). Detect ambiguous
-	// duplicates (same key, different identity) -> ambiguous.
-	identitiesByKey := make(map[identityKey][]correlation.ActivityModelIdentity, len(sources.Identities))
-	identityAmbiguous := make(map[identityKey]bool)
-	for i := range sources.Identities {
-		id := &sources.Identities[i]
+func buildIdentityIndices(identities []correlation.ActivityModelIdentity, identitiesByRef map[refKey][]correlation.ActivityModelIdentity, identityAmbiguous map[identityKey]bool) {
+	identitiesByKey := make(map[identityKey][]correlation.ActivityModelIdentity, len(identities))
+	for i := range identities {
+		id := &identities[i]
 		key := identityKey{id.BackendID, id.Epoch, id.ActivityID}
 		if identityAmbiguous[key] {
 			continue
@@ -670,22 +808,18 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 		}
 		identitiesByKey[key] = append(identitiesByKey[key], *id)
 	}
-
-	// Index identities by (backendID, canonicalRef) for model attribution.
-	identitiesByRef := make(map[refKey][]correlation.ActivityModelIdentity, len(sources.Identities))
-	for i := range sources.Identities {
-		id := &sources.Identities[i]
+	for i := range identities {
+		id := &identities[i]
 		if id.State != catalogResolvedState || id.CanonicalRef == "" {
 			continue
 		}
 		key := refKey{id.BackendID, id.CanonicalRef}
 		identitiesByRef[key] = append(identitiesByRef[key], *id)
 	}
+}
 
-	// Index activities by (backendID, epoch, activityID). Detect conflicts.
-	activitiesByKey := make(map[activityKey]*correlation.ActivityRecord, len(sources.Activities))
-	activityConflict := make(map[activityKey]bool)
-	for _, r := range sources.Activities {
+func buildActivityIndices(activities []*correlation.ActivityRecord, activitiesByKey map[activityKey]*correlation.ActivityRecord, activityConflict map[activityKey]bool) {
+	for _, r := range activities {
 		if r == nil {
 			continue
 		}
@@ -705,48 +839,51 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 		}
 		activitiesByKey[key] = r
 	}
+}
 
-	// Index GPU samples by (backendID, epoch, deviceID).
-	gpuSamplesByDevice := make(map[gpuSampleKey][]correlation.GPUSample, 4096)
-	if sources.GPUReport != nil {
-		for _, s := range sources.GPUReport.Samples {
-			key := gpuSampleKey{s.BackendID, s.Epoch, s.DeviceID}
-			gpuSamplesByDevice[key] = append(gpuSamplesByDevice[key], s)
-		}
+func buildGPUIndices(report *correlation.GPUReport, gpuSamplesByDevice map[gpuSampleKey][]correlation.GPUSample) {
+	if report == nil {
+		return
+	}
+	for _, s := range report.Samples {
+		key := gpuSampleKey{s.BackendID, s.Epoch, s.DeviceID}
+		gpuSamplesByDevice[key] = append(gpuSamplesByDevice[key], s)
 	}
 	for key := range gpuSamplesByDevice {
 		sort.SliceStable(gpuSamplesByDevice[key], func(i, j int) bool {
 			return gpuSamplesByDevice[key][i].Timestamp.Before(gpuSamplesByDevice[key][j].Timestamp)
 		})
 	}
+}
 
-	// Index device associations by (backendID, epoch, activityID).
-	deviceAssocsByActivity := make(map[activityKey][]correlation.ActivityDeviceAssociation, len(sources.DeviceAssociations))
-	for _, a := range sources.DeviceAssociations {
+func buildDeviceAssociationIndices(associations []correlation.ActivityDeviceAssociation, deviceAssocsByActivity map[activityKey][]correlation.ActivityDeviceAssociation) {
+	for _, a := range associations {
 		key := activityKey{a.BackendID, a.Epoch, a.ActivityID}
 		deviceAssocsByActivity[key] = append(deviceAssocsByActivity[key], a)
 	}
+}
 
-	// Index current lifecycle models by (backendID, modelRef). The existing
-	// /running API returns current canonical model snapshots, not transitions.
-	lifecycleModelsByKey := make(map[refKey][]correlation.LifecycleModel, 1000)
-	lifecycleModelDuplicate := make(map[refKey]bool)
-	if sources.LifecycleReport != nil {
-		for i := range sources.LifecycleReport.Models {
-			m := &sources.LifecycleReport.Models[i]
-			key := refKey{m.BackendID, m.ModelRef}
-			if lifecycleModelDuplicate[key] {
-				continue
-			}
-			if _, ok := lifecycleModelsByKey[key]; ok {
-				lifecycleModelDuplicate[key] = true
-				continue
-			}
-			lifecycleModelsByKey[key] = append(lifecycleModelsByKey[key], *m)
-		}
+func buildLifecycleIndices(report *correlation.LifecycleReport, lifecycleModelsByKey map[refKey][]correlation.LifecycleModel, lifecycleModelDuplicate map[refKey]bool) {
+	if report == nil {
+		return
 	}
+	for i := range report.Models {
+		m := &report.Models[i]
+		key := refKey{m.BackendID, m.ModelRef}
+		if lifecycleModelDuplicate[key] {
+			continue
+		}
+		if _, ok := lifecycleModelsByKey[key]; ok {
+			lifecycleModelDuplicate[key] = true
+			continue
+		}
+		lifecycleModelsByKey[key] = append(lifecycleModelsByKey[key], *m)
+	}
+}
 
-	// Sort and deduplicate catalog models.
+// sortCatalogModels sorts and deduplicates catalog models. Models within each
+// backend are sorted by local ID; backends are sorted by backend ID then prefix.
+func sortCatalogModels(backendModels []BackendModel) []BackendModel {
 	models := append([]BackendModel(nil), backendModels...)
 	for i := range models {
 		models[i].Models = append([]map[string]any(nil), models[i].Models...)
@@ -762,8 +899,13 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 		}
 		return models[i].Prefix < models[j].Prefix
 	})
+	return models
+}
 
-	// Public ID duplication for provenance resolution.
+// catalogPublicCounts counts public ID duplication for provenance resolution.
+// Models with invalid identity components are skipped before the public ID is
+// materialized.
+func catalogPublicCounts(models []BackendModel) map[string]int {
 	publicCounts := make(map[string]int)
 	for _, bm := range models {
 		for _, model := range bm.Models {
@@ -779,125 +921,122 @@ func (s *Service) SnapshotWithSources(ctx context.Context, backendModels []Backe
 			}
 		}
 	}
+	return publicCounts
+}
 
-	var result []*ModelSnapshot
-	for _, bm := range models {
-		snap := snapByBackend[bm.BackendID]
-		if duplicateBackends[bm.BackendID] {
-			snap = nil
+// resolveModelIdentity validates and resolves a catalog model's identity. It
+// enforces bounds before the public ID is materialized and returns the
+// canonical model reference used for activity attribution.
+func resolveModelIdentity(bm BackendModel, localID string) (ModelIdentity, string, bool) {
+	if localID == "" || !validIdentityComponent(localID) ||
+		!validIdentityComponent(bm.BackendID) || !validIdentityComponent(bm.Prefix) {
+		return ModelIdentity{}, "", false
+	}
+	publicID := bm.Prefix + localID
+	identity := ModelIdentity{PublicID: publicID, BackendID: bm.BackendID, LocalID: localID, Prefix: bm.Prefix}
+	if !identity.Valid() {
+		return ModelIdentity{}, "", false
+	}
+	expectedRef, ok := correlation.ModelReference(bm.BackendID, localID)
+	if !ok {
+		return ModelIdentity{}, "", false
+	}
+	return identity, expectedRef, true
+}
+
+// attributeActivities attributes activities to a model whose resolved identity
+// has a catalog_resolved canonical reference equal to
+// ModelReference(backendID, localModelID). No name/modelID or time coincidence
+// is used. Ambiguous or conflicting attributions mark the model ambiguous.
+func attributeActivities(identity ModelIdentity, expectedRef string, indices *snapshotIndices) ([]*correlation.ActivityRecord, bool, bool) {
+	matchingIdentities := indices.identitiesByRef[refKey{identity.BackendID, expectedRef}]
+	attributed := false
+	ambiguous := false
+	seenActivity := make(map[activityKey]bool)
+	var attributedRecords []*correlation.ActivityRecord
+	for _, id := range matchingIdentities {
+		if id.State != catalogResolvedState || id.CanonicalRef != expectedRef {
+			continue
 		}
-		bs := sources.BackendStates[bm.BackendID]
-
-		for _, model := range bm.Models {
-			localID, _ := model["id"].(string)
-			// Validate identity components before the public ID is
-			// materialized (prefix + local ID) so oversized or invalid
-			// identifiers are skipped without concatenation.
-			if localID == "" || !validIdentityComponent(localID) ||
-				!validIdentityComponent(bm.BackendID) || !validIdentityComponent(bm.Prefix) {
-				continue
-			}
-			publicID := bm.Prefix + localID
-
-			identity := ModelIdentity{
-				PublicID:  publicID,
-				BackendID: bm.BackendID,
-				LocalID:   localID,
-				Prefix:    bm.Prefix,
-			}
-			if !identity.Valid() {
-				continue
-			}
-
-			// Provenance via the shared provenance.Build API.
-			provIdentity := provenance.ModelIdentity{
-				PublicID:  publicID,
-				BackendID: bm.BackendID,
-				LocalID:   localID,
-				Prefix:    bm.Prefix,
-			}
-			prov := provenance.Build(provIdentity, model, snap, bm.ObservedAt)
-			if !provIdentity.Valid() {
-				continue
-			}
-			if publicCounts[publicID] > 1 {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "ambiguous_catalog_id", Source: "/v1/models", Verification: provenance.Conflicting}
-			} else {
-				prov.Fields["public_id_resolution"] = provenance.FieldProvenance{Value: "unique_catalog_id", Source: "/v1/models", Verification: provenance.Declared}
-			}
-
-			// Attribute the model to activities whose resolved identity has a
-			// catalog_resolved canonical reference equal to
-			// ModelReference(backendID, localModelID). No name/modelID or time
-			// coincidence is used.
-			expectedRef, ok := correlation.ModelReference(bm.BackendID, localID)
-			if !ok {
-				// Invalid local model ID: skip.
-				continue
-			}
-			matchingIdentities := identitiesByRef[refKey{bm.BackendID, expectedRef}]
-			attributed := false
-			ambiguous := false
-			seenActivity := make(map[activityKey]bool)
-			var attributedRecords []*correlation.ActivityRecord
-			for _, id := range matchingIdentities {
-				if id.State != catalogResolvedState || id.CanonicalRef != expectedRef {
-					continue
-				}
-				if identityAmbiguous[identityKey{id.BackendID, id.Epoch, id.ActivityID}] {
-					ambiguous = true
-					continue
-				}
-				key := activityKey{id.BackendID, id.Epoch, id.ActivityID}
-				if activityConflict[key] {
-					ambiguous = true
-					continue
-				}
-				r, ok := activitiesByKey[key]
-				if !ok || r == nil {
-					continue
-				}
-				if id.ReportedModelRef != "" && r.ReportedModelRef != "" && id.ReportedModelRef != r.ReportedModelRef {
-					ambiguous = true
-					continue
-				}
-				if r.IdentityConflict {
-					ambiguous = true
-					continue
-				}
-				activityIdentity := activityKey{r.BackendID, r.Epoch, r.ActivityID}
-				if seenActivity[activityIdentity] {
-					continue // dedupe by unique backend/epoch/activity ID
-				}
-				seenActivity[activityIdentity] = true
-				attributedRecords = append(attributedRecords, r)
-				attributed = true
-			}
-
-			// Activity measurement.
-			activity := buildActivityMeasurement(attributedRecords, attributed, ambiguous, bs)
-
-			// Shared GPU window (adjacency is not proof of ownership).
-			gpuWindow := buildGPUWindow(attributedRecords, deviceAssocsByActivity, gpuSamplesByDevice, sources.GPUReport)
-
-			// Current lifecycle snapshot.
-			lifecycle := buildLifecycle(bm.BackendID, expectedRef, lifecycleModelsByKey, lifecycleModelDuplicate, catalogStatus(model["status"]), bm.ObservedAt)
-
-			result = append(result, &ModelSnapshot{
-				Identity:  identity,
-				Catalog:   projectCatalog(model),
-				Activity:  activity,
-				GPUWindow: gpuWindow,
-				Lifecycle: lifecycle,
-				Provenance: &Provenance{
-					Identity: identity,
-					Fields:   prov.Fields,
-				},
-			})
+		if indices.identityAmbiguous[identityKey{id.BackendID, id.Epoch, id.ActivityID}] {
+			ambiguous = true
+			continue
 		}
+		key := activityKey{id.BackendID, id.Epoch, id.ActivityID}
+		if indices.activityConflict[key] {
+			ambiguous = true
+			continue
+		}
+		r, ok := indices.activitiesByKey[key]
+		if !ok || r == nil {
+			continue
+		}
+		if id.ReportedModelRef != "" && r.ReportedModelRef != "" && id.ReportedModelRef != r.ReportedModelRef {
+			ambiguous = true
+			continue
+		}
+		if r.IdentityConflict {
+			ambiguous = true
+			continue
+		}
+		activityIdentity := activityKey{r.BackendID, r.Epoch, r.ActivityID}
+		if seenActivity[activityIdentity] {
+			continue // dedupe by unique backend/epoch/activity ID
+		}
+		seenActivity[activityIdentity] = true
+		attributedRecords = append(attributedRecords, r)
+		attributed = true
+	}
+	return attributedRecords, attributed, ambiguous
+}
+
+// assembleModelSnapshot assembles one ModelSnapshot from a resolved catalog
+// model and the pre-built indexes. It keeps the orchestrator focused on
+// composition while delegating attribution and measurement to focused helpers.
+func assembleModelSnapshot(bm BackendModel, model map[string]any, snap *diagnostics.Snapshot, bs correlation.BackendState, indices *snapshotIndices, publicCounts map[string]int) (*ModelSnapshot, bool) {
+	localID, _ := model["id"].(string)
+	identity, expectedRef, ok := resolveModelIdentity(bm, localID)
+	if !ok {
+		return nil, false
 	}
 
-	return result, nil
+	// Provenance via the shared provenance.Build API.
+	provIdentity := provenance.ModelIdentity{
+		PublicID:  identity.PublicID,
+		BackendID: identity.BackendID,
+		LocalID:   identity.LocalID,
+		Prefix:    identity.Prefix,
+	}
+	prov := provenance.Build(provIdentity, model, snap, bm.ObservedAt)
+	if !provIdentity.Valid() {
+		return nil, false
+	}
+	prov.Fields["public_id_resolution"] = provenance.PublicIDResolutionField(identity.PublicID, publicCounts)
+
+	// Attribute the model to activities whose resolved identity has a
+	// catalog_resolved canonical reference equal to the model reference.
+	attributedRecords, attributed, ambiguous := attributeActivities(identity, expectedRef, indices)
+
+	// Activity measurement.
+	activity := buildActivityMeasurement(attributedRecords, attributed, ambiguous, bs)
+
+	// Shared GPU window (adjacency is not proof of ownership).
+	gpuWindow := buildGPUWindow(attributedRecords, indices.deviceAssocsByActivity, indices.gpuSamplesByDevice, indices.gpuReport)
+
+	// Current lifecycle snapshot.
+	lifecycle := buildLifecycle(bm.BackendID, expectedRef, indices.lifecycleModelsByKey, indices.lifecycleModelDuplicate, catalogStatus(model["status"]), bm.ObservedAt)
+
+	return &ModelSnapshot{
+		Identity:  identity,
+		Catalog:   projectCatalog(model),
+		Activity:  activity,
+		GPUWindow: gpuWindow,
+		Lifecycle: lifecycle,
+		Provenance: &Provenance{
+			Identity: identity,
+			Fields:   prov.Fields,
+		},
+	}, true
 }
 
 func validActivityMetrics(r *correlation.ActivityRecord) bool {
@@ -1077,68 +1216,104 @@ func addInt64(base *int64, v int64) *int64 {
 }
 
 // aggregateActivityRecords accumulates metrics from a set of activity records.
+// The orchestrator counts rows and iterates, delegating the per-record
+// accumulation to focused helpers so every function stays below the cognitive
+// complexity threshold. All per-field skip/nil semantics are preserved: missing
+// values increment the missing counter and are never summed as zero; transport
+// failures increment the failure counter.
 func aggregateActivityRecords(records []*correlation.ActivityRecord) activityAggregates {
 	var agg activityAggregates
 	agg.rowCount = len(records)
 	for _, r := range records {
-		if isTransportFailure(r.Status) {
-			agg.failureCount++
-		}
-		if r.DurationMS != nil {
-			agg.durationValues = append(agg.durationValues, float64(*r.DurationMS))
-		} else {
-			agg.durationMissing++
-		}
-		if r.InputTokens != nil {
-			agg.inputSum = addInt64(agg.inputSum, *r.InputTokens)
-			agg.inputKnown++
-		} else {
-			agg.inputMissing++
-		}
-		if r.OutputTokens != nil {
-			agg.outputSum = addInt64(agg.outputSum, *r.OutputTokens)
-			agg.outputKnown++
-		} else {
-			agg.outputMissing++
-		}
-		if r.CachedTokens != nil {
-			agg.cacheSum = addInt64(agg.cacheSum, *r.CachedTokens)
-			agg.cacheKnown++
-		} else {
-			agg.cacheMissing++
-		}
-		if r.ReasoningTokens != nil {
-			agg.reasoningSum = addInt64(agg.reasoningSum, *r.ReasoningTokens)
-			agg.reasoningKnown++
-		} else {
-			agg.reasoningMissing++
-		}
-		if r.DraftTokens != nil {
-			agg.draftSum = addInt64(agg.draftSum, *r.DraftTokens)
-			agg.draftKnown++
-		} else {
-			agg.draftMissing++
-		}
-		if r.DraftAcceptedTokens != nil {
-			agg.draftAccSum = addInt64(agg.draftAccSum, *r.DraftAcceptedTokens)
-			agg.draftAccKnown++
-		} else {
-			agg.draftAccMissing++
-		}
-		if r.PromptTokensPerSecond != nil {
-			agg.promptRateValues = append(agg.promptRateValues, *r.PromptTokensPerSecond)
-			agg.promptRateKnown++
-		} else {
-			agg.promptRateMissing++
-		}
-		if r.TokensPerSecond != nil {
-			agg.tokensRateValues = append(agg.tokensRateValues, *r.TokensPerSecond)
-			agg.tokensRateKnown++
-		} else {
-			agg.tokensRateMissing++
-		}
+		accumulateActivityRecord(&agg, r)
 	}
 	return agg
+}
+
+// accumulateActivityRecord accumulates the metrics of a single valid activity
+// record into agg. It delegates to field-focused helpers so each stays below
+// the cognitive complexity threshold.
+func accumulateActivityRecord(agg *activityAggregates, r *correlation.ActivityRecord) {
+	accumulateTransportFailure(agg, r)
+	accumulateDuration(agg, r)
+	accumulateIntegerMetrics(agg, r)
+	accumulateRateMetrics(agg, r)
+}
+
+// accumulateTransportFailure counts the record as a transport failure when its
+// status indicates a finite HTTP or transport outcome.
+func accumulateTransportFailure(agg *activityAggregates, r *correlation.ActivityRecord) {
+	if isTransportFailure(r.Status) {
+		agg.failureCount++
+	}
+}
+
+// accumulateDuration appends a known duration value or counts a missing one.
+func accumulateDuration(agg *activityAggregates, r *correlation.ActivityRecord) {
+	if r.DurationMS != nil {
+		agg.durationValues = append(agg.durationValues, float64(*r.DurationMS))
+	} else {
+		agg.durationMissing++
+	}
+}
+
+// accumulateIntegerMetrics sums the six optional integer metrics. Missing values
+// increment the missing counter and are never summed as zero; sums stay nil
+// until the first known value is observed.
+func accumulateIntegerMetrics(agg *activityAggregates, r *correlation.ActivityRecord) {
+	if r.InputTokens != nil {
+		agg.inputSum = addInt64(agg.inputSum, *r.InputTokens)
+		agg.inputKnown++
+	} else {
+		agg.inputMissing++
+	}
+	if r.OutputTokens != nil {
+		agg.outputSum = addInt64(agg.outputSum, *r.OutputTokens)
+		agg.outputKnown++
+	} else {
+		agg.outputMissing++
+	}
+	if r.CachedTokens != nil {
+		agg.cacheSum = addInt64(agg.cacheSum, *r.CachedTokens)
+		agg.cacheKnown++
+	} else {
+		agg.cacheMissing++
+	}
+	if r.ReasoningTokens != nil {
+		agg.reasoningSum = addInt64(agg.reasoningSum, *r.ReasoningTokens)
+		agg.reasoningKnown++
+	} else {
+		agg.reasoningMissing++
+	}
+	if r.DraftTokens != nil {
+		agg.draftSum = addInt64(agg.draftSum, *r.DraftTokens)
+		agg.draftKnown++
+	} else {
+		agg.draftMissing++
+	}
+	if r.DraftAcceptedTokens != nil {
+		agg.draftAccSum = addInt64(agg.draftAccSum, *r.DraftAcceptedTokens)
+		agg.draftAccKnown++
+	} else {
+		agg.draftAccMissing++
+	}
+}
+
+// accumulateRateMetrics collects the two optional per-second rates. Missing
+// values increment the missing counter and are never summed as zero.
+func accumulateRateMetrics(agg *activityAggregates, r *correlation.ActivityRecord) {
+	if r.PromptTokensPerSecond != nil {
+		agg.promptRateValues = append(agg.promptRateValues, *r.PromptTokensPerSecond)
+		agg.promptRateKnown++
+	} else {
+		agg.promptRateMissing++
+	}
+	if r.TokensPerSecond != nil {
+		agg.tokensRateValues = append(agg.tokensRateValues, *r.TokensPerSecond)
+		agg.tokensRateKnown++
+	} else {
+		agg.tokensRateMissing++
+	}
 }
 
 func isTransportFailure(status string) bool {
@@ -1186,28 +1361,13 @@ func metricSummary(sum *int64, known, missing int) *MetricSummary {
 }
 
 // buildActivityMeasurement builds an ActivityMeasurement from aggregated
-// activity records and the backend collection state.
+// activity records and the backend collection state. Metric projection logic
+// is delegated to focused helpers so the assembler stays below the cognitive
+// complexity threshold.
 func buildActivityMeasurement(records []*correlation.ActivityRecord, attributed bool, ambiguous bool, bs correlation.BackendState) *ActivityMeasurement {
 	agg := aggregateActivityRecords(records)
 
-	// Determine freshness and truncated from the backend collection state.
-	freshness := "not_fresh"
-	truncated := bs.Truncated
-	switch bs.State {
-	case "collected":
-		freshness = "fresh"
-	case "unknown":
-		freshness = "not_fresh"
-	case "unavailable":
-		freshness = "not_fresh"
-	case "unsupported":
-		freshness = "not_fresh"
-	case "disabled":
-		freshness = "not_fresh"
-	case "unauthorized":
-		freshness = "not_fresh"
-	}
-
+	freshness, truncated := collectionFreshness(bs)
 	state, freshness := measurementState(attributed, ambiguous, agg.rowCount, bs, freshness)
 
 	m := &ActivityMeasurement{
@@ -1220,76 +1380,11 @@ func buildActivityMeasurement(records []*correlation.ActivityRecord, attributed 
 		RowCount:        agg.rowCount,
 		FailureCount:    agg.failureCount,
 	}
-	for _, r := range records {
-		if r.Timestamp.IsZero() {
-			continue
-		}
-		if m.FirstActivityAt.IsZero() || r.Timestamp.Before(m.FirstActivityAt) {
-			m.FirstActivityAt = r.Timestamp
-		}
-		if m.LastActivityAt.IsZero() || r.Timestamp.After(m.LastActivityAt) {
-			m.LastActivityAt = r.Timestamp
-		}
-	}
-
-	// Duration MS: mean/p50 with sample denominator.
-	if len(agg.durationValues) > 0 {
-		mn := meanFloat(agg.durationValues)
-		p50 := p50Float(agg.durationValues)
-		m.DurationMS = &MeasurementSummary{
-			Mean:         &mn,
-			P50:          &p50,
-			SampleCount:  len(agg.durationValues),
-			MissingCount: agg.durationMissing,
-		}
-	} else {
-		m.DurationMS = &MeasurementSummary{
-			SampleCount:  0,
-			MissingCount: agg.durationMissing,
-		}
-	}
-
-	// Integer metric sums (missing never summed as zero).
-	m.InputTokens = metricSummary(agg.inputSum, agg.inputKnown, agg.inputMissing)
-	m.OutputTokens = metricSummary(agg.outputSum, agg.outputKnown, agg.outputMissing)
-	m.CachedTokens = metricSummary(agg.cacheSum, agg.cacheKnown, agg.cacheMissing)
-	m.ReasoningTokens = metricSummary(agg.reasoningSum, agg.reasoningKnown, agg.reasoningMissing)
-	m.DraftTokens = metricSummary(agg.draftSum, agg.draftKnown, agg.draftMissing)
-	m.DraftAcceptedTokens = metricSummary(agg.draftAccSum, agg.draftAccKnown, agg.draftAccMissing)
-
-	// Draft rate: aggregate across observed requests. Rate only when the
-	// aggregate denominator (proposed) is positive and every attributed pair
-	// is known (knownPairs == rowCount). When accepted exceeds proposed, the
-	// state is unknown/conflicting.
-	m.DraftRate = buildDraftRate(agg.draftAccSum, agg.draftAccKnown, agg.draftSum, agg.draftKnown, agg.rowCount)
-
-	// Throughput rates: mean with sample counts.
-	if agg.promptRateKnown > 0 {
-		mn := meanFloat(agg.promptRateValues)
-		m.PrefillTokensPerSecond = &RateSummary{
-			Mean:         &mn,
-			SampleCount:  agg.promptRateKnown,
-			MissingCount: agg.promptRateMissing,
-		}
-	} else {
-		m.PrefillTokensPerSecond = &RateSummary{
-			SampleCount:  0,
-			MissingCount: agg.promptRateMissing,
-		}
-	}
-	if agg.tokensRateKnown > 0 {
-		mn := meanFloat(agg.tokensRateValues)
-		m.DecodeTokensPerSecond = &RateSummary{
-			Mean:         &mn,
-			SampleCount:  agg.tokensRateKnown,
-			MissingCount: agg.tokensRateMissing,
-		}
-	} else {
-		m.DecodeTokensPerSecond = &RateSummary{
-			SampleCount:  0,
-			MissingCount: agg.tokensRateMissing,
-		}
-	}
+	m.FirstActivityAt, m.LastActivityAt = activityTimeRange(records)
+	m.DurationMS = durationSummary(agg)
+	applyIntegerMetricSummaries(m, agg)
+	m.DraftRate = draftRateProjection(agg, agg.rowCount)
+	m.PrefillTokensPerSecond, m.DecodeTokensPerSecond = throughputRateProjections(agg)
 	// Backend collection can be fresh while individual row metrics remain
 	// unknown (the upstream activity schema has no Usage.Found bit). Keep
 	// freshness separate, but mark the per-model metric aggregate partial.
@@ -1298,6 +1393,113 @@ func buildActivityMeasurement(records []*correlation.ActivityRecord, attributed 
 	}
 
 	return m
+}
+
+// collectionFreshness reports the collection freshness and truncated flag
+// derived from the backend collection state. Freshness is "fresh" only when
+// the backend state is collected; otherwise it is not_fresh. Truncated is
+// passed through from the backend state.
+func collectionFreshness(bs correlation.BackendState) (freshness string, truncated bool) {
+	freshness = "not_fresh"
+	truncated = bs.Truncated
+	switch bs.State {
+	case "collected":
+		freshness = "fresh"
+	case "unknown", "unavailable", "unsupported", "disabled", "unauthorized":
+		freshness = "not_fresh"
+	}
+	return freshness, truncated
+}
+
+// activityTimeRange reports the earliest and latest non-zero upstream row
+// timestamps. Zero timestamps are ignored; when no row carries a non-zero
+// timestamp, both are zero.
+func activityTimeRange(records []*correlation.ActivityRecord) (first, last time.Time) {
+	for _, r := range records {
+		if r.Timestamp.IsZero() {
+			continue
+		}
+		if first.IsZero() || r.Timestamp.Before(first) {
+			first = r.Timestamp
+		}
+		if last.IsZero() || r.Timestamp.After(last) {
+			last = r.Timestamp
+		}
+	}
+	return first, last
+}
+
+// durationSummary builds the DurationMS measurement summary. It is always
+// nonnil; mean/p50 are reported only when duration samples exist. Missing
+// values are never summed as zero.
+func durationSummary(agg activityAggregates) *MeasurementSummary {
+	if len(agg.durationValues) > 0 {
+		mn := meanFloat(agg.durationValues)
+		p50 := p50Float(agg.durationValues)
+		return &MeasurementSummary{
+			Mean:         &mn,
+			P50:          &p50,
+			SampleCount:  len(agg.durationValues),
+			MissingCount: agg.durationMissing,
+		}
+	}
+	return &MeasurementSummary{
+		SampleCount:  0,
+		MissingCount: agg.durationMissing,
+	}
+}
+
+// applyIntegerMetricSummaries fills the six integer metric summaries of m from
+// the aggregate sums and known/missing counts. Missing values are never summed
+// as zero; sums are nil when no values are known.
+func applyIntegerMetricSummaries(m *ActivityMeasurement, agg activityAggregates) {
+	m.InputTokens = metricSummary(agg.inputSum, agg.inputKnown, agg.inputMissing)
+	m.OutputTokens = metricSummary(agg.outputSum, agg.outputKnown, agg.outputMissing)
+	m.CachedTokens = metricSummary(agg.cacheSum, agg.cacheKnown, agg.cacheMissing)
+	m.ReasoningTokens = metricSummary(agg.reasoningSum, agg.reasoningKnown, agg.reasoningMissing)
+	m.DraftTokens = metricSummary(agg.draftSum, agg.draftKnown, agg.draftMissing)
+	m.DraftAcceptedTokens = metricSummary(agg.draftAccSum, agg.draftAccKnown, agg.draftAccMissing)
+}
+
+// draftRateProjection builds the aggregate draft acceptance rate from the
+// aggregate draft sums and row count. Rate is computed only when the aggregate
+// denominator (proposed) is positive and every attributed pair is known. The
+// calculation is delegated to buildDraftRate unchanged.
+func draftRateProjection(agg activityAggregates, rowCount int) *DraftRateSummary {
+	return buildDraftRate(agg.draftAccSum, agg.draftAccKnown, agg.draftSum, agg.draftKnown, rowCount)
+}
+
+// throughputRateProjections build the PrefillTokensPerSecond and
+// DecodeTokensPerSecond rate summaries. Each summary is nonnil even when no
+// rates are known; mean is reported only when rate samples exist.
+func throughputRateProjections(agg activityAggregates) (prefill, decode *RateSummary) {
+	if agg.promptRateKnown > 0 {
+		mn := meanFloat(agg.promptRateValues)
+		prefill = &RateSummary{
+			Mean:         &mn,
+			SampleCount:  agg.promptRateKnown,
+			MissingCount: agg.promptRateMissing,
+		}
+	} else {
+		prefill = &RateSummary{
+			SampleCount:  0,
+			MissingCount: agg.promptRateMissing,
+		}
+	}
+	if agg.tokensRateKnown > 0 {
+		mn := meanFloat(agg.tokensRateValues)
+		decode = &RateSummary{
+			Mean:         &mn,
+			SampleCount:  agg.tokensRateKnown,
+			MissingCount: agg.tokensRateMissing,
+		}
+	} else {
+		decode = &RateSummary{
+			SampleCount:  0,
+			MissingCount: agg.tokensRateMissing,
+		}
+	}
+	return prefill, decode
 }
 
 func activityHasMissingMetricValues(m *ActivityMeasurement) bool {
@@ -1415,7 +1617,60 @@ func measurementState(attributed bool, ambiguous bool, rowCount int, bs correlat
 // separately under approximate_shared_gpu_window with uncertainty flags and
 // are never represented as model-owned.
 func buildGPUWindow(records []*correlation.ActivityRecord, deviceAssocsByActivity map[activityKey][]correlation.ActivityDeviceAssociation, gpuSamplesByDevice map[gpuSampleKey][]correlation.GPUSample, report *correlation.GPUReport) *SharedGPUWindow {
-	var matched []correlation.GPUSample
+	matched, windowStart, windowEnd, hasWindow, backendID := collectGPUSamples(records, deviceAssocsByActivity, gpuSamplesByDevice)
+	if !hasWindow {
+		return nil
+	}
+	backendState, _, measurementState, freshness, reason := resolveGPUWindowState(backendID, matched, report)
+	w := &SharedGPUWindow{
+		State:                     measurementState,
+		Source:                    "/api/performance",
+		CollectionState:           finiteGPUCollectionState(backendState.State),
+		Freshness:                 freshness,
+		Reason:                    reason,
+		SharedDeviceOnly:          true,
+		ExecutionDeviceUnverified: true,
+		ClockAlignmentUnverified:  true,
+		WindowStart:               windowStart,
+		WindowEnd:                 windowEnd,
+		SampleCount:               len(matched),
+	}
+	if !backendState.ObservedAt.IsZero() {
+		w.ObservedAt = backendState.ObservedAt
+	}
+	w.FirstSampleAt, w.LastSampleAt = sampleTimestampRanges(matched)
+	// Aggregate metric ranges: known/missing counts and pointer-preserving
+	// min/max. Explicit zero values are known readings; nil values are missing.
+	var maxGpu, minGpu *float64
+	var maxMem, minMem *float64
+	var maxMemUsed, minMemUsed *int
+	for _, s := range matched {
+		if s.Timestamp.IsZero() {
+			continue
+		}
+		updateFloatRange(s.GpuUtilPct, &w.GpuUtilKnownSamples, &w.GpuUtilMissingSamples, &maxGpu, &minGpu)
+		updateFloatRange(s.MemUtilPct, &w.MemUtilKnownSamples, &w.MemUtilMissingSamples, &maxMem, &minMem)
+		updateIntRange(s.MemUsedMB, &w.MemUsedKnownSamples, &w.MemUsedMissingSamples, &maxMemUsed, &minMemUsed)
+	}
+	w.MaxGpuUtilPct = maxGpu
+	w.MinGpuUtilPct = minGpu
+	w.MaxMemUtilPct = maxMem
+	w.MinMemUtilPct = minMem
+	w.MaxMemUsedMB = maxMemUsed
+	w.MinMemUsedMB = minMemUsed
+	return w
+}
+
+// collectGPUSamples joins GPU samples referenced by approximate_time_window
+// device associations. It dedupes samples by backend+epoch+device+UTC timestamp
+// so overlapping associations count each sample once. It expands the shared
+// window across all qualifying associations. The backend ID of the last record
+// is returned for backend state resolution.
+func collectGPUSamples(
+	records []*correlation.ActivityRecord,
+	deviceAssocsByActivity map[activityKey][]correlation.ActivityDeviceAssociation,
+	gpuSamplesByDevice map[gpuSampleKey][]correlation.GPUSample,
+) (matched []correlation.GPUSample, windowStart, windowEnd time.Time, hasWindow bool, backendID string) {
 	// sampleKey bounds a deduplication key: backend + epoch + device + source
 	// timestamp. Overlapping associations that reference the same sample are
 	// counted once.
@@ -1428,9 +1683,6 @@ func buildGPUWindow(records []*correlation.ActivityRecord, deviceAssocsByActivit
 		timestamp time.Time
 	}
 	seen := make(map[sampleKey]struct{})
-	var windowStart, windowEnd time.Time
-	hasWindow := false
-	backendID := ""
 	for _, r := range records {
 		backendID = r.BackendID
 		key := activityKey{r.BackendID, r.Epoch, r.ActivityID}
@@ -1454,30 +1706,35 @@ func buildGPUWindow(records []*correlation.ActivityRecord, deviceAssocsByActivit
 			skey := gpuSampleKey{assoc.BackendID, assoc.Epoch, assoc.DeviceID}
 			for _, s := range gpuSamplesByDevice[skey] {
 				if !s.Timestamp.Before(assoc.WindowStart) && !s.Timestamp.After(assoc.WindowEnd) {
-					key := sampleKey{s.BackendID, s.Epoch, s.DeviceID, s.Timestamp.UTC()}
-					if _, exists := seen[key]; exists {
+					dedupKey := sampleKey{s.BackendID, s.Epoch, s.DeviceID, s.Timestamp.UTC()}
+					if _, exists := seen[dedupKey]; exists {
 						continue // duplicate sample: count once
 					}
-					seen[key] = struct{}{}
+					seen[dedupKey] = struct{}{}
 					matched = append(matched, s)
 				}
 			}
 		}
 	}
-	if !hasWindow {
-		return nil
-	}
-	backendState := correlation.GPUBackendState{State: gpuUnknownBackendState, Coverage: "unknown"}
-	globalTruncated := false
+	return matched, windowStart, windowEnd, hasWindow, backendID
+}
+
+// resolveGPUWindowState resolves the measurement state, freshness, and reason
+// from the backend state and global truncation. The default backend state is
+// unknown/unknown; the report only contributes the backend state lookup and the
+// global truncation/coverage flag.
+func resolveGPUWindowState(backendID string, matched []correlation.GPUSample, report *correlation.GPUReport) (backendState correlation.GPUBackendState, globalTruncated bool, measurementState MeasurementState, freshness, reason string) {
+	backendState = correlation.GPUBackendState{State: gpuUnknownBackendState, Coverage: "unknown"}
+	globalTruncated = false
 	if report != nil {
 		if state, ok := report.BackendStates[backendID]; ok {
 			backendState = state
 		}
 		globalTruncated = report.Truncated || report.Coverage == "truncated"
 	}
-	measurementState := gpuMeasurementState(backendState, globalTruncated)
-	freshness := "not_fresh"
-	reason := ""
+	measurementState = gpuMeasurementState(backendState, globalTruncated)
+	freshness = "not_fresh"
+	reason = ""
 	if len(matched) > 0 && backendState.State == "enabled" && backendState.Coverage == "complete" && !globalTruncated {
 		// The source supplies sample timestamps but no maximum sample age.
 		// Show collection and source time separately; don't claim fresh samples.
@@ -1486,79 +1743,59 @@ func buildGPUWindow(records []*correlation.ActivityRecord, deviceAssocsByActivit
 		measurementState = MeasurementUnknown
 		reason = "no_matching_samples"
 	}
-	w := &SharedGPUWindow{
-		State:                     measurementState,
-		Source:                    "/api/performance",
-		CollectionState:           finiteGPUCollectionState(backendState.State),
-		Freshness:                 freshness,
-		Reason:                    reason,
-		SharedDeviceOnly:          true,
-		ExecutionDeviceUnverified: true,
-		ClockAlignmentUnverified:  true,
-		WindowStart:               windowStart,
-		WindowEnd:                 windowEnd,
-		SampleCount:               len(matched),
-	}
-	if !backendState.ObservedAt.IsZero() {
-		w.ObservedAt = backendState.ObservedAt
-	}
-	var maxGpu, minGpu *float64
-	var maxMem, minMem *float64
-	var maxMemUsed, minMemUsed *int
+	return backendState, globalTruncated, measurementState, freshness, reason
+}
+
+// sampleTimestampRanges records the first and last nonzero sample timestamps.
+// Zero timestamps are excluded from the range but still count toward
+// SampleCount.
+func sampleTimestampRanges(matched []correlation.GPUSample) (first, last time.Time) {
 	for _, s := range matched {
 		if s.Timestamp.IsZero() {
 			continue
 		}
-		if w.FirstSampleAt.IsZero() || s.Timestamp.Before(w.FirstSampleAt) {
-			w.FirstSampleAt = s.Timestamp
+		if first.IsZero() || s.Timestamp.Before(first) {
+			first = s.Timestamp
 		}
-		if w.LastSampleAt.IsZero() || s.Timestamp.After(w.LastSampleAt) {
-			w.LastSampleAt = s.Timestamp
-		}
-		// ObservedAt is the local collector observation time (set from the
-		// backend state above); it is deliberately separate from the source
-		// sample timestamps and is not derived from samples.
-		if s.GpuUtilPct != nil {
-			w.GpuUtilKnownSamples++
-			if maxGpu == nil || *s.GpuUtilPct > *maxGpu {
-				maxGpu = s.GpuUtilPct
-			}
-			if minGpu == nil || *s.GpuUtilPct < *minGpu {
-				minGpu = s.GpuUtilPct
-			}
-		} else {
-			w.GpuUtilMissingSamples++
-		}
-		if s.MemUtilPct != nil {
-			w.MemUtilKnownSamples++
-			if maxMem == nil || *s.MemUtilPct > *maxMem {
-				maxMem = s.MemUtilPct
-			}
-			if minMem == nil || *s.MemUtilPct < *minMem {
-				minMem = s.MemUtilPct
-			}
-		} else {
-			w.MemUtilMissingSamples++
-		}
-		if s.MemUsedMB != nil {
-			w.MemUsedKnownSamples++
-			if maxMemUsed == nil || *s.MemUsedMB > *maxMemUsed {
-				maxMemUsed = s.MemUsedMB
-			}
-			if minMemUsed == nil || *s.MemUsedMB < *minMemUsed {
-				minMemUsed = s.MemUsedMB
-			}
-		} else {
-			w.MemUsedMissingSamples++
+		if last.IsZero() || s.Timestamp.After(last) {
+			last = s.Timestamp
 		}
 	}
-	w.MaxGpuUtilPct = maxGpu
-	w.MinGpuUtilPct = minGpu
-	w.MaxMemUtilPct = maxMem
-	w.MinMemUtilPct = minMem
-	w.MaxMemUsedMB = maxMemUsed
-	w.MinMemUsedMB = minMemUsed
-	return w
+	return first, last
+}
+
+// updateFloatRange records a float64 metric reading: known/missing counts and
+// pointer-preserving min/max. Nil values count as missing without touching
+// min/max; explicit zero values are known readings.
+func updateFloatRange(value *float64, known, missing *int, maxPtr, minPtr **float64) {
+	if value == nil {
+		*missing++
+		return
+	}
+	*known++
+	if *maxPtr == nil || *value > **maxPtr {
+		*maxPtr = value
+	}
+	if *minPtr == nil || *value < **minPtr {
+		*minPtr = value
+	}
+}
+
+// updateIntRange records an int metric reading: known/missing counts and
+// pointer-preserving min/max. Nil values count as missing without touching
+// min/max; explicit zero values are known readings.
+func updateIntRange(value *int, known, missing *int, maxPtr, minPtr **int) {
+	if value == nil {
+		*missing++
+		return
+	}
+	*known++
+	if *maxPtr == nil || *value > **maxPtr {
+		*maxPtr = value
+	}
+	if *minPtr == nil || *value < **minPtr {
+		*minPtr = value
+	}
 }
 
 const gpuUnknownBackendState = "unknown"
@@ -1628,7 +1865,7 @@ func buildLifecycle(backendID, canonicalRef string, lifecycleModelsByKey map[ref
 		// catalog timestamp exists; never infer unloaded from omission.
 		if (catalogState == "loaded" || catalogState == "unloaded") && !catalogObservedAt.IsZero() {
 			lifecycle.CurrentState = catalogState
-			lifecycle.Source = "/v1/models"
+			lifecycle.Source = modelCatalogSource
 			lifecycle.Observed = true
 			copied := catalogObservedAt
 			lifecycle.ObservedAt = &copied
@@ -1677,12 +1914,12 @@ type gpuSampleKey struct {
 }
 
 // isModelReference reports whether ref is a bounded opaque model reference:
-// the literal prefix "model-" followed by exactly 32 lowercase hex digits.
+// the modelRefPrefix prefix followed by exactly 32 lowercase hex digits.
 func isModelReference(ref string) bool {
-	if len(ref) != len("model-")+32 || !strings.HasPrefix(ref, "model-") {
+	if len(ref) != len(modelRefPrefix)+32 || !strings.HasPrefix(ref, modelRefPrefix) {
 		return false
 	}
-	for _, c := range ref[len("model-"):] {
+	for _, c := range ref[len(modelRefPrefix):] {
 		if !(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') {
 			return false
 		}

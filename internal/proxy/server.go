@@ -40,6 +40,7 @@ const (
 	routeInfoKindLocal   = "local"
 	comfyUIPathPrefix    = "/comfyui"
 	requestIDHeader      = "X-Request-ID"
+	apiKeyHeader         = "X-Api-Key"
 )
 
 // routeInfo captures how a request was routed for logging and correlation.
@@ -98,24 +99,34 @@ func isGenerationPath(request *http.Request) bool {
 }
 
 type Handler struct {
-	catalog            *catalog.Service
-	proxies            map[string]*httputil.ReverseProxy
-	defaultBackend     string
-	modelRoutes        []route
-	pathRoutes         []route
-	logger             *slog.Logger
-	healthTimeout      time.Duration
-	catalogTimeout     time.Duration
-	comfyUIWaitTimeout time.Duration
-	comfyUIBackendID   string
-	comfyUIEndpoint    string
-	backendEndpoints   map[string]string
-	comfyUIJobs        *comfyUIJobTracker
-	maxJSONBody        int64
-	diagnostics        *diagnostics.Service
-	modelDiagnostics   *modeldiagnostics.Service
-	provenance         *provenance.Service
-	history            *correlation.Correlator
+	catalog                    *catalog.Service
+	proxies                    map[string]*httputil.ReverseProxy
+	backendAdmission           func(*http.Request, string) (release func(), allowed bool)
+	backendAdmissionStatus     func() comfyUICoordinatorStatus
+	defaultBackend             string
+	modelRoutes                []route
+	pathRoutes                 []route
+	logger                     *slog.Logger
+	healthTimeout              time.Duration
+	catalogTimeout             time.Duration
+	comfyUIWaitTimeout         time.Duration
+	comfyUIBackendID           string
+	comfyUIEndpoint            string
+	backendEndpoints           map[string]string
+	comfyUIJobs                *comfyUIJobTracker
+	comfyUIResultReadProxy     *httputil.ReverseProxy
+	comfyUIResultReadProbe     func(context.Context) error
+	comfyUIStartMu             sync.Mutex
+	comfyUIStart               *comfyUIStartAttempt
+	comfyUIResultSlots         chan struct{}
+	comfyUIWebSocketSlots      chan struct{}
+	comfyUIFrontendSlots       chan struct{}
+	comfyUIImageUploadMaxBytes int64
+	maxJSONBody                int64
+	diagnostics                *diagnostics.Service
+	modelDiagnostics           *modeldiagnostics.Service
+	provenance                 *provenance.Service
+	history                    *correlation.Correlator
 	// requestObservation enables per-request inference timing observation.
 	requestObservation bool
 	// Diagnostics API auth boundary. A nonempty diagnosticsAPIKey protects
@@ -134,6 +145,13 @@ type Handler struct {
 	// for the /diagnostics/v1/models endpoint. It is constructed only when the
 	// diagnostics API key is configured.
 	modelSnapshotPages *modelSnapshotPageStore
+	peerCache          *peerCache
+	peerClients        map[string]*peerClient
+	peerRouteAliases   map[string]struct{}
+	peerPathRoutes     []peerPathRoute
+	peerPathSlots      chan struct{}
+	peerContext        context.Context
+	peerInferenceSlots chan struct{}
 	// pagerMu guards the model snapshot pager.
 	pagerMu sync.Mutex
 }
@@ -144,12 +162,16 @@ type route struct {
 }
 
 type handlerDependencies struct {
-	catalog          *catalog.Service
-	proxies          map[string]*httputil.ReverseProxy
-	modelRoutes      []route
-	pathRoutes       []route
-	backendEndpoints map[string]string
-	comfyUIJobs      *comfyUIJobTracker
+	catalog                *catalog.Service
+	proxies                map[string]*httputil.ReverseProxy
+	modelRoutes            []route
+	pathRoutes             []route
+	backendEndpoints       map[string]string
+	comfyUIJobs            *comfyUIJobTracker
+	comfyUIResultReadProxy *httputil.ReverseProxy
+	comfyUIResultReadProbe func(context.Context) error
+	backendAdmission       func(*http.Request, string) (func(), bool)
+	backendAdmissionStatus func() comfyUICoordinatorStatus
 }
 
 func New(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, timing *timing.Observer) (http.Handler, error) {
@@ -180,9 +202,54 @@ func buildHandlerDependencies(cfg config.Config, logger *slog.Logger, client *ht
 	}
 	pathRoutes := buildPathRoutes(cfg.PathRoutes)
 	catalogService := catalog.New(backends, client, cfg.ModelsCacheTTL, cfg.HealthTimeout, cfg.CatalogTimeout, logger)
+	var resultReadProxy *httputil.ReverseProxy
+	var resultReadProbe func(context.Context) error
+	if cfg.Peer != nil && cfg.Peer.ComfyUIResultRead != nil {
+		resultReadProxy, err = newComfyUIResultReadProxy(cfg.Peer.ComfyUIResultRead, logger)
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+		resultReadProbe, err = newComfyUIResultReadProbe(cfg.Peer.ComfyUIResultRead)
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+	}
+	var backendAdmission func(*http.Request, string) (func(), bool)
+	var backendAdmissionStatus func() comfyUICoordinatorStatus
+	if cfg.Peer != nil && cfg.Peer.ComfyUILease != nil && len(cfg.Peer.ComfyUILease.AdmissionBackends) > 0 {
+		releaseClient := &http.Client{
+			Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
+			Timeout:   5 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+		target := cfg.Peer.ComfyUIResultRead
+		headers := make(http.Header, len(target.Headers)+2)
+		for name, value := range target.Headers {
+			headers.Set(name, value)
+		}
+		if target.APIKey != "" && headers.Get("Authorization") == "" && headers.Get(apiKeyHeader) == "" {
+			headers.Set("Authorization", "Bearer "+target.APIKey)
+			headers.Set(apiKeyHeader, target.APIKey)
+		}
+		coordinator := newComfyUICoordinator(func(ctx context.Context) (ComfyUIReleaseResult, error) {
+			return VerifyComfyUIRelease(ctx, target.URL, headers, cfg.Peer.ComfyUILease, releaseClient)
+		})
+		backendAdmissionStatus = coordinator.snapshot
+		backendAdmission, err = newComfyUIDomainAdmission(coordinator,
+			cfg.Peer.ComfyUILease.AdmissionBackends, cfg.PathRoutes[comfyUIPathPrefix],
+			cfg.Peer.ComfyUILease.ReleaseTimeoutDuration())
+		if err != nil {
+			return handlerDependencies{}, err
+		}
+	}
 	return handlerDependencies{
 		catalog: catalogService, proxies: proxies, modelRoutes: routes, pathRoutes: pathRoutes,
-		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs,
+		backendEndpoints: backendEndpoints, comfyUIJobs: comfyJobs, comfyUIResultReadProxy: resultReadProxy,
+		comfyUIResultReadProbe: resultReadProbe,
+		backendAdmission:       backendAdmission,
+		backendAdmissionStatus: backendAdmissionStatus,
 	}, nil
 }
 
@@ -242,6 +309,9 @@ func newReverseProxy(cfg config.Config, logger *slog.Logger, backendID string, b
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(target)
 			request.SetXForwarded()
+			if preservePeerAddressHeaders(request.In.Context()) {
+				preservePeerForwardedAddress(request.Out.Header, request.In.Header)
+			}
 			applyBackendHeaders(request.Out.Header, backend)
 			setRequestIDHeader(request.Out.Header, requestIDFromContext(request.Out.Context()))
 		},
@@ -254,9 +324,36 @@ func newReverseProxy(cfg config.Config, logger *slog.Logger, backendID string, b
 	}
 }
 
+func preservePeerAddressHeaders(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	preserved, _ := ctx.Value(peerAddressHeadersContextKey{}).(bool)
+	return preserved
+}
+
+func preservePeerForwardedAddress(out, in http.Header) {
+	var forwarded []string
+	for _, value := range in.Values(xForwardedForHeader) {
+		forwarded = append(forwarded, value)
+	}
+	if len(forwarded) > 0 {
+		forwarded = append(forwarded, out.Values(xForwardedForHeader)...)
+		out.Set(xForwardedForHeader, strings.Join(forwarded, ", "))
+	}
+	if realIP := in.Values("X-Real-IP"); len(realIP) > 0 {
+		out[http.CanonicalHeaderKey("X-Real-IP")] = append([]string(nil), realIP...)
+	}
+}
+
 func modifyProxiedResponse(response *http.Response, backendID, comfyBackendID string, comfyJobs *comfyUIJobTracker) {
 	if response.Request != nil {
 		setRequestIDHeader(response.Header, requestIDFromContext(response.Request.Context()))
+		if response.StatusCode >= 200 && response.StatusCode < 300 {
+			if activation, ok := response.Request.Context().Value(comfyUILeaseActivationContextKey{}).(comfyUILeaseActivation); ok {
+				_ = activation.coordinator.activate(activation.leaseID)
+			}
+		}
 		observer := observerFromContext(response.Request.Context())
 		if observer != nil && response.StatusCode != http.StatusSwitchingProtocols {
 			observer.ObserveUpstream(response.StatusCode, response.Header)
@@ -269,28 +366,46 @@ func modifyProxiedResponse(response *http.Response, backendID, comfyBackendID st
 
 func assembleHandler(cfg config.Config, logger *slog.Logger, diagnostics *diagnostics.Service, modelDiagnostics *modeldiagnostics.Service, provenance *provenance.Service, dependencies handlerDependencies) *Handler {
 	h := &Handler{
-		catalog:            dependencies.catalog,
-		proxies:            dependencies.proxies,
-		defaultBackend:     cfg.DefaultBackend,
-		modelRoutes:        dependencies.modelRoutes,
-		pathRoutes:         dependencies.pathRoutes,
-		logger:             logger,
-		healthTimeout:      cfg.HealthTimeout,
-		catalogTimeout:     cfg.CatalogTimeout,
-		comfyUIWaitTimeout: cfg.ComfyUIWaitTimeout,
-		comfyUIBackendID:   cfg.PathRoutes[comfyUIPathPrefix],
-		comfyUIEndpoint:    dependencies.backendEndpoints[cfg.PathRoutes[comfyUIPathPrefix]],
-		backendEndpoints:   dependencies.backendEndpoints,
-		comfyUIJobs:        dependencies.comfyUIJobs,
-		maxJSONBody:        cfg.MaxJSONBody,
-		diagnostics:        diagnostics,
-		modelDiagnostics:   modelDiagnostics,
-		provenance:         provenance,
+		catalog:                dependencies.catalog,
+		proxies:                dependencies.proxies,
+		backendAdmission:       dependencies.backendAdmission,
+		backendAdmissionStatus: dependencies.backendAdmissionStatus,
+		defaultBackend:         cfg.DefaultBackend,
+		modelRoutes:            dependencies.modelRoutes,
+		pathRoutes:             dependencies.pathRoutes,
+		logger:                 logger,
+		healthTimeout:          cfg.HealthTimeout,
+		catalogTimeout:         cfg.CatalogTimeout,
+		comfyUIWaitTimeout:     cfg.ComfyUIWaitTimeout,
+		comfyUIBackendID:       cfg.PathRoutes[comfyUIPathPrefix],
+		comfyUIEndpoint:        dependencies.backendEndpoints[cfg.PathRoutes[comfyUIPathPrefix]],
+		backendEndpoints:       dependencies.backendEndpoints,
+		comfyUIJobs:            dependencies.comfyUIJobs,
+		comfyUIResultReadProxy: dependencies.comfyUIResultReadProxy,
+		comfyUIResultReadProbe: dependencies.comfyUIResultReadProbe,
+		maxJSONBody:            cfg.MaxJSONBody,
+		diagnostics:            diagnostics,
+		modelDiagnostics:       modelDiagnostics,
+		provenance:             provenance,
 		// The legacy timing prototype argument is accepted for signature
 		// compatibility but is ignored: per-request observers are created in
 		// ServeHTTP only when request_observation is enabled.
 		history:            historyStore(cfg),
 		requestObservation: cfg.RequestObservation,
+	}
+	if h.comfyUIResultReadProxy != nil {
+		h.comfyUIResultSlots = make(chan struct{}, 4)
+		h.comfyUIWebSocketSlots = make(chan struct{}, 8)
+		h.comfyUIFrontendSlots = make(chan struct{}, 16)
+		h.comfyUIImageUploadMaxBytes = cfg.Peer.ComfyUIResultRead.ImageUploadLimit()
+	}
+	if cfg.Peer != nil {
+		h.peerRouteAliases = make(map[string]struct{}, len(cfg.Peer.RouteAliases))
+		for _, id := range cfg.Peer.RouteAliases {
+			h.peerRouteAliases[id] = struct{}{}
+		}
+		h.peerPathRoutes = buildPeerPathRoutes(cfg.Peer)
+		h.peerPathSlots = make(chan struct{}, 8)
 	}
 
 	// Diagnostics API auth boundary: collectors and the concurrency/rate
@@ -376,11 +491,11 @@ func applyBackendHeaders(header http.Header, backend config.Backend) {
 }
 
 func setAPIKeyIfMissing(header http.Header, apiKey string) {
-	if apiKey == "" || header.Get("Authorization") != "" || header.Get("X-Api-Key") != "" {
+	if apiKey == "" || header.Get("Authorization") != "" || header.Get(apiKeyHeader) != "" {
 		return
 	}
 	header.Set("Authorization", "Bearer "+apiKey)
-	header.Set("X-Api-Key", apiKey)
+	header.Set(apiKeyHeader, apiKey)
 }
 
 type requestExecution struct {
@@ -483,6 +598,15 @@ func (h *Handler) serve(writer http.ResponseWriter, request *http.Request, info 
 		h.serveDiagnosticsAPI(writer, request, info)
 		return
 	}
+	if h.peerCache != nil && h.servePeerModelRoute(writer, request, info) {
+		return
+	}
+	if h.servePeerPathRoute(writer, request, info) {
+		return
+	}
+	if h.serveComfyUIResultRead(writer, request, info, true) {
+		return
+	}
 	if backendID, matched := h.routePath(request.URL.Path); matched {
 		h.servePathRoute(writer, request, info, backendID)
 		return
@@ -523,7 +647,7 @@ func (h *Handler) servePathRoute(writer http.ResponseWriter, request *http.Reque
 	if cleanup != nil {
 		defer cleanup()
 	}
-	h.proxies[backendID].ServeHTTP(writer, request)
+	h.dispatchBackend(writer, request, backendID)
 }
 
 func (h *Handler) waitForPathRequest(writer http.ResponseWriter, request *http.Request, backendID string) (func(), bool) {
@@ -562,7 +686,42 @@ func (h *Handler) serveModelRoute(writer http.ResponseWriter, request *http.Requ
 	if isInferenceRequest(request) && h.comfyUIWaitTimeout > 0 && h.comfyUIJobs != nil && h.sharesComfyUIBackend(backendID) {
 		defer h.comfyUIJobs.endInference()
 	}
-	h.proxies[backendID].ServeHTTP(writer, request)
+	h.dispatchBackend(writer, request, backendID)
+}
+
+// dispatchBackend is the common owner-side forwarding and optional admission boundary.
+func (h *Handler) dispatchBackend(w http.ResponseWriter, req *http.Request, backendID string) {
+	if h.backendAdmission != nil {
+		release, allowed := h.backendAdmission(req, backendID)
+		if release != nil {
+			defer release()
+		}
+		if !allowed {
+			if h.backendAdmissionStatus != nil {
+				state := h.backendAdmissionStatus()
+				h.logger.Warn("backend admission denied",
+					"request_id", requestIDFromContext(req.Context()),
+					"backend_id", backendID,
+					"method", req.Method,
+					"path", req.URL.Path,
+					"admission_state", state.State,
+					"lease_id_present", state.LeaseID != "",
+					"submissions", state.Submissions,
+					"competing", state.Competing,
+				)
+			} else {
+				h.logger.Warn("backend admission denied",
+					"request_id", requestIDFromContext(req.Context()),
+					"backend_id", backendID,
+					"method", req.Method,
+					"path", req.URL.Path,
+				)
+			}
+			writeJSONError(h.logger, w, http.StatusServiceUnavailable, "backend admission blocked")
+			return
+		}
+	}
+	h.proxies[backendID].ServeHTTP(w, req)
 }
 
 func (h *Handler) writeRouteRequestError(writer http.ResponseWriter, request *http.Request, info *routeInfo, err error) {
@@ -702,12 +861,17 @@ func (h *Handler) routeModel(model string) (string, string) {
 }
 
 func (h *Handler) routePath(requestPath string) (string, bool) {
+	backendID, _, matched := h.routePathMatch(requestPath)
+	return backendID, matched
+}
+
+func (h *Handler) routePathMatch(requestPath string) (string, string, bool) {
 	for _, candidate := range h.pathRoutes {
 		if candidate.prefix == "/" || requestPath == candidate.prefix || strings.HasPrefix(requestPath, candidate.prefix+"/") {
-			return candidate.backendID, true
+			return candidate.backendID, candidate.prefix, true
 		}
 	}
-	return "", false
+	return "", "", false
 }
 
 func restoreRequestBody(request *http.Request, body []byte) {
@@ -726,6 +890,9 @@ func (h *Handler) logRequest(request *http.Request, response *responseWriter, st
 			"request_id", requestID,
 			"method", request.Method,
 			"path", request.URL.Path,
+			"client_addr", request.RemoteAddr,
+			"x_forwarded_for", request.Header.Get(xForwardedForHeader),
+			"user_agent", request.UserAgent(),
 			"route_kind", info.kind,
 			"backend_id", info.backendID,
 			"status", response.status,
@@ -782,10 +949,15 @@ func (w *responseWriter) Unwrap() http.ResponseWriter {
 func (h *Handler) serveModels(writer http.ResponseWriter, request *http.Request) {
 	ctx, cancel := context.WithTimeout(request.Context(), h.catalogTimeout)
 	defer cancel()
-	response, err := h.catalog.Models(ctx, request.Header)
+	response, combined, err := h.modelCatalog(ctx, request.Header)
 	if err != nil {
-		h.logger.Error("model catalog request failed", "request_id", requestIDFromContext(request.Context()), "error", safeErrorDetail(err))
-		writeJSONError(h.logger, writer, http.StatusBadGateway, "default backend model catalog unavailable")
+		if combined {
+			h.logger.Error("combined model catalog failed", "error", err)
+			writeJSONError(h.logger, writer, http.StatusBadGateway, "combined model catalog unavailable")
+		} else {
+			h.logger.Error("model catalog request failed", "request_id", requestIDFromContext(request.Context()), "error", safeErrorDetail(err))
+			writeJSONError(h.logger, writer, http.StatusBadGateway, "default backend model catalog unavailable")
+		}
 		return
 	}
 	copyResponseHeaders(writer.Header(), response.Header)
@@ -793,6 +965,20 @@ func (h *Handler) serveModels(writer http.ResponseWriter, request *http.Request)
 	if _, err := writer.Write(response.Body); err != nil {
 		h.logger.Warn("model catalog response write failed", "request_id", requestIDFromContext(request.Context()), "error", err)
 	}
+}
+
+func (h *Handler) modelCatalog(ctx context.Context, headers http.Header) (catalog.Response, bool, error) {
+	response, err := h.catalog.Models(ctx, headers)
+	if err != nil {
+		return catalog.Response{}, false, err
+	}
+	if h.peerCache != nil {
+		response, err = h.mergePeerCatalog(response)
+		if err != nil {
+			return catalog.Response{}, true, err
+		}
+	}
+	return response, false, nil
 }
 
 func (h *Handler) serveReady(writer http.ResponseWriter, request *http.Request) {

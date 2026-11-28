@@ -1,0 +1,279 @@
+package ingestion
+
+import (
+	"context"
+	"errors"
+	"io"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"strings"
+	"time"
+)
+
+var (
+	ErrDownloadInvalid   = errors.New("invalid download configuration")
+	ErrDownloadRedirect  = errors.New("download redirect is unsupported")
+	ErrDownloadResponse  = errors.New("download response is unsupported")
+	ErrDownloadTransport = errors.New("download transport failed")
+)
+
+const maxDownloadRedirects = 8
+
+// hfHost is the canonical Hugging Face Hub host used to construct resolve URLs
+// and to decide whether to forward credentials on redirects.
+const hfHost = "huggingface.co"
+
+// DownloadArtifact stages a single Hub resolve response. token is never included
+// in the result or returned errors. Duration bounds the whole operation.
+func DownloadArtifact(ctx context.Context, options StageOptions, duration time.Duration, token string) (StageResult, error) {
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext:            dialPublicHTTPS,
+			ForceAttemptHTTP2:      true,
+			DisableCompression:     true,
+			TLSHandshakeTimeout:    10 * time.Second,
+			ResponseHeaderTimeout:  30 * time.Second,
+			MaxResponseHeaderBytes: 32 << 10,
+		},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	defer client.CloseIdleConnections()
+	return downloadArtifact(ctx, options, duration, token, client)
+}
+
+func downloadArtifact(ctx context.Context, options StageOptions, duration time.Duration, token string, client *http.Client) (StageResult, error) {
+	empty := StageResult{Publication: PublicationNotPublished, Durability: "not_applicable"}
+	if ctx == nil || duration <= 0 || len(token) > 4096 || strings.ContainsAny(token, "\r\n") || client == nil {
+		return empty, ErrDownloadInvalid
+	}
+	source, err := ParseSource(SourceInput{
+		Repository: options.Source.Repository, Filename: options.Source.Filename, Revision: options.Source.Revision,
+	})
+	if err != nil {
+		return empty, ErrStageInvalid
+	}
+	ctx, cancel := context.WithTimeout(ctx, duration)
+	defer cancel()
+	reader := &downloadReader{ctx: ctx, client: client, source: source, token: token, maxBytes: options.MaxBytes}
+	result, err := StageNewArtifact(ctx, options, reader)
+	if reader.body != nil {
+		if closeErr := reader.body.Close(); closeErr != nil {
+			err = errors.Join(err, ErrDownloadTransport)
+		}
+	}
+	if reader.err != nil {
+		err = errors.Join(err, reader.err)
+	}
+	return result, err
+}
+
+type downloadReader struct {
+	ctx      context.Context
+	client   *http.Client
+	source   Source
+	token    string
+	maxBytes int64
+	body     io.ReadCloser
+	expected int64
+	read     int64
+	err      error
+	opened   bool
+}
+
+func (r *downloadReader) Read(buffer []byte) (int, error) {
+	if !r.opened {
+		r.opened = true
+		r.err = r.open()
+		if r.err != nil {
+			return 0, r.err
+		}
+	}
+	n, err := r.body.Read(buffer)
+	if int64(n) > r.expected-r.read {
+		r.err = ErrDownloadResponse
+		return 0, r.err
+	}
+	r.read += int64(n)
+	if err == io.EOF && r.read == r.expected {
+		if closeErr := r.body.Close(); closeErr != nil {
+			r.err = ErrDownloadTransport
+			return n, r.err
+		}
+		r.body = nil
+		return n, io.EOF
+	}
+	if err != nil {
+		r.err = ErrDownloadTransport
+		return n, r.err
+	}
+	return n, nil
+}
+
+func (r *downloadReader) open() error {
+	current := &url.URL{
+		Scheme: "https", Host: hfHost,
+		Path: "/" + r.source.Repository + "/resolve/" + r.source.Revision + "/" + r.source.Filename,
+	}
+	sendToken := true
+	for redirects := 0; ; redirects++ {
+		next, nextSendToken, done, body, expected, err := r.fetchRound(r.ctx, current, sendToken, redirects)
+		if err != nil {
+			return err
+		}
+		if done {
+			r.body, r.expected = body, expected
+			return nil
+		}
+		current = next
+		sendToken = nextSendToken
+	}
+}
+
+// fetchRound performs one request to current and classifies the result.
+// next is the URL to follow on redirect (nil when terminal). nextSendToken is
+// the updated bearer-token forwarding decision. done is true when the round is
+// terminal (success or failure). body and expected are populated only on
+// success. err is a terminal error. The response body is closed on every
+// non-success path; on success it is returned to the caller for consumption.
+func (r *downloadReader) fetchRound(ctx context.Context, current *url.URL, sendToken bool, redirects int) (next *url.URL, nextSendToken bool, done bool, body io.ReadCloser, expected int64, err error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, current.String(), nil)
+	if err != nil {
+		return nil, false, true, nil, 0, ErrDownloadInvalid
+	}
+	request.Header.Set("Accept-Encoding", "identity")
+	if sendToken && r.token != "" {
+		request.Header.Set("Authorization", "Bearer "+r.token)
+	}
+	response, err := r.client.Do(request)
+	if err != nil {
+		return nil, false, true, nil, 0, ErrDownloadTransport
+	}
+	switch response.StatusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		next, nextSendToken, err = redirectDecision(response, redirects, maxDownloadRedirects, sendToken, hfHost)
+		if err != nil {
+			return nil, false, true, nil, 0, err
+		}
+		return next, nextSendToken, false, nil, 0, nil
+	case http.StatusOK:
+		body, expected, err = validateDownloadResponse(response, r.maxBytes)
+		if err != nil {
+			return nil, false, true, nil, 0, err
+		}
+		return nil, false, true, body, expected, nil
+	default:
+		err = closeDownloadResponse(response, ErrDownloadResponse)
+		return nil, false, true, nil, 0, err
+	}
+}
+
+// redirectDecision evaluates a redirect response and decides whether to follow it.
+// It closes the response body. On success it returns the next URL and whether the
+// bearer token should be forwarded to the next request. A token is dropped once a
+// redirect leaves the Hugging Face host and is never re-added on later redirects.
+func redirectDecision(response *http.Response, redirects, maxRedirects int, sendToken bool, host string) (*url.URL, bool, error) {
+	next, locationErr := response.Location()
+	closeErr := response.Body.Close()
+	if closeErr != nil {
+		return nil, sendToken, ErrDownloadTransport
+	}
+	if locationErr != nil || redirects >= maxRedirects || !trustedDownloadURL(next) {
+		return nil, sendToken, ErrDownloadRedirect
+	}
+	if !strings.EqualFold(next.Hostname(), host) {
+		sendToken = false
+	}
+	return next, sendToken, nil
+}
+
+// validateDownloadResponse validates a successful response's metadata and returns
+// its body and expected length. On any validation failure the response body is
+// closed and the original error is joined with ErrDownloadTransport when the close
+// itself fails.
+func validateDownloadResponse(response *http.Response, maxBytes int64) (io.ReadCloser, int64, error) {
+	encoding := response.Header.Get("Content-Encoding")
+	if response.ContentLength <= 0 || response.Header.Get("Content-Range") != "" ||
+		(encoding != "" && !strings.EqualFold(encoding, "identity")) {
+		return nil, 0, closeDownloadResponse(response, ErrDownloadResponse)
+	}
+	if response.ContentLength > maxBytes {
+		return nil, 0, closeDownloadResponse(response, ErrStageTooLarge)
+	}
+	return response.Body, response.ContentLength, nil
+}
+
+func closeDownloadResponse(response *http.Response, err error) error {
+	if closeErr := response.Body.Close(); closeErr != nil {
+		return errors.Join(err, ErrDownloadTransport)
+	}
+	return err
+}
+
+func trustedDownloadURL(u *url.URL) bool {
+	if u == nil || len(u.String()) > 16384 || u.Scheme != "https" || u.User != nil ||
+		u.Opaque != "" || u.Fragment != "" || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if !strings.EqualFold(u.Host, host) && !strings.EqualFold(u.Host, host+":443") {
+		return false
+	}
+	switch host {
+	case hfHost, "cas-bridge.xethub.hf.co",
+		"cas-server.xethub.hf.co", "cas-server.xethub-eu.hf.co",
+		"transfer.xethub.hf.co", "transfer.xethub-eu.hf.co",
+		"us.aws.cdn.hf.co", "us.gcp.cdn.hf.co", "cdn-lfs-us-1.hf.co",
+		"cdn-lfs-eu-1.hf.co", "cdn-lfs.huggingface.co":
+		return true
+	default:
+		return false
+	}
+}
+
+var nonPublicNetworks = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("2001::/23"), netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("2001:db8::/32"),
+}
+
+func publicAddress(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || (ip.Is6() && !netip.MustParsePrefix("2000::/3").Contains(ip)) {
+		return false
+	}
+	for _, prefix := range nonPublicNetworks {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func dialPublicHTTPS(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || port != "443" {
+		return nil, ErrDownloadTransport
+	}
+	addresses, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil || len(addresses) == 0 {
+		return nil, ErrDownloadTransport
+	}
+	for _, ip := range addresses {
+		if !publicAddress(ip) {
+			return nil, ErrDownloadTransport
+		}
+	}
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	for _, ip := range addresses {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+	}
+	return nil, ErrDownloadTransport
+}

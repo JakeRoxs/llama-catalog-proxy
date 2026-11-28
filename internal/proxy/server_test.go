@@ -297,6 +297,38 @@ func TestPathRoutePreservesRequestAndAppliesBackendCredentials(t *testing.T) {
 	}
 }
 
+func assertRawWebSocketEcho(t *testing.T, proxyURL string, path string, failOnHeaderRead bool) {
+	t.Helper()
+	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyURL, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.WriteString(connection, "GET "+path+" HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
+		t.Fatalf("upgrade status = %q, error = %v", status, err)
+	}
+	for {
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil {
+			if failOnHeaderRead {
+				t.Fatal(readErr)
+			}
+			break
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	_, _ = io.WriteString(connection, "ping\n")
+	if echo, readErr := reader.ReadString('\n'); readErr != nil || echo != "echo:ping\n" {
+		t.Fatalf("websocket tunnel response = %q, error = %v", echo, readErr)
+	}
+}
+
 func TestPathRouteProxiesWebSocketUpgrade(t *testing.T) {
 	backendPath := make(chan string, 1)
 	comfyServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -324,31 +356,7 @@ func TestPathRouteProxiesWebSocketUpgrade(t *testing.T) {
 	proxyServer := httptest.NewServer(newHandler(t, cfg))
 	defer proxyServer.Close()
 
-	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(proxyServer.URL, "http://"), time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer connection.Close()
-	_ = connection.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = io.WriteString(connection, "GET /comfyui/ws HTTP/1.1\r\nHost: proxy.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(connection)
-	status, err := reader.ReadString('\n')
-	if err != nil || !strings.Contains(status, "101 Switching Protocols") {
-		t.Fatalf("upgrade status = %q, error = %v", status, err)
-	}
-	for {
-		line, readErr := reader.ReadString('\n')
-		if readErr != nil {
-			t.Fatal(readErr)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	_, _ = io.WriteString(connection, "ping\n")
-	if echo, readErr := reader.ReadString('\n'); readErr != nil || echo != "echo:ping\n" {
-		t.Fatalf("websocket tunnel response = %q, error = %v", echo, readErr)
-	}
+	assertRawWebSocketEcho(t, proxyServer.URL, "/comfyui/ws", true)
 	if path := <-backendPath; path != "/comfyui/ws" {
 		t.Fatalf("backend path = %q", path)
 	}
@@ -714,9 +722,31 @@ func TestHistoryConcurrentAndSSE(t *testing.T) {
 	}
 	h := handler.(*Handler)
 
-	// Concurrent normal traffic.
+	// Concurrent normal traffic: 10 concurrent requests, then history count.
+	concurrentRequests(t, h, 10)
+
+	// SSE through proxy must remain byte-exact.
+	resp, err := validateSSEResponse(t, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestID := resp.Header.Get("X-Request-ID")
+	record, ok := h.history.GetByRequestID(requestID)
+	if !ok || record == nil {
+		t.Fatal("no history record for SSE request")
+	}
+	if record.Status != statusHTTPSuccess {
+		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPSuccess)
+	}
+}
+
+// concurrentRequests issues count concurrent GET /custom requests through h,
+// waits for all to complete, and asserts the history contains count records.
+func concurrentRequests(t *testing.T, h *Handler, count int) {
+	t.Helper()
 	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
+	for i := 0; i < count; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
@@ -730,39 +760,27 @@ func TestHistoryConcurrentAndSSE(t *testing.T) {
 	wg.Wait()
 
 	stats := h.history.Stats()
-	if stats["record_count"] != 10 {
-		t.Fatalf("history record count = %v, want 10", stats["record_count"])
+	if stats["record_count"] != count {
+		t.Fatalf("history record count = %v, want %d", stats["record_count"], count)
 	}
+}
 
-	// SSE through proxy must remain byte-exact.
+// validateSSEResponse proxies a GET through h and asserts the SSE response is
+// byte-exact: Content-Type text/event-stream with events "data: hello" and
+// "data: world". It returns the response so the caller can inspect headers.
+func validateSSEResponse(t *testing.T, h *Handler) (*http.Response, error) {
+	t.Helper()
 	proxyServer := httptest.NewServer(h)
 	defer proxyServer.Close()
 	resp, err := http.DefaultClient.Get(proxyServer.URL + "/v1/chat/completions")
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.Header.Get("Content-Type") != "text/event-stream" {
 		t.Fatalf("SSE content type = %q", resp.Header.Get("Content-Type"))
 	}
-	var lines []string
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if err := scanner.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if len(lines) < 2 {
-		t.Fatalf("expected SSE chunks, got %d", len(lines))
-	}
-	var events []string
-	for _, line := range lines {
-		if line == "" {
-			continue
-		}
-		events = append(events, line)
-	}
+	events := sseDataLines(t, resp)
 	if len(events) < 2 {
 		t.Fatalf("expected SSE events, got %d", len(events))
 	}
@@ -771,15 +789,28 @@ func TestHistoryConcurrentAndSSE(t *testing.T) {
 			t.Fatalf("unexpected SSE line = %q", line)
 		}
 	}
+	return resp, nil
+}
 
-	requestID := resp.Header.Get("X-Request-ID")
-	record, ok := h.history.GetByRequestID(requestID)
-	if !ok || record == nil {
-		t.Fatal("no history record for SSE request")
+// sseDataLines reads resp.Body and returns the non-empty data lines.
+func sseDataLines(t *testing.T, resp *http.Response) []string {
+	t.Helper()
+	var lines []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
 	}
-	if record.Status != statusHTTPSuccess {
-		t.Fatalf("record status = %q, want %q", record.Status, statusHTTPSuccess)
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
 	}
+	var events []string
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		events = append(events, line)
+	}
+	return events
 }
 
 func TestHistoryClientCanceled(t *testing.T) {

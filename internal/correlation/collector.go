@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -314,31 +315,18 @@ func (c *ActivityCollector) Refresh(ctx context.Context) ([]*ActivityRecord, err
 // collect fetches one page of activity from a backend and normalizes it. It
 // never follows redirects, never leaks credentials, and bounds the response
 // body and row count. The only allowed upstream path is
-// /api/metrics/activity with a bounded limit and page.
+// /api/metrics/activity with a bounded limit and page. Complexity is kept low
+// by delegating to pure helpers: request building, status classification,
+// bounded page decode/validation, and row normalization.
 func (c *ActivityCollector) collect(ctx context.Context, id string, b *backendInfo) ([]*ActivityRecord, BackendState) {
 	state := BackendState{State: "unknown", Reason: "not_collected", ObservedAt: c.now(), LastAttemptAt: c.now()}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	u := b.url.JoinPath("api/metrics/activity")
-	// Fixed allowlist: only a bounded limit and page are requested.
-	q := u.Query()
-	q.Set("limit", strconv.Itoa(c.maxRowsPerBackend))
-	q.Set("page", "1")
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+
+	req, err := c.buildActivityRequest(ctx, b)
 	if err != nil {
 		state.State, state.Reason = "unsupported", "invalid_request"
 		return nil, state
-	}
-	req.Header.Set("Accept", "application/json")
-	for key, value := range b.config.Headers {
-		if req.Header.Get(key) == "" {
-			req.Header.Set(key, value)
-		}
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
@@ -348,51 +336,119 @@ func (c *ActivityCollector) collect(ctx context.Context, id string, b *backendIn
 	}
 	defer response.Body.Close()
 	state.HTTPStatus = response.StatusCode
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		state.State, state.Reason = "unauthorized", "authorization_required"
-		return nil, state
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		state.State, state.Reason = "unsupported", "not_available"
-		return nil, state
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		state.State, state.Reason = "unknown", "redirect_refused"
-		return nil, state
-	case response.StatusCode != http.StatusOK:
-		state.State, state.Reason = "unavailable", "http_error"
+	if st, reason, stop := classifyActivityStatus(response.StatusCode); stop {
+		state.State, state.Reason = st, reason
 		return nil, state
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+	page, err := readAndDecodeActivityPage(response.Body, c.maxResponseBytes)
 	if err != nil {
-		state.State, state.Reason = "unavailable", "response_read_failed"
+		state.State, state.Reason = activityErrorState(err)
 		return nil, state
 	}
-	if len(body) > int(c.maxResponseBytes) {
-		state.State, state.Reason = "unknown", "response_too_large"
-		return nil, state
+	records, pageState := c.normalizeActivityPage(id, page.Data, c.maxRowsPerBackend, page.Total)
+	state.State = pageState.State
+	state.Reason = pageState.Reason
+	state.Rows = pageState.Rows
+	state.Coverage = pageState.Coverage
+	state.Truncated = pageState.Truncated
+	return records, state
+}
+
+// buildActivityRequest builds the fixed, allowlisted request for one backend.
+// Only a bounded limit and page=1 are requested. Config headers are applied
+// only when not already set on the request; the API key is added only when no
+// Authorization or X-Api-Key header is present. Redirects are refused by the
+// client's CheckRedirect policy, so this builder never enables following them.
+func (c *ActivityCollector) buildActivityRequest(ctx context.Context, b *backendInfo) (*http.Request, error) {
+	u := b.url.JoinPath("api/metrics/activity")
+	// Fixed allowlist: only a bounded limit and page are requested.
+	q := u.Query()
+	q.Set("limit", strconv.Itoa(c.maxRowsPerBackend))
+	q.Set("page", "1")
+	u.RawQuery = q.Encode()
+	return newBackendJSONRequest(ctx, u.String(), b.config.Headers, b.config.APIKey)
+}
+
+// classifyActivityStatus maps an HTTP status to the backend state/reason and
+// whether collection should stop. A 200 continues; every other status stops
+// with a documented state/reason. Redirects are refused (never followed) and
+// reported as redirect_refused rather than followed. It delegates to the
+// shared classifyBackendStatus, supplying the activity collector's state
+// strings.
+func classifyActivityStatus(code int) (state, reason string, stop bool) {
+	return classifyBackendStatus(code, backendStatusLabels{
+		unauthorized: "unauthorized",
+		unsupported:  "unsupported",
+		unknown:      "unknown",
+		unavailable:  "unavailable",
+	})
+}
+
+var (
+	errActivityPageTooLarge    = errors.New("activity response body exceeds the configured byte limit")
+	errActivityPageMalformed   = errors.New("activity page data is missing or null")
+	errActivityPageInvalidJSON = errors.New("activity page is not valid JSON")
+)
+
+// readAndDecodeActivityPage reads a bounded response body, decodes the activity
+// page, and validates required fields. The caller is responsible for closing
+// the body. It returns a sentinel error for size/malformed/JSON failures so the
+// caller can map each to the exact state/reason; other read errors map to the
+// generic response_read_failed state.
+func readAndDecodeActivityPage(body io.ReadCloser, maxResponseBytes int64) (*activityPage, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read activity response: %w", err)
+	}
+	if len(raw) > int(maxResponseBytes) {
+		return nil, errActivityPageTooLarge
 	}
 	var page activityPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		state.State, state.Reason = "unknown", "invalid_json"
-		return nil, state
+	if err := json.Unmarshal(raw, &page); err != nil {
+		// Keep the documented sentinel in the error chain so the caller can
+		// map decode failures to the exact invalid_json state/reason.
+		return nil, fmt.Errorf("decode activity page: %w", errActivityPageInvalidJSON)
 	}
 	// Validate required page fields: data must be an array (non-nil). A bare
 	// {} or {"data":null} is malformed.
 	if page.Data == nil {
-		state.State, state.Reason = "unknown", "malformed_page"
-		return nil, state
+		return nil, errActivityPageMalformed
 	}
-	// Bound rows by the row cap; detect truncation vs page.total.
-	rows := page.Data
-	truncated := len(rows) > c.maxRowsPerBackend || page.Total > len(page.Data)
-	if len(rows) > c.maxRowsPerBackend {
-		rows = rows[:c.maxRowsPerBackend]
+	return &page, nil
+}
+
+// activityErrorState maps a read/decode error from readAndDecodeActivityPage to
+// the exact backend state/reason. Read failures are unavailable, size and
+// schema failures are unknown.
+func activityErrorState(err error) (state, reason string) {
+	switch {
+	case errors.Is(err, errActivityPageTooLarge):
+		return "unknown", "response_too_large"
+	case errors.Is(err, errActivityPageMalformed):
+		return "unknown", "malformed_page"
+	case errors.Is(err, errActivityPageInvalidJSON):
+		return "unknown", "invalid_json"
+	default:
+		return "unavailable", "response_read_failed"
+	}
+}
+
+// normalizeActivityPage bounds rows by the row cap, normalizes each row, and
+// assigns the final collected state. It returns the normalized records and the
+// BackendState to assign (State/Reason/Rows/Coverage/Truncated). The caller
+// preserves HTTPStatus/ObservedAt/LastAttemptAt from its own state.
+func (c *ActivityCollector) normalizeActivityPage(backendID string, rows []activityLogEntry, maxRows, pageTotal int) ([]*ActivityRecord, BackendState) {
+	// Bound rows by the row cap; detect truncation vs page.total using the
+	// pre-truncation row count.
+	truncated := len(rows) > maxRows || pageTotal > len(rows)
+	if len(rows) > maxRows {
+		rows = rows[:maxRows]
 	}
 	records := make([]*ActivityRecord, 0, len(rows))
 	skipped := 0
 	metricsInvalid := false
 	for _, entry := range rows {
-		rec, ok := c.normalizeActivity(id, entry)
+		rec, ok := c.normalizeActivity(backendID, entry)
 		if rec == nil {
 			skipped++
 			continue
@@ -402,9 +458,7 @@ func (c *ActivityCollector) collect(ctx context.Context, id string, b *backendIn
 		}
 		records = append(records, rec)
 	}
-	state.State = "collected"
-	state.Reason = "ok"
-	state.Rows = len(records)
+	state := BackendState{State: "collected", Reason: "ok", Rows: len(records)}
 	if skipped > 0 || metricsInvalid {
 		state.Coverage = "partial"
 	} else if truncated {

@@ -34,6 +34,7 @@ func TestReloaderAppliesNewConfigWithoutRestart(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
@@ -57,6 +58,7 @@ func TestReloaderKeepsPreviousConfigWhenNewConfigIsInvalid(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
@@ -89,6 +91,7 @@ func TestReloaderInvokesReloadCallbackWithNewConfig(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	contents := "default_backend: default\nhealth_timeout: 40ms\ncatalog_timeout: 80ms\nbackends:\n  default:\n    url: " + serverB.URL + "\n"
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
@@ -132,6 +135,7 @@ func TestReloaderDetectsSameSizeChangeWithUnchangedModTime(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	writeReloaderConfig(t, path, serverB.URL)
 	if err := os.Chtimes(path, initial.ModTime(), initial.ModTime()); err != nil {
@@ -163,13 +167,14 @@ func TestReloaderReloadResetsHistoryStore(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
 	}
 
 	// Initial handler should have a nil history store (request_history disabled by default).
-	initialHandler := (*reloader.handler.Load()).(*Handler)
+	initialHandler := reloader.state.Load().handler.(*Handler)
 	if initialHandler.history != nil {
 		t.Fatal("initial history store should be nil when request_history is disabled")
 	}
@@ -185,7 +190,7 @@ func TestReloaderReloadResetsHistoryStore(t *testing.T) {
 
 	// Reloaded handler should have a non-nil, fresh history store (new pointer
 	// after reload). It may contain records from post-reload probe traffic.
-	reloadedHandler := (*reloader.handler.Load()).(*Handler)
+	reloadedHandler := reloader.state.Load().handler.(*Handler)
 	if reloadedHandler.history == nil {
 		t.Fatal("reloaded history store should be non-nil when request_history is enabled")
 	}
@@ -209,13 +214,14 @@ func TestReloaderReloadReconstructsDiagnosticsCollectors(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
 	}
 
 	// Initial handler should have nil collectors (diagnostics API disabled).
-	initialHandler := (*reloader.handler.Load()).(*Handler)
+	initialHandler := reloader.state.Load().handler.(*Handler)
 	if initialHandler.activityCollector != nil || initialHandler.aliasCollector != nil ||
 		initialHandler.gpuCollector != nil || initialHandler.lifecycleCollector != nil {
 		t.Fatal("collectors should be nil when diagnostics API is disabled")
@@ -231,7 +237,7 @@ func TestReloaderReloadReconstructsDiagnosticsCollectors(t *testing.T) {
 	}
 
 	// Reloaded handler should have non-nil, fresh collectors.
-	reloadedHandler := (*reloader.handler.Load()).(*Handler)
+	reloadedHandler := reloader.state.Load().handler.(*Handler)
 	if reloadedHandler.activityCollector == nil || reloadedHandler.aliasCollector == nil ||
 		reloadedHandler.gpuCollector == nil || reloadedHandler.lifecycleCollector == nil {
 		t.Fatal("collectors should be non-nil when diagnostics API is enabled")
@@ -253,7 +259,7 @@ func TestReloaderReloadReconstructsDiagnosticsCollectors(t *testing.T) {
 	}
 
 	// Collectors should be nil again after reload.
-	disabledHandler := (*reloader.handler.Load()).(*Handler)
+	disabledHandler := reloader.state.Load().handler.(*Handler)
 	if disabledHandler.activityCollector != nil || disabledHandler.aliasCollector != nil ||
 		disabledHandler.gpuCollector != nil || disabledHandler.lifecycleCollector != nil {
 		t.Fatal("collectors should be nil when diagnostics API is disabled after reload")
@@ -338,6 +344,7 @@ func TestReloaderSuppressesIdenticalReloadFailures(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
@@ -388,6 +395,7 @@ func TestReloaderLogsRecoveryAndChangedFailure(t *testing.T) {
 	}
 	reloader.SetWatchInterval(20 * time.Millisecond)
 	reloader.Start()
+	t.Cleanup(reloader.Stop)
 
 	if got := probeUpstream(t, reloader); got != "A" {
 		t.Fatalf("initial upstream = %q, want A", got)
@@ -431,4 +439,128 @@ func TestReloaderLogsRecoveryAndChangedFailure(t *testing.T) {
 	if !strings.Contains(logs.String(), "config reload failed") {
 		t.Fatal("changed reload failure was not logged")
 	}
+}
+
+// recordingHandler records whether the current state handler was invoked so
+// tests can distinguish route dispatch from falling through to the handler.
+type recordingHandler struct {
+	mu     sync.Mutex
+	called bool
+	path   string
+}
+
+func (h *recordingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.called = true
+	h.path = r.URL.Path
+	w.WriteHeader(http.StatusOK)
+}
+
+func newTestReloader(benchmark *benchmarkRuntime, adminAuth *adminAuth, peerListen, managementListen string, handler http.Handler) *Reloader {
+	r := &Reloader{
+		benchmark:        benchmark,
+		adminAuth:        adminAuth,
+		peerListen:       peerListen,
+		managementListen: managementListen,
+	}
+	r.state.Store(&reloaderState{handler: handler})
+	return r
+}
+
+func TestServeHTTPRouteDispatch(t *testing.T) {
+	t.Run("benchmark route handled before fallback", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(&benchmarkRuntime{}, nil, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/benchmark", nil))
+		if recorder.Code != http.StatusTemporaryRedirect {
+			t.Fatalf("benchmark /benchmark not handled by benchmark route: %d", recorder.Code)
+		}
+		if handler.called {
+			t.Fatal("current state handler invoked for benchmark route")
+		}
+	})
+
+	t.Run("benchmark nil falls through to current handler", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/benchmark", nil))
+		if !handler.called {
+			t.Fatal("current state handler not invoked for /benchmark with nil benchmark")
+		}
+	})
+
+	t.Run("admin prefix with nil auth is 404", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin", nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("admin /admin with nil auth: %d", recorder.Code)
+		}
+		if handler.called {
+			t.Fatal("current state handler invoked for admin route with nil auth")
+		}
+	})
+
+	t.Run("admin unmatched path falls through to adminAuth", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, &adminAuth{}, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin/api/v1/session", nil))
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("admin session fallback: %d", recorder.Code)
+		}
+		if handler.called {
+			t.Fatal("current state handler invoked for admin fallback path")
+		}
+	})
+
+	t.Run("reserved peer prefix 404 when enabled", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "127.0.0.1:1234", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/peer", nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("peer 404: %d", recorder.Code)
+		}
+		if handler.called {
+			t.Fatal("current state handler invoked for peer route")
+		}
+	})
+
+	t.Run("reserved management prefix 404 when enabled", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "", "127.0.0.1:5678", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/management", nil))
+		if recorder.Code != http.StatusNotFound {
+			t.Fatalf("management 404: %d", recorder.Code)
+		}
+		if handler.called {
+			t.Fatal("current state handler invoked for management route")
+		}
+	})
+
+	t.Run("reserved prefix disabled falls through to current handler", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/peer", nil))
+		if !handler.called {
+			t.Fatal("current state handler not invoked for /peer with peer listener disabled")
+		}
+	})
+
+	t.Run("unmatched path falls through to current handler", func(t *testing.T) {
+		handler := &recordingHandler{}
+		r := newTestReloader(nil, nil, "", "", handler)
+		recorder := httptest.NewRecorder()
+		r.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		if !handler.called {
+			t.Fatal("current state handler not invoked for unmatched path")
+		}
+	})
 }

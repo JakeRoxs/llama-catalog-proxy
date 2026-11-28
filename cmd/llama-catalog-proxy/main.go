@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -30,6 +31,16 @@ var (
 	commit    = "unknown"
 	buildDate = "unknown"
 )
+
+// mainOptions captures the global flags that trigger a preflight action and
+// then exit. It is populated from the flag package definitions in main().
+type mainOptions struct {
+	configPath      string
+	healthcheckURL  string
+	checkConfig     bool
+	showVersion     bool
+	showDiagnostics bool
+}
 
 func parseLogLevel(level string) slog.Level {
 	switch strings.ToUpper(strings.TrimSpace(level)) {
@@ -76,120 +87,111 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version information and exit")
 	showDiagnostics := flag.Bool("diagnostics", false, "report opt-in backend diagnostics and, when request history is enabled, normalized backend activity as JSON and exit")
 	flag.Parse()
-	if *showVersion {
-		fmt.Printf("llama-catalog-proxy %s (commit %s, built %s)\n", version, commit, buildDate)
-		return
+
+	options := mainOptions{
+		configPath:      *configPath,
+		healthcheckURL:  *healthcheckURL,
+		checkConfig:     *checkConfig,
+		showVersion:     *showVersion,
+		showDiagnostics: *showDiagnostics,
 	}
-	if *healthcheckURL != "" {
-		if err := runHealthcheck(*healthcheckURL); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-	if *checkConfig {
-		if _, err := config.Load(*configPath); err != nil {
-			fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Println("configuration valid")
-		return
-	}
-	if *showDiagnostics {
-		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-		defer stop()
-		if err := runDiagnostics(ctx, *configPath, os.Stdout); err != nil {
-			fmt.Fprintf(os.Stderr, "diagnostics failed: %v\n", err)
+
+	if handled, exitCode := runSpecialSubcommand(os.Args[1:], os.Stdout, os.Stderr); handled {
+		if exitCode != 0 {
 			os.Exit(1)
 		}
 		return
 	}
 
-	level := int32(slog.LevelInfo)
-	levelHandler := &dynamicLevelHandler{inner: slog.NewJSONHandler(os.Stdout, nil), level: &level}
-	logger := slog.New(levelHandler)
-
-	var initialListen string
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		logger.Error("configuration failed", "error", err)
-		os.Exit(1)
-	}
-	diagnosticsService, err := diagnostics.New(cfg.Backends)
-	if err != nil {
-		logger.Error("diagnostics service failed", "error", err)
-		os.Exit(1)
-	}
-	modelDiagnosticsService := modeldiagnostics.New()
-	provenanceService := provenance.New()
-	// The legacy timing prototype argument is accepted for signature
-	// compatibility but is ignored: per-request observers are created in
-	// ServeHTTP only when request_observation is enabled.
-	reloader, cfg, err := proxyserver.NewReloader(*configPath, logger, func(newCfg config.Config) {
-		levelHandler.setLevel(parseLogLevel(newCfg.LogLevel))
-		if newCfg.Listen != initialListen {
-			logger.Warn("listen address change requires a restart", "requested", newCfg.Listen, "current", initialListen)
+	if handled, exitCode := runPreflight(options, os.Stdout, os.Stderr); handled {
+		if exitCode != 0 {
+			os.Exit(1)
 		}
-	}, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
+		return
+	}
+
+	cfg, logger, reloader, err := initializeRuntime(options.configPath)
 	if err != nil {
-		logger.Error("configuration failed", "error", err)
 		os.Exit(1)
 	}
-	initialListen = cfg.Listen
-	levelHandler.setLevel(parseLogLevel(cfg.LogLevel))
-
-	backendURLs := make(map[string]string, len(cfg.Backends))
-	for id, backend := range cfg.Backends {
-		backendURLs[id] = config.RedactedURL(backend.URL)
+	listeners, err := openRuntimeListeners(cfg, reloader, logger)
+	if err != nil {
+		os.Exit(1)
 	}
-	logger.Info("starting llama-catalog-proxy",
-		"listen", cfg.Listen,
-		"default_backend", cfg.DefaultBackend,
-		"backends", backendURLs,
-		"log_level", cfg.LogLevel,
-		"models_cache_ttl", cfg.ModelsCacheTTL,
-		"request_timeout", cfg.RequestTimeout,
-		"max_json_request_body_bytes", cfg.MaxJSONBody,
-		"version", version,
-		"commit", commit,
-	)
 
 	reloader.Start()
-
-	server := &http.Server{
-		Addr:              cfg.Listen,
-		Handler:           reloader,
-		ReadHeaderTimeout: cfg.RequestTimeout,
-	}
+	defer reloader.Stop()
 
 	signals, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	serverErrors := make(chan error, 1)
-	go func() {
-		logger.Info("server listening", "address", cfg.Listen)
-		serverErrors <- server.ListenAndServe()
-	}()
-
-	select {
-	case <-signals.Done():
-		logger.Info("shutdown signal received")
-	case err := <-serverErrors:
-		if err != nil && err != http.ErrServerClosed {
-			logger.Error("server stopped unexpectedly", "error", err)
-			os.Exit(1)
-		}
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		logger.Error("graceful shutdown failed", "error", err)
-		_ = server.Close()
+	failed, err := serveAndShutdown(signals, listeners, reloader, logger)
+	if err != nil {
 		os.Exit(1)
 	}
-	logger.Info("server stopped")
+	if failed {
+		os.Exit(1)
+	}
+}
+
+// runSpecialSubcommand dispatches to the peer and comfyui-lease subcommands.
+// It returns handled=true when a subcommand was recognized and executed,
+// along with its exit code. Otherwise it returns handled=false so that main()
+// continues to the preflight and server startup. Argument slicing preserves
+// the original os.Args[2:] behavior for the subcommand implementations.
+func runSpecialSubcommand(args []string, stdout, stderr io.Writer) (handled bool, exitCode int) {
+	if len(args) > 0 && args[0] == "peer" {
+		if err := runPeerCommand(args[1:], stdout, stderr); err != nil {
+			peerCommandError(stderr, err)
+			return true, 1
+		}
+		return true, 0
+	}
+	if len(args) > 0 && args[0] == "comfyui-lease" {
+		if err := runComfyUILeaseCommand(args[1:], stdout, stderr); err != nil {
+			fmt.Fprintln(stderr, "comfyui lease command failed:", err)
+			return true, 1
+		}
+		return true, 0
+	}
+	return false, 0
+}
+
+// runPreflight executes the global preflight actions (version, healthcheck,
+// check-config, diagnostics) that terminate the process. It returns
+// handled=true when a preflight action was taken, along with its exit code.
+// The signal context and defer stop for diagnostics live inside this helper,
+// and errors are returned to main() as exit code 1.
+func runPreflight(options mainOptions, stdout, stderr io.Writer) (handled bool, exitCode int) {
+	if options.showVersion {
+		fmt.Printf("llama-catalog-proxy %s (commit %s, built %s)\n", version, commit, buildDate)
+		return true, 0
+	}
+	if options.healthcheckURL != "" {
+		if err := runHealthcheck(options.healthcheckURL); err != nil {
+			fmt.Fprintln(stderr, err)
+			return true, 1
+		}
+		return true, 0
+	}
+	if options.checkConfig {
+		if _, err := config.Load(options.configPath); err != nil {
+			fmt.Fprintf(stderr, "configuration invalid: %v\n", err)
+			return true, 1
+		}
+		fmt.Println("configuration valid")
+		return true, 0
+	}
+	if options.showDiagnostics {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		if err := runDiagnostics(ctx, options.configPath, stdout); err != nil {
+			fmt.Fprintf(stderr, "diagnostics failed: %v\n", err)
+			return true, 1
+		}
+		return true, 0
+	}
+	return false, 0
 }
 
 func runHealthcheck(target string) error {
@@ -221,109 +223,326 @@ func runDiagnostics(ctx context.Context, path string, writer io.Writer) error {
 		return err
 	}
 	report := map[string]any{"backends": snapshots}
-	if cfg.RequestHistory {
-		// The collector gates collection itself: only backends with
-		// Diagnostics == "llama_swap" are collected; all others make no
-		// requests and are reported as disabled. No server is constructed
-		// and no background collection is started here.
-		collector := correlation.NewActivityCollector(cfg.Backends)
-		if _, err := collector.Refresh(ctx); err != nil {
-			return err
-		}
-		report["backend_activity"] = collector.Stats()
-
-		// The same collector epoch scopes alias and lifecycle collection
-		// so that activity, alias, and lifecycle observations share one
-		// collection scope. Only GET /v1/models (source cache) and GET
-		// /running (proven finite read-only) are requested; no public
-		// route, background collection, SSE, or lifecycle action is
-		// invoked.
-		epoch := collector.Epoch()
-
-		// Describe lifecycle event support: pure, no HTTP, no goroutines.
-		// Reports what the adapter contract exposes (or does not expose)
-		// rather than probing a deployed backend. The unsupported adapter
-		// contract explains the absence of transition events; we do not
-		// pretend 0 events were collected.
-		support, err := correlation.DescribeLifecycleEventSupport(cfg.Backends, epoch)
-		if err != nil {
-			return err
-		}
-		report["backend_lifecycle_events"] = support
-
-		// Alias collection: GET /v1/models only, source-cache read-only.
-		aliasCollector := correlation.NewAliasCollector(cfg.Backends)
-		aliasReport, err := aliasCollector.Collect(ctx, epoch)
-		if err != nil {
-			return err
-		}
-		report["backend_aliases"] = aliasReport
-
-		// Resolve activity identities against the alias catalog.
-		identities, err := correlation.ResolveActivityAliases(collector.Snapshot(), aliasReport)
-		if err != nil {
-			return err
-		}
-		report["activity_model_identity"] = identities
-
-		// Associate activity records with lifecycle transition events.
-		// The source adapter (llama-swap) does not expose transition events,
-		// so the event list is empty and associations correctly report
-		// no_matching_event (for resolved identities) or identity_unresolved
-		// (for unresolved identities). This is expected: the unsupported
-		// adapter contract explains the absence; we do not pretend 0 events
-		// were collected.
-		activityLifecycleEvents, err := correlation.AssociateLifecycleEvents(collector.Snapshot(), identities, nil, correlation.DefaultAssociationWindow())
-		if err != nil {
-			return err
-		}
-		report["activity_lifecycle_events"] = activityLifecycleEvents
-
-		// Lifecycle collection: GET /running only, proven finite
-		// read-only.
-		lifecycleCollector := correlation.NewLifecycleCollector(cfg.Backends)
-		lifecycleReport, err := lifecycleCollector.Collect(ctx, epoch)
-		if err != nil {
-			return err
-		}
-		report["backend_lifecycle"] = lifecycleReport
-
-		// Link the current lifecycle snapshot to the resolved activity
-		// identities.
-		observations, err := correlation.LinkCurrentLifecycle(identities, lifecycleReport)
-		if err != nil {
-			return err
-		}
-		report["activity_lifecycle"] = observations
-
-		// GPU collection runs after activity collection and shares the
-		// same collector epoch so activity and GPU samples can be
-		// associated within a single collection scope. No public endpoint,
-		// background collection, inference, or model request is made here.
-		gpuCollector := correlation.NewGPUCollector(cfg.Backends)
-		gpuReport, err := gpuCollector.Collect(ctx, epoch)
-		if err != nil {
-			return err
-		}
-		report["backend_gpu"] = gpuReport
-
-		// Associate activity records with GPU device samples within the
-		// default time window. Samples are converted to normalized
-		// timed device samples; raw upstream metadata is never copied.
-		timed := make([]correlation.TimedDeviceSample, 0, len(gpuReport.Samples))
-		for _, s := range gpuReport.Samples {
-			timed = append(timed, correlation.TimedDeviceSample{
-				BackendID: s.BackendID,
-				Epoch:     s.Epoch,
-				DeviceID:  s.DeviceID,
-				Timestamp: s.Timestamp,
-			})
-		}
-		associations, err := correlation.AssociateActivities(collector.Snapshot(), timed, correlation.DefaultAssociationWindow())
-		if err != nil {
-			return err
-		}
-		report["activity_gpu_associations"] = associations
+	extra, err := collectRequestHistory(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	for k, v := range extra {
+		report[k] = v
 	}
 	return json.NewEncoder(writer).Encode(report)
+}
+
+// collectRequestHistory collects the optional request-history diagnostics:
+// backend activity, alias and lifecycle associations, lifecycle snapshots,
+// and GPU associations. It returns the report fields to merge into the
+// top-level report (excluding "backends"). When request history is disabled
+// it returns an empty map so no request-history keys are emitted. All
+// collection uses the shared 30s context and a single collector epoch; no
+// server is constructed and no background collection is started. Collection
+// is driven by the correlation collectors over cfg.Backends.
+func collectRequestHistory(ctx context.Context, cfg config.Config) (map[string]any, error) {
+	if !cfg.RequestHistory {
+		return map[string]any{}, nil
+	}
+	// The collector gates collection itself: only backends with
+	// Diagnostics == "llama_swap" are collected; all others make no
+	// requests and are reported as disabled. No server is constructed
+	// and no background collection is started here.
+	collector := correlation.NewActivityCollector(cfg.Backends)
+	if _, err := collector.Refresh(ctx); err != nil {
+		return nil, err
+	}
+	report := map[string]any{"backend_activity": collector.Stats()}
+
+	// The same collector epoch scopes alias and lifecycle collection
+	// so that activity, alias, and lifecycle observations share one
+	// collection scope. Only GET /v1/models (source cache) and GET
+	// /running (proven finite read-only) are requested; no public
+	// route, background collection, SSE, or lifecycle action is
+	// invoked.
+	epoch := collector.Epoch()
+
+	// Describe lifecycle event support: pure, no HTTP, no goroutines.
+	// Reports what the adapter contract exposes (or does not expose)
+	// rather than probing a deployed backend. The unsupported adapter
+	// contract explains the absence of transition events; we do not
+	// pretend 0 events were collected.
+	support, err := correlation.DescribeLifecycleEventSupport(cfg.Backends, epoch)
+	if err != nil {
+		return nil, err
+	}
+	report["backend_lifecycle_events"] = support
+
+	// Alias collection: GET /v1/models only, source-cache read-only.
+	aliasCollector := correlation.NewAliasCollector(cfg.Backends)
+	aliasReport, err := aliasCollector.Collect(ctx, epoch)
+	if err != nil {
+		return nil, err
+	}
+	report["backend_aliases"] = aliasReport
+
+	// Resolve activity identities against the alias catalog.
+	identities, err := correlation.ResolveActivityAliases(collector.Snapshot(), aliasReport)
+	if err != nil {
+		return nil, err
+	}
+	report["activity_model_identity"] = identities
+
+	// Associate activity records with lifecycle transition events.
+	// The source adapter (llama-swap) does not expose transition events,
+	// so the event list is empty and associations correctly report
+	// no_matching_event (for resolved identities) or identity_unresolved
+	// (for unresolved identities). This is expected: the unsupported
+	// adapter contract explains the absence; we do not pretend 0 events
+	// were collected.
+	activityLifecycleEvents, err := correlation.AssociateLifecycleEvents(collector.Snapshot(), identities, nil, correlation.DefaultAssociationWindow())
+	if err != nil {
+		return nil, err
+	}
+	report["activity_lifecycle_events"] = activityLifecycleEvents
+
+	// Lifecycle collection: GET /running only, proven finite
+	// read-only.
+	lifecycleCollector := correlation.NewLifecycleCollector(cfg.Backends)
+	lifecycleReport, err := lifecycleCollector.Collect(ctx, epoch)
+	if err != nil {
+		return nil, err
+	}
+	report["backend_lifecycle"] = lifecycleReport
+
+	// Link the current lifecycle snapshot to the resolved activity
+	// identities.
+	observations, err := correlation.LinkCurrentLifecycle(identities, lifecycleReport)
+	if err != nil {
+		return nil, err
+	}
+	report["activity_lifecycle"] = observations
+
+	// GPU collection runs after activity collection and shares the
+	// same collector epoch so activity and GPU samples can be
+	// associated within a single collection scope. No public endpoint,
+	// background collection, inference, or model request is made here.
+	gpuCollector := correlation.NewGPUCollector(cfg.Backends)
+	gpuReport, err := gpuCollector.Collect(ctx, epoch)
+	if err != nil {
+		return nil, err
+	}
+	report["backend_gpu"] = gpuReport
+
+	// Associate activity records with GPU device samples within the
+	// default time window. Samples are converted to normalized
+	// timed device samples; raw upstream metadata is never copied.
+	timed := make([]correlation.TimedDeviceSample, 0, len(gpuReport.Samples))
+	for _, s := range gpuReport.Samples {
+		timed = append(timed, correlation.TimedDeviceSample{
+			BackendID: s.BackendID,
+			Epoch:     s.Epoch,
+			DeviceID:  s.DeviceID,
+			Timestamp: s.Timestamp,
+		})
+	}
+	associations, err := correlation.AssociateActivities(collector.Snapshot(), timed, correlation.DefaultAssociationWindow())
+	if err != nil {
+		return nil, err
+	}
+	report["activity_gpu_associations"] = associations
+
+	return report, nil
+}
+
+// runtimeListeners holds the servers and listeners created during startup so
+// that shutdown can close them in the correct order.
+type runtimeListeners struct {
+	server             *http.Server
+	listener           net.Listener
+	peerServer         *http.Server
+	peerListener       net.Listener
+	managementServer   *http.Server
+	managementListener net.Listener
+}
+
+// initializeRuntime loads configuration, creates the diagnostics service and
+// the proxy reloader, and logs the startup banner. It returns the config,
+// logger and reloader needed by the server runtime.
+func initializeRuntime(configPath string) (config.Config, *slog.Logger, *proxyserver.Reloader, error) {
+	level := int32(slog.LevelInfo)
+	levelHandler := &dynamicLevelHandler{inner: slog.NewJSONHandler(os.Stdout, nil), level: &level}
+	logger := slog.New(levelHandler)
+
+	var initialListen string
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		logger.Error("configuration failed", "error", err)
+		return config.Config{}, nil, nil, err
+	}
+	diagnosticsService, err := diagnostics.New(cfg.Backends)
+	if err != nil {
+		logger.Error("diagnostics service failed", "error", err)
+		return config.Config{}, nil, nil, err
+	}
+	modelDiagnosticsService := modeldiagnostics.New()
+	provenanceService := provenance.New()
+	// The legacy timing prototype argument is accepted for signature
+	// compatibility but is ignored: per-request observers are created in
+	// ServeHTTP only when request_observation is enabled.
+	reloader, cfg, err := proxyserver.NewReloader(configPath, logger, func(newCfg config.Config) {
+		levelHandler.setLevel(parseLogLevel(newCfg.LogLevel))
+		if newCfg.Listen != initialListen {
+			logger.Warn("listen address change requires a restart", "requested", newCfg.Listen, "current", initialListen)
+		}
+	}, diagnosticsService, modelDiagnosticsService, provenanceService, nil)
+	if err != nil {
+		logger.Error("configuration failed", "error", err)
+		return config.Config{}, nil, nil, err
+	}
+	initialListen = cfg.Listen
+	levelHandler.setLevel(parseLogLevel(cfg.LogLevel))
+
+	backendURLs := make(map[string]string, len(cfg.Backends))
+	for id, backend := range cfg.Backends {
+		backendURLs[id] = config.RedactedURL(backend.URL)
+	}
+	logger.Info("starting llama-catalog-proxy",
+		"listen", cfg.Listen,
+		"default_backend", cfg.DefaultBackend,
+		"backends", backendURLs,
+		"log_level", cfg.LogLevel,
+		"models_cache_ttl", cfg.ModelsCacheTTL,
+		"request_timeout", cfg.RequestTimeout,
+		"max_json_request_body_bytes", cfg.MaxJSONBody,
+		"version", version,
+		"commit", commit,
+	)
+
+	return cfg, logger, reloader, nil
+}
+
+// openRuntimeListeners opens the client, optional peer and optional management
+// listeners. On failure it closes any listeners already opened and returns the
+// error, preserving the partial-cleanup order of the original inline code.
+func openRuntimeListeners(cfg config.Config, reloader *proxyserver.Reloader, logger *slog.Logger) (runtimeListeners, error) {
+	server := &http.Server{
+		Addr:              cfg.Listen,
+		Handler:           reloader,
+		ReadHeaderTimeout: cfg.RequestTimeout,
+	}
+	listener, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		logger.Error("client listener failed", "error", err)
+		return runtimeListeners{}, err
+	}
+
+	var peerServer *http.Server
+	var peerListener net.Listener
+	if cfg.Peer != nil {
+		peerListener, err = net.Listen("tcp", cfg.Peer.Listen)
+		if err != nil {
+			_ = listener.Close()
+			logger.Error("peer listener failed", "error", err)
+			return runtimeListeners{}, err
+		}
+		peerServer = &http.Server{
+			Handler: reloader.PeerHandler(), TLSConfig: reloader.PeerTLSConfig(),
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+			MaxHeaderBytes: 16 << 10,
+		}
+	}
+
+	var managementServer *http.Server
+	var managementListener net.Listener
+	if cfg.Management != nil {
+		managementListener, err = net.Listen("tcp", cfg.Management.Listen)
+		if err != nil {
+			_ = listener.Close()
+			if peerListener != nil {
+				_ = peerListener.Close()
+			}
+			logger.Error("management listener failed", "error", err)
+			return runtimeListeners{}, err
+		}
+		managementServer = &http.Server{
+			Handler: reloader.ManagementHandler(), TLSConfig: reloader.ManagementTLSConfig(),
+			ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second,
+			WriteTimeout: 15 * time.Second, MaxHeaderBytes: 16 << 10,
+		}
+	}
+
+	return runtimeListeners{
+		server:             server,
+		listener:           listener,
+		peerServer:         peerServer,
+		peerListener:       peerListener,
+		managementServer:   managementServer,
+		managementListener: managementListener,
+	}, nil
+}
+
+// serveAndShutdown launches the server goroutines, waits for a shutdown signal
+// or a server error, then orders the shutdown. It returns whether a fatal
+// failure occurred and any error from the shutdown.
+func serveAndShutdown(signals context.Context, listeners runtimeListeners, reloader *proxyserver.Reloader, logger *slog.Logger) (bool, error) {
+	serverErrors := make(chan error, 3)
+	go func() {
+		logger.Info("server listening", "address", listeners.server.Addr)
+		serverErrors <- listeners.server.Serve(listeners.listener)
+	}()
+	if listeners.peerServer != nil {
+		go func() {
+			logger.Info("peer server listening", "address", listeners.peerServer.Addr)
+			serverErrors <- listeners.peerServer.ServeTLS(listeners.peerListener, "", "")
+		}()
+	}
+	if listeners.managementServer != nil {
+		go func() {
+			logger.Info("management server listening", "address", listeners.managementServer.Addr)
+			serverErrors <- listeners.managementServer.ServeTLS(listeners.managementListener, "", "")
+		}()
+	}
+
+	failed := false
+	select {
+	case <-signals.Done():
+		logger.Info("shutdown signal received")
+	case err := <-serverErrors:
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("server stopped unexpectedly", "error", err)
+			failed = true
+		}
+	}
+
+	shutdownFailed, err := shutdownRuntime(listeners, reloader, logger)
+	return failed || shutdownFailed, err
+}
+
+// shutdownRuntime stops the reloader and shuts down the servers in order:
+// client, then peer, then management. A client shutdown failure is fatal;
+// peer and management failures set the failed flag but do not abort the
+// remaining shutdowns.
+func shutdownRuntime(listeners runtimeListeners, reloader *proxyserver.Reloader, logger *slog.Logger) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	reloader.Stop()
+	if err := listeners.server.Shutdown(ctx); err != nil {
+		logger.Error("graceful shutdown failed", "error", err)
+		_ = listeners.server.Close()
+		return true, err
+	}
+	failed := false
+	if listeners.peerServer != nil {
+		if err := listeners.peerServer.Shutdown(ctx); err != nil {
+			logger.Error("peer graceful shutdown failed", "error", err)
+			_ = listeners.peerServer.Close()
+			failed = true
+		}
+	}
+	if listeners.managementServer != nil {
+		if err := listeners.managementServer.Shutdown(ctx); err != nil {
+			logger.Error("management graceful shutdown failed", "error", err)
+			_ = listeners.managementServer.Close()
+			failed = true
+		}
+	}
+	logger.Info("server stopped")
+	return failed, nil
 }

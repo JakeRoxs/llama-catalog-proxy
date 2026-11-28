@@ -25,6 +25,7 @@ type ollamaBackend struct {
 	showLatency  time.Duration
 	showInFlight atomic.Int64
 	showPeak     atomic.Int64
+	modelsJSON   []byte
 }
 
 func newOllamaBackend(t *testing.T, models ...string) *ollamaBackend {
@@ -37,88 +38,117 @@ func newOllamaBackend(t *testing.T, models ...string) *ollamaBackend {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := &ollamaBackend{chats: make(chan string, 16), showDetails: make(map[string]string, len(models))}
-	for _, model := range models {
-		backend.showDetails[model] = fmt.Sprintf(`{
-			"capabilities": ["completion", "toolcalling"],
-			"details": {
-				"family": "qwen3",
-				"format": "safetensors",
-				"parameter_size": "8.3B",
-				"quantization_level": "Q4_K_M",
-				"context_length": 40960,
-				"max_completion_tokens": 8192
-			}
-		}`)
+	backend := &ollamaBackend{
+		chats:       make(chan string, 16),
+		showDetails: make(map[string]string, len(models)),
+		modelsJSON:  modelsJSON,
 	}
-	backend.server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodGet {
-			switch request.URL.Path {
-			case "/api/version":
-				writer.Header().Set("Content-Type", "application/json")
-				_, _ = writer.Write([]byte(`{"version":"0.11.0"}`))
-			case "/v1/models":
-				writer.Header().Set("Content-Type", "application/json")
-				_, _ = writer.Write(modelsJSON)
-			default:
-				writer.WriteHeader(http.StatusNotFound)
-			}
-			return
-		}
-		if request.URL.Path == "/api/show" {
-			current := backend.showInFlight.Add(1)
-			for {
-				peak := backend.showPeak.Load()
-				if current <= peak || backend.showPeak.CompareAndSwap(peak, current) {
-					break
-				}
-			}
-			defer backend.showInFlight.Add(-1)
-			var showRequest struct {
-				Model string `json:"model"`
-			}
-			if err := json.NewDecoder(request.Body).Decode(&showRequest); err != nil {
-				writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			if backend.showFail.Load() {
-				writer.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			details, exists := backend.showDetails[showRequest.Model]
-			if !exists {
-				writer.WriteHeader(http.StatusNotFound)
-				return
-			}
-			if backend.showLatency > 0 {
-				time.Sleep(backend.showLatency)
-			}
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte(details))
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		model, _ := body["model"].(string)
-		backend.chats <- request.URL.Path + " " + model
-		if stream, _ := body["stream"].(bool); stream {
-			writer.Header().Set("Content-Type", "text/event-stream")
-			flusher := writer.(http.Flusher)
-			_, _ = writer.Write([]byte("data: {\"model\":\"" + model + "\"}\n\n"))
-			flusher.Flush()
-			_, _ = writer.Write([]byte("data: [DONE]\n\n"))
-			flusher.Flush()
-			return
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		response, _ := json.Marshal(map[string]any{"model": model, "path": request.URL.Path})
-		_, _ = writer.Write(response)
-	}))
+	for _, model := range models {
+		backend.showDetails[model] = showDetailsJSON()
+	}
+	backend.server = httptest.NewServer(http.HandlerFunc(backend.dispatcher))
 	t.Cleanup(func() { backend.server.Close() })
 	return backend
+}
+
+// dispatcher routes requests to the focused handler: GET version/models, /api/show
+// concurrency/failure/details, and chat JSON/SSE.
+func (b *ollamaBackend) dispatcher(writer http.ResponseWriter, request *http.Request) {
+	switch {
+	case request.Method == http.MethodGet:
+		b.serveGet(writer, request)
+	case request.URL.Path == "/api/show":
+		b.serveShow(writer, request)
+	default:
+		b.serveChat(writer, request)
+	}
+}
+
+// serveGet handles GET /api/version and GET /v1/models.
+func (b *ollamaBackend) serveGet(writer http.ResponseWriter, request *http.Request) {
+	switch request.URL.Path {
+	case "/api/version":
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"version":"0.11.0"}`))
+	case "/v1/models":
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write(b.modelsJSON)
+	default:
+		writer.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// serveShow handles POST /api/show: in-flight concurrency tracking, decode,
+// failure, not-found, latency, and details response.
+func (b *ollamaBackend) serveShow(writer http.ResponseWriter, request *http.Request) {
+	current := b.showInFlight.Add(1)
+	for {
+		peak := b.showPeak.Load()
+		if current <= peak || b.showPeak.CompareAndSwap(peak, current) {
+			break
+		}
+	}
+	defer b.showInFlight.Add(-1)
+	var showRequest struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(request.Body).Decode(&showRequest); err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if b.showFail.Load() {
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	details, exists := b.showDetails[showRequest.Model]
+	if !exists {
+		writer.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if b.showLatency > 0 {
+		time.Sleep(b.showLatency)
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	_, _ = writer.Write([]byte(details))
+}
+
+// serveChat handles POST /api/chat and OpenAI-compatible chat endpoints: JSON
+// response or SSE stream.
+func (b *ollamaBackend) serveChat(writer http.ResponseWriter, request *http.Request) {
+	var body map[string]any
+	if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	model, _ := body["model"].(string)
+	b.chats <- request.URL.Path + " " + model
+	if stream, _ := body["stream"].(bool); stream {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		flusher := writer.(http.Flusher)
+		_, _ = writer.Write([]byte("data: {\"model\":\"" + model + "\"}\n\n"))
+		flusher.Flush()
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	response, _ := json.Marshal(map[string]any{"model": model, "path": request.URL.Path})
+	_, _ = writer.Write(response)
+}
+
+// showDetailsJSON returns the static model detail payload used by the backend.
+func showDetailsJSON() string {
+	return fmt.Sprintf(`{
+		"capabilities": ["completion", "toolcalling"],
+		"details": {
+			"family": "qwen3",
+			"format": "safetensors",
+			"parameter_size": "8.3B",
+			"quantization_level": "Q4_K_M",
+			"context_length": 40960,
+			"max_completion_tokens": 8192
+		}
+	}`)
 }
 
 func openaiCatalogServer(t *testing.T, models ...string) *httptest.Server {
@@ -269,20 +299,7 @@ func TestOllamaStreamingChatCompletionsProxySSE(t *testing.T) {
 
 func TestOllamaShowEnrichmentAddsNamespacedMetadata(t *testing.T) {
 	ollama := newOllamaBackend(t, "qwen3:8b", "llama3.2:3b")
-	defaultServer := openaiCatalogServer(t, "local-model")
-	cfg := baseConfig(defaultServer.URL)
-	cfg.Backends["ollama"] = config.Backend{
-		URL: ollama.server.URL, Prefix: "ollama/", HealthPath: "/api/version",
-		OllamaShowEnrichment: true,
-	}
-	handler := newHandler(t, cfg)
-
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d", recorder.Code)
-	}
-	catalog := ollamaCatalog(t, recorder)
+	catalog := ollamaEnrichmentCatalog(t, ollama)
 	for _, want := range []string{"ollama/qwen3:8b", "ollama/llama3.2:3b"} {
 		model := catalog[want]
 		if model == nil {
@@ -348,20 +365,7 @@ func TestOllamaShowEnrichmentDisabledByDefault(t *testing.T) {
 func TestOllamaShowEnrichmentFailureLeavesCatalogUsable(t *testing.T) {
 	ollama := newOllamaBackend(t, "qwen3:8b", "llama3.2:3b")
 	delete(ollama.showDetails, "llama3.2:3b")
-	defaultServer := openaiCatalogServer(t, "local-model")
-	cfg := baseConfig(defaultServer.URL)
-	cfg.Backends["ollama"] = config.Backend{
-		URL: ollama.server.URL, Prefix: "ollama/", HealthPath: "/api/version",
-		OllamaShowEnrichment: true,
-	}
-	handler := newHandler(t, cfg)
-
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
-	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d", recorder.Code)
-	}
-	catalog := ollamaCatalog(t, recorder)
+	catalog := ollamaEnrichmentCatalog(t, ollama)
 	if metadata, exists := catalog["ollama/qwen3:8b"]["ollama"]; !exists || metadata == nil {
 		t.Fatal("healthy model lost its ollama metadata")
 	}
@@ -427,6 +431,27 @@ func TestOllamaShowEnrichmentSurvivesCatalogCache(t *testing.T) {
 			t.Fatalf("attempt %d metadata = %#v", attempt, metadata)
 		}
 	}
+}
+
+// ollamaEnrichmentCatalog builds the handler with OllamaShowEnrichment enabled,
+// issues the catalog request, and returns the decoded catalog. It shares the
+// exact setup/request/status/decode block that was duplicated across two tests.
+func ollamaEnrichmentCatalog(t *testing.T, ollama *ollamaBackend) map[string]map[string]any {
+	t.Helper()
+	defaultServer := openaiCatalogServer(t, "local-model")
+	cfg := baseConfig(defaultServer.URL)
+	cfg.Backends["ollama"] = config.Backend{
+		URL: ollama.server.URL, Prefix: "ollama/", HealthPath: "/api/version",
+		OllamaShowEnrichment: true,
+	}
+	handler := newHandler(t, cfg)
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	return ollamaCatalog(t, recorder)
 }
 
 func ollamaCatalog(t *testing.T, recorder *httptest.ResponseRecorder) map[string]map[string]any {

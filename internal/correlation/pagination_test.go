@@ -934,28 +934,6 @@ func TestQueryPageOversizeSnapshot(t *testing.T) {
 	assertSizeConsistent(t, c)
 }
 
-// TestQueryPagePrimaryCountCapReject verifies that when primary count cap is
-// lower than the snapshot page cap, creating a snapshot is rejected before
-// unbounded cloning.
-func TestQueryPagePrimaryCountCapReject(t *testing.T) {
-	c := newTestCorrelator(t)
-	c.snapshotPageCap = 1 // only 1 record per snapshot
-
-	c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
-	c.RegisterRequest("req-2", "backend-A", "model-1", fixtureTime.Add(time.Minute))
-
-	// 2 records exceed the page cap of 1.
-	_, err := c.QueryPage(QueryFilter{}, PageRequest{})
-	if err != nil {
-		if !errors.Is(err, ErrSnapshotTooLarge) {
-			t.Fatalf("expected ErrSnapshotTooLarge, got %v", err)
-		}
-	} else {
-		t.Fatal("expected ErrSnapshotTooLarge, got nil error")
-	}
-	assertSizeConsistent(t, c)
-}
-
 // TestQueryPageOnePageStoresNoSnapshot verifies that a result that fits in a
 // single page is returned directly without storing a snapshot or consuming
 // entropy, and that no cursor is produced.

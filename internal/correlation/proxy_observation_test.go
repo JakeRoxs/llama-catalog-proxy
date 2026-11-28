@@ -77,16 +77,22 @@ func observation(t *testing.T, c *Correlator, requestID string) *ProxyObservatio
 	return r.ProxyObservation
 }
 
-func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
-	c := newTestCorrelator(t)
-	c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
+// assertProxyObservationFields checks the common observation fields expected on
+// the happy path: fixed proxy labels, all valid summary values, and valid
+// outcomes. It preserves the nil-vs-zero distinction and every metric value.
+func assertProxyObservationFields(t *testing.T, obs *ProxyObservation) {
+	t.Helper()
+	assertProxyObservationLabels(t, obs)
+	assertProxyObservationPhases(t, obs)
+	assertProxyObservationUsage(t, obs)
+	assertProxyObservationOutcomes(t, obs)
+	// No sourceModel/header/error/path/body fields are present by construction.
+}
 
-	ok := c.AttachObservation("req-1", validSummary(fixtureTime, 90*time.Millisecond))
-	if !ok {
-		t.Fatal("expected attach to succeed")
-	}
-
-	obs := observation(t, c, "req-1")
+// assertProxyObservationLabels checks the fixed proxy labels that are never
+// copied from the summary.
+func assertProxyObservationLabels(t *testing.T, obs *ProxyObservation) {
+	t.Helper()
 	if obs.Source != "proxy" {
 		t.Fatalf("source = %q, want proxy", obs.Source)
 	}
@@ -96,6 +102,11 @@ func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
 	if obs.UpstreamRequestMapping != "not_established" {
 		t.Fatalf("mapping = %q, want not_established", obs.UpstreamRequestMapping)
 	}
+}
+
+// assertProxyObservationPhases checks the wall-phase and total duration values.
+func assertProxyObservationPhases(t *testing.T, obs *ProxyObservation) {
+	t.Helper()
 	if obs.UpstreamHeaderMs == nil || *obs.UpstreamHeaderMs != 10.0 {
 		t.Fatalf("upstream_header_ms = %v, want 10", obs.UpstreamHeaderMs)
 	}
@@ -111,6 +122,12 @@ func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
 	if obs.TotalDurationMs == nil || *obs.TotalDurationMs != 90.0 {
 		t.Fatalf("total_duration_ms = %v, want 90", obs.TotalDurationMs)
 	}
+}
+
+// assertProxyObservationUsage checks the reported usage and engine timing
+// values, preserving the nil-vs-zero distinction.
+func assertProxyObservationUsage(t *testing.T, obs *ProxyObservation) {
+	t.Helper()
 	if obs.PromptTokens == nil || *obs.PromptTokens != 0 {
 		t.Fatalf("prompt_tokens = %v, want 0", obs.PromptTokens)
 	}
@@ -123,6 +140,12 @@ func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
 	if obs.PredictedMS == nil || *obs.PredictedMS != 10.0 {
 		t.Fatalf("predicted_ms = %v, want 10", obs.PredictedMS)
 	}
+}
+
+// assertProxyObservationOutcomes checks the transport, generation, inspection,
+// and finish-reason outcomes.
+func assertProxyObservationOutcomes(t *testing.T, obs *ProxyObservation) {
+	t.Helper()
 	if obs.TransportOutcome != "returned" {
 		t.Fatalf("transport_outcome = %q, want returned", obs.TransportOutcome)
 	}
@@ -135,7 +158,42 @@ func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
 	if obs.FinishReason != "stop" {
 		t.Fatalf("finish_reason = %q, want stop", obs.FinishReason)
 	}
-	// No sourceModel/header/error/path/body fields are present by construction.
+}
+
+// assertOutcomeExpectations checks transport, generation, inspection, and
+// finish-reason expectations for a single outcome case. It preserves the
+// cross-outcome constraint logic: empty finishReason or uninspected inspection
+// requires an empty finish_reason; otherwise the finish_reason is retained.
+func assertOutcomeExpectations(t *testing.T, obs *ProxyObservation, transport, wantGeneration, inspection, finishReason string) {
+	t.Helper()
+	if obs.TransportOutcome != transport {
+		t.Fatalf("transport_outcome = %q, want %q", obs.TransportOutcome, transport)
+	}
+	if obs.GenerationOutcome != wantGeneration {
+		t.Fatalf("generation_outcome = %q, want %q", obs.GenerationOutcome, wantGeneration)
+	}
+	if obs.InspectionState != inspection {
+		t.Fatalf("inspection_state = %q, want %q", obs.InspectionState, inspection)
+	}
+	if (finishReason == "" || inspection == "uninspected") && obs.FinishReason != "" {
+		t.Fatalf("finish_reason should be empty, got %q", obs.FinishReason)
+	}
+	if (finishReason != "" && inspection != "uninspected") && obs.FinishReason != finishReason {
+		t.Fatalf("finish_reason = %q, want %q", obs.FinishReason, finishReason)
+	}
+}
+
+func TestCorrelatorAttachObservationHappyPath(t *testing.T) {
+	c := newTestCorrelator(t)
+	c.RegisterRequest("req-1", "backend-A", "model-1", fixtureTime)
+
+	ok := c.AttachObservation("req-1", validSummary(fixtureTime, 90*time.Millisecond))
+	if !ok {
+		t.Fatal("expected attach to succeed")
+	}
+
+	obs := observation(t, c, "req-1")
+	assertProxyObservationFields(t, obs)
 	assertSizeConsistent(t, c)
 }
 
@@ -537,24 +595,7 @@ func TestCorrelatorAttachObservationOutcomesDistinct(t *testing.T) {
 				t.Fatal("expected attach to succeed")
 			}
 			obs := observation(t, c, "req-1")
-			if obs.TransportOutcome != tc.transport {
-				t.Fatalf("transport_outcome = %q, want %q", obs.TransportOutcome, tc.transport)
-			}
-			if obs.GenerationOutcome != tc.wantGeneration {
-				t.Fatalf("generation_outcome = %q, want %q", obs.GenerationOutcome, tc.wantGeneration)
-			}
-			if obs.InspectionState != tc.inspection {
-				t.Fatalf("inspection_state = %q, want %q", obs.InspectionState, tc.inspection)
-			}
-			if tc.finishReason == "" || tc.inspection == "uninspected" {
-				if obs.FinishReason != "" {
-					t.Fatalf("finish_reason should be empty, got %q", obs.FinishReason)
-				}
-			} else {
-				if obs.FinishReason != tc.finishReason {
-					t.Fatalf("finish_reason = %q, want %q", obs.FinishReason, tc.finishReason)
-				}
-			}
+			assertOutcomeExpectations(t, obs, tc.transport, tc.wantGeneration, tc.inspection, tc.finishReason)
 			assertSizeConsistent(t, c)
 		})
 	}
@@ -725,4 +766,282 @@ func TestCorrelatorAttachObservationFailedReplaceLeavesOldObservation(t *testing
 		t.Fatal("old observation should be unchanged after failed replace")
 	}
 	assertSizeConsistent(t, c)
+}
+
+func TestValidationHelpersNilZeroNaNInfNegative(t *testing.T) {
+	nilV := (*float64)(nil)
+	zeroV := ptrF64(0.0)
+	posV := ptrF64(5.0)
+
+	if !validPhase(nilV) {
+		t.Fatal("nil phase should be valid")
+	}
+	if !validPhase(zeroV) {
+		t.Fatal("zero phase should be valid")
+	}
+	if !validPhase(posV) {
+		t.Fatal("positive phase should be valid")
+	}
+	if validPhase(ptrF64(-1.0)) {
+		t.Fatal("negative phase should be invalid")
+	}
+	if validPhase(ptrF64(math.NaN())) {
+		t.Fatal("NaN phase should be invalid")
+	}
+	if validPhase(ptrF64(math.Inf(1))) {
+		t.Fatal("Inf phase should be invalid")
+	}
+	if validPhase(ptrF64(math.Inf(-1))) {
+		t.Fatal("-Inf phase should be invalid")
+	}
+
+	// copyPhase preserves nil and zero; rejects invalid.
+	if copyPhase(nilV) != nil {
+		t.Fatal("copyPhase(nil) should be nil")
+	}
+	if got := copyPhase(zeroV); got == nil || *got != 0.0 {
+		t.Fatal("copyPhase(zero) should preserve &0")
+	}
+	if copyPhase(ptrF64(-1.0)) != nil {
+		t.Fatal("copyPhase(negative) should be nil")
+	}
+	if copyPhase(ptrF64(math.NaN())) != nil {
+		t.Fatal("copyPhase(NaN) should be nil")
+	}
+
+	// copyFiniteNonnegativeFloat uses the validFiniteNonnegativeFloat predicate.
+	if copyFiniteNonnegativeFloat(nilV) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(nil) should be nil")
+	}
+	if got := copyFiniteNonnegativeFloat(zeroV); got == nil || *got != 0.0 {
+		t.Fatal("copyFiniteNonnegativeFloat(zero) should preserve &0")
+	}
+	if copyFiniteNonnegativeFloat(ptrF64(-1.0)) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(negative) should be nil")
+	}
+	if copyFiniteNonnegativeFloat(ptrF64(math.NaN())) != nil {
+		t.Fatal("copyFiniteNonnegativeFloat(NaN) should be nil")
+	}
+}
+
+func TestValidatePhases(t *testing.T) {
+	// All nil => valid.
+	if !validatePhases(&ProxyObservation{}) {
+		t.Fatal("all-nil phases should be valid")
+	}
+	// Negative phase invalid.
+	obs := &ProxyObservation{UpstreamHeaderMs: ptrF64(-1.0)}
+	if validatePhases(obs) {
+		t.Fatal("negative phase should be invalid")
+	}
+	// NaN invalid.
+	obs.UpstreamHeaderMs = ptrF64(math.NaN())
+	if validatePhases(obs) {
+		t.Fatal("NaN phase should be invalid")
+	}
+	// Phase > total invalid.
+	obs = &ProxyObservation{
+		UpstreamHeaderMs: ptrF64(10.0),
+		TotalDurationMs:  ptrF64(5.0),
+	}
+	if validatePhases(obs) {
+		t.Fatal("phase > total should be invalid")
+	}
+	// Pairwise order violations.
+	obs = &ProxyObservation{
+		UpstreamHeaderMs: ptrF64(100.0),
+		FirstByteMs:      ptrF64(20.0),
+	}
+	if validatePhases(obs) {
+		t.Fatal("header > firstbyte should be invalid")
+	}
+	obs = &ProxyObservation{
+		FirstByteMs:   ptrF64(100.0),
+		FirstOutputMs: ptrF64(30.0),
+	}
+	if validatePhases(obs) {
+		t.Fatal("byte > output should be invalid")
+	}
+	obs = &ProxyObservation{
+		FirstOutputMs: ptrF64(100.0),
+		FirstAnswerMs: ptrF64(30.0),
+	}
+	if validatePhases(obs) {
+		t.Fatal("output > answer should be invalid")
+	}
+	obs = &ProxyObservation{
+		FirstByteMs:   ptrF64(100.0),
+		FirstAnswerMs: ptrF64(30.0),
+	}
+	if validatePhases(obs) {
+		t.Fatal("byte > answer should be invalid")
+	}
+	// Valid ordered phases within total.
+	obs = &ProxyObservation{
+		UpstreamHeaderMs: ptrF64(10.0),
+		FirstByteMs:      ptrF64(20.0),
+		FirstOutputMs:    ptrF64(30.0),
+		FirstAnswerMs:    ptrF64(50.0),
+		TotalDurationMs:  ptrF64(90.0),
+	}
+	if !validatePhases(obs) {
+		t.Fatal("valid ordered phases within total should be valid")
+	}
+	// Missing answer is fine.
+	obs.FirstAnswerMs = nil
+	if !validatePhases(obs) {
+		t.Fatal("missing answer should still be valid")
+	}
+}
+
+func TestSummaryTimesValid(t *testing.T) {
+	start := fixtureTime
+	end := start.Add(90 * time.Millisecond)
+	valid := timing.Summary{StartTime: start, EndTime: end, TotalDurationMs: ptrF64(90.0)}
+	if !summaryTimesValid(valid) {
+		t.Fatal("valid summary should be time-valid")
+	}
+	// Unfinished: zero EndTime.
+	u := valid
+	u.EndTime = time.Time{}
+	if summaryTimesValid(u) {
+		t.Fatal("zero EndTime should be invalid")
+	}
+	// Zero StartTime.
+	u = valid
+	u.StartTime = time.Time{}
+	if summaryTimesValid(u) {
+		t.Fatal("zero StartTime should be invalid")
+	}
+	// Year > 9999.
+	u = valid
+	u.StartTime = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC)
+	if summaryTimesValid(u) {
+		t.Fatal("year 10000 should be invalid")
+	}
+	// Backwards horizon.
+	u = valid
+	u.EndTime = start.Add(-time.Minute)
+	if summaryTimesValid(u) {
+		t.Fatal("backwards horizon should be invalid")
+	}
+	// Nil total.
+	u = valid
+	u.TotalDurationMs = nil
+	if summaryTimesValid(u) {
+		t.Fatal("nil total should be invalid")
+	}
+}
+
+func TestCopyAndValidatePhasesInvalidation(t *testing.T) {
+	// Negative phase: non-nil original copies to nil => invalid.
+	obs := &ProxyObservation{}
+	summary := timing.Summary{UpstreamHeaderMs: ptrF64(-1.0)}
+	if copyAndValidatePhases(summary, obs) {
+		t.Fatal("negative phase should invalidate")
+	}
+	if obs.UpstreamHeaderMs != nil {
+		t.Fatal("invalid phase should not be copied")
+	}
+	// NaN phase.
+	summary = timing.Summary{UpstreamHeaderMs: ptrF64(math.NaN())}
+	obs = &ProxyObservation{}
+	if copyAndValidatePhases(summary, obs) {
+		t.Fatal("NaN phase should invalidate")
+	}
+	// Valid phase preserved and within total.
+	summary = timing.Summary{UpstreamHeaderMs: ptrF64(10.0), TotalDurationMs: ptrF64(90.0)}
+	obs = &ProxyObservation{}
+	if !copyAndValidatePhases(summary, obs) {
+		t.Fatal("valid phase should be accepted")
+	}
+	if obs.UpstreamHeaderMs == nil || *obs.UpstreamHeaderMs != 10.0 {
+		t.Fatal("valid phase should be copied")
+	}
+	if obs.TotalDurationMs == nil || *obs.TotalDurationMs != 90.0 {
+		t.Fatal("valid total should be copied")
+	}
+}
+
+func TestCopyAndValidateTokenUsage(t *testing.T) {
+	// Negative counter invalidates.
+	obs := &ProxyObservation{}
+	summary := timing.Summary{TokenUsage: timing.TokenUsage{PromptTokens: ptrI64(-1)}}
+	if copyAndValidateTokenUsage(summary, obs) {
+		t.Fatal("negative counter should invalidate")
+	}
+	if obs.PromptTokens != nil {
+		t.Fatal("invalid counter should not be copied")
+	}
+	// Zero preserved.
+	summary = timing.Summary{TokenUsage: timing.TokenUsage{PromptTokens: ptrI64(0)}}
+	obs = &ProxyObservation{}
+	if !copyAndValidateTokenUsage(summary, obs) {
+		t.Fatal("zero counter should be accepted")
+	}
+	if obs.PromptTokens == nil || *obs.PromptTokens != 0 {
+		t.Fatal("zero counter should be preserved as &0")
+	}
+}
+
+func TestCopyAndValidateEngineTimings(t *testing.T) {
+	// NaN timing invalidates.
+	obs := &ProxyObservation{}
+	summary := timing.Summary{EngineTimings: timing.EngineTimings{PromptMS: ptrF64(math.NaN())}}
+	if copyAndValidateEngineTimings(summary, obs) {
+		t.Fatal("NaN timing should invalidate")
+	}
+	// Negative timing invalidates.
+	summary = timing.Summary{EngineTimings: timing.EngineTimings{PredictedMS: ptrF64(-5.0)}}
+	obs = &ProxyObservation{}
+	if copyAndValidateEngineTimings(summary, obs) {
+		t.Fatal("negative timing should invalidate")
+	}
+	// Zero preserved.
+	summary = timing.Summary{EngineTimings: timing.EngineTimings{PromptMS: ptrF64(0.0)}}
+	obs = &ProxyObservation{}
+	if !copyAndValidateEngineTimings(summary, obs) {
+		t.Fatal("zero timing should be accepted")
+	}
+	if obs.PromptMS == nil || *obs.PromptMS != 0.0 {
+		t.Fatal("zero timing should be preserved as &0")
+	}
+}
+
+func TestApplyCrossOutcomeConstraints(t *testing.T) {
+	// Interrupted transport forces completed generation to incomplete.
+	obs := &ProxyObservation{TransportOutcome: "canceled", GenerationOutcome: "completed"}
+	applyCrossOutcomeConstraints(obs)
+	if obs.GenerationOutcome != "incomplete" {
+		t.Fatal("interrupted transport should force generation incomplete")
+	}
+	// Partial inspection forces completed to unknown.
+	obs = &ProxyObservation{InspectionState: "partial", GenerationOutcome: "completed"}
+	applyCrossOutcomeConstraints(obs)
+	if obs.GenerationOutcome != "unknown" {
+		t.Fatal("partial inspection should force generation unknown")
+	}
+	// Unknown transport forces completed to unknown.
+	obs = &ProxyObservation{TransportOutcome: "", GenerationOutcome: "completed"}
+	applyCrossOutcomeConstraints(obs)
+	if obs.GenerationOutcome != "unknown" {
+		t.Fatal("unknown transport should force generation unknown")
+	}
+	// Uninspected forces generation uninspected and clears forged body evidence.
+	obs = &ProxyObservation{
+		InspectionState:   "uninspected",
+		GenerationOutcome: "completed",
+		FirstOutputMs:     ptrF64(30.0),
+		PromptTokens:      ptrI64(7),
+		PromptMS:          ptrF64(10.0),
+		PromptN:           ptrI64(7),
+		FinishReason:      "stop",
+	}
+	applyCrossOutcomeConstraints(obs)
+	if obs.GenerationOutcome != "uninspected" {
+		t.Fatal("uninspected should force generation uninspected")
+	}
+	if obs.FirstOutputMs != nil || obs.PromptTokens != nil || obs.PromptMS != nil || obs.PromptN != nil || obs.FinishReason != "" {
+		t.Fatal("uninspected should clear forged body evidence")
+	}
 }

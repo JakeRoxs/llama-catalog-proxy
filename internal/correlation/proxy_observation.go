@@ -155,9 +155,9 @@ func copyIntPtr(v *int64) *int64 {
 	return &x
 }
 
-// validPhase reports true if v is unknown (nil) or a finite, nonnegative
-// phase value. NaN, Inf, and negative phases are invalid.
-func validPhase(v *float64) bool {
+// validFiniteNonnegativeFloat reports true if v is unknown (nil) or a finite,
+// nonnegative value. NaN, Inf, and negative values are invalid.
+func validFiniteNonnegativeFloat(v *float64) bool {
 	if v == nil {
 		return true
 	}
@@ -165,13 +165,10 @@ func validPhase(v *float64) bool {
 	return !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0
 }
 
-// copyPhase copies a phase pointer. The caller must ensure validPhase(v) is
-// true; otherwise the result is nil (invalid).
-func copyPhase(v *float64) *float64 {
-	if v == nil || !validPhase(v) {
-		return nil
-	}
-	return copyFloatPtr(v)
+// validPhase reports true if v is unknown (nil) or a finite, nonnegative phase
+// value. It is the phase-specific alias for validFiniteNonnegativeFloat.
+func validPhase(v *float64) bool {
+	return validFiniteNonnegativeFloat(v)
 }
 
 // validInt64 reports true if v is unknown (nil) or a nonnegative integer.
@@ -191,23 +188,19 @@ func copyInt64(v *int64) *int64 {
 	return copyIntPtr(v)
 }
 
-// validFiniteFloat reports true if v is unknown (nil) or a finite, nonnegative
-// float. NaN, Inf, and negative values are invalid.
-func validFiniteFloat(v *float64) bool {
-	if v == nil {
-		return true
-	}
-	f := *v
-	return !math.IsNaN(f) && !math.IsInf(f, 0) && f >= 0
-}
-
-// copyFiniteFloat copies a finite float pointer. The caller must ensure
-// validFiniteFloat(v) is true; otherwise the result is nil (invalid).
-func copyFiniteFloat(v *float64) *float64 {
-	if v == nil || !validFiniteFloat(v) {
+// copyFiniteNonnegativeFloat copies a finite, nonnegative float pointer. The
+// caller must ensure validFiniteNonnegativeFloat(v) is true; otherwise the
+// result is nil (invalid). Zero values are preserved.
+func copyFiniteNonnegativeFloat(v *float64) *float64 {
+	if v == nil || !validFiniteNonnegativeFloat(v) {
 		return nil
 	}
 	return copyFloatPtr(v)
+}
+
+// copyPhase copies a phase pointer. It delegates to copyFiniteNonnegativeFloat.
+func copyPhase(v *float64) *float64 {
+	return copyFiniteNonnegativeFloat(v)
 }
 
 // sanitizeString returns s if it is a member of the allowlist, otherwise "".
@@ -219,13 +212,9 @@ func sanitizeString(s string, allowlist map[string]bool) string {
 	return ""
 }
 
-// validatePhases checks that all non-nil phases are finite, nonnegative, each
-// phase does not exceed the total (when total is set), and pairwise phase
-// order holds whenever both sides are known: header<=firstbyte,
-// byte<=output, output<=answer, byte<=answer (even if the middle is missing).
-// It returns false if any check fails.
-func validatePhases(o *ProxyObservation) bool {
-	// Each phase must be finite and nonnegative.
+// allPhasesFiniteNonnegative reports true if every phase is unknown (nil) or a
+// finite, nonnegative value. NaN, Inf, and negative phases are invalid.
+func allPhasesFiniteNonnegative(o *ProxyObservation) bool {
 	for _, p := range []*float64{
 		o.UpstreamHeaderMs, o.FirstByteMs, o.FirstOutputMs, o.FirstAnswerMs,
 		o.TotalDurationMs,
@@ -234,20 +223,30 @@ func validatePhases(o *ProxyObservation) bool {
 			return false
 		}
 	}
+	return true
+}
 
-	// A phase must not exceed the total (when total is established).
-	if o.TotalDurationMs != nil {
-		total := *o.TotalDurationMs
-		for _, p := range []*float64{
-			o.UpstreamHeaderMs, o.FirstByteMs, o.FirstOutputMs, o.FirstAnswerMs,
-		} {
-			if p != nil && *p > total {
-				return false
-			}
+// phaseWithinTotal reports true if no known phase exceeds the established total
+// duration. When the total is unknown, no bound is enforced.
+func phaseWithinTotal(o *ProxyObservation) bool {
+	if o.TotalDurationMs == nil {
+		return true
+	}
+	total := *o.TotalDurationMs
+	for _, p := range []*float64{
+		o.UpstreamHeaderMs, o.FirstByteMs, o.FirstOutputMs, o.FirstAnswerMs,
+	} {
+		if p != nil && *p > total {
+			return false
 		}
 	}
+	return true
+}
 
-	// Pairwise order when both sides are known.
+// phaseOrderValid reports true if pairwise phase order holds whenever both
+// sides are known: header<=firstbyte, byte<=output, output<=answer,
+// byte<=answer (even if the middle is missing).
+func phaseOrderValid(o *ProxyObservation) bool {
 	if o.UpstreamHeaderMs != nil && o.FirstByteMs != nil && *o.UpstreamHeaderMs > *o.FirstByteMs {
 		return false
 	}
@@ -260,102 +259,135 @@ func validatePhases(o *ProxyObservation) bool {
 	if o.FirstByteMs != nil && o.FirstAnswerMs != nil && *o.FirstByteMs > *o.FirstAnswerMs {
 		return false
 	}
-
 	return true
+}
+
+// validatePhases checks that all non-nil phases are finite, nonnegative, each
+// phase does not exceed the total (when total is set), and pairwise phase
+// order holds whenever both sides are known: header<=firstbyte,
+// byte<=output, output<=answer, byte<=answer (even if the middle is missing).
+// It returns false if any check fails.
+func validatePhases(o *ProxyObservation) bool {
+	return allPhasesFiniteNonnegative(o) && phaseWithinTotal(o) && phaseOrderValid(o)
 }
 
 // projectSummary returns a validated ProxyObservation projection of summary,
 // or nil if the summary is unfinished or malformed. The returned observation
-// is a fresh value; callers may mutate it without affecting the summary.
+// is a fresh value; callers may mutate it without affecting the summary. The
+// input summary is never mutated.
 func projectSummary(summary timing.Summary) *ProxyObservation {
-	// Unfinished: a zero EndTime means the observation is not complete.
-	if summary.EndTime.IsZero() {
+	if !summaryTimesValid(summary) {
 		return nil
 	}
-	// Invalid time: zero StartTime or a year JSON cannot represent (<1 or >9999).
-	if summary.StartTime.IsZero() {
-		return nil
-	}
-	if !validJSONTime(summary.StartTime) || !validJSONTime(summary.EndTime) {
-		return nil
-	}
-	// Invalid time horizon: end must not precede start.
-	if summary.EndTime.Before(summary.StartTime) {
-		return nil
-	}
-	// A finished summary must establish a total duration.
-	if summary.TotalDurationMs == nil {
-		return nil
-	}
-
 	obs := &ProxyObservation{
 		Source:                 proxySource,
 		Scope:                  proxyScope,
 		UpstreamRequestMapping: upstreamRequestMapping,
 	}
+	if !copyAndValidatePhases(summary, obs) {
+		return nil
+	}
+	if !copyAndValidateTokenUsage(summary, obs) {
+		return nil
+	}
+	if !copyAndValidateEngineTimings(summary, obs) {
+		return nil
+	}
+	sanitizeOutcomes(summary, obs)
+	applyCrossOutcomeConstraints(obs)
+	if estimatedProxyObservationSize(obs) > proxyObservationBudget {
+		return nil
+	}
+	return obs
+}
 
-	// Wall phases: copy and validate.
+// summaryTimesValid reports true if the summary is finished and has a valid,
+// representable time horizon and an established total duration. It does not
+// mutate the summary.
+func summaryTimesValid(summary timing.Summary) bool {
+	if summary.EndTime.IsZero() {
+		return false
+	}
+	if summary.StartTime.IsZero() {
+		return false
+	}
+	if !validJSONTime(summary.StartTime) || !validJSONTime(summary.EndTime) {
+		return false
+	}
+	if summary.EndTime.Before(summary.StartTime) {
+		return false
+	}
+	if summary.TotalDurationMs == nil {
+		return false
+	}
+	return true
+}
+
+// copyAndValidatePhases copies wall phases into obs and reports false if any
+// established phase is invalid (nil=>unknown preserved; NaN/Inf/negative or
+// order/total violations invalidate). The input summary is not mutated.
+func copyAndValidatePhases(summary timing.Summary, obs *ProxyObservation) bool {
 	obs.UpstreamHeaderMs = copyPhase(summary.UpstreamHeaderMs)
 	obs.FirstByteMs = copyPhase(summary.FirstByteMs)
 	obs.FirstOutputMs = copyPhase(summary.FirstOutputMs)
 	obs.FirstAnswerMs = copyPhase(summary.FirstAnswerMs)
 	obs.TotalDurationMs = copyPhase(summary.TotalDurationMs)
 
-	// Detect invalid phases: a non-nil original that copied to nil is invalid.
+	// A non-nil original that copied to nil is invalid.
 	if (summary.UpstreamHeaderMs != nil && obs.UpstreamHeaderMs == nil) ||
 		(summary.FirstByteMs != nil && obs.FirstByteMs == nil) ||
 		(summary.FirstOutputMs != nil && obs.FirstOutputMs == nil) ||
 		(summary.FirstAnswerMs != nil && obs.FirstAnswerMs == nil) ||
 		(summary.TotalDurationMs != nil && obs.TotalDurationMs == nil) {
-		return nil
+		return false
 	}
-	if !validatePhases(obs) {
-		return nil
-	}
+	return validatePhases(obs)
+}
 
-	// ReportedUsage: nonnegative int pointers. Negative counters invalidate.
+// copyAndValidateTokenUsage copies reported usage into obs and reports false if
+// any established counter is negative. The input summary is not mutated.
+func copyAndValidateTokenUsage(summary timing.Summary, obs *ProxyObservation) bool {
 	obs.PromptTokens = copyInt64(summary.TokenUsage.PromptTokens)
 	obs.CompletionTokens = copyInt64(summary.TokenUsage.CompletionTokens)
 	obs.TotalTokens = copyInt64(summary.TokenUsage.TotalTokens)
 	obs.CachedTokens = copyInt64(summary.TokenUsage.CachedTokens)
 	obs.ReasoningTokens = copyInt64(summary.TokenUsage.ReasoningTokens)
+
 	if (summary.TokenUsage.PromptTokens != nil && obs.PromptTokens == nil) ||
 		(summary.TokenUsage.CompletionTokens != nil && obs.CompletionTokens == nil) ||
 		(summary.TokenUsage.TotalTokens != nil && obs.TotalTokens == nil) ||
 		(summary.TokenUsage.CachedTokens != nil && obs.CachedTokens == nil) ||
 		(summary.TokenUsage.ReasoningTokens != nil && obs.ReasoningTokens == nil) {
-		return nil
+		return false
 	}
+	return true
+}
 
-	// ReportedEngineTimings: finite float pointers. NaN/Inf/negative
-	// invalidates.
-	obs.PromptMS = copyFiniteFloat(summary.EngineTimings.PromptMS)
-	obs.PredictedMS = copyFiniteFloat(summary.EngineTimings.PredictedMS)
+// copyAndValidateEngineTimings copies engine timings into obs and reports false
+// if any established timing is non-finite or negative. The input summary is
+// not mutated.
+func copyAndValidateEngineTimings(summary timing.Summary, obs *ProxyObservation) bool {
+	obs.PromptMS = copyFiniteNonnegativeFloat(summary.EngineTimings.PromptMS)
+	obs.PredictedMS = copyFiniteNonnegativeFloat(summary.EngineTimings.PredictedMS)
 	obs.PromptN = copyInt64(summary.EngineTimings.PromptN)
 	obs.PredictedN = copyInt64(summary.EngineTimings.PredictedN)
+
 	if (summary.EngineTimings.PromptMS != nil && obs.PromptMS == nil) ||
 		(summary.EngineTimings.PredictedMS != nil && obs.PredictedMS == nil) ||
 		(summary.EngineTimings.PromptN != nil && obs.PromptN == nil) ||
 		(summary.EngineTimings.PredictedN != nil && obs.PredictedN == nil) {
-		return nil
+		return false
 	}
+	return true
+}
 
-	// Finite states: unknown values are omitted, never copied.
+// sanitizeOutcomes copies finite states; unknown values are omitted, never
+// copied. The input summary is not mutated.
+func sanitizeOutcomes(summary timing.Summary, obs *ProxyObservation) {
 	obs.TransportOutcome = sanitizeString(summary.TransportOutcome, transportOutcomeAllowlist)
 	obs.GenerationOutcome = sanitizeString(summary.GenerationOutcome, generationOutcomeAllowlist)
 	obs.InspectionState = sanitizeString(summary.InspectionState, inspectionStateAllowlist)
 	obs.FinishReason = sanitizeString(summary.TokenUsage.FinishReason, finishReasonAllowlist)
-
-	// Cross-outcome constraints: interrupted transport cannot retain
-	// completed/truncated generation; partial inspection cannot be completed;
-	// unknown transport cannot confidently be completed; uninspected inspection
-	// forces generation uninspected.
-	applyCrossOutcomeConstraints(obs)
-
-	if estimatedProxyObservationSize(obs) > proxyObservationBudget {
-		return nil
-	}
-	return obs
 }
 
 // applyCrossOutcomeConstraints enforces consistency between transport,

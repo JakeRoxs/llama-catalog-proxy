@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -271,25 +272,53 @@ func NewLifecycleCollector(backends map[string]config.Backend) *LifecycleCollect
 // cancellation and returns ctx.Err() rather than blocking forever. The epoch
 // is captured before any HTTP request.
 func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (LifecycleReport, error) {
-	if epoch <= 0 {
-		return LifecycleReport{}, errors.New("epoch must be positive")
+	release, err := c.collectLifecycleGate(ctx, epoch)
+	if err != nil {
+		return LifecycleReport{}, err
 	}
+	defer release()
+
+	jobs := c.snapshotBackendJobs()
+	results := c.runBackendWorkers(ctx, jobs, epoch)
+
+	states, models, globalTruncated := c.mergeLifecycleResults(ctx, results)
 	if err := ctx.Err(); err != nil {
 		return LifecycleReport{}, err
+	}
+
+	coverage, truncated := computeLifecycleCoverage(states, globalTruncated)
+	return buildLifecycleReport(states, models, coverage, truncated), nil
+}
+
+// collectLifecycleGate validates the epoch and context, then serializes the
+// caller behind the single-unit refresh gate. It returns a release function
+// that the caller must defer. A canceled context returns ctx.Err without
+// acquiring the gate; if the context is canceled after the gate is acquired,
+// the gate is released before returning the error.
+func (c *LifecycleCollector) collectLifecycleGate(ctx context.Context, epoch int64) (func(), error) {
+	if epoch <= 0 {
+		return nil, errors.New("epoch must be positive")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	// Serialize callers. Honor cancellation while waiting for the gate.
 	select {
 	case c.refreshGate <- struct{}{}:
 	case <-ctx.Done():
-		return LifecycleReport{}, ctx.Err()
+		return nil, ctx.Err()
 	}
-	defer func() { <-c.refreshGate }()
 	if err := ctx.Err(); err != nil {
-		return LifecycleReport{}, err
+		<-c.refreshGate
+		return nil, ctx.Err()
 	}
+	return func() { <-c.refreshGate }, nil
+}
 
-	// Snapshot the backend jobs under the lock, then release it so collection
-	// can proceed without holding the lock across HTTP.
+// snapshotBackendJobs copies the configured backends under the lock and
+// returns them sorted by backend ID. The lock is released before returning so
+// that HTTP collection never runs while holding the mutex.
+func (c *LifecycleCollector) snapshotBackendJobs() []lifecycleBackendJob {
 	c.mu.Lock()
 	jobs := make([]lifecycleBackendJob, 0, len(c.backends))
 	for id, b := range c.backends {
@@ -297,10 +326,15 @@ func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (Lifecycl
 	}
 	sort.Slice(jobs, func(i, j int) bool { return jobs[i].id < jobs[j].id })
 	c.mu.Unlock()
+	return jobs
+}
 
-	// Run the bounded worker pool: at most 4 goroutines reading from a bounded
-	// job channel and sending to a bounded result channel. No goroutine is
-	// dedicated to a backend.
+// runBackendWorkers runs at most four goroutines that each collect one backend
+// from a bounded job channel and send results to a bounded result channel. The
+// feeder pushes all jobs, stopping on context cancellation, then closes the job
+// channel and waits for the workers before closing the result channel. The
+// caller must drain the returned channel to EOF.
+func (c *LifecycleCollector) runBackendWorkers(ctx context.Context, jobs []lifecycleBackendJob, epoch int64) <-chan lifecycleBackendResult {
 	n := 4
 	if n > len(jobs) {
 		n = len(jobs)
@@ -331,16 +365,22 @@ func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (Lifecycl
 		close(jobChan)
 		wg.Wait()
 	}()
+	return resultChan
+}
 
-	// Merge each result into the report. Models are sorted deterministically
-	// by backend ID then ModelRef. Global count cap applied after draining.
+// mergeLifecycleResults drains the result channel, merging per-backend states
+// and models. Models are sorted by backend ID then ModelRef after each result,
+// and the global cap is applied after each drain. It returns the merged
+// states, the merged models, and whether the global cap truncated the model
+// list.
+func (c *LifecycleCollector) mergeLifecycleResults(ctx context.Context, results <-chan lifecycleBackendResult) (map[string]LifecycleBackendState, []LifecycleModel, bool) {
 	states := make(map[string]LifecycleBackendState, len(c.backendStates))
 	for id, state := range c.backendStates {
 		states[id] = state
 	}
 	models := make([]LifecycleModel, 0, c.maxModels)
 	globalTruncated := false
-	for r := range resultChan {
+	for r := range results {
 		states[r.id] = r.state
 		models = append(models, r.models...)
 		sort.Slice(models, func(i, j int) bool {
@@ -355,29 +395,16 @@ func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (Lifecycl
 			globalTruncated = true
 		}
 	}
-	// Honor parent cancellation: never return partial success on cancel.
-	if err := ctx.Err(); err != nil {
-		return LifecycleReport{}, err
-	}
+	return states, models, globalTruncated
+}
 
-	report := LifecycleReport{
-		BackendStates:                       states,
-		Models:                              models,
-		SnapshotScope:                       "non_stopped_local_processes",
-		AbsenceState:                        "unknown",
-		TransitionTime:                      "unavailable",
-		UpstreamGenerationUnknown:           lifecycleUpstreamGenerationUnknown,
-		AliasResolutionUnsupported:          lifecycleAliasResolutionUnsupported,
-		RequestIDMappingUnsupported:         lifecycleRequestIDMappingUnsupported,
-		ModelExecutionAttributionUnverified: lifecycleModelExecutionAttributionUnverified,
-		MaxModels:                           lifecycleMaxModelsGlobal,
-		MaxModelsPerBackend:                 lifecycleMaxModelsPerBackend,
-	}
-
-	// Determine coverage from per-backend states and global truncation.
+// computeLifecycleCoverage determines the coverage string and truncated flag
+// from the per-backend states and the global truncation flag. Precedence:
+// unknown outranks partial; global truncation overrides to truncated.
+func computeLifecycleCoverage(states map[string]LifecycleBackendState, globalTruncated bool) (string, bool) {
 	coverage := "complete"
 	truncated := globalTruncated
-	for _, st := range report.BackendStates {
+	for _, st := range states {
 		if st.State != lifecycleEnabledState && st.State != lifecycleDisabledState {
 			coverage = "unknown"
 		}
@@ -398,15 +425,45 @@ func (c *LifecycleCollector) Collect(ctx context.Context, epoch int64) (Lifecycl
 	if truncated {
 		coverage = "truncated"
 	}
-	report.Coverage = coverage
-	report.Truncated = truncated
-	report.TotalModels = len(report.Models)
-	return report, nil
+	return coverage, truncated
+}
+
+// buildLifecycleReport assembles the fixed-schema report from the merged
+// collection state. TotalModels is the count of returned models.
+func buildLifecycleReport(states map[string]LifecycleBackendState, models []LifecycleModel, coverage string, truncated bool) LifecycleReport {
+	return LifecycleReport{
+		BackendStates:                       states,
+		Models:                              models,
+		SnapshotScope:                       "non_stopped_local_processes",
+		AbsenceState:                        "unknown",
+		TransitionTime:                      "unavailable",
+		UpstreamGenerationUnknown:           lifecycleUpstreamGenerationUnknown,
+		AliasResolutionUnsupported:          lifecycleAliasResolutionUnsupported,
+		RequestIDMappingUnsupported:         lifecycleRequestIDMappingUnsupported,
+		ModelExecutionAttributionUnverified: lifecycleModelExecutionAttributionUnverified,
+		MaxModels:                           lifecycleMaxModelsGlobal,
+		MaxModelsPerBackend:                 lifecycleMaxModelsPerBackend,
+		Coverage:                            coverage,
+		Truncated:                           truncated,
+		TotalModels:                         len(models),
+	}
+}
+
+// lifecycleCollectionFailure centralizes the terminal collection-failure
+// assignment: it sets the backend state/reason and returns the state for the
+// caller to return. It preserves HTTPStatus (and ObservedAt/LastAttemptAt)
+// that the caller set before the failure.
+func lifecycleCollectionFailure(st LifecycleBackendState, stateCode, reason string) LifecycleBackendState {
+	st.State = stateCode
+	st.Reason = reason
+	return st
 }
 
 // collect fetches one page of lifecycle from a backend and normalizes it. It
 // never follows redirects, never leaks credentials, and bounds the response
 // body and model count. The only allowed upstream path is GET /running.
+// Complexity is kept low by delegating to pure helpers: request building,
+// status classification, bounded page decode/validation, and row normalization.
 func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycleBackendInfo, epoch int64) ([]LifecycleModel, LifecycleBackendState) {
 	state := LifecycleBackendState{
 		State:         lifecycleUnknownState,
@@ -416,74 +473,116 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
-	u := b.url.JoinPath(lifecyclePath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+
+	req, err := buildLifecycleRequest(ctx, b)
 	if err != nil {
-		state.State, state.Reason = lifecycleUnsupportedState, "invalid_request"
-		return nil, state
-	}
-	req.Header.Set("Accept", "application/json")
-	for key, value := range b.config.Headers {
-		if req.Header.Get(key) == "" {
-			req.Header.Set(key, value)
-		}
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
+		return nil, lifecycleCollectionFailure(state, lifecycleUnsupportedState, "invalid_request")
 	}
 	response, err := c.client.Do(req)
 	if err != nil {
-		state.State, state.Reason = lifecycleUnavailableState, "request_failed"
 		state.HTTPStatus = 0
-		return nil, state
+		return nil, lifecycleCollectionFailure(state, lifecycleUnavailableState, "request_failed")
 	}
 	defer response.Body.Close()
 	state.HTTPStatus = response.StatusCode
-
-	// Check HTTP status codes first. 401/403, 404/405, 3xx, and other
-	// non-200 statuses are returned without parsing the body.
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		state.State, state.Reason = lifecycleUnauthorizedState, "authorization_required"
-		return nil, state
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		state.State, state.Reason = lifecycleUnsupportedState, "not_available"
-		return nil, state
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		state.State, state.Reason = lifecycleUnknownState, "redirect_refused"
-		return nil, state
-	case response.StatusCode != http.StatusOK:
-		state.State, state.Reason = lifecycleUnavailableState, "http_error"
-		return nil, state
+	if st, reason, stop := classifyLifecycleStatus(response.StatusCode); stop {
+		return nil, lifecycleCollectionFailure(state, st, reason)
 	}
-
-	body, err := io.ReadAll(io.LimitReader(response.Body, c.maxResponseBytes+1))
+	page, err := readAndDecodeLifecyclePage(response.Body, c.maxResponseBytes)
 	if err != nil {
-		state.State, state.Reason = lifecycleUnavailableState, "response_read_failed"
-		return nil, state
+		stateCode, reason := lifecycleErrorState(err)
+		return nil, lifecycleCollectionFailure(state, stateCode, reason)
 	}
-	if len(body) > int(c.maxResponseBytes) {
-		state.State, state.Reason = lifecycleUnknownState, "response_too_large"
-		return nil, state
-	}
+	models, pageState := c.normalizeLifecyclePage(id, page.Running, c.maxModelsPerBackend, epoch)
+	state.State = pageState.State
+	state.Reason = pageState.Reason
+	state.Rows = pageState.Rows
+	state.Coverage = pageState.Coverage
+	state.Truncated = pageState.Truncated
+	return models, state
+}
 
-	var page lifecycleRunningPage
-	if err := json.Unmarshal(body, &page); err != nil {
-		state.State, state.Reason = lifecycleUnknownState, "invalid_json"
-		return nil, state
+// buildLifecycleRequest builds the fixed, allowlisted request for one backend.
+// Only GET /running is requested. Config headers are applied only when not
+// already set on the request; the API key is added only when no Authorization
+// or X-Api-Key header is present. Redirects are refused by the client's
+// CheckRedirect policy, so this builder never enables following them.
+func buildLifecycleRequest(ctx context.Context, b *lifecycleBackendInfo) (*http.Request, error) {
+	u := b.url.JoinPath(lifecyclePath)
+	return newBackendJSONRequest(ctx, u.String(), b.config.Headers, b.config.APIKey)
+}
+
+// classifyLifecycleStatus maps an HTTP status to the backend state/reason and
+// whether collection should stop. A 200 continues; every other status stops
+// with a documented state/reason. Redirects are refused (never followed) and
+// reported as redirect_refused rather than followed. It delegates to the
+// shared classifyBackendStatus, supplying the lifecycle collector's state
+// constants.
+func classifyLifecycleStatus(code int) (state, reason string, stop bool) {
+	return classifyBackendStatus(code, backendStatusLabels{
+		unauthorized: lifecycleUnauthorizedState,
+		unsupported:  lifecycleUnsupportedState,
+		unknown:      lifecycleUnknownState,
+		unavailable:  lifecycleUnavailableState,
+	})
+}
+
+var (
+	errLifecyclePageTooLarge    = errors.New("lifecycle response body exceeds the configured byte limit")
+	errLifecyclePageMalformed   = errors.New("lifecycle page running is missing or null")
+	errLifecyclePageInvalidJSON = errors.New("lifecycle page is not valid JSON")
+)
+
+// readAndDecodeLifecyclePage reads a bounded response body, decodes the
+// /running page, and validates required fields. The caller is responsible for
+// closing the body. It returns a sentinel error for size/malformed/JSON
+// failures so the caller can map each to the exact state/reason; other read
+// errors map to the generic response_read_failed state.
+func readAndDecodeLifecyclePage(body io.ReadCloser, maxResponseBytes int64) (*lifecycleRunningPage, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read lifecycle response: %w", err)
 	}
-	// Validate required page field: running must be an array (non-nil). A bare
+	if len(raw) > int(maxResponseBytes) {
+		return nil, errLifecyclePageTooLarge
+	}
+	var page lifecycleRunningPage
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, fmt.Errorf("decode lifecycle page: %w", errLifecyclePageInvalidJSON)
+	}
+	// Validate required page fields: running must be an array (non-nil). A bare
 	// {} or {"running":null} is malformed.
 	if page.Running == nil {
-		state.State, state.Reason = lifecycleUnknownState, "malformed_page"
-		return nil, state
+		return nil, errLifecyclePageMalformed
 	}
+	return &page, nil
+}
 
-	models := make([]LifecycleModel, 0, c.maxModelsPerBackend)
+// lifecycleErrorState maps a read/decode error from readAndDecodeLifecyclePage
+// to the exact backend state/reason. Read failures are unavailable, size and
+// schema failures are unknown.
+func lifecycleErrorState(err error) (state, reason string) {
+	switch {
+	case errors.Is(err, errLifecyclePageTooLarge):
+		return lifecycleUnknownState, "response_too_large"
+	case errors.Is(err, errLifecyclePageMalformed):
+		return lifecycleUnknownState, "malformed_page"
+	case errors.Is(err, errLifecyclePageInvalidJSON):
+		return lifecycleUnknownState, "invalid_json"
+	default:
+		return lifecycleUnavailableState, "response_read_failed"
+	}
+}
+
+// normalizeLifecyclePage bounds rows by the per-backend cap, normalizes each
+// row, and assigns the final collected state. It returns the normalized
+// models and the BackendState to assign (State/Reason/Rows/Coverage/Truncated).
+// The caller preserves HTTPStatus/ObservedAt/LastAttemptAt from its own state.
+func (c *LifecycleCollector) normalizeLifecyclePage(id string, entries []lifecycleRunningModel, maxModelsPerBackend int, epoch int64) ([]LifecycleModel, LifecycleBackendState) {
+	models := make([]LifecycleModel, 0, maxModelsPerBackend)
 	truncated := false
-	for _, entry := range page.Running {
-		if len(models) >= c.maxModelsPerBackend {
+	for _, entry := range entries {
+		if len(models) >= maxModelsPerBackend {
 			truncated = true
 			break
 		}
@@ -493,9 +592,7 @@ func (c *LifecycleCollector) collect(ctx context.Context, id string, b *lifecycl
 		}
 		models = append(models, *m)
 	}
-	state.State = lifecycleEnabledState
-	state.Reason = "ok"
-	state.Rows = len(models)
+	state := LifecycleBackendState{State: lifecycleEnabledState, Reason: "ok", Rows: len(models)}
 	if truncated {
 		state.Coverage = "truncated"
 		state.Truncated = true

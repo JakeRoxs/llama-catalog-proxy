@@ -36,6 +36,23 @@ func ms(t *testing.T, p *float64, want float64) {
 
 func TestPhasesAndLateTerminalUsage(t *testing.T) {
 	now := time.Date(2026, 11, 11, 0, 0, 0, 0, time.UTC)
+	o, w, chunks := runPhases(t, now)
+	s := o.Summary()
+
+	assertSummaryTimings(t, s)
+	assertTokenUsage(t, s)
+	assertEngineTimings(t, s)
+	assertOutcomes(t, s)
+	assertForwarding(t, w, chunks)
+	assertRedaction(t, s)
+	assertParserBuffersCleared(t, o)
+	assertSummaryDeepCopy(t, o, s)
+}
+
+// runPhases replays the SSE stream through the observer, advancing the fake
+// clock between each phase, and returns the observer, recorder, and chunks.
+func runPhases(t *testing.T, now time.Time) (*Observer, *httptest.ResponseRecorder, []string) {
+	t.Helper()
 	w := httptest.NewRecorder()
 	o := New(w, WithClock(func() time.Time { return now }))
 	if o.Summary().TotalDurationMs != nil {
@@ -66,33 +83,65 @@ func TestPhasesAndLateTerminalUsage(t *testing.T) {
 	}
 	now = now.Add(10 * time.Millisecond)
 	_ = o.Finish(nil)
-	s := o.Summary()
+	return o, w, chunks
+}
+
+func assertSummaryTimings(t *testing.T, s Summary) {
+	t.Helper()
 	ms(t, s.UpstreamHeaderMs, 10)
 	ms(t, s.FirstByteMs, 20)
 	ms(t, s.FirstOutputMs, 30)
 	ms(t, s.FirstAnswerMs, 50)
 	ms(t, s.TotalDurationMs, 90)
+}
+
+func assertTokenUsage(t *testing.T, s Summary) {
+	t.Helper()
 	if s.TokenUsage.PromptTokens == nil || *s.TokenUsage.PromptTokens != 0 || s.TokenUsage.CompletionTokens == nil || *s.TokenUsage.CompletionTokens != 7 || s.TokenUsage.CachedTokens == nil || *s.TokenUsage.CachedTokens != 0 || s.TokenUsage.ReasoningTokens == nil || *s.TokenUsage.ReasoningTokens != 2 {
 		t.Fatalf("reported usage=%+v", s.TokenUsage)
 	}
+}
+
+func assertEngineTimings(t *testing.T, s Summary) {
+	t.Helper()
 	if s.EngineTimings.PromptMS == nil || *s.EngineTimings.PromptMS != 0 || s.EngineTimings.PredictedMS == nil || *s.EngineTimings.PredictedMS != 10 {
 		t.Fatal("engine timings absent")
 	}
+}
+
+func assertOutcomes(t *testing.T, s Summary) {
+	t.Helper()
 	if s.TransportOutcome != "returned" || s.GenerationOutcome != "completed" {
 		t.Fatalf("outcomes=%s/%s", s.TransportOutcome, s.GenerationOutcome)
 	}
+}
+
+func assertForwarding(t *testing.T, w *httptest.ResponseRecorder, chunks []string) {
+	t.Helper()
 	if w.Body.String() != strings.Join(chunks, "") {
 		t.Fatal("forwarded bytes changed")
 	}
+}
+
+func assertRedaction(t *testing.T, s Summary) {
+	t.Helper()
 	b, _ := json.Marshal(s)
 	for _, secret := range []string{"PRIVATE_REASONING", "PRIVATE_TOOL", "PRIVATE_ANSWER"} {
 		if bytes.Contains(b, []byte(secret)) {
 			t.Fatal("text retained in summary")
 		}
 	}
+}
+
+func assertParserBuffersCleared(t *testing.T, o *Observer) {
+	t.Helper()
 	if o.parser.line != nil || o.parser.event != nil || o.parser.body != nil {
 		t.Fatal("body buffers retained after Finish")
 	}
+}
+
+func assertSummaryDeepCopy(t *testing.T, o *Observer, s Summary) {
+	t.Helper()
 	*s.TokenUsage.CompletionTokens = 999
 	*s.FirstAnswerMs = 999
 	if *o.Summary().TokenUsage.CompletionTokens != 7 || *o.Summary().FirstAnswerMs != 50 {

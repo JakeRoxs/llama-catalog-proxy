@@ -39,21 +39,32 @@ func identityFor(backendID, localID string, epoch int64, activityID string) corr
 	}
 }
 
+// activityMetrics groups the five optional integer metrics of an activity
+// record. Each field is nil when the metric is missing; the -1 sentinel is
+// represented as nil (missing).
+type activityMetrics struct {
+	DurationMS          *int64
+	InputTokens         *int64
+	OutputTokens        *int64
+	DraftTokens         *int64
+	DraftAcceptedTokens *int64
+}
+
 // activityFor builds an activity record with the given transport status and
-// optional integer metrics. -1 sentinel is represented as nil (missing).
-func activityFor(backendID string, epoch int64, activityID, status string,
-	durationMS, inputTokens, outputTokens, draftTokens, draftAccTokens *int64) *correlation.ActivityRecord {
+// optional integer metrics grouped in activityMetrics. -1 sentinel is
+// represented as nil (missing).
+func activityFor(backendID string, epoch int64, activityID, status string, metrics activityMetrics) *correlation.ActivityRecord {
 	return &correlation.ActivityRecord{
 		BackendID:           backendID,
 		Epoch:               epoch,
 		ActivityID:          activityID,
 		Timestamp:           fixtureTime,
 		Status:              status,
-		DurationMS:          durationMS,
-		InputTokens:         inputTokens,
-		OutputTokens:        outputTokens,
-		DraftTokens:         draftTokens,
-		DraftAcceptedTokens: draftAccTokens,
+		DurationMS:          metrics.DurationMS,
+		InputTokens:         metrics.InputTokens,
+		OutputTokens:        metrics.OutputTokens,
+		DraftTokens:         metrics.DraftTokens,
+		DraftAcceptedTokens: metrics.DraftAcceptedTokens,
 	}
 }
 
@@ -156,33 +167,23 @@ func basicSources() ([]BackendModel, []*diagnostics.Snapshot, SnapshotSources) {
 	return backendModels, []*diagnostics.Snapshot{snap}, sources
 }
 
-func TestSnapshotWithSourcesBasicAttribution(t *testing.T) {
-	backendModels, _, sources := basicSources()
-	localID := "local-model"
-	identities := []correlation.ActivityModelIdentity{
-		identityFor("default", localID, epoch1, "act-1"),
-	}
-	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), ptr64(5), nil, nil),
-	}
-	sources.Activities = activities
-	sources.Identities = identities
-
-	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 snapshot, got %d", len(result))
-	}
-	m := result[0]
-	if m.Identity.PublicID != "local-model" || m.Identity.BackendID != "default" {
+// assertSnapshotIdentityAndCatalog verifies the model identity and catalog
+// projection for the basic attribution test. The catalog projection must be
+// present with a nil context length (not advertised).
+func assertSnapshotIdentityAndCatalog(t *testing.T, m *ModelSnapshot, publicID, backendID string) {
+	t.Helper()
+	if m.Identity.PublicID != publicID || m.Identity.BackendID != backendID {
 		t.Fatalf("identity = %#v", m.Identity)
 	}
 	if m.Catalog == nil || m.Catalog.ContextLength != nil {
 		t.Fatalf("context_length should be nil (not advertised), got %#v", m.Catalog)
 	}
-	act := m.Activity
+}
+
+// assertActivityBasics verifies activity state, freshness, row count, and
+// failure count for the basic attribution test.
+func assertActivityBasics(t *testing.T, act *ActivityMeasurement) {
+	t.Helper()
 	if act == nil {
 		t.Fatal("activity measurement should be present")
 	}
@@ -195,6 +196,12 @@ func TestSnapshotWithSourcesBasicAttribution(t *testing.T) {
 	if act.FailureCount != 0 {
 		t.Fatalf("failure_count = %d, want 0", act.FailureCount)
 	}
+}
+
+// assertActivityMetrics verifies duration, input, and output metric aggregates
+// for the basic attribution test. Missing values are never summed as zero.
+func assertActivityMetrics(t *testing.T, act *ActivityMeasurement) {
+	t.Helper()
 	if act.DurationMS == nil || act.DurationMS.Mean == nil || *act.DurationMS.Mean != 100 {
 		t.Fatalf("duration mean = %#v, want 100", act.DurationMS)
 	}
@@ -210,9 +217,41 @@ func TestSnapshotWithSourcesBasicAttribution(t *testing.T) {
 	if act.OutputTokens == nil || act.OutputTokens.Sum == nil || *act.OutputTokens.Sum != 5 {
 		t.Fatalf("output sum = %#v, want 5", act.OutputTokens)
 	}
+}
+
+// assertDraftRateUnknown verifies the draft rate is explicitly unknown when
+// speculative acceptance tokens are unreported.
+func assertDraftRateUnknown(t *testing.T, act *ActivityMeasurement) {
+	t.Helper()
 	if act.DraftRate == nil || act.DraftRate.State != MeasurementUnknown || act.DraftRate.Rate != nil {
 		t.Fatal("unreported speculative-acceptance rate should be explicitly unknown")
 	}
+}
+
+func TestSnapshotWithSourcesBasicAttribution(t *testing.T) {
+	backendModels, _, sources := basicSources()
+	localID := "local-model"
+	identities := []correlation.ActivityModelIdentity{
+		identityFor("default", localID, epoch1, "act-1"),
+	}
+	activities := []*correlation.ActivityRecord{
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: ptr64(5), DraftTokens: nil, DraftAcceptedTokens: nil}),
+	}
+	sources.Activities = activities
+	sources.Identities = identities
+
+	result, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 snapshot, got %d", len(result))
+	}
+	m := result[0]
+	assertSnapshotIdentityAndCatalog(t, m, "local-model", "default")
+	assertActivityBasics(t, m.Activity)
+	assertActivityMetrics(t, m.Activity)
+	assertDraftRateUnknown(t, m.Activity)
 }
 
 func TestSnapshotWithSourcesDraftRateAggregate(t *testing.T) {
@@ -225,8 +264,8 @@ func TestSnapshotWithSourcesDraftRateAggregate(t *testing.T) {
 	}
 	// act-1: proposed 10, accepted 8. act-2: proposed 10, accepted 5.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, ptr64(10), ptr64(8)),
-		activityFor("default", epoch1, "act-2", "http_success", nil, nil, nil, ptr64(10), ptr64(5)),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: ptr64(10), DraftAcceptedTokens: ptr64(8)}),
+		activityFor("default", epoch1, "act-2", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: ptr64(10), DraftAcceptedTokens: ptr64(5)}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -269,7 +308,7 @@ func TestSnapshotWithSourcesDraftRateConflicting(t *testing.T) {
 	}
 	// accepted 12 > proposed 10 -> conflicting.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, ptr64(10), ptr64(12)),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: ptr64(10), DraftAcceptedTokens: ptr64(12)}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -299,7 +338,7 @@ func TestSnapshotWithSourcesDraftRateMissingPair(t *testing.T) {
 	}
 	// proposed known, accepted missing -> pair not known -> rate nil.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, ptr64(10), nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: ptr64(10), DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -329,7 +368,7 @@ func TestSnapshotWithSourcesMissingMetricsNotSummedAsZero(t *testing.T) {
 	}
 	// input known, output missing, cache missing.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -365,11 +404,11 @@ func TestSnapshotWithSourcesTransportFailuresOnly(t *testing.T) {
 	identities = append(identities, identityFor("default", localID, epoch1, "act-3"),
 		identityFor("default", localID, epoch1, "act-4"), identityFor("default", localID, epoch1, "act-5"))
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-2", "http_server_error", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-3", "http_client_error", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-4", "http_other", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-5", "transport_error", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-2", "http_server_error", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-3", "http_client_error", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-4", "http_other", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-5", "transport_error", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -398,8 +437,8 @@ func TestSnapshotWithSourcesThroughputMeans(t *testing.T) {
 	// prompt rates 2.0 and 4.0 -> mean 3.0, sample_count 2.
 	// token rates 1.0 and 3.0 -> mean 2.0, sample_count 2.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-2", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-2", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	activities[0].PromptTokensPerSecond = ptrF64(2.0)
 	activities[0].TokensPerSecond = ptrF64(1.0)
@@ -445,8 +484,8 @@ func TestSnapshotWithSourcesAliasResolutionPositive(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-alias-b"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-alias-a", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
-		activityFor("default", epoch1, "act-alias-b", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-alias-a", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-alias-b", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -491,7 +530,7 @@ func TestSnapshotWithSourcesAliasAmbiguousUnknown(t *testing.T) {
 		},
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -529,7 +568,7 @@ func TestSnapshotWithSourcesCrossBackendEpochUnknown(t *testing.T) {
 		identityFor("other", localID, epoch1, "act-1"), // ref of other backend
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("other", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("other", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -563,8 +602,8 @@ func TestSnapshotWithSourcesDuplicateRowsDedup(t *testing.T) {
 	// Same activity ID appears twice with the same timestamp (replay) -> dedup,
 	// count once.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -593,8 +632,8 @@ func TestSnapshotWithSourcesDuplicateConflictAmbiguous(t *testing.T) {
 	}
 	// Same activity ID with conflicting timestamps -> conflict -> ambiguous.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(200), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(200), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	activities[1].Timestamp = fixtureTime.Add(time.Minute) // conflicting timestamp
 	sources.Activities = activities
@@ -620,7 +659,7 @@ func TestSnapshotWithSourcesStalePartialBackendNotFresh(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -681,7 +720,7 @@ func TestSnapshotWithSourcesNoRawMetadataOutput(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -729,7 +768,7 @@ func TestSnapshotWithSourcesMalformedContextUnknown(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -764,7 +803,7 @@ func TestSnapshotWithSourcesContextNegativeUnknown(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -789,7 +828,7 @@ func TestSnapshotWithSourcesGPUSharedUnknownOwnership(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -841,7 +880,7 @@ func TestSnapshotWithSourcesGPUNoTimestampOnlyJoin(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -879,7 +918,7 @@ func TestSnapshotWithSourcesGPUAssociationUnavailable(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -918,7 +957,7 @@ func TestSnapshotWithSourcesLifecycleCurrentSnapshot(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -983,7 +1022,7 @@ func TestSnapshotWithSourcesLifecycleAbsentNotUnloaded(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1023,7 +1062,7 @@ func TestSnapshotWithSourcesDeterministic(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1060,7 +1099,7 @@ func TestSnapshotWithSourcesBoundsBeforeAllocate(t *testing.T) {
 	}
 	activities := make([]*correlation.ActivityRecord, 1001)
 	for i := range activities {
-		activities[i] = activityFor("default", epoch1, "act-"+string(rune('0'+i%10)), "http_success", nil, nil, nil, nil, nil)
+		activities[i] = activityFor("default", epoch1, "act-"+string(rune('0'+i%10)), "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil})
 	}
 	sources.Activities = activities
 	if _, err := New().SnapshotWithSources(context.Background(), backendModels, nil, sources); err == nil {
@@ -1192,7 +1231,7 @@ func TestSnapshotWithSourcesNoAliasDefensive(t *testing.T) {
 	_, _ = correlation.ModelReference("default", localID)
 	identities := []correlation.ActivityModelIdentity{} // empty
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1213,7 +1252,7 @@ func TestSnapshotWithSourcesConcurrentReads(t *testing.T) {
 	backendModels, snapshots, sources := basicSources()
 	activityIdentity := identityFor("default", "local-model", epoch1, "act-1")
 	sources.Identities = []correlation.ActivityModelIdentity{activityIdentity}
-	sources.Activities = []*correlation.ActivityRecord{activityFor("default", epoch1, "act-1", "http_success", ptr64(10), ptr64(5), ptr64(3), ptr64(4), ptr64(2))}
+	sources.Activities = []*correlation.ActivityRecord{activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(10), InputTokens: ptr64(5), OutputTokens: ptr64(3), DraftTokens: ptr64(4), DraftAcceptedTokens: ptr64(2)})}
 	svc := New()
 	const readers = 12
 	var wg sync.WaitGroup
@@ -1243,7 +1282,7 @@ func TestSnapshotWithSourcesReusedServiceDoesNotRetainOldGeneration(t *testing.T
 	svc := New()
 	backendModels, oldSnapshots, oldSources := basicSources()
 	oldSources.Identities = []correlation.ActivityModelIdentity{identityFor("default", "local-model", epoch1, "old-activity")}
-	oldSources.Activities = []*correlation.ActivityRecord{activityFor("default", epoch1, "old-activity", "http_success", ptr64(10), ptr64(5), nil, nil, nil)}
+	oldSources.Activities = []*correlation.ActivityRecord{activityFor("default", epoch1, "old-activity", "http_success", activityMetrics{DurationMS: ptr64(10), InputTokens: ptr64(5), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil})}
 	oldResult, err := svc.SnapshotWithSources(context.Background(), backendModels, oldSnapshots, oldSources)
 	if err != nil {
 		t.Fatal(err)
@@ -1290,7 +1329,7 @@ func TestSnapshotWithSourcesHugeIdentifierSkippedBeforePublicID(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1324,7 +1363,7 @@ func TestSnapshotWithSourcesInvalidInputRejected(t *testing.T) {
 	// Invalid activity backend ID (empty) must be rejected before indexing;
 	// the error is generic and echoes no raw value.
 	activities := []*correlation.ActivityRecord{
-		activityFor("", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1340,7 +1379,7 @@ func TestSnapshotWithSourcesInvalidInputRejected(t *testing.T) {
 			"default": backendState("collected", "complete", false, fixtureTime),
 		},
 		Activities: []*correlation.ActivityRecord{
-			activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+			activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 		},
 		Identities: []correlation.ActivityModelIdentity{
 			{
@@ -1367,7 +1406,7 @@ func TestSnapshotWithSourcesEmptyCoverageNotSupported(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", ptr64(100), ptr64(10), nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: ptr64(100), InputTokens: ptr64(10), OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1395,8 +1434,8 @@ func TestSnapshotWithSourcesHttpOtherCountedAsFailure(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-2"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-2", "http_other", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-2", "http_other", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1423,7 +1462,7 @@ func TestSnapshotWithSourcesMissingCounts(t *testing.T) {
 	}
 	// duration missing, input missing, output known.
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, ptr64(5), nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: ptr64(5), DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1459,8 +1498,8 @@ func TestSnapshotWithSourcesGPUOverlappingSampleDedup(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-2"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
-		activityFor("default", epoch1, "act-2", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
+		activityFor("default", epoch1, "act-2", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1513,7 +1552,7 @@ func TestSnapshotWithSourcesGPUExplicitZeroPreserved(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1564,7 +1603,7 @@ func TestSnapshotWithSourcesGPUBackendStateEpochIsolation(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1625,7 +1664,7 @@ func TestSnapshotWithSourcesGPUMissingSamplesUnknown(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities
@@ -1676,7 +1715,7 @@ func TestSnapshotWithSourcesGPUBackendStateDrivesState(t *testing.T) {
 		identityFor("default", localID, epoch1, "act-1"),
 	}
 	activities := []*correlation.ActivityRecord{
-		activityFor("default", epoch1, "act-1", "http_success", nil, nil, nil, nil, nil),
+		activityFor("default", epoch1, "act-1", "http_success", activityMetrics{DurationMS: nil, InputTokens: nil, OutputTokens: nil, DraftTokens: nil, DraftAcceptedTokens: nil}),
 	}
 	sources.Activities = activities
 	sources.Identities = identities

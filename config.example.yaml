@@ -24,7 +24,8 @@ path_routes:
 # the same backend endpoint. Requires path_routes /comfyui. Timeout returns HTTP 504.
 # comfyui_wait_timeout: 45m
 
-models_cache_ttl: 15s
+# Catalog cache validity; peer reports include this owner-side expiration.
+models_cache_ttl: 5m
 request_timeout: 10s
 # health_timeout: 2s   # inherits request_timeout when omitted
 # catalog_timeout: 20s # inherits request_timeout when omitted

@@ -149,6 +149,22 @@ func (s *Service) All(ctx context.Context) ([]Snapshot, error) {
 	return results, nil
 }
 
+// snapshotMode describes the decision returned by beginSnapshotRefresh.
+type snapshotMode int
+
+const (
+	// snapshotCached means the backend is disabled or still within its
+	// backoff/TTL window; the caller should snapshot the cache. beginSnapshotRefresh
+	// returns with b.mu held for this mode.
+	snapshotCached snapshotMode = iota
+	// snapshotWait means another goroutine is refreshing; the caller should wait
+	// on the returned busy channel. beginSnapshotRefresh releases b.mu.
+	snapshotWait
+	// snapshotOwner means no refresh is in flight; the caller should probe and
+	// commit. beginSnapshotRefresh creates b.busy and releases b.mu.
+	snapshotOwner
+)
+
 // Snapshot coalesces concurrent refreshes. Canceled callers do not poison the
 // cache; a waiting caller may retry with its own context after a canceled owner.
 func (s *Service) Snapshot(ctx context.Context, id string) (Snapshot, error) {
@@ -160,61 +176,166 @@ func (s *Service) Snapshot(ctx context.Context, id string) (Snapshot, error) {
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
-		b.mu.Lock()
-		if b.config.Diagnostics == "" || s.now().Before(b.next) {
-			result := s.snapshot(id, b)
-			b.mu.Unlock()
-			return result, nil
-		}
-		if b.busy != nil {
-			busy := b.busy
-			b.mu.Unlock()
-			select {
-			case <-ctx.Done():
-				return Snapshot{}, ctx.Err()
-			case <-busy:
-				continue
-			}
-		}
-		b.busy = make(chan struct{})
-		b.mu.Unlock()
-		observations := make(map[string]Observation, len(operations))
-		for _, op := range operations {
-			observations[op.name] = s.probe(ctx, b, op.name, op.path)
-		}
-		b.mu.Lock()
-		if ctx.Err() == nil {
-			failed := false
-			for name, current := range observations {
-				bad := current.State == Unavailable || current.State == Unknown || current.State == Unauthorized
-				failed = failed || bad
-				previous := b.cache[name]
-				if (current.State == Unavailable || current.State == Unknown) &&
-					(previous.State == Supported || previous.State == Disabled) && s.now().Before(previous.ExpiresAt) {
-					previous.LastAttemptAt, previous.LastAttemptState = current.LastAttemptAt, current.State
-					previous.HTTPStatus, previous.Reason = current.HTTPStatus, current.Reason
-					b.cache[name] = previous
-				} else {
-					b.cache[name] = current
-				}
-			}
-			if failed {
-				b.fails = min(b.fails+1, 7)
-				b.next = s.now().Add(min(time.Second<<uint(b.fails-1), time.Minute))
-			} else {
-				b.fails = 0
-				b.next = s.now().Add(s.ttl)
-			}
-		}
-		close(b.busy)
-		b.busy = nil
-		result := s.snapshot(id, b)
-		b.mu.Unlock()
-		if err := ctx.Err(); err != nil {
+		result, retry, err := s.refreshOnce(ctx, id, b)
+		if err != nil {
 			return Snapshot{}, err
 		}
-		return result, nil
+		if !retry {
+			return result, nil
+		}
 	}
+}
+
+// refreshOnce performs a single snapshot refresh decision. Entry and exit are
+// with b.mu not held. For snapshotCached beginSnapshotRefresh returns with b.mu
+// held; the caller snapshots the cache and unlocks exactly once before return.
+// For snapshotWait the lock is already released and the busy channel captured;
+// the caller waits and reports retry so the top-level loop re-decides. For
+// snapshotOwner the caller probes all operations outside the lock and commits
+// through finishSnapshotRefresh. A non-retryable terminal error is returned as-is.
+func (s *Service) refreshOnce(ctx context.Context, id string, b *backend) (Snapshot, bool, error) {
+	mode, busy := s.beginSnapshotRefresh(b)
+	switch mode {
+	case snapshotCached:
+		return s.snapshotCachedPath(id, b)
+	case snapshotWait:
+		return s.snapshotWaitPath(ctx, busy)
+	case snapshotOwner:
+		return s.snapshotOwnerPath(ctx, id, b)
+	}
+	return Snapshot{}, false, errors.New("unknown snapshot refresh mode")
+}
+
+// snapshotCachedPath snapshots the cache and releases the b.mu lock held by
+// beginSnapshotRefresh on entry.
+func (s *Service) snapshotCachedPath(id string, b *backend) (Snapshot, bool, error) {
+	result := s.snapshot(id, b)
+	b.mu.Unlock()
+	return result, false, nil
+}
+
+// snapshotWaitPath waits for an in-flight refresh and reports retry so the
+// caller re-decides. b.mu is not held on entry.
+func (s *Service) snapshotWaitPath(ctx context.Context, busy chan struct{}) (Snapshot, bool, error) {
+	if err := waitForSnapshotRefresh(ctx, busy); err != nil {
+		return Snapshot{}, false, err
+	}
+	return Snapshot{}, true, nil
+}
+
+// snapshotOwnerPath probes all operations outside the lock and commits the
+// result. b.mu is not held on entry.
+func (s *Service) snapshotOwnerPath(ctx context.Context, id string, b *backend) (Snapshot, bool, error) {
+	observations := make(map[string]Observation, len(operations))
+	for _, op := range operations {
+		observations[op.name] = s.probe(ctx, b, op.name, op.path)
+	}
+	result, err := s.finishSnapshotRefresh(ctx, id, b, observations)
+	if err != nil {
+		return Snapshot{}, false, err
+	}
+	return result, false, nil
+}
+
+// beginSnapshotRefresh decides, under b.mu, whether the caller should use the
+// cached snapshot, wait for an in-flight refresh, or become the owner. For
+// snapshotCached b.mu is held on return (the caller unlocks after snapshotting);
+// for snapshotWait and snapshotOwner b.mu is released and b.busy is captured or
+// created. The owner must probe before calling finishSnapshotRefresh.
+func (s *Service) beginSnapshotRefresh(b *backend) (snapshotMode, chan struct{}) {
+	b.mu.Lock()
+	if b.config.Diagnostics == "" || s.now().Before(b.next) {
+		return snapshotCached, nil
+	}
+	if b.busy != nil {
+		busy := b.busy
+		b.mu.Unlock()
+		return snapshotWait, busy
+	}
+	b.busy = make(chan struct{})
+	b.mu.Unlock()
+	return snapshotOwner, nil
+}
+
+// waitForSnapshotRefresh waits for an in-flight refresh to release its busy
+// channel. It returns ctx.Err() when the caller is canceled before the refresh
+// completes, so waiting callers never block past their own context.
+func waitForSnapshotRefresh(ctx context.Context, busy chan struct{}) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-busy:
+		return nil
+	}
+}
+
+// isFailedState reports whether a probe observation counts toward the backend
+// failure budget and backoff.
+func isFailedState(state State) bool {
+	return state == Unavailable || state == Unknown || state == Unauthorized
+}
+
+// preserveFreshCache reports whether a failed observation should be merged into
+// a fresh cached Supported/Disabled observation instead of replacing it.
+func preserveFreshCache(current, previous Observation, now time.Time) bool {
+	return (current.State == Unavailable || current.State == Unknown) &&
+		(previous.State == Supported || previous.State == Disabled) &&
+		now.Before(previous.ExpiresAt)
+}
+
+// finishSnapshotRefresh commits probe observations under the backend lock,
+// closes the busy channel, and snapshots the cache. The caller is the owner;
+// b.mu is not held on entry and is released before return. When the context is
+// canceled, observations are not applied but the busy channel is still released
+// and the context error is returned.
+func (s *Service) finishSnapshotRefresh(ctx context.Context, id string, b *backend, observations map[string]Observation) (Snapshot, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		close(b.busy)
+		b.busy = nil
+		return Snapshot{}, err
+	}
+	failed := s.mergeObservations(b, observations, s.now())
+	s.commitBackoff(b, failed)
+	result := s.snapshot(id, b)
+	if err := ctx.Err(); err != nil {
+		return Snapshot{}, err
+	}
+	return result, nil
+}
+
+// mergeObservations merges probe observations into the cache and reports
+// whether any observation is a failed state. b.mu is held on entry and remains
+// held on exit.
+func (s *Service) mergeObservations(b *backend, observations map[string]Observation, now time.Time) bool {
+	failed := false
+	for name, current := range observations {
+		failed = failed || isFailedState(current.State)
+		previous := b.cache[name]
+		if preserveFreshCache(current, previous, now) {
+			previous.LastAttemptAt, previous.LastAttemptState = current.LastAttemptAt, current.State
+			previous.HTTPStatus, previous.Reason = current.HTTPStatus, current.Reason
+			b.cache[name] = previous
+		} else {
+			b.cache[name] = current
+		}
+	}
+	return failed
+}
+
+// commitBackoff records the failure count and backoff, then releases the busy
+// channel. b.mu is held on entry and remains held on exit.
+func (s *Service) commitBackoff(b *backend, failed bool) {
+	if failed {
+		b.fails = min(b.fails+1, 7)
+		b.next = s.now().Add(min(time.Second<<uint(b.fails-1), time.Minute))
+	} else {
+		b.fails = 0
+		b.next = s.now().Add(s.ttl)
+	}
+	close(b.busy)
+	b.busy = nil
 }
 
 // Called with the backend lock held; returned values never alias cached data.
@@ -247,64 +368,74 @@ func (s *Service) probe(ctx context.Context, b *backend, name, path string) Obse
 		LastAttemptAt: now, FreshUntil: now.Add(s.ttl), ExpiresAt: now.Add(s.maxAge)}
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
-	select {
-	case s.limit <- struct{}{}:
-		defer func() { <-s.limit }()
-	case <-ctx.Done():
+	if !s.acquireProbeSlot(ctx) {
 		result.Reason = "timeout_or_cancellation"
 		return result
 	}
-	u := b.url.JoinPath(path)
-	if name == "activity" {
-		u.RawQuery = "limit=1"
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	defer func() { <-s.limit }()
+	s.probeHTTP(ctx, b, name, path, &result)
+	return result
+}
+
+// probeHTTP performs the request and applies the status and body results to
+// the observation. The caller must hold a concurrency slot. When the HTTP
+// status is terminal, the body is not read.
+func (s *Service) probeHTTP(ctx context.Context, b *backend, name, path string, result *Observation) {
+	req, err := buildProbeRequest(ctx, b.url, path, name, b.config)
 	if err != nil {
 		result.State, result.Reason = Unknown, "invalid_request"
-		return result
+		return
 	}
-	for key, value := range b.config.Headers {
-		req.Header.Set(key, value)
-	}
-	if b.config.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
-		req.Header.Set("Authorization", "Bearer "+b.config.APIKey)
-		req.Header.Set("X-Api-Key", b.config.APIKey)
-	}
-	req.Header.Set("Accept", "application/json")
 	response, err := s.client.Do(req)
 	if err != nil {
 		result.Reason = "request_failed"
-		return result
+		return
 	}
 	defer response.Body.Close()
 	result.HTTPStatus = response.StatusCode
-	switch {
-	case response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden:
-		result.State, result.Reason = Unauthorized, "authorization_required"
-		return result
-	case response.StatusCode == http.StatusNotFound || response.StatusCode == http.StatusMethodNotAllowed:
-		result.State = Unsupported
-		return result
-	case response.StatusCode >= 300 && response.StatusCode < 400:
-		result.State, result.Reason = Unknown, "redirect_refused"
-		return result
-	case response.StatusCode != http.StatusOK && !(name == "performance" && response.StatusCode == http.StatusServiceUnavailable):
-		result.Reason = "http_error"
-		return result
+	if applyProbeStatus(result, name, response) {
+		return
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil {
-		result.Reason = "response_read_failed"
-		return result
+	applyProbeBody(result, name, response)
+}
+
+// acquireProbeSlot acquires the concurrency slot. It returns false when the
+// context is canceled before a slot is available; the caller must not release
+// a slot it did not acquire.
+func (s *Service) acquireProbeSlot(ctx context.Context) bool {
+	select {
+	case s.limit <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
 	}
-	if len(body) > maxResponseBytes {
-		result.State, result.Reason = Unknown, "response_too_large"
-		return result
+}
+
+// applyProbeStatus applies the HTTP status classification to the observation.
+// It returns true when the observation is terminal and the body must not be
+// read. A zero State means leave the current state unchanged.
+func applyProbeStatus(result *Observation, name string, response *http.Response) bool {
+	state, reason, stop := classifyProbeStatus(name, response.StatusCode)
+	if !stop {
+		return false
 	}
-	var object map[string]json.RawMessage
-	if json.Unmarshal(body, &object) != nil || object == nil {
-		result.State, result.Reason = Unknown, "invalid_json"
-		return result
+	result.Reason = reason
+	if state != "" {
+		result.State = state
+	}
+	return true
+}
+
+// applyProbeBody reads the response body, recognizes it, and applies the final
+// state/reason rules to the observation.
+func applyProbeBody(result *Observation, name string, response *http.Response) {
+	object, state, reason, stop := readProbeBody(response.Body)
+	if stop {
+		result.Reason = reason
+		if state != "" {
+			result.State = state
+		}
+		return
 	}
 	result.State, result.Build = recognize(name, object)
 	if response.StatusCode != http.StatusOK && result.State != Disabled {
@@ -313,7 +444,66 @@ func (s *Service) probe(ctx context.Context, b *backend, name, path string) Obse
 	if result.State == Unknown {
 		result.Reason = "unrecognized_response"
 	}
-	return result
+}
+
+// buildProbeRequest builds the GET request used to probe a backend operation.
+// Backend headers are applied first, the APIKey fallback is added only when
+// neither Authorization nor X-Api-Key is present, and Accept is always set.
+func buildProbeRequest(ctx context.Context, base *url.URL, path, name string, cfg config.Backend) (*http.Request, error) {
+	u := base.JoinPath(path)
+	if name == "activity" {
+		u.RawQuery = "limit=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range cfg.Headers {
+		req.Header.Set(key, value)
+	}
+	if cfg.APIKey != "" && req.Header.Get("Authorization") == "" && req.Header.Get("X-Api-Key") == "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
+		req.Header.Set("X-Api-Key", cfg.APIKey)
+	}
+	req.Header.Set("Accept", "application/json")
+	return req, nil
+}
+
+// classifyProbeStatus maps an HTTP status to an observation state and reason.
+// It returns stop=true when the caller should apply the result and return. The
+// performance endpoint tolerates 503 as an enabled-but-unavailable signal. A
+// zero State means leave the current state unchanged.
+func classifyProbeStatus(name string, status int) (State, string, bool) {
+	switch {
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return Unauthorized, "authorization_required", true
+	case status == http.StatusNotFound || status == http.StatusMethodNotAllowed:
+		return Unsupported, "", true
+	case status >= 300 && status < 400:
+		return Unknown, "redirect_refused", true
+	case status != http.StatusOK && !(name == "performance" && status == http.StatusServiceUnavailable):
+		return "", "http_error", true
+	}
+	return "", "", false
+}
+
+// readProbeBody reads at most maxResponseBytes+1 bytes, rejects oversized
+// bodies, and decodes a JSON object. It returns stop=true when the caller
+// should apply the result and return. A zero State means leave the current
+// state unchanged.
+func readProbeBody(body io.ReadCloser) (map[string]json.RawMessage, State, string, bool) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, "", "response_read_failed", true
+	}
+	if len(raw) > maxResponseBytes {
+		return nil, Unknown, "response_too_large", true
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal(raw, &object) != nil || object == nil {
+		return nil, Unknown, "invalid_json", true
+	}
+	return object, "", "", false
 }
 
 var (
@@ -322,46 +512,92 @@ var (
 )
 
 func recognize(name string, object map[string]json.RawMessage) (State, *Build) {
-	var valid bool
 	switch name {
 	case "version":
-		var raw struct {
-			Version, Commit string
-			BuildDate       string `json:"build_date"`
-		}
-		encoded, _ := json.Marshal(object)
-		valid = json.Unmarshal(encoded, &raw) == nil && raw.Version != ""
-		build := &Build{}
-		if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 {
-			build.Version = raw.Version
-		}
-		if commitPattern.MatchString(raw.Commit) {
-			build.Commit = raw.Commit
-		}
-		if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil {
-			build.Date = date.Format(time.RFC3339)
-		}
-		if valid {
-			return Supported, build
-		}
+		return recognizeVersion(object)
 	case "models":
-		valid = isArray(object["data"])
+		return recognizeModels(object)
 	case "activity":
-		valid = isArray(object["data"]) && isCount(object["page"]) && isCount(object["total"])
+		return recognizeActivity(object)
 	case "stats":
-		valid = isCount(object["total_requests"]) && isCount(object["total_input_tokens"]) && isCount(object["total_output_tokens"])
+		return recognizeStats(object)
 	case "performance":
-		var enabled *bool
-		if value, exists := object["enabled"]; exists && json.Unmarshal(value, &enabled) == nil && enabled != nil {
-			if !*enabled {
-				return Disabled, nil
-			}
-			valid = isArray(object["sys_stats"]) && isArray(object["gpu_stats"])
-		}
+		return recognizePerformance(object)
 	case "hardware":
-		valid = isCount(object["schema_version"]) && isArray(object["accelerators"])
+		return recognizeHardware(object)
 	}
-	if valid {
+	return Unknown, nil
+}
+
+// recognizeVersion validates and builds the version observation. A missing or
+// unparseable version yields Unknown; a valid version yields Supported with the
+// parsed build metadata (unset fields remain nil when they do not validate).
+func recognizeVersion(object map[string]json.RawMessage) (State, *Build) {
+	var raw struct {
+		Version, Commit string
+		BuildDate       string `json:"build_date"`
+	}
+	encoded, _ := json.Marshal(object)
+	if json.Unmarshal(encoded, &raw) != nil || raw.Version == "" {
+		return Unknown, nil
+	}
+	build := &Build{}
+	if versionPattern.MatchString(raw.Version) && len(raw.Version) <= 96 {
+		build.Version = raw.Version
+	}
+	if commitPattern.MatchString(raw.Commit) {
+		build.Commit = raw.Commit
+	}
+	if date, err := time.Parse(time.RFC3339, raw.BuildDate); err == nil {
+		build.Date = date.Format(time.RFC3339)
+	}
+	return Supported, build
+}
+
+// recognizeModels reports Supported when the response is a JSON array under data.
+func recognizeModels(object map[string]json.RawMessage) (State, *Build) {
+	if isArray(object["data"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizeActivity reports Supported when data is an array and page/total are counts.
+func recognizeActivity(object map[string]json.RawMessage) (State, *Build) {
+	if isArray(object["data"]) && isCount(object["page"]) && isCount(object["total"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizeStats reports Supported when all three totals are counts.
+func recognizeStats(object map[string]json.RawMessage) (State, *Build) {
+	if isCount(object["total_requests"]) && isCount(object["total_input_tokens"]) && isCount(object["total_output_tokens"]) {
+		return Supported, nil
+	}
+	return Unknown, nil
+}
+
+// recognizePerformance reports Disabled only for an explicit enabled:false, and
+// Supported when enabled is true and sys_stats/gpu_stats are arrays. Any other
+// input (missing or unparseable enabled) yields Unknown.
+func recognizePerformance(object map[string]json.RawMessage) (State, *Build) {
+	var enabled *bool
+	if value, exists := object["enabled"]; exists && json.Unmarshal(value, &enabled) == nil && enabled != nil {
+		if !*enabled {
+			return Disabled, nil
+		}
+		if isArray(object["sys_stats"]) && isArray(object["gpu_stats"]) {
+			return Supported, nil
+		}
+	}
+	return Unknown, nil
+}
+
+// recognizeHardware reports Supported when schema_version is a count and
+// accelerators is an array.
+func recognizeHardware(object map[string]json.RawMessage) (State, *Build) {
+	if isCount(object["schema_version"]) && isArray(object["accelerators"]) {
 		return Supported, nil
 	}
 	return Unknown, nil

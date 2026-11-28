@@ -125,6 +125,20 @@ func payloadEqual(a, b eventPayload) bool {
 	return true
 }
 
+// identityKey and eventKey are package-level so the indexing and per-activity
+// association helpers can share the lookup keys without redefining them.
+type identityKey struct {
+	backendID  string
+	epoch      int64
+	activityID string
+}
+
+type eventKey struct {
+	backendID string
+	epoch     int64
+	modelRef  string
+}
+
 // AssociateLifecycleEvents associates activities with nearby lifecycle
 // transition events within a time window. It is pure: it does not mutate the
 // inputs and is safe for concurrent calls. Identities are looked up by
@@ -146,102 +160,159 @@ func payloadEqual(a, b eventPayload) bool {
 // queue, or execution.
 func AssociateLifecycleEvents(activities []*ActivityRecord, identities []ActivityModelIdentity, events []LifecycleTransitionEvidence, window AssociationWindow) ([]ActivityLifecycleAssociation, error) {
 	// Validate the window upfront.
-	if window.Before < 0 || window.Before > lifecycleAssociationWindowMax {
-		return nil, errors.New("association window before out of range: must be 0..1 minute")
-	}
-	if window.After < 0 || window.After > lifecycleAssociationWindowMax {
-		return nil, errors.New("association window after out of range: must be 0..1 minute")
+	if err := validateAssociationWindow(window); err != nil {
+		return nil, err
 	}
 
 	// Validate input bounds upfront.
-	if len(activities) > 1000 {
-		return nil, errors.New("too many activities: max 1000")
-	}
-	if len(identities) > 1000 {
-		return nil, errors.New("too many identities: max 1000")
-	}
-	if len(events) > lifecycleAssociationMaxEvents {
-		return nil, errors.New("too many events: max 256")
+	if err := validateAssociationInputBounds(activities, identities, events); err != nil {
+		return nil, err
 	}
 
 	// Validate activities: nil, invalid IDs, zero timestamps, non-positive
 	// epochs are rejected with explicit unavailable errors.
-	for _, a := range activities {
-		if a == nil {
-			return nil, errors.New("nil activity: explicit unavailable")
-		}
-		if !validIdentifier(a.BackendID) {
-			return nil, errors.New("invalid backend id: explicit unavailable")
-		}
-		if !validIdentifier(a.ActivityID) {
-			return nil, errors.New("invalid activity id: explicit unavailable")
-		}
-		if a.Timestamp.IsZero() {
-			return nil, errors.New("zero timestamp: explicit unavailable")
-		}
-		if a.Epoch <= 0 {
-			return nil, errors.New("non-positive epoch: explicit unavailable")
-		}
+	if err := validateActivities(activities); err != nil {
+		return nil, err
 	}
 
 	// Validate identities: scope must be finite; reported/canonical refs,
 	// when present, must be bounded opaque ModelReferences.
-	for _, id := range identities {
-		if !validIdentifier(id.BackendID) {
-			return nil, errors.New("invalid identity backend id: explicit unavailable")
-		}
-		if !validIdentifier(id.ActivityID) {
-			return nil, errors.New("invalid identity activity id: explicit unavailable")
-		}
-		if id.Epoch <= 0 {
-			return nil, errors.New("non-positive identity epoch: explicit unavailable")
-		}
-		if id.ReportedModelRef != "" && !isModelReference(id.ReportedModelRef) {
-			return nil, errors.New("invalid identity reported model ref: explicit unavailable")
-		}
-		if id.CanonicalRef != "" && !isModelReference(id.CanonicalRef) {
-			return nil, errors.New("invalid identity canonical ref: explicit unavailable")
-		}
+	if err := validateIdentities(identities); err != nil {
+		return nil, err
 	}
 
 	// Validate events: scope and finite enum fields must be valid; zero
 	// observation times are rejected. A non-nil SourceTime must be non-zero.
 	// SourceEventID is capped at 256 bytes; it may contain secrets and is
 	// never emitted.
-	for _, e := range events {
-		if !validIdentifier(e.BackendID) {
-			return nil, errors.New("invalid event backend id: explicit unavailable")
-		}
-		if e.Epoch <= 0 {
-			return nil, errors.New("non-positive event epoch: explicit unavailable")
-		}
-		if e.ModelRef != "" && !isModelReference(e.ModelRef) {
-			return nil, errors.New("invalid event model ref: explicit unavailable")
-		}
-		if !isLifecycleTransitionState(e.OldState) {
-			return nil, errors.New("invalid event old state: explicit unavailable")
-		}
-		if !isLifecycleTransitionState(e.NewState) {
-			return nil, errors.New("invalid event new state: explicit unavailable")
-		}
-		if e.ObservedAt.IsZero() {
-			return nil, errors.New("zero event observed at: explicit unavailable")
-		}
-		if e.SourceTime != nil && e.SourceTime.IsZero() {
-			return nil, errors.New("zero event source time: explicit unavailable")
-		}
-		if len(e.SourceEventID) > 256 {
-			return nil, errors.New("source event id too long: explicit unavailable")
-		}
+	if err := validateEvents(events); err != nil {
+		return nil, err
 	}
 
 	// Index identities by (backendID, epoch, ActivityID). Duplicates are
 	// ambiguous even if identical: no winner is picked.
-	type identityKey struct {
-		backendID  string
-		epoch      int64
-		activityID string
+	identityByKey, identityAmbiguous := indexIdentities(identities)
+
+	// Index events by (backendID, epoch, ModelRef). Track SourceEventID
+	// conflicts per scope: the same source event ID with a different payload
+	// (SourceTime, OldState, NewState) is a conservative conflict; exact
+	// replays are deduplicated and never inflate the count. Events are never
+	// merged.
+	eventsByKey, conflictKeys := indexEvents(events)
+
+	// Sort each event list stably by SourceTime (nil last) so FirstEventTime /
+	// LastEventTime are deterministic regardless of receipt order. Receipt
+	// order itself is preserved for processing; SourceTime order is only used
+	// for reporting first/last bounds.
+	sortEventListsBySourceTime(eventsByKey)
+
+	result := make([]ActivityLifecycleAssociation, 0, len(activities))
+
+	for i := range activities {
+		a := activities[i]
+		result = append(result, associateOneActivity(a, identityByKey, identityAmbiguous, eventsByKey, conflictKeys, window))
 	}
+
+	// Cap association count defensively.
+	if len(result) > lifecycleAssociationMaxAssociations {
+		result = result[:lifecycleAssociationMaxAssociations]
+	}
+
+	return result, nil
+}
+
+// validateAssociationWindow validates the association look-behind / look-ahead
+// window bounds.
+func validateAssociationWindow(window AssociationWindow) error {
+	if window.Before < 0 || window.Before > lifecycleAssociationWindowMax {
+		return errors.New("association window before out of range: must be 0..1 minute")
+	}
+	if window.After < 0 || window.After > lifecycleAssociationWindowMax {
+		return errors.New("association window after out of range: must be 0..1 minute")
+	}
+	return nil
+}
+
+// validateAssociationInputBounds validates the input size bounds upfront.
+func validateAssociationInputBounds(activities []*ActivityRecord, identities []ActivityModelIdentity, events []LifecycleTransitionEvidence) error {
+	if len(activities) > 1000 {
+		return errors.New("too many activities: max 1000")
+	}
+	if len(identities) > 1000 {
+		return errors.New("too many identities: max 1000")
+	}
+	if len(events) > lifecycleAssociationMaxEvents {
+		return errors.New("too many events: max 256")
+	}
+	return nil
+}
+
+// validateActivities validates each activity record.
+func validateActivities(activities []*ActivityRecord) error {
+	for _, a := range activities {
+		if err := validateActivity(a); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateIdentities validates each activity identity.
+func validateIdentities(identities []ActivityModelIdentity) error {
+	for _, id := range identities {
+		if !validIdentifier(id.BackendID) {
+			return errors.New("invalid identity backend id: explicit unavailable")
+		}
+		if !validIdentifier(id.ActivityID) {
+			return errors.New("invalid identity activity id: explicit unavailable")
+		}
+		if id.Epoch <= 0 {
+			return errors.New("non-positive identity epoch: explicit unavailable")
+		}
+		if id.ReportedModelRef != "" && !isModelReference(id.ReportedModelRef) {
+			return errors.New("invalid identity reported model ref: explicit unavailable")
+		}
+		if id.CanonicalRef != "" && !isModelReference(id.CanonicalRef) {
+			return errors.New("invalid identity canonical ref: explicit unavailable")
+		}
+	}
+	return nil
+}
+
+// validateEvents validates each lifecycle transition event.
+func validateEvents(events []LifecycleTransitionEvidence) error {
+	for _, e := range events {
+		if !validIdentifier(e.BackendID) {
+			return errors.New("invalid event backend id: explicit unavailable")
+		}
+		if e.Epoch <= 0 {
+			return errors.New("non-positive event epoch: explicit unavailable")
+		}
+		if e.ModelRef != "" && !isModelReference(e.ModelRef) {
+			return errors.New("invalid event model ref: explicit unavailable")
+		}
+		if !isLifecycleTransitionState(e.OldState) {
+			return errors.New("invalid event old state: explicit unavailable")
+		}
+		if !isLifecycleTransitionState(e.NewState) {
+			return errors.New("invalid event new state: explicit unavailable")
+		}
+		if e.ObservedAt.IsZero() {
+			return errors.New("zero event observed at: explicit unavailable")
+		}
+		if e.SourceTime != nil && e.SourceTime.IsZero() {
+			return errors.New("zero event source time: explicit unavailable")
+		}
+		if len(e.SourceEventID) > 256 {
+			return errors.New("source event id too long: explicit unavailable")
+		}
+	}
+	return nil
+}
+
+// indexIdentities indexes identities by (backendID, epoch, ActivityID).
+// Duplicates are ambiguous even if identical: no winner is picked.
+func indexIdentities(identities []ActivityModelIdentity) (map[identityKey]*ActivityModelIdentity, map[identityKey]bool) {
 	identityByKey := make(map[identityKey]*ActivityModelIdentity, len(identities))
 	identityAmbiguous := make(map[identityKey]bool)
 	for i := range identities {
@@ -256,18 +327,15 @@ func AssociateLifecycleEvents(activities []*ActivityRecord, identities []Activit
 		}
 		identityByKey[key] = id
 	}
+	return identityByKey, identityAmbiguous
+}
 
-	// Index events by (backendID, epoch, ModelRef). Track SourceEventID
-	// conflicts per scope: the same source event ID with a different payload
-	// (SourceTime, OldState, NewState) is a conservative conflict; exact
-	// replays are deduplicated and never inflate the count. Events are never
-	// merged.
-	type eventKey struct {
-		backendID string
-		epoch     int64
-		modelRef  string
-	}
-
+// indexEvents indexes events by (backendID, epoch, ModelRef) and tracks
+// SourceEventID conflicts per scope. The same source event ID with a
+// differing payload (SourceTime, OldState, NewState) is a conservative
+// conflict; exact replays are deduplicated and never inflate the count.
+// Events are never merged.
+func indexEvents(events []LifecycleTransitionEvidence) (map[eventKey][]*LifecycleTransitionEvidence, map[eventKey]bool) {
 	eventsByKey := make(map[eventKey][]*LifecycleTransitionEvidence, len(events))
 	seenSourceEvent := make(map[eventKey]map[string]eventPayload)
 	conflictKeys := make(map[eventKey]bool)
@@ -295,10 +363,14 @@ func AssociateLifecycleEvents(activities []*ActivityRecord, identities []Activit
 		}
 	}
 
-	// Sort each event list stably by SourceTime (nil last) so FirstEventTime /
-	// LastEventTime are deterministic regardless of receipt order. Receipt
-	// order itself is preserved for processing; SourceTime order is only used
-	// for reporting first/last bounds.
+	return eventsByKey, conflictKeys
+}
+
+// sortEventListsBySourceTime sorts each indexed event list stably by
+// SourceTime (nil last) so FirstEventTime / LastEventTime are deterministic
+// regardless of receipt order. Receipt order itself is preserved for
+// processing; SourceTime order is only used for reporting first/last bounds.
+func sortEventListsBySourceTime(eventsByKey map[eventKey][]*LifecycleTransitionEvidence) {
 	for key := range eventsByKey {
 		evts := eventsByKey[key]
 		sort.SliceStable(evts, func(i, j int) bool {
@@ -315,142 +387,142 @@ func AssociateLifecycleEvents(activities []*ActivityRecord, identities []Activit
 			return ti.Before(*tj)
 		})
 	}
+}
 
-	result := make([]ActivityLifecycleAssociation, 0, len(activities))
+// buildBaseAssoc builds the unavailable base association for one activity:
+// fixed attribution fields, the activity's association window, and the state
+// at the activity is always unknown.
+func buildBaseAssoc(a *ActivityRecord, window AssociationWindow) ActivityLifecycleAssociation {
+	return ActivityLifecycleAssociation{
+		Kind:                     lifecycleAssociationUnavailable,
+		Attribution:              lifecycleAssociationAttribution,
+		RequestIDMapping:         "unsupported",
+		UpstreamGeneration:       "unknown",
+		LifecycleState:           "unknown",
+		ClockAlignmentUnverified: true,
+		ExecutionAttribution:     lifecycleAssociationExecutionAttribution,
+		BackendID:                a.BackendID,
+		Epoch:                    a.Epoch,
+		ActivityID:               a.ActivityID,
+		WindowStart:              a.Timestamp.Add(-window.Before),
+		WindowEnd:                a.Timestamp.Add(window.After),
+	}
+}
 
-	for i := range activities {
-		a := activities[i]
+// associateOneActivity associates one activity with nearby lifecycle transition
+// events. It starts from the unavailable base association and applies the
+// identity resolution, conflict, and source-clock window rules. The result is
+// returned without mutating the inputs.
+func associateOneActivity(
+	a *ActivityRecord,
+	identityByKey map[identityKey]*ActivityModelIdentity,
+	identityAmbiguous map[identityKey]bool,
+	eventsByKey map[eventKey][]*LifecycleTransitionEvidence,
+	conflictKeys map[eventKey]bool,
+	window AssociationWindow,
+) ActivityLifecycleAssociation {
+	assoc := buildBaseAssoc(a, window)
 
-		// Base association: unavailable, fixed attribution fields. The state
-		// at the activity is always unknown.
-		assoc := ActivityLifecycleAssociation{
-			Kind:                     lifecycleAssociationUnavailable,
-			Attribution:              lifecycleAssociationAttribution,
-			RequestIDMapping:         "unsupported",
-			UpstreamGeneration:       "unknown",
-			LifecycleState:           "unknown",
-			ClockAlignmentUnverified: true,
-			ExecutionAttribution:     lifecycleAssociationExecutionAttribution,
-			BackendID:                a.BackendID,
-			Epoch:                    a.Epoch,
-			ActivityID:               a.ActivityID,
-			WindowStart:              a.Timestamp.Add(-window.Before),
-			WindowEnd:                a.Timestamp.Add(window.After),
-		}
+	// Validate the activity's reported model ref before output: it must
+	// be blank or an opaque model reference. Raw labels are never copied.
+	if a.ReportedModelRef != "" && !isModelReference(a.ReportedModelRef) {
+		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
+		return assoc
+	}
+	assoc.ReportedModelRef = a.ReportedModelRef
 
-		// Validate the activity's reported model ref before output: it must
-		// be blank or an opaque model reference. Raw labels are never copied.
-		if a.ReportedModelRef != "" && !isModelReference(a.ReportedModelRef) {
-			assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
-			result = append(result, assoc)
-			continue
-		}
-		assoc.ReportedModelRef = a.ReportedModelRef
+	// Look up the identity by (backendID, epoch, ActivityID) - never by
+	// positional index. Duplicates are ambiguous; a conflicting activity
+	// is never merged.
+	key := identityKey{a.BackendID, a.Epoch, a.ActivityID}
+	id, ok := identityByKey[key]
+	if !ok || identityAmbiguous[key] || a.IdentityConflict {
+		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
+		return assoc
+	}
 
-		// Look up the identity by (backendID, epoch, ActivityID) - never by
-		// positional index. Duplicates are ambiguous; a conflicting activity
-		// is never merged.
-		key := identityKey{a.BackendID, a.Epoch, a.ActivityID}
-		id, ok := identityByKey[key]
-		if !ok || identityAmbiguous[key] || a.IdentityConflict {
-			assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
-			result = append(result, assoc)
-			continue
-		}
+	// The activity's reported model ref must match the identity's when
+	// both are present; never borrow the canonical ref as the model ref.
+	if a.ReportedModelRef != "" && id.ReportedModelRef != "" && a.ReportedModelRef != id.ReportedModelRef {
+		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
+		return assoc
+	}
 
-		// The activity's reported model ref must match the identity's when
-		// both are present; never borrow the canonical ref as the model ref.
-		if a.ReportedModelRef != "" && id.ReportedModelRef != "" && a.ReportedModelRef != id.ReportedModelRef {
-			assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
-			result = append(result, assoc)
-			continue
-		}
+	// Only a uniquely catalog_resolved identity with a canonical ref and
+	// positive epoch is matched.
+	identityResolved := false
+	if id.State == aliasStateExact && id.CanonicalRef != "" && id.Epoch > 0 {
+		identityResolved = true
+		assoc.CanonicalRef = id.CanonicalRef
+	}
 
-		// Only a uniquely catalog_resolved identity with a canonical ref and
-		// positive epoch is matched.
-		identityResolved := false
-		if id.State == aliasStateExact && id.CanonicalRef != "" && id.Epoch > 0 {
-			identityResolved = true
-			assoc.CanonicalRef = id.CanonicalRef
-		}
+	if !identityResolved {
+		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
+		return assoc
+	}
 
-		if !identityResolved {
-			assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
-			result = append(result, assoc)
-			continue
-		}
+	// Transition events name configured models. Match the independently
+	// resolved canonical reference, never the possibly aliased reported name.
+	ekey := eventKey{id.BackendID, id.Epoch, id.CanonicalRef}
+	matching := eventsByKey[ekey]
+	if len(matching) == 0 {
+		assoc.Reason = lifecycleAssociationReasonNoMatchingEvent
+		return assoc
+	}
 
-		// Transition events name configured models. Match the independently
-		// resolved canonical reference, never the possibly aliased reported name.
-		ekey := eventKey{id.BackendID, id.Epoch, id.CanonicalRef}
-		matching := eventsByKey[ekey]
-		if len(matching) == 0 {
-			assoc.Reason = lifecycleAssociationReasonNoMatchingEvent
-			result = append(result, assoc)
-			continue
-		}
-
-		// Conservative conflict flag: duplicate source event IDs with
-		// differing payloads are not merged. A conflicting identity never
-		// emits an approximate association.
-		if conflictKeys[ekey] {
-			assoc.Conflict = true
-			assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
-			assoc.ObservedEventCount = len(matching)
-			result = append(result, assoc)
-			continue
-		}
-
-		// Source clock window: [activity.Timestamp - Before,
-		// activity.Timestamp + After] inclusive. Local ObservedAt is never
-		// substituted for the source clock.
-		ws := a.Timestamp.Add(-window.Before)
-		we := a.Timestamp.Add(window.After)
-
-		var validSourceTimes []time.Time
-		hasSourceTime := false
-		for _, e := range matching {
-			if e.SourceTime != nil {
-				hasSourceTime = true
-				st := *e.SourceTime
-				if !st.Before(ws) && !st.After(we) {
-					validSourceTimes = append(validSourceTimes, st)
-				}
-			}
-		}
-
-		// Observed event count is scoped metadata: the number of distinct
-		// transition events observed for this backend/epoch/model ref.
+	// Conservative conflict flag: duplicate source event IDs with
+	// differing payloads are not merged. A conflicting identity never
+	// emits an approximate association.
+	if conflictKeys[ekey] {
+		assoc.Conflict = true
+		assoc.Reason = lifecycleAssociationReasonIdentityUnresolved
 		assoc.ObservedEventCount = len(matching)
+		return assoc
+	}
 
-		if len(validSourceTimes) > 0 {
-			// Valid source-clock association.
-			assoc.Kind = lifecycleAssociationKind
-			assoc.MatchedEventCount = len(validSourceTimes)
-			sort.SliceStable(validSourceTimes, func(i, j int) bool {
-				return validSourceTimes[i].Before(validSourceTimes[j])
-			})
-			assoc.FirstEventTime = validSourceTimes[0]
-			assoc.LastEventTime = validSourceTimes[len(validSourceTimes)-1]
-		} else {
-			// No valid source-clock association. Matched count is zero;
-			// report observed count as metadata but do not compare clock
-			// domains.
-			assoc.MatchedEventCount = 0
-			if !hasSourceTime {
-				assoc.Reason = lifecycleAssociationReasonSourceTimeUnavailable
-			} else {
-				assoc.Reason = lifecycleAssociationReasonOutsideWindow
+	// Source clock window: [activity.Timestamp - Before,
+	// activity.Timestamp + After] inclusive. Local ObservedAt is never
+	// substituted for the source clock. The base association already
+	// computed the window from the activity timestamp.
+	ws := assoc.WindowStart
+	we := assoc.WindowEnd
+
+	var validSourceTimes []time.Time
+	hasSourceTime := false
+	for _, e := range matching {
+		if e.SourceTime != nil {
+			hasSourceTime = true
+			st := *e.SourceTime
+			if !st.Before(ws) && !st.After(we) {
+				validSourceTimes = append(validSourceTimes, st)
 			}
 		}
-
-		result = append(result, assoc)
 	}
 
-	// Cap association count defensively.
-	if len(result) > lifecycleAssociationMaxAssociations {
-		result = result[:lifecycleAssociationMaxAssociations]
+	// Observed event count is scoped metadata: the number of distinct
+	// transition events observed for this backend/epoch/model ref.
+	assoc.ObservedEventCount = len(matching)
+
+	if len(validSourceTimes) > 0 {
+		// Valid source-clock association.
+		assoc.Kind = lifecycleAssociationKind
+		assoc.MatchedEventCount = len(validSourceTimes)
+		sort.SliceStable(validSourceTimes, func(i, j int) bool {
+			return validSourceTimes[i].Before(validSourceTimes[j])
+		})
+		assoc.FirstEventTime = validSourceTimes[0]
+		assoc.LastEventTime = validSourceTimes[len(validSourceTimes)-1]
+	} else {
+		// No valid source-clock association. Matched count is zero;
+		// report observed count as metadata but do not compare clock
+		// domains.
+		assoc.MatchedEventCount = 0
+		if !hasSourceTime {
+			assoc.Reason = lifecycleAssociationReasonSourceTimeUnavailable
+		} else {
+			assoc.Reason = lifecycleAssociationReasonOutsideWindow
+		}
 	}
 
-	return result, nil
+	return assoc
 }
